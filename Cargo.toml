@@ -6,6 +6,7 @@ rust-version = "1.95"
 description = "Multi-host USB HID switch over Bluetooth LE for ESP32-S3"
 license = "MIT"
 readme = "README.md"
+repository = "https://github.com/abco20/HIDShift"
 publish = false
 
 [lib]
