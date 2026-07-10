@@ -1,0 +1,123 @@
+[package]
+name = "hidshift"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Multi-host USB HID switch over Bluetooth LE for ESP32-S3"
+license = "MIT"
+readme = "README.md"
+publish = false
+
+[lib]
+name = "hidshift"
+path = "src/lib.rs"
+
+[[bin]]
+name = "firmware"
+path = "src/bin/firmware.rs"
+required-features = ["usb-host"]
+
+[features]
+default = []
+firmware = [
+    "dep:embassy-executor",
+    "dep:embassy-sync",
+    "dep:embassy-time",
+    "dep:esp-backtrace",
+    "dep:esp-bootloader-esp-idf",
+    "dep:esp-hal",
+    "dep:esp-println",
+    "dep:esp-rtos",
+    "dep:log",
+    "dep:static_cell",
+    "esp-backtrace/esp32s3",
+    "esp-backtrace/panic-handler",
+    "esp-backtrace/println",
+    "esp-bootloader-esp-idf/esp32s3",
+    "esp-hal/esp32s3",
+    "esp-hal/unstable",
+    "esp-println/esp32s3",
+    "esp-println/log-04",
+    "esp-println/uart",
+    "esp-rtos/embassy",
+    "esp-rtos/esp32s3",
+]
+usb-host = [
+    "firmware",
+    "dep:embassy-futures",
+    "dep:embassy-usb-driver",
+    "dep:embassy-usb-host",
+    "dep:embassy-usb-synopsys-otg",
+    "dep:esp-synopsys-usb-otg",
+]
+ble-hid = [
+    "firmware",
+    "dep:embassy-futures",
+    "dep:esp-alloc",
+    "dep:esp-radio",
+    "dep:static_cell",
+    "dep:trouble-host",
+    "esp-hal/__bluetooth",
+    "esp-radio/ble",
+    "esp-radio/esp-alloc",
+    "esp-radio/esp32s3",
+    "esp-radio/log-04",
+    "esp-radio/unstable",
+    "esp-rtos/esp-alloc",
+    "esp-rtos/esp-radio",
+    "esp-alloc/compat",
+    "esp-alloc/esp32s3",
+    "esp-alloc/global-allocator",
+    "trouble-host/default-packet-pool",
+    "trouble-host/derive",
+    "trouble-host/log",
+    "trouble-host/peripheral",
+    "trouble-host/security",
+]
+storage = [
+    "firmware",
+    "dep:esp-storage",
+    "esp-storage/esp32s3",
+]
+diagnostic-input = ["firmware"]
+
+[dependencies]
+bitflags = "2.10.0"
+embedded-storage = "0.3.1"
+embassy-executor = { version = "0.10.0", optional = true }
+embassy-futures = { version = "0.1.2", optional = true }
+embassy-sync = { version = "0.7.2", optional = true }
+embassy-time = { version = "0.5.1", optional = true }
+embassy-usb-driver = { version = "0.2.2", optional = true }
+embassy-usb-host = { version = "0.1.0", optional = true }
+embassy-usb-synopsys-otg = { version = "0.4.0", features = ["host"], optional = true }
+esp-alloc = { version = "0.10.0", default-features = false, optional = true }
+esp-backtrace = { version = "0.19.0", default-features = false, optional = true }
+esp-bootloader-esp-idf = { version = "0.5.0", optional = true }
+esp-hal = { version = "1.1.1", default-features = false, optional = true }
+esp-println = { version = "0.17.0", default-features = false, optional = true }
+esp-radio = { version = "1.0.0-beta.0", default-features = false, optional = true }
+esp-rtos = { version = "0.3.0", optional = true }
+esp-synopsys-usb-otg = { version = "0.4.2", optional = true }
+esp-storage = { version = "0.9.0", default-features = false, optional = true }
+heapless = "0.9.2"
+log = { version = "0.4.33", optional = true }
+static_cell = { version = "2.1.1", optional = true }
+trouble-host = { version = "0.6.0", default-features = false, features = ["gatt"], optional = true }
+
+[dev-dependencies]
+embassy-usb-host = "0.1.0"
+hidreport = { version = "0.6.0", default-features = false }
+
+[patch.crates-io]
+embassy-usb-synopsys-otg = { path = "vendor/embassy-usb-synopsys-otg-0.4.0" }
+
+[profile.dev]
+debug = true
+opt-level = "z"
+
+[profile.release]
+codegen-units = 1
+debug = 2
+lto = "fat"
+opt-level = "s"

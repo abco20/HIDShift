@@ -1,0 +1,7 @@
+/target/
+/.embuild/
+/.vscode/
+*.log
+*.elf
+*.bin
+!third_party/hidreport-fixtures/tests/data/*.hid.bin

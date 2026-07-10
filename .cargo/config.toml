@@ -1,0 +1,15 @@
+[build]
+# Keep host tests as the default; firmware commands select an Xtensa target explicitly.
+
+[env]
+# Keep lifecycle and fault logs by default. Bench builds can override this with
+# ESP_LOG=debug or ESP_LOG=trace.
+ESP_LOG = { value = "info", force = false }
+
+[target.xtensa-esp32s3-none-elf]
+runner = "espflash flash --monitor"
+rustflags = ["-C", "link-arg=-Tlinkall.x"]
+
+[target.xtensa-esp32-none-elf]
+runner = "espflash flash --monitor"
+rustflags = ["-C", "link-arg=-Tlinkall.x"]

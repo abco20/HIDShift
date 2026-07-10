@@ -1,0 +1,8 @@
+#[cfg(feature = "ble-hid")]
+pub mod ble_hid_task;
+pub mod button_task;
+pub mod flash_backend;
+#[cfg(feature = "diagnostic-input")]
+pub mod serial_diagnostic_task;
+pub mod storage_task;
+pub mod usb_host_task;

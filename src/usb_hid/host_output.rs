@@ -1,0 +1,150 @@
+#[cfg(feature = "usb-host")]
+use crate::usb_hid::host_interface::{HidInterfaceInfo, find_hid_interfaces};
+#[cfg(feature = "usb-host")]
+use crate::usb_hid::output::KeyboardLedOutputBytes;
+#[cfg(feature = "usb-host")]
+use embassy_usb_driver::host::{PipeError, UsbHostAllocator, UsbPipe, pipe};
+#[cfg(feature = "usb-host")]
+use embassy_usb_driver::{Direction as UsbDirection, EndpointAddress, EndpointInfo, EndpointType};
+#[cfg(feature = "usb-host")]
+use embassy_usb_host::class::hid::HidError;
+#[cfg(feature = "usb-host")]
+use embassy_usb_host::control::SetupPacket;
+#[cfg(feature = "usb-host")]
+use embassy_usb_host::handler::EnumerationInfo;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UsbKeyboardLedWriteError {
+    NoInterface,
+    NoPipe,
+    Transfer,
+}
+
+#[cfg(feature = "usb-host")]
+impl From<HidError> for UsbKeyboardLedWriteError {
+    fn from(error: HidError) -> Self {
+        match error {
+            HidError::Transfer(_) => Self::Transfer,
+            HidError::NoInterface => Self::NoInterface,
+            HidError::NoPipe => Self::NoPipe,
+        }
+    }
+}
+
+#[cfg(feature = "usb-host")]
+pub struct UsbKeyboardLedWriter<'d, A: UsbHostAllocator<'d>> {
+    transport: UsbKeyboardLedTransport<'d, A>,
+    interface: u8,
+}
+
+#[cfg(feature = "usb-host")]
+enum UsbKeyboardLedTransport<'d, A: UsbHostAllocator<'d>> {
+    Control(A::Pipe<pipe::Control, pipe::InOut>),
+    Interrupt(A::Pipe<pipe::Interrupt, pipe::Out>),
+}
+
+#[cfg(feature = "usb-host")]
+impl<'d, A: UsbHostAllocator<'d>> UsbKeyboardLedWriter<'d, A> {
+    pub fn new(
+        alloc: &A,
+        config_desc: &[u8],
+        enum_info: &EnumerationInfo,
+    ) -> Result<Self, UsbKeyboardLedWriteError> {
+        let info = find_hid_interfaces::<1>(config_desc)
+            .ok()
+            .and_then(|infos| infos.first().copied())
+            .ok_or(UsbKeyboardLedWriteError::NoInterface)?;
+        Self::new_for_interface(alloc, info, enum_info)
+    }
+
+    pub fn new_for_interface(
+        alloc: &A,
+        info: HidInterfaceInfo,
+        enum_info: &EnumerationInfo,
+    ) -> Result<Self, UsbKeyboardLedWriteError> {
+        let transport = if info.interrupt_out_ep != 0 {
+            let endpoint = EndpointInfo {
+                addr: EndpointAddress::from_parts(
+                    (info.interrupt_out_ep & 0x0f) as usize,
+                    UsbDirection::Out,
+                ),
+                ep_type: EndpointType::Interrupt,
+                max_packet_size: info.interrupt_out_mps,
+                interval_ms: info.interrupt_out_interval_ms,
+            };
+            UsbKeyboardLedTransport::Interrupt(
+                alloc
+                    .alloc_pipe::<pipe::Interrupt, pipe::Out>(
+                        enum_info.device_address,
+                        &endpoint,
+                        enum_info.split(),
+                    )
+                    .map_err(|_| UsbKeyboardLedWriteError::NoPipe)?,
+            )
+        } else {
+            let endpoint = EndpointInfo {
+                addr: EndpointAddress::from_parts(0, UsbDirection::In),
+                ep_type: EndpointType::Control,
+                max_packet_size: enum_info.device_desc.max_packet_size0 as u16,
+                interval_ms: 0,
+            };
+            UsbKeyboardLedTransport::Control(
+                alloc
+                    .alloc_pipe::<pipe::Control, pipe::InOut>(
+                        enum_info.device_address,
+                        &endpoint,
+                        enum_info.split(),
+                    )
+                    .map_err(|_| UsbKeyboardLedWriteError::NoPipe)?,
+            )
+        };
+
+        Ok(Self {
+            transport,
+            interface: info.interface_number,
+        })
+    }
+
+    pub async fn write_leds(
+        &mut self,
+        bytes: KeyboardLedOutputBytes,
+    ) -> Result<(), UsbKeyboardLedWriteError> {
+        match &mut self.transport {
+            UsbKeyboardLedTransport::Control(pipe) => {
+                let (report_id, payload) = bytes.control_set_report();
+                let setup =
+                    set_report_setup_packet(self.interface, report_id, payload.len() as u16);
+                pipe.control_out(&setup.to_bytes(), payload)
+                    .await
+                    .map_err(|_err: PipeError| UsbKeyboardLedWriteError::Transfer)
+            }
+            UsbKeyboardLedTransport::Interrupt(pipe) => pipe
+                .request_out(bytes.as_slice(), true)
+                .await
+                .map_err(|_err: PipeError| UsbKeyboardLedWriteError::Transfer),
+        }
+    }
+}
+
+#[cfg(feature = "usb-host")]
+fn set_report_setup_packet(interface: u8, report_id: u8, payload_len: u16) -> SetupPacket {
+    const SET_REPORT: u8 = 0x09;
+    const OUTPUT_REPORT_TYPE: u16 = 2 << 8;
+    SetupPacket::class_interface_out(
+        SET_REPORT,
+        OUTPUT_REPORT_TYPE | report_id as u16,
+        interface as u16,
+        payload_len,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "usb-host")]
+    #[test]
+    fn set_report_setup_uses_output_report_type_and_report_id() {
+        let setup = super::set_report_setup_packet(3, 4, 2).to_bytes();
+
+        assert_eq!(setup, [0x21, 0x09, 0x04, 0x02, 0x03, 0x00, 0x02, 0x00]);
+    }
+}
