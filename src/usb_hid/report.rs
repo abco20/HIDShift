@@ -166,14 +166,14 @@ impl<const N: usize> HidReportDescriptor<N> {
             match field.usage_page {
                 USAGE_PAGE_KEYBOARD => domains.keyboard = true,
                 USAGE_PAGE_BUTTON => domains.mouse = true,
-                USAGE_PAGE_GENERIC_DESKTOP => {
+                USAGE_PAGE_GENERIC_DESKTOP
                     if field.index_of_usage(USAGE_X).is_some()
                         || field.index_of_usage(USAGE_Y).is_some()
-                        || field.index_of_usage(USAGE_WHEEL).is_some()
-                    {
-                        domains.mouse = true;
-                    }
+                        || field.index_of_usage(USAGE_WHEEL).is_some() =>
+                {
+                    domains.mouse = true;
                 }
+                USAGE_PAGE_GENERIC_DESKTOP => {}
                 USAGE_PAGE_CONSUMER => {
                     if field.is_variable()
                         && field.usage_min == USAGE_AC_PAN

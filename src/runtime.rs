@@ -333,17 +333,18 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
 
     fn observe_bridge_event(&mut self, event: &BridgeEvent) {
         match event {
-            BridgeEvent::EnterPairingMode { host_id } => {
-                if self.pairing_mode.map(|state| state.host_id) != Some(*host_id) {
-                    self.pairing_mode = Some(PairingModeState {
-                        host_id: *host_id,
-                        deadline_ms: self
-                            .pairing_mode
-                            .map(|state| state.deadline_ms)
-                            .unwrap_or(PAIRING_MODE_TIMEOUT_MS),
-                    });
-                }
+            BridgeEvent::EnterPairingMode { host_id }
+                if self.pairing_mode.map(|state| state.host_id) != Some(*host_id) =>
+            {
+                self.pairing_mode = Some(PairingModeState {
+                    host_id: *host_id,
+                    deadline_ms: self
+                        .pairing_mode
+                        .map(|state| state.deadline_ms)
+                        .unwrap_or(PAIRING_MODE_TIMEOUT_MS),
+                });
             }
+            BridgeEvent::EnterPairingMode { .. } => {}
             BridgeEvent::PairingModeExpired { host_id } | BridgeEvent::ClearHost { host_id }
                 if self.pairing_mode.map(|state| state.host_id) == Some(*host_id) =>
             {
