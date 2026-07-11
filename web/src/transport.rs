@@ -6,6 +6,7 @@ use hidshift::{
     MANAGEMENT_SERVICE_UUID,
 };
 use hidshift_client::{PendingRequest, SerialResponseDecoder, encode_serial_request};
+use gloo_timers::future::TimeoutFuture;
 use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
@@ -57,6 +58,11 @@ impl BrowserTransport {
 
 pub struct BluetoothTransport {
     request_characteristic: JsValue,
+    // Keep the notification source alive for as long as the transport. The JS
+    // event listener alone does not guarantee that the characteristic wrapper
+    // remains rooted after `connect` returns.
+    response_characteristic: JsValue,
+    on_bytes: BytesCallback,
     _notification: Closure<dyn FnMut(Event)>,
     _disconnect: Closure<dyn FnMut(Event)>,
 }
@@ -121,10 +127,12 @@ impl BluetoothTransport {
             .clone()
             .dyn_into()
             .map_err(|_| "Bluetooth response characteristic is not an EventTarget")?;
+        let notification_on_bytes = on_bytes.clone();
         let notification = Closure::wrap(Box::new(move |event: Event| {
-            if let Some(bytes) = bluetooth_event_bytes(&event) {
-                on_bytes(&bytes);
-            }
+            // Forward an empty frame on extraction failure so the pending request
+            // reports the transport/protocol problem instead of becoming a timeout.
+            let bytes = bluetooth_event_bytes(&event).unwrap_or_default();
+            notification_on_bytes(&bytes);
         }) as Box<dyn FnMut(Event)>);
         response_target
             .add_event_listener_with_callback(
@@ -148,12 +156,15 @@ impl BluetoothTransport {
 
         Ok(Self {
             request_characteristic,
+            response_characteristic,
+            on_bytes,
             _notification: notification,
             _disconnect: disconnect,
         })
     }
 
     async fn write(&self, request: PendingRequest) -> Result<(), String> {
+        let request_id = request.request().request_id;
         let bytes = Uint8Array::from(request.encode().as_slice());
         await_method(
             &self.request_characteristic,
@@ -161,6 +172,16 @@ impl BluetoothTransport {
             &[bytes.into()],
         )
         .await?;
+        for _ in 0..50 {
+            if let Ok(value) = await_method(&self.response_characteristic, "readValue", &[]).await
+                && let Some(response) = bluetooth_value_bytes(&value)
+                && response_matches_request(&response, request_id)
+            {
+                (self.on_bytes)(&response);
+                break;
+            }
+            TimeoutFuture::new(20).await;
+        }
         Ok(())
     }
 }
@@ -233,8 +254,12 @@ async fn read_serial(reader: JsValue, on_bytes: BytesCallback, on_disconnect: Di
 }
 
 fn bluetooth_event_bytes(event: &Event) -> Option<Vec<u8>> {
-    let target = event.target()?;
+    let target = event.target().or_else(|| event.current_target())?;
     let value = Reflect::get(&target, &"value".into()).ok()?;
+    bluetooth_value_bytes(&value)
+}
+
+fn bluetooth_value_bytes(value: &JsValue) -> Option<Vec<u8>> {
     let buffer = Reflect::get(&value, &"buffer".into()).ok()?;
     let offset = Reflect::get(&value, &"byteOffset".into()).ok()?.as_f64()? as u32;
     let length = Reflect::get(&value, &"byteLength".into()).ok()?.as_f64()? as u32;
@@ -242,6 +267,10 @@ fn bluetooth_event_bytes(event: &Event) -> Option<Vec<u8>> {
         return None;
     }
     Some(Uint8Array::new_with_byte_offset_and_length(&buffer, offset, length).to_vec())
+}
+
+fn response_matches_request(response: &[u8], request_id: u8) -> bool {
+    response.len() == MANAGEMENT_RESPONSE_LEN && response.get(1) == Some(&request_id)
 }
 
 async fn await_method(target: &JsValue, name: &str, args: &[JsValue]) -> Result<JsValue, String> {
@@ -269,4 +298,22 @@ fn js_error(error: JsValue) -> String {
         .as_string()
         .or_else(|| Reflect::get(&error, &"message".into()).ok()?.as_string())
         .unwrap_or_else(|| format!("{error:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_fallback_accepts_only_the_current_response() {
+        let mut response = [0; MANAGEMENT_RESPONSE_LEN];
+        response[1] = 7;
+
+        assert!(response_matches_request(&response, 7));
+        assert!(!response_matches_request(&response, 6));
+        assert!(!response_matches_request(
+            &response[..MANAGEMENT_RESPONSE_LEN - 1],
+            7
+        ));
+    }
 }

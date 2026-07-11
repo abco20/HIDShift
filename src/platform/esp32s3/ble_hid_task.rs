@@ -41,6 +41,7 @@ const BLE_CONNECTIONS_MAX: usize = 4;
 const BLE_L2CAP_CHANNELS_MAX: usize = BLE_CONNECTIONS_MAX * 2;
 const BLE_ATTRIBUTE_TABLE_SIZE: usize = 72;
 const BLE_NOTIFY_TIMEOUT_MS: u64 = 30;
+const MANAGEMENT_NOTIFY_TIMEOUT_MS: u64 = 1_000;
 const MANAGEMENT_SERVICE_UUID_LE: [u8; 16] = [
     0x01, 0x00, 0x3a, 0x4f, 0x6d, 0x5b, 0x4b, 0x9f, 0x0d, 0x4f, 0x15, 0x1b, 0x00, 0x00, 0x51, 0x7f,
 ];
@@ -1126,7 +1127,18 @@ async fn dispatch_ble_command_to_connected_slot(
             }
         }
         BleTaskCommand::ManagementResponse { .. } => {
-            let _ = dispatch_ble_command_to_slot(server, conn, command).await;
+            if with_timeout(
+                Duration::from_millis(MANAGEMENT_NOTIFY_TIMEOUT_MS),
+                dispatch_ble_command_to_slot(server, conn, command),
+            )
+            .await
+            .is_err()
+            {
+                log::warn!(
+                    "firmware: management response notify timeout host={}",
+                    host_id.0
+                );
+            }
         }
     }
 }
