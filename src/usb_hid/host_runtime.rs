@@ -65,24 +65,6 @@ impl<const FIELDS: usize, const EVENTS: usize> UsbHidInterfaceRuntimeSession<FIE
         })
     }
 
-    #[cfg(feature = "usb-host")]
-    pub fn from_embassy_descriptor<const N: usize>(
-        interface_id: InterfaceId,
-        device_id: DeviceId,
-        descriptor: &embassy_usb_host::class::hid::ReportDescriptor<N>,
-        report_descriptor: &[u8],
-        boot_keyboard_led_fallback: bool,
-    ) -> Result<Self, UsbHidInterfaceRuntimeDescriptorError> {
-        let descriptor = to_core_descriptor::<N, FIELDS>(descriptor)?;
-        Self::from_core_descriptor(
-            interface_id,
-            device_id,
-            descriptor,
-            report_descriptor,
-            boot_keyboard_led_fallback,
-        )
-    }
-
     pub const fn interface_id(&self) -> InterfaceId {
         self.interface_id
     }
@@ -133,28 +115,6 @@ impl<const FIELDS: usize, const EVENTS: usize> UsbHidInterfaceRuntimeSession<FIE
             report,
         )
     }
-}
-
-#[cfg(feature = "usb-host")]
-pub fn to_core_descriptor<const SRC: usize, const DST: usize>(
-    descriptor: &embassy_usb_host::class::hid::ReportDescriptor<SRC>,
-) -> Result<HidReportDescriptor<DST>, HidReportError> {
-    let mut core_descriptor = HidReportDescriptor::new(descriptor.has_report_ids);
-    for field in descriptor.fields() {
-        core_descriptor.push(crate::usb_hid::report::ReportField {
-            report_id: field.report_id,
-            usage_page: field.usage_page,
-            usage_min: field.usage_min,
-            usage_max: field.usage_max,
-            bit_offset: field.bit_offset,
-            bit_size: field.bit_size,
-            count: field.count,
-            flags: field.flags,
-            logical_min: field.logical_min,
-            logical_max: field.logical_max,
-        })?;
-    }
-    Ok(core_descriptor)
 }
 
 #[cfg(test)]

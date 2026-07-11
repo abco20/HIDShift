@@ -1484,6 +1484,16 @@ name = "hidshift"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.13.0",
+ "embassy-usb-host",
+ "embedded-storage",
+ "heapless 0.9.3",
+ "hidreport",
+]
+
+[[package]]
+name = "hidshift-firmware"
+version = "0.1.0"
+dependencies = [
  "embassy-executor",
  "embassy-futures",
  "embassy-sync 0.7.2",
@@ -1491,7 +1501,6 @@ dependencies = [
  "embassy-usb-driver",
  "embassy-usb-host",
  "embassy-usb-synopsys-otg 0.4.0",
- "embedded-storage",
  "esp-alloc",
  "esp-backtrace",
  "esp-bootloader-esp-idf",
@@ -1502,7 +1511,7 @@ dependencies = [
  "esp-storage",
  "esp-synopsys-usb-otg",
  "heapless 0.9.3",
- "hidreport",
+ "hidshift",
  "log",
  "static_cell",
  "trouble-host",

@@ -1,18 +1,13 @@
-#[cfg(feature = "storage")]
 use esp_bootloader_esp_idf::partitions::{
     DataPartitionSubType, PARTITION_TABLE_MAX_LEN, PartitionType, read_partition_table,
 };
-#[cfg(feature = "storage")]
 use esp_storage::FlashStorage;
-#[cfg(feature = "storage")]
 use hidshift::storage::{NorFlashStorageBackend, STORAGE_FLASH_LEN, StorageFlashLayout};
 use hidshift::storage::{STORAGE_IMAGE_LEN, StorageError, StorageSlotBackend, StorageSlotIndex};
 
-#[cfg(feature = "storage")]
 pub const STORAGE_PARTITION_LABEL: &str = "bridge";
 
 pub enum FirmwareStorageBackend {
-    #[cfg(feature = "storage")]
     Flash(NorFlashStorageBackend<FlashStorage<'static>>),
     Memory(InMemoryStorageBackend),
 }
@@ -20,7 +15,6 @@ pub enum FirmwareStorageBackend {
 impl StorageSlotBackend for FirmwareStorageBackend {
     fn slot(&self, index: StorageSlotIndex) -> &[u8; STORAGE_IMAGE_LEN] {
         match self {
-            #[cfg(feature = "storage")]
             Self::Flash(backend) => backend.slot(index),
             Self::Memory(backend) => backend.slot(index),
         }
@@ -32,14 +26,12 @@ impl StorageSlotBackend for FirmwareStorageBackend {
         image: [u8; STORAGE_IMAGE_LEN],
     ) -> Result<(), StorageError> {
         match self {
-            #[cfg(feature = "storage")]
             Self::Flash(backend) => backend.write_slot(index, image),
             Self::Memory(backend) => backend.write_slot(index, image),
         }
     }
 }
 
-#[cfg(feature = "storage")]
 pub fn new_storage_backend(flash: esp_hal::peripherals::FLASH<'static>) -> FirmwareStorageBackend {
     match new_flash_storage_backend(flash) {
         Ok(backend) => {
@@ -59,12 +51,6 @@ pub fn new_storage_backend(flash: esp_hal::peripherals::FLASH<'static>) -> Firmw
     }
 }
 
-#[cfg(not(feature = "storage"))]
-pub fn new_storage_backend() -> FirmwareStorageBackend {
-    FirmwareStorageBackend::Memory(InMemoryStorageBackend::new())
-}
-
-#[cfg(feature = "storage")]
 fn new_flash_storage_backend(
     flash: esp_hal::peripherals::FLASH<'static>,
 ) -> Result<NorFlashStorageBackend<FlashStorage<'static>>, FirmwareStorageInitError> {
@@ -91,7 +77,6 @@ fn new_flash_storage_backend(
         .map_err(FirmwareStorageInitError::Storage)
 }
 
-#[cfg(feature = "storage")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FirmwareStorageInitError {
     PartitionTable,

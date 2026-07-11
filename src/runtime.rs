@@ -1652,14 +1652,6 @@ pub enum RuntimeEffect {
     SetLogLevel(u8),
 }
 
-impl RuntimeEffect {
-    pub fn apply(self) {
-        match self {
-            Self::SetLogLevel(level) => apply_log_level(level),
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommandClass {
     Critical,
@@ -1989,19 +1981,6 @@ fn scale_axis_with_remainder(value: i8, percent: u16, remainder: &mut i32) -> i8
     let output = available.clamp(i8::MIN as i32, i8::MAX as i32) as i8;
     *remainder = scaled - i32::from(output) * 100;
     output
-}
-
-fn apply_log_level(level: u8) {
-    #[cfg(feature = "firmware")]
-    log::set_max_level(match level {
-        0 => log::LevelFilter::Error,
-        1 => log::LevelFilter::Warn,
-        2 => log::LevelFilter::Info,
-        3 => log::LevelFilter::Debug,
-        _ => log::LevelFilter::Trace,
-    });
-    #[cfg(not(feature = "firmware"))]
-    let _ = level;
 }
 
 #[cfg(test)]

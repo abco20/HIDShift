@@ -1,34 +1,24 @@
 #![no_std]
 #![no_main]
 
-#[cfg(feature = "ble-hid")]
 extern crate alloc;
 
 use embassy_executor::{SpawnError, SpawnToken, Spawner};
-#[cfg(all(feature = "ble-hid", feature = "storage"))]
 use embassy_futures::select::{Either, select};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::{Channel, Receiver, Sender, TrySendError};
 use esp_backtrace as _;
-#[path = "../platform/esp32s3/mod.rs"]
-mod esp32s3_platform;
+mod platform;
 use esp_hal::clock::CpuClock;
 use esp_hal::interrupt::software::SoftwareInterruptControl;
 use esp_hal::timer::timg::TimerGroup;
-#[cfg(all(feature = "ble-hid", feature = "storage"))]
 use esp32s3_platform::ble_hid_task::BleRuntimeSnapshot;
-#[cfg(all(feature = "ble-hid", feature = "storage"))]
 use esp32s3_platform::ble_hid_task::active_ble_connections;
 use esp32s3_platform::button_task::control_task;
 use esp32s3_platform::storage_task::storage_command_task;
 use esp32s3_platform::usb_host_task::usb_input_task;
 use hidshift::DefaultRuntimeOwner;
-#[cfg(not(feature = "ble-hid"))]
-use hidshift::ble_notify::BleNotificationSink;
-#[cfg(not(feature = "ble-hid"))]
-use hidshift::ble_notify::dispatch_ble_task_command;
 use hidshift::mouse_accumulator::MouseReportAccumulator;
-#[cfg(all(feature = "ble-hid", feature = "storage"))]
 use hidshift::runtime::RUNTIME_HOSTS_MAX;
 use hidshift::runtime::driver::RuntimeTaskSink;
 use hidshift::runtime::message::RuntimeInputMessage;
@@ -39,8 +29,8 @@ use hidshift::runtime::{
     RUNTIME_USB_COMMAND_QUEUE_CAPACITY, RuntimeDiagnosticsEvent, StatusTaskCommand,
     StorageTaskCommand, UsbTaskCommand,
 };
-#[cfg(feature = "ble-hid")]
 use hidshift::storage::StorageState;
+use platform as esp32s3_platform;
 use static_cell::StaticCell;
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -72,29 +62,19 @@ static STORAGE_COMMAND_CHANNEL: Channel<
     StorageTaskCommand,
     RUNTIME_STORAGE_COMMAND_QUEUE_CAPACITY,
 > = Channel::new();
-#[cfg(feature = "ble-hid")]
 static BLE_RESTORE_CHANNEL: Channel<CriticalSectionRawMutex, Option<StorageState>, 1> =
     Channel::new();
-#[cfg(all(feature = "ble-hid", feature = "storage"))]
 static BLE_QUIESCE_REQUEST_CHANNEL: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
-#[cfg(all(feature = "ble-hid", feature = "storage"))]
 static BLE_QUIESCE_READY_CHANNEL: Channel<CriticalSectionRawMutex, Option<StorageState>, 1> =
     Channel::new();
-#[cfg(all(feature = "ble-hid", feature = "storage"))]
 static BLE_QUIESCE_DONE_CHANNEL: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
-#[cfg(all(feature = "ble-hid", feature = "storage"))]
 static USB_BLE_QUIESCE_REQUEST_CHANNEL: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
-#[cfg(all(feature = "ble-hid", feature = "storage"))]
 static USB_BLE_QUIESCE_READY_CHANNEL: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
-#[cfg(all(feature = "ble-hid", feature = "storage"))]
 static USB_BLE_QUIESCE_DONE_CHANNEL: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
-#[cfg(all(feature = "ble-hid", feature = "storage"))]
 static BLE_RUNTIME_BARRIER_REQUEST_CHANNEL: Channel<CriticalSectionRawMutex, usize, 1> =
     Channel::new();
-#[cfg(all(feature = "ble-hid", feature = "storage"))]
 static BLE_RUNTIME_BARRIER_DONE_CHANNEL: Channel<CriticalSectionRawMutex, BleRuntimeSnapshot, 1> =
     Channel::new();
-#[cfg(all(feature = "ble-hid", feature = "storage"))]
 static BLE_RUNTIME_BARRIER_RESUME_CHANNEL: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
 static STATUS_COMMAND_CHANNEL: Channel<
     CriticalSectionRawMutex,
@@ -125,10 +105,7 @@ fn spawn_or_reset<S>(
 fn main() -> ! {
     esp_println::logger::init_logger_from_env();
 
-    #[cfg(feature = "ble-hid")]
-    {
-        esp_alloc::heap_allocator!(size: 72 * 1024);
-    }
+    esp_alloc::heap_allocator!(size: 72 * 1024);
 
     let reset_reason = esp_hal::system::reset_reason();
     let reset_reason_code = reset_reason.map_or(0, |reason| reason as u8);
@@ -149,13 +126,9 @@ fn main() -> ! {
         let storage_sender = RUNTIME_INPUT_CHANNEL.sender();
         let usb_input_sender = RUNTIME_INPUT_CHANNEL.sender();
         let usb_receiver = USB_COMMAND_CHANNEL.receiver();
-        #[cfg(feature = "ble-hid")]
         let ble_control_receiver = BLE_CONTROL_COMMAND_CHANNEL.receiver();
-        #[cfg(feature = "ble-hid")]
         let ble_notify_receiver = BLE_NOTIFY_COMMAND_CHANNEL.receiver();
-        #[cfg(feature = "ble-hid")]
         let ble_input_sender = RUNTIME_INPUT_CHANNEL.sender();
-        #[cfg(feature = "ble-hid")]
         let ble_restore_receiver = BLE_RESTORE_CHANNEL.receiver();
         let sink = ChannelTaskSink {
             ble_control: BLE_CONTROL_COMMAND_CHANNEL.sender(),
@@ -174,11 +147,8 @@ fn main() -> ! {
             runtime_owner_task(
                 runtime_owner_receiver,
                 &RUNTIME_TICK_PENDING,
-                #[cfg(all(feature = "ble-hid", feature = "storage"))]
                 BLE_RUNTIME_BARRIER_REQUEST_CHANNEL.receiver(),
-                #[cfg(all(feature = "ble-hid", feature = "storage"))]
                 BLE_RUNTIME_BARRIER_DONE_CHANNEL.sender(),
-                #[cfg(all(feature = "ble-hid", feature = "storage"))]
                 BLE_RUNTIME_BARRIER_RESUME_CHANNEL.receiver(),
                 sink,
             ),
@@ -218,16 +188,12 @@ fn main() -> ! {
                 peripherals.USB0,
                 peripherals.GPIO20,
                 peripherals.GPIO19,
-                #[cfg(all(feature = "ble-hid", feature = "storage"))]
                 USB_BLE_QUIESCE_REQUEST_CHANNEL.sender(),
-                #[cfg(all(feature = "ble-hid", feature = "storage"))]
                 USB_BLE_QUIESCE_READY_CHANNEL.receiver(),
-                #[cfg(all(feature = "ble-hid", feature = "storage"))]
                 USB_BLE_QUIESCE_DONE_CHANNEL.sender(),
             ),
             "usb-input",
         );
-        #[cfg(feature = "ble-hid")]
         spawn_or_reset(
             &spawner,
             esp32s3_platform::ble_hid_task::ble_host_event_task(
@@ -235,23 +201,14 @@ fn main() -> ! {
                 ble_control_receiver,
                 ble_notify_receiver,
                 ble_restore_receiver,
-                #[cfg(feature = "storage")]
                 BLE_QUIESCE_REQUEST_CHANNEL.receiver(),
-                #[cfg(feature = "storage")]
                 BLE_QUIESCE_READY_CHANNEL.sender(),
-                #[cfg(feature = "storage")]
                 BLE_QUIESCE_DONE_CHANNEL.receiver(),
-                #[cfg(feature = "storage")]
                 USB_BLE_QUIESCE_REQUEST_CHANNEL.receiver(),
-                #[cfg(feature = "storage")]
                 USB_BLE_QUIESCE_READY_CHANNEL.sender(),
-                #[cfg(feature = "storage")]
                 USB_BLE_QUIESCE_DONE_CHANNEL.receiver(),
-                #[cfg(feature = "storage")]
                 BLE_RUNTIME_BARRIER_REQUEST_CHANNEL.sender(),
-                #[cfg(feature = "storage")]
                 BLE_RUNTIME_BARRIER_DONE_CHANNEL.receiver(),
-                #[cfg(feature = "storage")]
                 BLE_RUNTIME_BARRIER_RESUME_CHANNEL.sender(),
                 peripherals.BT,
                 peripherals.RNG,
@@ -259,49 +216,17 @@ fn main() -> ! {
             ),
             "ble-host-event",
         );
-        #[cfg(not(feature = "ble-hid"))]
-        spawn_or_reset(
-            &spawner,
-            ble_command_task(
-                BLE_CONTROL_COMMAND_CHANNEL.receiver(),
-                BLE_NOTIFY_COMMAND_CHANNEL.receiver(),
-            ),
-            "ble-command",
-        );
-        #[cfg(not(feature = "usb-host"))]
-        spawn_or_reset(
-            &spawner,
-            usb_command_task(USB_COMMAND_CHANNEL.receiver()),
-            "usb-command",
-        );
-        #[cfg(feature = "storage")]
         spawn_or_reset(
             &spawner,
             storage_command_task(
                 STORAGE_COMMAND_CHANNEL.receiver(),
                 storage_sender,
-                #[cfg(feature = "ble-hid")]
                 BLE_RESTORE_CHANNEL.sender(),
-                #[cfg(all(feature = "ble-hid", feature = "storage"))]
                 BLE_QUIESCE_REQUEST_CHANNEL.sender(),
-                #[cfg(all(feature = "ble-hid", feature = "storage"))]
                 BLE_QUIESCE_READY_CHANNEL.receiver(),
-                #[cfg(all(feature = "ble-hid", feature = "storage"))]
                 BLE_QUIESCE_DONE_CHANNEL.sender(),
                 active_ble_connections,
                 peripherals.FLASH,
-            ),
-            "storage-command",
-        );
-        #[cfg(not(feature = "storage"))]
-        spawn_or_reset(
-            &spawner,
-            storage_command_task(
-                STORAGE_COMMAND_CHANNEL.receiver(),
-                storage_sender,
-                #[cfg(feature = "ble-hid")]
-                BLE_RESTORE_CHANNEL.sender(),
-                active_ble_connections,
             ),
             "storage-command",
         );
@@ -325,24 +250,9 @@ async fn runtime_owner_task(
         RUNTIME_INPUT_QUEUE_CAPACITY,
     >,
     tick_pending: &'static hidshift::runtime::RuntimeTickPending,
-    #[cfg(all(feature = "ble-hid", feature = "storage"))] barrier_request: Receiver<
-        'static,
-        CriticalSectionRawMutex,
-        usize,
-        1,
-    >,
-    #[cfg(all(feature = "ble-hid", feature = "storage"))] barrier_done: Sender<
-        'static,
-        CriticalSectionRawMutex,
-        BleRuntimeSnapshot,
-        1,
-    >,
-    #[cfg(all(feature = "ble-hid", feature = "storage"))] barrier_resume: Receiver<
-        'static,
-        CriticalSectionRawMutex,
-        (),
-        1,
-    >,
+    barrier_request: Receiver<'static, CriticalSectionRawMutex, usize, 1>,
+    barrier_done: Sender<'static, CriticalSectionRawMutex, BleRuntimeSnapshot, 1>,
+    barrier_resume: Receiver<'static, CriticalSectionRawMutex, (), 1>,
     mut sink: ChannelTaskSink,
 ) {
     let mut owner = DefaultRuntimeOwner::new(0);
@@ -355,7 +265,6 @@ async fn runtime_owner_task(
             sink.mouse.stats(),
             sink.status_updates_dropped,
         );
-        #[cfg(all(feature = "ble-hid", feature = "storage"))]
         let message = match select(receiver.receive(), barrier_request.receive()).await {
             Either::First(message) => message,
             Either::Second(active_host_mask) => {
@@ -388,8 +297,6 @@ async fn runtime_owner_task(
                 continue;
             }
         };
-        #[cfg(not(all(feature = "ble-hid", feature = "storage")))]
-        let message = receiver.receive().await;
         if matches!(message, RuntimeInputMessage::Tick { .. }) {
             tick_pending.mark_processed();
         }
@@ -421,56 +328,8 @@ async fn process_runtime_message(
     }
     *owner = next_owner;
     for effect in owner.default_queues().effects.iter().copied() {
-        effect.apply();
+        apply_runtime_effect(effect);
     }
-}
-
-#[embassy_executor::task]
-#[cfg(not(feature = "ble-hid"))]
-async fn ble_command_task(
-    control_receiver: Receiver<
-        'static,
-        CriticalSectionRawMutex,
-        BleTaskCommand,
-        RUNTIME_BLE_CONTROL_COMMAND_QUEUE_CAPACITY,
-    >,
-    notify_receiver: Receiver<
-        'static,
-        CriticalSectionRawMutex,
-        BleTaskCommand,
-        RUNTIME_BLE_NOTIFY_COMMAND_QUEUE_CAPACITY,
-    >,
-) {
-    log::info!("firmware: ble command task boot");
-    let mut sink = LoggingBleNotificationSink;
-    loop {
-        let command = receive_ble_command(control_receiver, notify_receiver).await;
-        log::trace!("firmware: ble_command {:?}", command);
-        if let Err(error) = dispatch_ble_task_command(command, &mut sink) {
-            log::error!("firmware: ble_notify_dispatch error {:?}", error);
-        }
-    }
-}
-
-#[embassy_executor::task]
-async fn usb_command_task(
-    receiver: Receiver<
-        'static,
-        CriticalSectionRawMutex,
-        UsbTaskCommand,
-        RUNTIME_USB_COMMAND_QUEUE_CAPACITY,
-    >,
-) {
-    log::info!("firmware: usb command task boot");
-    loop {
-        let command = receiver.receive().await;
-        log::debug!("firmware: usb_command {:?}", command);
-    }
-}
-
-#[cfg(not(all(feature = "ble-hid", feature = "storage")))]
-fn active_ble_connections() -> usize {
-    0
 }
 
 #[embassy_executor::task]
@@ -576,7 +435,6 @@ struct ChannelTaskSink {
 }
 
 impl ChannelTaskSink {
-    #[cfg(all(feature = "ble-hid", feature = "storage"))]
     fn discard_transient_input(&mut self) {
         self.mouse.discard_all();
     }
@@ -866,27 +724,6 @@ impl ChannelTaskSink {
     }
 }
 
-#[cfg(not(feature = "ble-hid"))]
-struct LoggingBleNotificationSink;
-
-#[cfg(not(feature = "ble-hid"))]
-impl BleNotificationSink for LoggingBleNotificationSink {
-    type Error = core::convert::Infallible;
-
-    fn send_notification(
-        &mut self,
-        characteristic: hidshift::reports::BleHidCharacteristic,
-        value: &[u8],
-    ) -> Result<(), (hidshift::runtime::driver::RuntimeTaskKind, Self::Error)> {
-        log::trace!(
-            "firmware: ble_notification characteristic={:?} bytes={:?}",
-            characteristic,
-            value
-        );
-        Ok(())
-    }
-}
-
 impl RuntimeTaskSink for ChannelTaskSink {
     type Error = ChannelTaskSendError;
 
@@ -950,7 +787,21 @@ impl RuntimeTaskSink for ChannelTaskSink {
     }
 
     fn apply_effect(&mut self, effect: hidshift::runtime::RuntimeEffect) {
-        effect.apply();
+        apply_runtime_effect(effect);
+    }
+}
+
+fn apply_runtime_effect(effect: hidshift::runtime::RuntimeEffect) {
+    match effect {
+        hidshift::runtime::RuntimeEffect::SetLogLevel(level) => {
+            log::set_max_level(match level {
+                0 => log::LevelFilter::Error,
+                1 => log::LevelFilter::Warn,
+                2 => log::LevelFilter::Info,
+                3 => log::LevelFilter::Debug,
+                _ => log::LevelFilter::Trace,
+            });
+        }
     }
 }
 
@@ -983,34 +834,5 @@ impl From<TrySendError<StorageTaskCommand>> for ChannelTaskSendError {
 impl From<TrySendError<StatusTaskCommand>> for ChannelTaskSendError {
     fn from(_: TrySendError<StatusTaskCommand>) -> Self {
         Self::StatusQueueFull
-    }
-}
-
-#[cfg(not(feature = "ble-hid"))]
-async fn receive_ble_command(
-    control_receiver: Receiver<
-        'static,
-        CriticalSectionRawMutex,
-        BleTaskCommand,
-        RUNTIME_BLE_CONTROL_COMMAND_QUEUE_CAPACITY,
-    >,
-    notify_receiver: Receiver<
-        'static,
-        CriticalSectionRawMutex,
-        BleTaskCommand,
-        RUNTIME_BLE_NOTIFY_COMMAND_QUEUE_CAPACITY,
-    >,
-) -> BleTaskCommand {
-    if let Ok(command) = control_receiver.try_receive() {
-        return command;
-    }
-    if let Ok(command) = notify_receiver.try_receive() {
-        return command;
-    }
-    match embassy_futures::select::select(control_receiver.receive(), notify_receiver.receive())
-        .await
-    {
-        embassy_futures::select::Either::First(command)
-        | embassy_futures::select::Either::Second(command) => command,
     }
 }

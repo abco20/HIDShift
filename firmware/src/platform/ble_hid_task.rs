@@ -50,7 +50,6 @@ static BLE_ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 static BLE_ACTIVE_HOST_MASK: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg(feature = "storage")]
 pub struct BleRuntimeSnapshot {
     pub storage: Option<StorageState>,
     pub pairable_host: Option<HostId>,
@@ -161,7 +160,6 @@ struct DeviceInformationService {
     model_number: &'static str,
 }
 
-#[cfg(feature = "storage")]
 pub fn active_ble_connections() -> usize {
     BLE_ACTIVE_CONNECTIONS.load(Ordering::Relaxed)
 }
@@ -187,40 +185,15 @@ pub async fn ble_host_event_task(
         RUNTIME_BLE_NOTIFY_COMMAND_QUEUE_CAPACITY,
     >,
     restore_receiver: Receiver<'static, CriticalSectionRawMutex, Option<StorageState>, 1>,
-    #[cfg(feature = "storage")] quiesce_request: Receiver<'static, CriticalSectionRawMutex, (), 1>,
-    #[cfg(feature = "storage")] quiesce_ready: Sender<
-        'static,
-        CriticalSectionRawMutex,
-        Option<StorageState>,
-        1,
-    >,
-    #[cfg(feature = "storage")] quiesce_done: Receiver<'static, CriticalSectionRawMutex, (), 1>,
-    #[cfg(feature = "storage")] usb_quiesce_request: Receiver<
-        'static,
-        CriticalSectionRawMutex,
-        (),
-        1,
-    >,
-    #[cfg(feature = "storage")] usb_quiesce_ready: Sender<'static, CriticalSectionRawMutex, (), 1>,
-    #[cfg(feature = "storage")] usb_quiesce_done: Receiver<'static, CriticalSectionRawMutex, (), 1>,
-    #[cfg(feature = "storage")] runtime_barrier_request: Sender<
-        'static,
-        CriticalSectionRawMutex,
-        usize,
-        1,
-    >,
-    #[cfg(feature = "storage")] runtime_barrier_done: Receiver<
-        'static,
-        CriticalSectionRawMutex,
-        BleRuntimeSnapshot,
-        1,
-    >,
-    #[cfg(feature = "storage")] runtime_barrier_resume: Sender<
-        'static,
-        CriticalSectionRawMutex,
-        (),
-        1,
-    >,
+    quiesce_request: Receiver<'static, CriticalSectionRawMutex, (), 1>,
+    quiesce_ready: Sender<'static, CriticalSectionRawMutex, Option<StorageState>, 1>,
+    quiesce_done: Receiver<'static, CriticalSectionRawMutex, (), 1>,
+    usb_quiesce_request: Receiver<'static, CriticalSectionRawMutex, (), 1>,
+    usb_quiesce_ready: Sender<'static, CriticalSectionRawMutex, (), 1>,
+    usb_quiesce_done: Receiver<'static, CriticalSectionRawMutex, (), 1>,
+    runtime_barrier_request: Sender<'static, CriticalSectionRawMutex, usize, 1>,
+    runtime_barrier_done: Receiver<'static, CriticalSectionRawMutex, BleRuntimeSnapshot, 1>,
+    runtime_barrier_resume: Sender<'static, CriticalSectionRawMutex, (), 1>,
     bt: esp_hal::peripherals::BT<'static>,
     rng: esp_hal::peripherals::RNG<'static>,
     adc1: esp_hal::peripherals::ADC1<'static>,
@@ -240,14 +213,8 @@ pub async fn ble_host_event_task(
         }
     };
     let restored_state = restore_receiver.receive().await;
-    #[cfg(feature = "storage")]
     let mut current_storage = restored_state;
-    #[cfg(not(feature = "storage"))]
-    let current_storage = restored_state;
-    #[cfg(feature = "storage")]
     let mut pairable_host = None;
-    #[cfg(not(feature = "storage"))]
-    let pairable_host = None;
     let mut bt = Some(bt);
     let server = match Server::new_with_config(GapConfig::Peripheral(PeripheralConfig {
         name: BLE_DEVICE_NAME,
@@ -285,7 +252,6 @@ pub async fn ble_host_event_task(
         };
         let controller: ExternalController<_, 20> = ExternalController::new(connector);
 
-        #[cfg(feature = "storage")]
         match select3(
             run_ble_host_events(
                 controller,
@@ -336,23 +302,9 @@ pub async fn ble_host_event_task(
                 runtime_barrier_resume.send(()).await;
             }
         }
-
-        #[cfg(not(feature = "storage"))]
-        run_ble_host_events(
-            controller,
-            &mut trng,
-            sender,
-            control_receiver,
-            notify_receiver,
-            server,
-            current_storage.as_ref(),
-            pairable_host,
-        )
-        .await;
     }
 }
 
-#[cfg(feature = "storage")]
 async fn disconnect_runtime_hosts_before_quiesce(
     barrier_request: Sender<'static, CriticalSectionRawMutex, usize, 1>,
     barrier_done: Receiver<'static, CriticalSectionRawMutex, BleRuntimeSnapshot, 1>,

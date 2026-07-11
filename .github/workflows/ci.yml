@@ -21,6 +21,8 @@ jobs:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+      - name: Install host system dependencies
+        run: sudo apt-get update && sudo apt-get install --yes libdbus-1-dev pkg-config
       - run: cargo test --locked
       - run: cargo fmt --check
       - run: cargo check --locked --lib
@@ -48,22 +50,12 @@ jobs:
       - name: Build production firmware
         run: >-
           cargo +esp build --locked -Zbuild-std=core,alloc --release
-          --bin firmware --features usb-host,ble-hid,storage
+          --manifest-path firmware/Cargo.toml --bin firmware
           --target xtensa-esp32s3-none-elf
       - name: Record firmware size
         run: stat --printf='firmware_bytes=%s\n' target/xtensa-esp32s3-none-elf/release/firmware
       - name: Check diagnostic firmware
         run: >-
           cargo +esp check --locked -Zbuild-std=core,alloc
-          --bin firmware --features usb-host,ble-hid,storage,diagnostic-input
-          --target xtensa-esp32s3-none-elf
-      - name: Check without storage
-        run: >-
-          cargo +esp check --locked -Zbuild-std=core,alloc
-          --bin firmware --features usb-host,ble-hid
-          --target xtensa-esp32s3-none-elf
-      - name: Check without BLE HID
-        run: >-
-          cargo +esp check --locked -Zbuild-std=core,alloc
-          --bin firmware --features usb-host,storage
+          --manifest-path firmware/Cargo.toml --bin firmware --features diagnostic-input
           --target xtensa-esp32s3-none-elf

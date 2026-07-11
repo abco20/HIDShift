@@ -40,7 +40,9 @@ enum CliCommand {
     Diagnostics,
     History,
     SettingsList,
-    SettingDescribe { key: String },
+    SettingDescribe {
+        key: String,
+    },
     SettingGet {
         key: String,
         slot: Option<u8>,
@@ -83,21 +85,43 @@ enum CommandArgs {
     /// 接続イベントの履歴を表示
     History,
     /// 入力の送信先を切り替え
-    Select { #[arg(value_parser = clap::value_parser!(u8).range(1..=4))] slot: u8 },
+    Select {
+        #[arg(value_parser = clap::value_parser!(u8).range(1..=4))]
+        slot: u8,
+    },
     /// 新しいPCやスマートフォンのペアリングを開始
-    Pair { #[arg(value_parser = clap::value_parser!(u8).range(1..=4))] slot: u8 },
+    Pair {
+        #[arg(value_parser = clap::value_parser!(u8).range(1..=4))]
+        slot: u8,
+    },
     /// 実行中のペアリングを中止
     PairCancel,
     /// スロットに登録された機器を削除
-    Forget { #[arg(value_parser = clap::value_parser!(u8).range(1..=4))] slot: u8 },
+    Forget {
+        #[arg(value_parser = clap::value_parser!(u8).range(1..=4))]
+        slot: u8,
+    },
     /// スロットの機器名と状態を表示
-    Info { #[arg(value_parser = clap::value_parser!(u8).range(1..=4))] slot: u8 },
+    Info {
+        #[arg(value_parser = clap::value_parser!(u8).range(1..=4))]
+        slot: u8,
+    },
     /// スロットの最終接続情報を表示
-    Timing { #[arg(value_parser = clap::value_parser!(u8).range(1..=4))] slot: u8 },
+    Timing {
+        #[arg(value_parser = clap::value_parser!(u8).range(1..=4))]
+        slot: u8,
+    },
     /// スロットの表示名を変更（空文字列で自動名に戻す）
-    Name { #[arg(value_parser = clap::value_parser!(u8).range(1..=4))] slot: u8, name: String },
+    Name {
+        #[arg(value_parser = clap::value_parser!(u8).range(1..=4))]
+        slot: u8,
+        name: String,
+    },
     /// 動作設定を確認・変更
-    Settings { #[command(subcommand)] command: SettingsArgs },
+    Settings {
+        #[command(subcommand)]
+        command: SettingsArgs,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -107,9 +131,18 @@ enum SettingsArgs {
     /// 設定の用途・範囲・選択肢を表示
     Describe { key: String },
     /// 設定値を表示
-    Get { key: String, #[arg(long, value_parser = clap::value_parser!(u8).range(1..=4))] slot: Option<u8> },
+    Get {
+        key: String,
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=4))]
+        slot: Option<u8>,
+    },
     /// 設定値を変更（例: on, slot-2, jis, 125%）
-    Set { key: String, value: String, #[arg(long, value_parser = clap::value_parser!(u8).range(1..=4))] slot: Option<u8> },
+    Set {
+        key: String,
+        value: String,
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=4))]
+        slot: Option<u8>,
+    },
 }
 
 #[tokio::main]
@@ -185,7 +218,9 @@ async fn request(
         Transport::Ble(address) => {
             ble_request(address.as_deref(), request, DEFAULT_TIMEOUT).await?
         }
-        Transport::None => return Err("接続方法を指定してください（--serial PORT または --ble）".into()),
+        Transport::None => {
+            return Err("接続方法を指定してください（--serial PORT または --ble）".into());
+        }
     };
     let response = client
         .accept(&bytes)
@@ -539,7 +574,10 @@ async fn print_settings(transport: &Transport) -> Result<(), Box<dyn Error>> {
     {
         return Err("firmware settings schema does not match this CLI".into());
     }
-    println!("HIDShift settings (firmware {}.{}.{})", schema_info.firmware_major, schema_info.firmware_minor, schema_info.firmware_patch);
+    println!(
+        "HIDShift settings (firmware {}.{}.{})",
+        schema_info.firmware_major, schema_info.firmware_minor, schema_info.firmware_patch
+    );
     for descriptor in SETTING_DESCRIPTORS {
         match descriptor.scope {
             SettingScope::Global => print_response(
@@ -575,15 +613,41 @@ fn print_setting_description(key: &str) -> Result<(), Box<dyn Error>> {
     let descriptor = setting_by_key(key).ok_or_else(|| unknown_setting_message(key))?;
     println!("{} ({})", descriptor.label, descriptor.key);
     println!("  {}", descriptor.description);
-    println!("  対象: {}", if descriptor.scope == SettingScope::Global { "本体全体" } else { "接続先スロット（--slotが必要）" });
+    println!(
+        "  対象: {}",
+        if descriptor.scope == SettingScope::Global {
+            "本体全体"
+        } else {
+            "接続先スロット（--slotが必要）"
+        }
+    );
     if descriptor.choices.is_empty() {
-        println!("  値: {}{}〜{}{}（刻み {}{}）", descriptor.min, descriptor.unit, descriptor.max, descriptor.unit, descriptor.step, descriptor.unit);
+        println!(
+            "  値: {}{}〜{}{}（刻み {}{}）",
+            descriptor.min,
+            descriptor.unit,
+            descriptor.max,
+            descriptor.unit,
+            descriptor.step,
+            descriptor.unit
+        );
     } else {
         println!("  選択肢:");
-        for choice in descriptor.choices { println!("    {:<10} {}", choice_cli_name(descriptor.id, choice.value), choice.label); }
+        for choice in descriptor.choices {
+            println!(
+                "    {:<10} {}",
+                choice_cli_name(descriptor.id, choice.value),
+                choice.label
+            );
+        }
     }
-    println!("  初期値: {}", display_setting_value(descriptor, descriptor.default));
-    if descriptor.restart_required { println!("  注意: 変更はHIDShiftの再起動後に反映されます"); }
+    println!(
+        "  初期値: {}",
+        display_setting_value(descriptor, descriptor.default)
+    );
+    if descriptor.restart_required {
+        println!("  注意: 変更はHIDShiftの再起動後に反映されます");
+    }
     Ok(())
 }
 
@@ -591,13 +655,20 @@ fn display_setting_value(descriptor: &hidshift::SettingDescriptor, value: i32) -
     if descriptor.kind == hidshift::SettingValueKind::Bool {
         return if value == 0 { "オフ" } else { "オン" }.into();
     }
-    if let Some(choice) = descriptor.choices.iter().find(|choice| choice.value == value) {
+    if let Some(choice) = descriptor
+        .choices
+        .iter()
+        .find(|choice| choice.value == value)
+    {
         return format!("{} ({})", choice.label, value);
     }
     format!("{}{}", value, descriptor.unit)
 }
 
-fn parse_cli_setting_value(descriptor: &hidshift::SettingDescriptor, input: &str) -> Result<i32, Box<dyn Error>> {
+fn parse_cli_setting_value(
+    descriptor: &hidshift::SettingDescriptor,
+    input: &str,
+) -> Result<i32, Box<dyn Error>> {
     let normalized = input.trim();
     let value = if descriptor.kind == hidshift::SettingValueKind::Bool {
         match normalized.to_ascii_lowercase().as_str() {
@@ -608,7 +679,12 @@ fn parse_cli_setting_value(descriptor: &hidshift::SettingDescriptor, input: &str
     } else if descriptor.kind == hidshift::SettingValueKind::Choice {
         choice_alias(descriptor.id, normalized).or_else(|| normalized.parse().ok())
     } else {
-        normalized.strip_suffix(descriptor.unit).unwrap_or(normalized).trim().parse().ok()
+        normalized
+            .strip_suffix(descriptor.unit)
+            .unwrap_or(normalized)
+            .trim()
+            .parse()
+            .ok()
     };
     value.filter(|value| (descriptor.min..=descriptor.max).contains(value)).ok_or_else(|| {
         format!("'{}' は {} の有効な値ではありません。`settings describe {}` で候補を確認してください", input, descriptor.label, descriptor.key).into()
@@ -624,10 +700,30 @@ fn choice_alias(id: hidshift::SettingId, input: &str) -> Option<i32> {
         (SettingId::BootTarget, "slot-2" | "slot2") => 2,
         (SettingId::BootTarget, "slot-3" | "slot3") => 3,
         (SettingId::BootTarget, "slot-4" | "slot4") => 4,
-        (SettingId::ButtonShortAction | SettingId::ButtonLongAction | SettingId::ButtonVeryLongAction, "none") => 0,
-        (SettingId::ButtonShortAction | SettingId::ButtonLongAction | SettingId::ButtonVeryLongAction, "next") => 1,
-        (SettingId::ButtonShortAction | SettingId::ButtonLongAction | SettingId::ButtonVeryLongAction, "pair") => 2,
-        (SettingId::ButtonShortAction | SettingId::ButtonLongAction | SettingId::ButtonVeryLongAction, "forget") => 3,
+        (
+            SettingId::ButtonShortAction
+            | SettingId::ButtonLongAction
+            | SettingId::ButtonVeryLongAction,
+            "none",
+        ) => 0,
+        (
+            SettingId::ButtonShortAction
+            | SettingId::ButtonLongAction
+            | SettingId::ButtonVeryLongAction,
+            "next",
+        ) => 1,
+        (
+            SettingId::ButtonShortAction
+            | SettingId::ButtonLongAction
+            | SettingId::ButtonVeryLongAction,
+            "pair",
+        ) => 2,
+        (
+            SettingId::ButtonShortAction
+            | SettingId::ButtonLongAction
+            | SettingId::ButtonVeryLongAction,
+            "forget",
+        ) => 3,
         (SettingId::KeyboardLayout, "raw" | "none") => 0,
         (SettingId::KeyboardLayout, "us") => 1,
         (SettingId::KeyboardLayout, "jis" | "jp") => 2,
@@ -648,10 +744,30 @@ fn choice_cli_name(id: hidshift::SettingId, value: i32) -> &'static str {
         (SettingId::BootTarget, 2) => "slot-2",
         (SettingId::BootTarget, 3) => "slot-3",
         (SettingId::BootTarget, 4) => "slot-4",
-        (SettingId::ButtonShortAction | SettingId::ButtonLongAction | SettingId::ButtonVeryLongAction, 0) => "none",
-        (SettingId::ButtonShortAction | SettingId::ButtonLongAction | SettingId::ButtonVeryLongAction, 1) => "next",
-        (SettingId::ButtonShortAction | SettingId::ButtonLongAction | SettingId::ButtonVeryLongAction, 2) => "pair",
-        (SettingId::ButtonShortAction | SettingId::ButtonLongAction | SettingId::ButtonVeryLongAction, 3) => "forget",
+        (
+            SettingId::ButtonShortAction
+            | SettingId::ButtonLongAction
+            | SettingId::ButtonVeryLongAction,
+            0,
+        ) => "none",
+        (
+            SettingId::ButtonShortAction
+            | SettingId::ButtonLongAction
+            | SettingId::ButtonVeryLongAction,
+            1,
+        ) => "next",
+        (
+            SettingId::ButtonShortAction
+            | SettingId::ButtonLongAction
+            | SettingId::ButtonVeryLongAction,
+            2,
+        ) => "pair",
+        (
+            SettingId::ButtonShortAction
+            | SettingId::ButtonLongAction
+            | SettingId::ButtonVeryLongAction,
+            3,
+        ) => "forget",
         (SettingId::KeyboardLayout, 0) => "raw",
         (SettingId::KeyboardLayout, 1) => "us",
         (SettingId::KeyboardLayout, 2) => "jis",
@@ -665,7 +781,11 @@ fn choice_cli_name(id: hidshift::SettingId, value: i32) -> &'static str {
 }
 
 fn unknown_setting_message(key: &str) -> String {
-    let available = SETTING_DESCRIPTORS.iter().map(|item| item.key).collect::<Vec<_>>().join(", ");
+    let available = SETTING_DESCRIPTORS
+        .iter()
+        .map(|item| item.key)
+        .collect::<Vec<_>>()
+        .join(", ");
     format!("設定 '{key}' はありません。利用可能: {available}")
 }
 
@@ -757,7 +877,8 @@ fn parse_arguments<I>(arguments: I) -> Result<Arguments, Box<dyn Error>>
 where
     I: IntoIterator<Item = String>,
 {
-    let parsed = CliArgs::try_parse_from(std::iter::once("hidshiftctl".to_owned()).chain(arguments))?;
+    let parsed =
+        CliArgs::try_parse_from(std::iter::once("hidshiftctl".to_owned()).chain(arguments))?;
     let transport = if let Some(port) = parsed.serial {
         Transport::Serial(port)
     } else if parsed.ble {
@@ -771,23 +892,39 @@ where
         CommandArgs::Devices => CliCommand::Devices,
         CommandArgs::Diagnostics => CliCommand::Diagnostics,
         CommandArgs::History => CliCommand::History,
-        CommandArgs::Select { slot } => CliCommand::Request(ManagementCommand::SelectHost(hidshift::HostId(slot))),
-        CommandArgs::Pair { slot } => CliCommand::Request(ManagementCommand::StartPairing(hidshift::HostId(slot))),
+        CommandArgs::Select { slot } => {
+            CliCommand::Request(ManagementCommand::SelectHost(hidshift::HostId(slot)))
+        }
+        CommandArgs::Pair { slot } => {
+            CliCommand::Request(ManagementCommand::StartPairing(hidshift::HostId(slot)))
+        }
         CommandArgs::PairCancel => CliCommand::Request(ManagementCommand::CancelPairing),
-        CommandArgs::Forget { slot } => CliCommand::Request(ManagementCommand::ForgetHost(hidshift::HostId(slot))),
-        CommandArgs::Info { slot } => CliCommand::Request(ManagementCommand::GetHostInfo(hidshift::HostId(slot))),
-        CommandArgs::Timing { slot } => CliCommand::Request(ManagementCommand::GetHostTiming(hidshift::HostId(slot))),
+        CommandArgs::Forget { slot } => {
+            CliCommand::Request(ManagementCommand::ForgetHost(hidshift::HostId(slot)))
+        }
+        CommandArgs::Info { slot } => {
+            CliCommand::Request(ManagementCommand::GetHostInfo(hidshift::HostId(slot)))
+        }
+        CommandArgs::Timing { slot } => {
+            CliCommand::Request(ManagementCommand::GetHostTiming(hidshift::HostId(slot)))
+        }
         CommandArgs::Name { slot, name } => CliCommand::Request(ManagementCommand::SetHostName {
             host_id: hidshift::HostId(slot),
-            name: hidshift::ManagementHostName::from_ascii(&name).map_err(|_| "名前は半角12文字以内で入力してください")?,
+            name: hidshift::ManagementHostName::from_ascii(&name)
+                .map_err(|_| "名前は半角12文字以内で入力してください")?,
         }),
         CommandArgs::Settings { command } => match command {
             SettingsArgs::List => CliCommand::SettingsList,
             SettingsArgs::Describe { key } => CliCommand::SettingDescribe { key },
             SettingsArgs::Get { key, slot } => CliCommand::SettingGet { key, slot },
             SettingsArgs::Set { key, value, slot } => {
-                let descriptor = setting_by_key(&key).ok_or_else(|| unknown_setting_message(&key))?;
-                CliCommand::SettingSet { key, slot, value: parse_cli_setting_value(descriptor, &value)? }
+                let descriptor =
+                    setting_by_key(&key).ok_or_else(|| unknown_setting_message(&key))?;
+                CliCommand::SettingSet {
+                    key,
+                    slot,
+                    value: parse_cli_setting_value(descriptor, &value)?,
+                }
             }
         },
     };
@@ -866,33 +1003,26 @@ mod tests {
             0
         );
         assert_eq!(
-            parse_cli_setting_value(
-                setting_by_key("mouse_sensitivity_percent").unwrap(),
-                "125%"
-            )
-            .unwrap(),
+            parse_cli_setting_value(setting_by_key("mouse_sensitivity_percent").unwrap(), "125%")
+                .unwrap(),
             125
         );
     }
 
     #[test]
     fn setting_value_errors_point_to_describe_command() {
-        let error = parse_cli_setting_value(
-            setting_by_key("mouse_sensitivity_percent").unwrap(),
-            "500%",
-        )
-        .unwrap_err()
-        .to_string();
+        let error =
+            parse_cli_setting_value(setting_by_key("mouse_sensitivity_percent").unwrap(), "500%")
+                .unwrap_err()
+                .to_string();
         assert!(error.contains("settings describe mouse_sensitivity_percent"));
     }
 
     #[test]
     fn setting_description_does_not_require_a_device_transport() {
         assert_eq!(
-            parse_arguments(
-                ["settings", "describe", "keyboard_layout"].map(str::to_owned)
-            )
-            .unwrap(),
+            parse_arguments(["settings", "describe", "keyboard_layout"].map(str::to_owned))
+                .unwrap(),
             Arguments {
                 transport: Transport::None,
                 command: CliCommand::SettingDescribe {

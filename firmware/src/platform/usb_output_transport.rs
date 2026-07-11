@@ -1,17 +1,10 @@
-#[cfg(feature = "usb-host")]
-use crate::usb_hid::host_interface::{HidInterfaceInfo, find_hid_interfaces};
-#[cfg(feature = "usb-host")]
-use crate::usb_hid::output::KeyboardLedOutputBytes;
-#[cfg(feature = "usb-host")]
 use embassy_usb_driver::host::{PipeError, UsbHostAllocator, UsbPipe, pipe};
-#[cfg(feature = "usb-host")]
 use embassy_usb_driver::{Direction as UsbDirection, EndpointAddress, EndpointInfo, EndpointType};
-#[cfg(feature = "usb-host")]
 use embassy_usb_host::class::hid::HidError;
-#[cfg(feature = "usb-host")]
 use embassy_usb_host::control::SetupPacket;
-#[cfg(feature = "usb-host")]
 use embassy_usb_host::handler::EnumerationInfo;
+use hidshift::usb_hid::host_interface::HidInterfaceInfo;
+use hidshift::usb_hid::output::KeyboardLedOutputBytes;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UsbKeyboardLedWriteError {
@@ -20,7 +13,6 @@ pub enum UsbKeyboardLedWriteError {
     Transfer,
 }
 
-#[cfg(feature = "usb-host")]
 impl From<HidError> for UsbKeyboardLedWriteError {
     fn from(error: HidError) -> Self {
         match error {
@@ -31,32 +23,17 @@ impl From<HidError> for UsbKeyboardLedWriteError {
     }
 }
 
-#[cfg(feature = "usb-host")]
 pub struct UsbKeyboardLedWriter<'d, A: UsbHostAllocator<'d>> {
     transport: UsbKeyboardLedTransport<'d, A>,
     interface: u8,
 }
 
-#[cfg(feature = "usb-host")]
 enum UsbKeyboardLedTransport<'d, A: UsbHostAllocator<'d>> {
     Control(A::Pipe<pipe::Control, pipe::InOut>),
     Interrupt(A::Pipe<pipe::Interrupt, pipe::Out>),
 }
 
-#[cfg(feature = "usb-host")]
 impl<'d, A: UsbHostAllocator<'d>> UsbKeyboardLedWriter<'d, A> {
-    pub fn new(
-        alloc: &A,
-        config_desc: &[u8],
-        enum_info: &EnumerationInfo,
-    ) -> Result<Self, UsbKeyboardLedWriteError> {
-        let info = find_hid_interfaces::<1>(config_desc)
-            .ok()
-            .and_then(|infos| infos.first().copied())
-            .ok_or(UsbKeyboardLedWriteError::NoInterface)?;
-        Self::new_for_interface(alloc, info, enum_info)
-    }
-
     pub fn new_for_interface(
         alloc: &A,
         info: HidInterfaceInfo,
@@ -126,7 +103,6 @@ impl<'d, A: UsbHostAllocator<'d>> UsbKeyboardLedWriter<'d, A> {
     }
 }
 
-#[cfg(feature = "usb-host")]
 fn set_report_setup_packet(interface: u8, report_id: u8, payload_len: u16) -> SetupPacket {
     const SET_REPORT: u8 = 0x09;
     const OUTPUT_REPORT_TYPE: u16 = 2 << 8;
@@ -136,15 +112,4 @@ fn set_report_setup_packet(interface: u8, report_id: u8, payload_len: u16) -> Se
         interface as u16,
         payload_len,
     )
-}
-
-#[cfg(test)]
-mod tests {
-    #[cfg(feature = "usb-host")]
-    #[test]
-    fn set_report_setup_uses_output_report_type_and_report_id() {
-        let setup = super::set_report_setup_packet(3, 4, 2).to_bytes();
-
-        assert_eq!(setup, [0x21, 0x09, 0x04, 0x02, 0x03, 0x00, 0x02, 0x00]);
-    }
 }

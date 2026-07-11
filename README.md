@@ -27,12 +27,17 @@ source "$HOME/export-esp.sh"
 cargo +esp build \
   -Zbuild-std=core,alloc \
   --release \
+  --manifest-path firmware/Cargo.toml \
   --bin firmware \
-  --features usb-host,ble-hid,storage \
   --target xtensa-esp32s3-none-elf
 ```
 
 Do not enable the `diagnostic-input` feature in production builds.
+
+The `hidshift` crate contains the host-testable `no_std` bridge core. The
+`firmware` crate owns all ESP32-S3, USB Host, BLE HID, and flash integration;
+those capabilities are mandatory rather than Cargo features. The optional
+`diagnostic-input` feature only enables verbose input diagnostics.
 
 ## Flash
 
@@ -134,8 +139,8 @@ building to change the compile-time maximum log level:
 ESP_LOG=debug cargo +esp build \
   -Zbuild-std=core,alloc \
   --release \
+  --manifest-path firmware/Cargo.toml \
   --bin firmware \
-  --features usb-host,ble-hid,storage \
   --target xtensa-esp32s3-none-elf
 ```
 
@@ -162,6 +167,6 @@ Binary releases must also include the generated dependency license report:
 
 ```sh
 cargo install --locked cargo-about --features cli
-cargo about generate --locked --features "usb-host ble-hid storage" \
+cargo about generate --locked --manifest-path firmware/Cargo.toml \
   --target xtensa-esp32s3-none-elf about.hbs -o THIRD_PARTY_LICENSES.html
 ```

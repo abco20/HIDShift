@@ -2,12 +2,8 @@ use embassy_futures::select::{Either, select};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::{Receiver, Sender};
 use embassy_time::{Duration, Instant, Timer};
-#[cfg(feature = "storage")]
 use esp_hal::peripherals::FLASH;
-#[cfg(all(feature = "storage", feature = "usb-host"))]
 use esp_hal::{peripherals::Interrupt, system::Cpu};
-#[cfg(not(feature = "storage"))]
-use hidshift::BridgeEvent;
 use hidshift::ids::HostId;
 use hidshift::runtime::bootstrap::{initial_pairing_host, storage_with_default_target};
 use hidshift::runtime::message::RuntimeInputMessage;
@@ -41,37 +37,14 @@ pub async fn storage_command_task(
         RuntimeInputMessage,
         RUNTIME_INPUT_QUEUE_CAPACITY,
     >,
-    #[cfg(feature = "ble-hid")] ble_restore: Sender<
-        'static,
-        CriticalSectionRawMutex,
-        Option<StorageState>,
-        1,
-    >,
-    #[cfg(all(feature = "ble-hid", feature = "storage"))] ble_quiesce_request: Sender<
-        'static,
-        CriticalSectionRawMutex,
-        (),
-        1,
-    >,
-    #[cfg(all(feature = "ble-hid", feature = "storage"))] ble_quiesce_ready: Receiver<
-        'static,
-        CriticalSectionRawMutex,
-        Option<StorageState>,
-        1,
-    >,
-    #[cfg(all(feature = "ble-hid", feature = "storage"))] ble_quiesce_done: Sender<
-        'static,
-        CriticalSectionRawMutex,
-        (),
-        1,
-    >,
+    ble_restore: Sender<'static, CriticalSectionRawMutex, Option<StorageState>, 1>,
+    ble_quiesce_request: Sender<'static, CriticalSectionRawMutex, (), 1>,
+    ble_quiesce_ready: Receiver<'static, CriticalSectionRawMutex, Option<StorageState>, 1>,
+    ble_quiesce_done: Sender<'static, CriticalSectionRawMutex, (), 1>,
     active_ble_connections: fn() -> usize,
-    #[cfg(feature = "storage")] flash: FLASH<'static>,
+    flash: FLASH<'static>,
 ) {
-    #[cfg(feature = "storage")]
     let mut backend = new_storage_backend(flash);
-    #[cfg(not(feature = "storage"))]
-    let mut backend = new_storage_backend();
     let mut persistence =
         StoragePersistence::new(STORAGE_PERSIST_DEBOUNCE_MS, STORAGE_PERSIST_LAZY_MS);
     let storage_policy = StorageTaskPolicy {
@@ -81,7 +54,6 @@ pub async fn storage_command_task(
     log::info!("firmware: storage command task boot");
 
     let restored_state = restore_latest_storage_state(&backend);
-    #[cfg(feature = "ble-hid")]
     ble_restore.send(restored_state.clone()).await;
     if let Some(state) = restored_state {
         let initial_pairing_host = initial_pairing_host(&state, HostId(1));
@@ -117,16 +89,6 @@ pub async fn storage_command_task(
             })
             .await;
     }
-    #[cfg(not(feature = "storage"))]
-    {
-        log::info!("firmware: storage disabled; default active target host=1");
-        runtime_input
-            .send(RuntimeInputMessage::BridgeEvent(
-                BridgeEvent::SwitchTarget { target: HostId(1) },
-            ))
-            .await;
-    }
-
     loop {
         let now_ms = Instant::now().as_millis();
         match storage_policy.evaluate(&persistence, now_ms, active_ble_connections()) {
@@ -164,17 +126,8 @@ pub async fn storage_command_task(
                         "firmware: storage_command forcing ble quiesce for overdue critical persist"
                     );
                 }
-                #[cfg(all(feature = "ble-hid", feature = "storage"))]
-                let quiesce_snapshot = quiesce_ble_for_flash_write(
-                    #[cfg(all(feature = "ble-hid", feature = "storage"))]
-                    ble_quiesce_request,
-                    #[cfg(all(feature = "ble-hid", feature = "storage"))]
-                    ble_quiesce_ready,
-                )
-                .await;
-                #[cfg(not(all(feature = "ble-hid", feature = "storage")))]
-                quiesce_ble_for_flash_write().await;
-                #[cfg(all(feature = "ble-hid", feature = "storage"))]
+                let quiesce_snapshot =
+                    quiesce_ble_for_flash_write(ble_quiesce_request, ble_quiesce_ready).await;
                 let Some(state) = quiesce_snapshot else {
                     log::error!(
                         "firmware: storage_command aborting persist without runtime snapshot"
@@ -182,7 +135,6 @@ pub async fn storage_command_task(
                     resume_ble_after_flash_write(ble_quiesce_done).await;
                     continue;
                 };
-                #[cfg(all(feature = "ble-hid", feature = "storage"))]
                 persistence.stage_quiesce_snapshot(state, Instant::now().as_millis());
                 let usb_interrupt_guard = UsbInterruptQuiesceGuard::new();
                 let persisted = persist_due_storage_snapshot(&mut persistence, &mut backend);
@@ -195,11 +147,7 @@ pub async fn storage_command_task(
                             },
                         ))
                         .await;
-                    resume_ble_after_flash_write(
-                        #[cfg(all(feature = "ble-hid", feature = "storage"))]
-                        ble_quiesce_done,
-                    )
-                    .await;
+                    resume_ble_after_flash_write(ble_quiesce_done).await;
                 } else {
                     runtime_input
                         .send(RuntimeInputMessage::DiagnosticsEvent(
@@ -208,11 +156,7 @@ pub async fn storage_command_task(
                             },
                         ))
                         .await;
-                    resume_ble_after_flash_write(
-                        #[cfg(all(feature = "ble-hid", feature = "storage"))]
-                        ble_quiesce_done,
-                    )
-                    .await;
+                    resume_ble_after_flash_write(ble_quiesce_done).await;
                 }
             }
         }
@@ -220,66 +164,36 @@ pub async fn storage_command_task(
 }
 
 async fn quiesce_ble_for_flash_write(
-    #[cfg(all(feature = "ble-hid", feature = "storage"))] ble_quiesce_request: Sender<
-        'static,
-        CriticalSectionRawMutex,
-        (),
-        1,
-    >,
-    #[cfg(all(feature = "ble-hid", feature = "storage"))] ble_quiesce_ready: Receiver<
-        'static,
-        CriticalSectionRawMutex,
-        Option<StorageState>,
-        1,
-    >,
+    ble_quiesce_request: Sender<'static, CriticalSectionRawMutex, (), 1>,
+    ble_quiesce_ready: Receiver<'static, CriticalSectionRawMutex, Option<StorageState>, 1>,
 ) -> Option<StorageState> {
-    #[cfg(all(feature = "ble-hid", feature = "storage"))]
-    {
-        log::info!("firmware: storage_command requesting ble quiesce");
-        ble_quiesce_request.send(()).await;
-        let snapshot = ble_quiesce_ready.receive().await;
-        log::info!("firmware: storage_command ble quiesce ready");
-        return snapshot;
-    }
-    #[cfg(not(all(feature = "ble-hid", feature = "storage")))]
-    None
+    log::info!("firmware: storage_command requesting ble quiesce");
+    ble_quiesce_request.send(()).await;
+    let snapshot = ble_quiesce_ready.receive().await;
+    log::info!("firmware: storage_command ble quiesce ready");
+    snapshot
 }
 
 async fn resume_ble_after_flash_write(
-    #[cfg(all(feature = "ble-hid", feature = "storage"))] ble_quiesce_done: Sender<
-        'static,
-        CriticalSectionRawMutex,
-        (),
-        1,
-    >,
+    ble_quiesce_done: Sender<'static, CriticalSectionRawMutex, (), 1>,
 ) {
-    #[cfg(all(feature = "ble-hid", feature = "storage"))]
-    {
-        ble_quiesce_done.send(()).await;
-    }
+    ble_quiesce_done.send(()).await;
 }
 
 struct UsbInterruptQuiesceGuard {
-    #[cfg(all(feature = "storage", feature = "usb-host"))]
     active: bool,
 }
 
 impl UsbInterruptQuiesceGuard {
     fn new() -> Self {
-        #[cfg(all(feature = "storage", feature = "usb-host"))]
-        {
-            log::info!("firmware: storage_command disabling USB interrupt for flash write");
-            esp_hal::interrupt::disable(Cpu::ProCpu, Interrupt::USB);
-            return Self { active: true };
-        }
-        #[cfg(not(all(feature = "storage", feature = "usb-host")))]
-        Self {}
+        log::info!("firmware: storage_command disabling USB interrupt for flash write");
+        esp_hal::interrupt::disable(Cpu::ProCpu, Interrupt::USB);
+        Self { active: true }
     }
 }
 
 impl Drop for UsbInterruptQuiesceGuard {
     fn drop(&mut self) {
-        #[cfg(all(feature = "storage", feature = "usb-host"))]
         if self.active {
             esp_hal::interrupt::enable(Interrupt::USB, esp_hal::interrupt::Priority::max());
             self.active = false;

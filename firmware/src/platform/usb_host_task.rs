@@ -27,12 +27,13 @@ use hidshift::runtime::{
 };
 use hidshift::storage::FixedName;
 use hidshift::usb_hid::host_interface::{
-    HidInterfaceInfo, UsbHidControl, UsbHidReader, config_descriptor_has_interface_class,
-    find_hid_interfaces,
+    HidInterfaceInfo, config_descriptor_has_interface_class, find_hid_interfaces,
 };
-use hidshift::usb_hid::host_output::UsbKeyboardLedWriter;
 use hidshift::usb_hid::host_runtime::UsbHidInterfaceRuntimeSession;
 use hidshift::usb_hid::topology::{DefaultUsbTopologyManager, UsbDeviceRoute};
+
+use super::usb_output_transport::UsbKeyboardLedWriter;
+use super::usb_transport::{UsbHidControl, UsbHidReader};
 
 const HOST_CHANNELS: usize = 8;
 const CONFIG_DESCRIPTOR_BUF_LEN: usize = 512;
@@ -416,24 +417,9 @@ pub async fn usb_input_task(
     usb0: esp_hal::peripherals::USB0<'static>,
     usb_dp: esp_hal::peripherals::GPIO20<'static>,
     usb_dm: esp_hal::peripherals::GPIO19<'static>,
-    #[cfg(all(feature = "ble-hid", feature = "storage"))] ble_quiesce_request: Sender<
-        'static,
-        CriticalSectionRawMutex,
-        (),
-        1,
-    >,
-    #[cfg(all(feature = "ble-hid", feature = "storage"))] ble_quiesce_ready: Receiver<
-        'static,
-        CriticalSectionRawMutex,
-        (),
-        1,
-    >,
-    #[cfg(all(feature = "ble-hid", feature = "storage"))] ble_quiesce_done: Sender<
-        'static,
-        CriticalSectionRawMutex,
-        (),
-        1,
-    >,
+    ble_quiesce_request: Sender<'static, CriticalSectionRawMutex, (), 1>,
+    ble_quiesce_ready: Receiver<'static, CriticalSectionRawMutex, (), 1>,
+    ble_quiesce_done: Sender<'static, CriticalSectionRawMutex, (), 1>,
 ) {
     log::info!("firmware: usb input task boot");
     log::info!("firmware: waiting for USB HID device on OTG");
@@ -517,13 +503,8 @@ pub async fn usb_input_task(
                             port,
                             speed
                         );
-                        quiesce_ble_for_usb_enumeration(
-                            #[cfg(all(feature = "ble-hid", feature = "storage"))]
-                            ble_quiesce_request,
-                            #[cfg(all(feature = "ble-hid", feature = "storage"))]
-                            ble_quiesce_ready,
-                        )
-                        .await;
+                        quiesce_ble_for_usb_enumeration(ble_quiesce_request, ble_quiesce_ready)
+                            .await;
                         if with_timeout(
                             Duration::from_millis(HUB_ENUMERATION_TOTAL_TIMEOUT_MS),
                             handle_hub_device_detected(
@@ -616,11 +597,7 @@ pub async fn usb_input_task(
                                 Err(_) => break,
                             }
                         }
-                        resume_ble_after_usb_enumeration(
-                            #[cfg(all(feature = "ble-hid", feature = "storage"))]
-                            ble_quiesce_done,
-                        )
-                        .await;
+                        resume_ble_after_usb_enumeration(ble_quiesce_done).await;
                         if hub_failed {
                             break;
                         }
@@ -873,40 +850,19 @@ pub async fn usb_input_task(
 }
 
 async fn quiesce_ble_for_usb_enumeration(
-    #[cfg(all(feature = "ble-hid", feature = "storage"))] ble_quiesce_request: Sender<
-        'static,
-        CriticalSectionRawMutex,
-        (),
-        1,
-    >,
-    #[cfg(all(feature = "ble-hid", feature = "storage"))] ble_quiesce_ready: Receiver<
-        'static,
-        CriticalSectionRawMutex,
-        (),
-        1,
-    >,
+    ble_quiesce_request: Sender<'static, CriticalSectionRawMutex, (), 1>,
+    ble_quiesce_ready: Receiver<'static, CriticalSectionRawMutex, (), 1>,
 ) {
-    #[cfg(all(feature = "ble-hid", feature = "storage"))]
-    {
-        log::debug!("firmware: usb requesting ble quiesce for hub enumeration");
-        ble_quiesce_request.send(()).await;
-        ble_quiesce_ready.receive().await;
-        log::debug!("firmware: usb ble quiesce ready for hub enumeration");
-    }
+    log::debug!("firmware: usb requesting ble quiesce for hub enumeration");
+    ble_quiesce_request.send(()).await;
+    ble_quiesce_ready.receive().await;
+    log::debug!("firmware: usb ble quiesce ready for hub enumeration");
 }
 
 async fn resume_ble_after_usb_enumeration(
-    #[cfg(all(feature = "ble-hid", feature = "storage"))] ble_quiesce_done: Sender<
-        'static,
-        CriticalSectionRawMutex,
-        (),
-        1,
-    >,
+    ble_quiesce_done: Sender<'static, CriticalSectionRawMutex, (), 1>,
 ) {
-    #[cfg(all(feature = "ble-hid", feature = "storage"))]
-    {
-        ble_quiesce_done.send(()).await;
-    }
+    ble_quiesce_done.send(()).await;
 }
 
 async fn enumerate_hub_port_with_retries<'d, A: embassy_usb_driver::host::UsbHostAllocator<'d>>(
@@ -1050,13 +1006,21 @@ async fn attach_hid_interfaces_for_device<'d>(
             Ok(len) => {
                 let report_descriptor =
                     ReportDescriptor::<MAX_REPORT_FIELDS>::parse(&report_descriptor_buf[..len]);
-                match UsbHidInterfaceRuntimeSession::<
-                    MAX_REPORT_FIELDS,
-                    MAX_REPORT_EVENTS,
-                >::from_embassy_descriptor(
+                let descriptor = match to_core_descriptor(&report_descriptor) {
+                    Ok(descriptor) => descriptor,
+                    Err(error) => {
+                        log::warn!(
+                            "firmware: usb descriptor capacity exceeded interface={} err={:?}",
+                            interface_id.0,
+                            error
+                        );
+                        return Err(());
+                    }
+                };
+                match UsbHidInterfaceRuntimeSession::<MAX_REPORT_FIELDS, MAX_REPORT_EVENTS>::from_core_descriptor(
                     interface_id,
                     device_id,
-                    &report_descriptor,
+                    descriptor,
                     &report_descriptor_buf[..len],
                     hid_info.boot_keyboard_led_fallback_allowed(),
                 ) {
@@ -1166,6 +1130,30 @@ async fn attach_hid_interfaces_for_device<'d>(
     }
 
     Ok(())
+}
+
+fn to_core_descriptor<const SRC: usize, const DST: usize>(
+    descriptor: &ReportDescriptor<SRC>,
+) -> Result<
+    hidshift::usb_hid::report::HidReportDescriptor<DST>,
+    hidshift::usb_hid::report::HidReportError,
+> {
+    let mut result = hidshift::usb_hid::report::HidReportDescriptor::new(descriptor.has_report_ids);
+    for field in descriptor.fields() {
+        result.push(hidshift::usb_hid::report::ReportField {
+            report_id: field.report_id,
+            usage_page: field.usage_page,
+            usage_min: field.usage_min,
+            usage_max: field.usage_max,
+            bit_offset: field.bit_offset,
+            bit_size: field.bit_size,
+            count: field.count,
+            flags: field.flags,
+            logical_min: field.logical_min,
+            logical_max: field.logical_max,
+        })?;
+    }
+    Ok(result)
 }
 
 async fn read_usb_product_name<'d>(

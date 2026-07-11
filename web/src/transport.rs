@@ -1,12 +1,12 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use gloo_timers::future::TimeoutFuture;
 use hidshift::{
     MANAGEMENT_REQUEST_UUID, MANAGEMENT_RESPONSE_LEN, MANAGEMENT_RESPONSE_UUID,
     MANAGEMENT_SERVICE_UUID,
 };
 use hidshift_client::{PendingRequest, SerialResponseDecoder, encode_serial_request};
-use gloo_timers::future::TimeoutFuture;
 use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
