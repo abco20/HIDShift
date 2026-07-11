@@ -15,6 +15,7 @@ pub const HID_INFORMATION: [u8; 4] = [
 pub const BLE_HID_INPUT_REPORT_MAX_LEN: usize = KEYBOARD_REPORT_LEN;
 pub const BLE_HID_NOTIFY_MAX_LEN: usize = BLE_HID_INPUT_REPORT_MAX_LEN;
 pub const BLE_HID_NOTIFICATIONS_PER_REPORT_MAX: usize = 1;
+pub const BLE_CONSUMER_USAGE_MAX: u16 = 0x03ff;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BleHidInputReport {

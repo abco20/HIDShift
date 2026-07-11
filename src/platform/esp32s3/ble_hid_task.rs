@@ -1101,29 +1101,24 @@ async fn dispatch_ble_command_to_connected_slot(
                     ..
                 }
             );
-            let sent = match with_timeout(
+            match with_timeout(
                 Duration::from_millis(BLE_NOTIFY_TIMEOUT_MS),
                 dispatch_ble_command_to_slot(server, conn, command),
             )
             .await
             {
-                Ok(sent) => sent,
+                Ok(true) => {}
+                Ok(false) => {
+                    let _ = sender.try_send(RuntimeInputMessage::DiagnosticsEvent(
+                        RuntimeDiagnosticsEvent::BleNotifyFailed,
+                    ));
+                }
                 Err(_) => {
                     log::warn!("firmware: ble notify timeout host={}", host_id.0);
-                    sender
-                        .send(RuntimeInputMessage::DiagnosticsEvent(
-                            RuntimeDiagnosticsEvent::BleNotifyTimedOut { critical_release },
-                        ))
-                        .await;
-                    false
+                    let _ = sender.try_send(RuntimeInputMessage::DiagnosticsEvent(
+                        RuntimeDiagnosticsEvent::BleNotifyTimedOut { critical_release },
+                    ));
                 }
-            };
-            if !sent {
-                sender
-                    .send(RuntimeInputMessage::DiagnosticsEvent(
-                        RuntimeDiagnosticsEvent::BleNotifyFailed,
-                    ))
-                    .await;
             }
         }
         BleTaskCommand::ManagementResponse { .. } => {
@@ -1138,6 +1133,9 @@ async fn dispatch_ble_command_to_connected_slot(
                     "firmware: management response notify timeout host={}",
                     host_id.0
                 );
+                let _ = sender.try_send(RuntimeInputMessage::DiagnosticsEvent(
+                    RuntimeDiagnosticsEvent::BleManagementNotifyTimedOut,
+                ));
             }
         }
     }

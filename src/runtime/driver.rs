@@ -7,10 +7,21 @@ use super::{
 pub trait RuntimeTaskSink {
     type Error;
 
+    fn reserve_batch<
+        const BLE: usize,
+        const USB: usize,
+        const STORAGE: usize,
+        const STATUS: usize,
+    >(
+        &mut self,
+        queues: &RuntimeCommandQueues<BLE, USB, STORAGE, STATUS>,
+    ) -> Result<(), (RuntimeTaskKind, Self::Error)>;
+
     fn send_ble(&mut self, command: BleTaskCommand) -> Result<(), Self::Error>;
     fn send_usb(&mut self, command: UsbTaskCommand) -> Result<(), Self::Error>;
     fn send_storage(&mut self, command: StorageTaskCommand) -> Result<(), Self::Error>;
     fn send_status(&mut self, command: StatusTaskCommand) -> Result<(), Self::Error>;
+    fn apply_effect(&mut self, effect: super::RuntimeEffect);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,8 +73,16 @@ pub fn drive_runtime_message<
 where
     S: RuntimeTaskSink,
 {
-    let queues = owner.process_message(message)?;
-    dispatch_runtime_queues(queues, sink)
+    let next_owner = owner.staged_message(message)?;
+    let queues = next_owner.queues();
+    sink.reserve_batch(queues)
+        .map_err(|(task, error)| RuntimeDriverError::Sink { task, error })?;
+    dispatch_runtime_queues(queues, sink)?;
+    *owner = next_owner;
+    for effect in owner.queues().effects.iter().copied() {
+        sink.apply_effect(effect);
+    }
+    Ok(())
 }
 
 pub fn dispatch_runtime_queues<
@@ -117,6 +136,7 @@ mod tests {
     use crate::ids::{DeviceId, HostId, InterfaceId};
     use crate::input::{InputFrame, KeyUsage, KeyboardFrame, ModifierState, StandardInputFrame};
     use crate::reports::{BleHidReport, ReportKind};
+    use crate::runtime::RuntimeEffect;
     use crate::runtime::message::RuntimeBleGattWrite;
     use crate::runtime::message::RuntimeBleHostEvent;
     use crate::usb_hid::output::KeyboardLedOutputReport;
@@ -180,6 +200,86 @@ mod tests {
     }
 
     #[test]
+    fn batch_reservation_prevents_ble_side_effect_when_usb_is_full() {
+        let mut owner = ready_owner_with_usb();
+        let mut setup_sink = RecordingSink::default();
+        for message in [
+            RuntimeInputMessage::BridgeEvent(BridgeEvent::HostConnected { host_id: HostId(2) }),
+            RuntimeInputMessage::BridgeEvent(BridgeEvent::HostSecurityChanged {
+                host_id: HostId(2),
+                encrypted: true,
+                bonded: true,
+                bond: None,
+            }),
+            RuntimeInputMessage::BridgeEvent(BridgeEvent::CccdChanged {
+                host_id: HostId(2),
+                report: ReportKind::Keyboard,
+                enabled: true,
+            }),
+            RuntimeInputMessage::BridgeEvent(BridgeEvent::InputFrame(InputFrame::Standard(
+                keyboard_input(DeviceId(7), KeyUsage(0x04)),
+            ))),
+        ] {
+            drive_runtime_message(&mut owner, &message, &mut setup_sink).unwrap();
+        }
+        let before = owner.clone();
+        let mut failing_sink = RecordingSink {
+            fail_task: Some(RuntimeTaskKind::Usb),
+            ..RecordingSink::default()
+        };
+
+        let error = drive_runtime_message(
+            &mut owner,
+            &RuntimeInputMessage::BridgeEvent(BridgeEvent::SwitchTarget { target: HostId(2) }),
+            &mut failing_sink,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            RuntimeDriverError::Sink {
+                task: RuntimeTaskKind::Usb,
+                error: SinkError::Rejected,
+            }
+        );
+        assert!(failing_sink.ble.is_empty());
+        assert_eq!(owner, before);
+    }
+
+    #[test]
+    fn log_level_effect_runs_only_after_successful_commit() {
+        let message = RuntimeInputMessage::ManagementRequest {
+            destination: crate::management::ManagementDestination::Wired,
+            request: crate::management::ManagementRequest {
+                request_id: 9,
+                command: crate::management::ManagementCommand::SetSetting {
+                    id: crate::settings::SettingId::LogLevel,
+                    target: crate::settings::SettingTarget::Global,
+                    value: 3,
+                },
+            },
+            now_ms: 0,
+        };
+        let mut owner = ready_owner();
+        let before = owner.clone();
+        let mut failed = RecordingSink {
+            fail_task: Some(RuntimeTaskKind::Storage),
+            ..RecordingSink::default()
+        };
+        assert!(drive_runtime_message(&mut owner, &message, &mut failed).is_err());
+        assert!(failed.effects.is_empty());
+        assert_eq!(owner, before);
+
+        let mut success = RecordingSink::default();
+        drive_runtime_message(&mut owner, &message, &mut success).unwrap();
+        assert_eq!(success.effects.as_slice(), &[RuntimeEffect::SetLogLevel(3)]);
+
+        let mut same_value = RecordingSink::default();
+        drive_runtime_message(&mut owner, &message, &mut same_value).unwrap();
+        assert!(same_value.effects.is_empty());
+    }
+
+    #[test]
     fn drive_runtime_message_accepts_owned_ble_message_boundary() {
         let mut owner = ready_owner_with_usb();
         let mut sink = RecordingSink::default();
@@ -214,10 +314,34 @@ mod tests {
         storage: heapless::Vec<StorageTaskCommand, 8>,
         status: heapless::Vec<StatusTaskCommand, 8>,
         fail_task: Option<RuntimeTaskKind>,
+        effects: heapless::Vec<RuntimeEffect, 8>,
     }
 
     impl RuntimeTaskSink for RecordingSink {
         type Error = SinkError;
+
+        fn reserve_batch<
+            const BLE: usize,
+            const USB: usize,
+            const STORAGE: usize,
+            const STATUS: usize,
+        >(
+            &mut self,
+            queues: &RuntimeCommandQueues<BLE, USB, STORAGE, STATUS>,
+        ) -> Result<(), (RuntimeTaskKind, Self::Error)> {
+            let rejected = match self.fail_task {
+                Some(RuntimeTaskKind::Ble) => !queues.ble.is_empty(),
+                Some(RuntimeTaskKind::Usb) => !queues.usb.is_empty(),
+                Some(RuntimeTaskKind::Storage) => !queues.storage.is_empty(),
+                Some(RuntimeTaskKind::Status) => !queues.status.is_empty(),
+                None => false,
+            };
+            if rejected {
+                Err((self.fail_task.unwrap(), SinkError::Rejected))
+            } else {
+                Ok(())
+            }
+        }
 
         fn send_ble(&mut self, command: BleTaskCommand) -> Result<(), Self::Error> {
             if self.fail_task == Some(RuntimeTaskKind::Ble) {
@@ -249,6 +373,10 @@ mod tests {
             }
             self.status.push(command).unwrap();
             Ok(())
+        }
+
+        fn apply_effect(&mut self, effect: RuntimeEffect) {
+            self.effects.push(effect).unwrap();
         }
     }
 
@@ -308,6 +436,7 @@ mod tests {
         frame.push_key(key).unwrap();
         StandardInputFrame {
             device_id,
+            interface_id: InterfaceId(device_id.0),
             keyboard: Some(frame),
             mouse: None,
             consumer: None,

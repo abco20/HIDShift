@@ -3,6 +3,7 @@ use embassy_sync::channel::Sender;
 use embassy_time::{Duration, Instant, Timer};
 use esp_hal::gpio::{Input, InputConfig, Pull};
 use hidshift::runtime::RUNTIME_INPUT_QUEUE_CAPACITY;
+use hidshift::runtime::RuntimeTickPending;
 use hidshift::runtime::message::RuntimeInputMessage;
 use hidshift::target_control::TargetSwitchControl;
 
@@ -19,6 +20,7 @@ pub async fn control_task(
         RuntimeInputMessage,
         RUNTIME_INPUT_QUEUE_CAPACITY,
     >,
+    tick_pending: &'static RuntimeTickPending,
     button_pin: esp_hal::peripherals::GPIO0<'static>,
 ) {
     log::info!("firmware: control task boot");
@@ -62,10 +64,14 @@ pub async fn control_task(
             // one queued message so they cannot consume capacity needed by the operation
             // which will resume the runtime. Dropping ticks is safe: deadlines are
             // absolute and the next accepted tick evaluates them again.
-            if sender.free_capacity() == RUNTIME_INPUT_QUEUE_CAPACITY {
-                let _ = sender.try_send(RuntimeInputMessage::Tick {
-                    now_ms: now.as_millis(),
-                });
+            if tick_pending.try_mark_pending()
+                && sender
+                    .try_send(RuntimeInputMessage::Tick {
+                        now_ms: now.as_millis(),
+                    })
+                    .is_err()
+            {
+                tick_pending.mark_processed();
             }
         }
     }

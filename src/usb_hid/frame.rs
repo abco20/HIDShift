@@ -1,4 +1,4 @@
-use crate::ids::DeviceId;
+use crate::ids::{DeviceId, InterfaceId};
 use crate::input::{
     ConsumerFrame, ConsumerUsage, InputError, KeyUsage, KeyboardFrame, Modifier, ModifierState,
     MouseButtons, MouseFrame, MouseMovement, StandardInputFrame,
@@ -8,6 +8,7 @@ use crate::usb_hid::report::{HidReportEvent, HidReportEvents};
 
 pub fn decode_standard_input_frame<const FIELDS: usize, const EVENTS: usize>(
     device_id: DeviceId,
+    interface_id: InterfaceId,
     descriptor: &HidReportDescriptor<FIELDS>,
     report: &[u8],
 ) -> Result<StandardInputFrame, UsbInputFrameError> {
@@ -15,8 +16,8 @@ pub fn decode_standard_input_frame<const FIELDS: usize, const EVENTS: usize>(
     let (report_id, _) = descriptor.report_id_for(report)?;
     let domains = descriptor.report_domains(report_id);
     crate::usb_hid::report::decode_report(descriptor, report, &mut events)?;
-    let mut frame =
-        events_to_standard_input_frame(device_id, &events).map_err(UsbInputFrameError::Input)?;
+    let mut frame = events_to_standard_input_frame(device_id, interface_id, &events)
+        .map_err(UsbInputFrameError::Input)?;
 
     if domains.keyboard && frame.keyboard.is_none() {
         frame.keyboard = Some(KeyboardFrame::new(ModifierState::empty()));
@@ -36,6 +37,7 @@ pub fn decode_standard_input_frame<const FIELDS: usize, const EVENTS: usize>(
 
 pub fn events_to_standard_input_frame<const EVENTS: usize>(
     device_id: DeviceId,
+    interface_id: InterfaceId,
     events: &HidReportEvents<EVENTS>,
 ) -> Result<StandardInputFrame, InputError> {
     let mut modifiers = ModifierState::empty();
@@ -88,6 +90,7 @@ pub fn events_to_standard_input_frame<const EVENTS: usize>(
 
     Ok(StandardInputFrame {
         device_id,
+        interface_id,
         keyboard: has_keyboard.then_some(keyboard),
         mouse: has_mouse.then_some(MouseFrame {
             buttons: mouse_buttons,
@@ -162,6 +165,7 @@ mod tests {
     use crate::usb_hid::test_fixtures;
 
     const DEVICE: DeviceId = DeviceId(7);
+    const INTERFACE: InterfaceId = InterfaceId(3);
     const HOST: crate::ids::HostId = crate::ids::HostId(1);
 
     #[test]
@@ -175,7 +179,7 @@ mod tests {
         events.push_for_test(HidReportEvent::MouseButtonDown(MouseButton::Left));
         events.push_for_test(HidReportEvent::ConsumerUsageDown(0x00e9));
 
-        let frame = events_to_standard_input_frame(DEVICE, &events).unwrap();
+        let frame = events_to_standard_input_frame(DEVICE, INTERFACE, &events).unwrap();
 
         assert_eq!(frame.device_id, DEVICE);
         assert_eq!(
@@ -210,7 +214,7 @@ mod tests {
     fn events_without_a_domain_do_not_create_empty_subframes() {
         let events = HidReportEvents::<4>::new();
 
-        let frame = events_to_standard_input_frame(DEVICE, &events).unwrap();
+        let frame = events_to_standard_input_frame(DEVICE, INTERFACE, &events).unwrap();
 
         assert_eq!(frame.device_id, DEVICE);
         assert!(frame.keyboard.is_none());
@@ -224,6 +228,7 @@ mod tests {
 
         let frame = decode_standard_input_frame::<3, 8>(
             DEVICE,
+            INTERFACE,
             &descriptor,
             &[0b0000_0010, 0, 0x04, 0x05, 0, 0, 0, 0],
         )
@@ -263,9 +268,13 @@ mod tests {
         let mut bridge = ready_keyboard_bridge();
         let mut actions = heapless::Vec::<BridgeAction, 4>::new();
 
-        let press_frame =
-            decode_standard_input_frame::<3, 8>(DEVICE, &descriptor, &[0, 0, 0x04, 0, 0, 0, 0, 0])
-                .unwrap();
+        let press_frame = decode_standard_input_frame::<3, 8>(
+            DEVICE,
+            INTERFACE,
+            &descriptor,
+            &[0, 0, 0x04, 0, 0, 0, 0, 0],
+        )
+        .unwrap();
         bridge
             .handle_event(
                 BridgeEvent::InputFrame(crate::input::InputFrame::Standard(press_frame)),
@@ -274,9 +283,13 @@ mod tests {
             .unwrap();
         actions.clear();
 
-        let release_frame =
-            decode_standard_input_frame::<3, 8>(DEVICE, &descriptor, &[0, 0, 0, 0, 0, 0, 0, 0])
-                .unwrap();
+        let release_frame = decode_standard_input_frame::<3, 8>(
+            DEVICE,
+            INTERFACE,
+            &descriptor,
+            &[0, 0, 0, 0, 0, 0, 0, 0],
+        )
+        .unwrap();
         bridge
             .handle_event(
                 BridgeEvent::InputFrame(crate::input::InputFrame::Standard(release_frame)),
@@ -298,9 +311,13 @@ mod tests {
     fn decodes_empty_keyboard_report_as_keyboard_release_frame() {
         let descriptor = keyboard_descriptor();
 
-        let frame =
-            decode_standard_input_frame::<3, 8>(DEVICE, &descriptor, &[0, 0, 0, 0, 0, 0, 0, 0])
-                .unwrap();
+        let frame = decode_standard_input_frame::<3, 8>(
+            DEVICE,
+            INTERFACE,
+            &descriptor,
+            &[0, 0, 0, 0, 0, 0, 0, 0],
+        )
+        .unwrap();
 
         let keyboard = frame.keyboard.expect("keyboard frame");
         assert_eq!(keyboard.modifiers, ModifierState::empty());
@@ -327,7 +344,8 @@ mod tests {
             })
             .unwrap();
 
-        let frame = decode_standard_input_frame::<2, 8>(DEVICE, &descriptor, &[0]).unwrap();
+        let frame =
+            decode_standard_input_frame::<2, 8>(DEVICE, INTERFACE, &descriptor, &[0]).unwrap();
 
         assert_eq!(
             frame.mouse,
@@ -358,7 +376,8 @@ mod tests {
             })
             .unwrap();
 
-        let frame = decode_standard_input_frame::<1, 8>(DEVICE, &descriptor, &[0, 0]).unwrap();
+        let frame =
+            decode_standard_input_frame::<1, 8>(DEVICE, INTERFACE, &descriptor, &[0, 0]).unwrap();
 
         assert_eq!(frame.consumer, Some(ConsumerFrame { active: None }));
         assert!(frame.keyboard.is_none());
@@ -397,9 +416,13 @@ mod tests {
             })
             .unwrap();
 
-        let frame =
-            decode_standard_input_frame::<2, 8>(DEVICE, &descriptor, &[0b0000_0101, 0x7f, 0x80])
-                .unwrap();
+        let frame = decode_standard_input_frame::<2, 8>(
+            DEVICE,
+            INTERFACE,
+            &descriptor,
+            &[0b0000_0101, 0x7f, 0x80],
+        )
+        .unwrap();
 
         assert_eq!(
             frame.mouse,
@@ -421,6 +444,7 @@ mod tests {
 
         let frame = decode_standard_input_frame::<8, 8>(
             DEVICE,
+            INTERFACE,
             &descriptor,
             &test_fixtures::mouse_report(0b0000_0001, 10, -4, 2, -3),
         )
@@ -448,6 +472,7 @@ mod tests {
 
         let frame = decode_standard_input_frame::<1, 8>(
             DEVICE,
+            INTERFACE,
             &descriptor,
             &test_fixtures::consumer_report(0x00e2),
         )

@@ -215,11 +215,11 @@ settings_schema! {
     },
     ConsumerFromUsage = 13 => {
         key: "consumer_from_usage", label: "Consumer変更元", description: "Consumer Control Usage ID。0で無効です",
-        kind: HidUsage, scope: Host, default: 0, min: 0, max: 4095, step: 1, unit: "", choices: NO_CHOICES, restart: false
+        kind: HidUsage, scope: Host, default: 0, min: 0, max: 1023, step: 1, unit: "", choices: NO_CHOICES, restart: false
     },
     ConsumerToUsage = 14 => {
         key: "consumer_to_usage", label: "Consumer変更先", description: "送信するConsumer Control Usage IDです",
-        kind: HidUsage, scope: Host, default: 0, min: 0, max: 4095, step: 1, unit: "", choices: NO_CHOICES, restart: false
+        kind: HidUsage, scope: Host, default: 0, min: 0, max: 1023, step: 1, unit: "", choices: NO_CHOICES, restart: false
     },
     LogLevel = 15 => {
         key: "log_level", label: "ログレベル", description: "0:error 1:warn 2:info 3:debug 4:trace",
@@ -228,13 +228,60 @@ settings_schema! {
 }
 
 pub const SETTING_COUNT: usize = SETTING_DESCRIPTORS.len();
-pub const SETTINGS_SCHEMA_HASH: u32 = {
+pub const SETTINGS_SCHEMA_HASH: u32 =
+    settings_schema_hash(SETTINGS_SCHEMA_VERSION, SETTING_DESCRIPTORS);
+
+/// FNV-1a over fields that affect setting wire compatibility. Human-facing
+/// labels/descriptions are intentionally excluded so translations do not
+/// invalidate clients.
+pub const fn settings_schema_hash(version: u16, descriptors: &[SettingDescriptor]) -> u32 {
     let mut hash = 0x811c_9dc5u32;
-    hash ^= SETTINGS_SCHEMA_VERSION as u32;
-    hash = hash.wrapping_mul(0x0100_0193);
-    hash ^= SETTING_COUNT as u32;
-    hash.wrapping_mul(0x0100_0193)
-};
+    hash = hash_u16(hash, version);
+    hash = hash_u16(hash, descriptors.len() as u16);
+    let mut index = 0;
+    while index < descriptors.len() {
+        let descriptor = &descriptors[index];
+        hash = hash_u16(hash, descriptor.id as u16);
+        hash = hash_bytes(hash, descriptor.key.as_bytes());
+        hash = hash_byte(hash, 0);
+        hash = hash_byte(hash, descriptor.kind as u8);
+        hash = hash_byte(hash, descriptor.scope as u8);
+        hash = hash_i32(hash, descriptor.default);
+        hash = hash_i32(hash, descriptor.min);
+        hash = hash_i32(hash, descriptor.max);
+        hash = hash_u16(hash, descriptor.step);
+        hash = hash_byte(hash, descriptor.restart_required as u8);
+        hash = hash_u16(hash, descriptor.choices.len() as u16);
+        let mut choice = 0;
+        while choice < descriptor.choices.len() {
+            hash = hash_i32(hash, descriptor.choices[choice].value);
+            choice += 1;
+        }
+        index += 1;
+    }
+    hash
+}
+
+const fn hash_bytes(mut hash: u32, bytes: &[u8]) -> u32 {
+    let mut index = 0;
+    while index < bytes.len() {
+        hash = hash_byte(hash, bytes[index]);
+        index += 1;
+    }
+    hash
+}
+
+const fn hash_byte(hash: u32, byte: u8) -> u32 {
+    (hash ^ byte as u32).wrapping_mul(0x0100_0193)
+}
+
+const fn hash_u16(hash: u32, value: u16) -> u32 {
+    hash_bytes(hash, &value.to_le_bytes())
+}
+
+const fn hash_i32(hash: u32, value: i32) -> u32 {
+    hash_bytes(hash, &value.to_le_bytes())
+}
 
 pub const fn setting_descriptor(id: SettingId) -> &'static SettingDescriptor {
     let mut index = 0;
@@ -401,6 +448,54 @@ mod tests {
         assert_eq!(
             setting_by_key("auto_reconnect").unwrap().id,
             SettingId::AutoReconnect
+        );
+    }
+
+    #[test]
+    fn consumer_validation_matches_ble_descriptor_limit() {
+        for id in [SettingId::ConsumerFromUsage, SettingId::ConsumerToUsage] {
+            let descriptor = setting_descriptor(id);
+            assert_eq!(
+                descriptor.max,
+                i32::from(crate::reports::ble_hid::BLE_CONSUMER_USAGE_MAX)
+            );
+            assert!(validate_setting_value(id, descriptor.max));
+            assert!(!validate_setting_value(id, descriptor.max + 1));
+        }
+    }
+
+    #[test]
+    fn schema_hash_covers_wire_compatible_descriptor_fields() {
+        let original = [SETTING_DESCRIPTORS[10]];
+        let stable = settings_schema_hash(SETTINGS_SCHEMA_VERSION, &original);
+        assert_eq!(
+            stable,
+            settings_schema_hash(SETTINGS_SCHEMA_VERSION, &original)
+        );
+
+        let mut changed = original;
+        changed[0].min += 1;
+        assert_ne!(
+            stable,
+            settings_schema_hash(SETTINGS_SCHEMA_VERSION, &changed)
+        );
+        changed = original;
+        changed[0].max -= 1;
+        assert_ne!(
+            stable,
+            settings_schema_hash(SETTINGS_SCHEMA_VERSION, &changed)
+        );
+        changed = original;
+        changed[0].default += 1;
+        assert_ne!(
+            stable,
+            settings_schema_hash(SETTINGS_SCHEMA_VERSION, &changed)
+        );
+        changed = original;
+        changed[0].id = SettingId::ScrollMultiplierPercent;
+        assert_ne!(
+            stable,
+            settings_schema_hash(SETTINGS_SCHEMA_VERSION, &changed)
         );
     }
 }

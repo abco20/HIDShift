@@ -16,7 +16,7 @@ pub use host_state::{BleHostStateMachine, HostRuntimeState, HostStateError, Repo
 pub use pairing::{PairingMode, PairingSession};
 
 pub const BRIDGE_USB_HID_INTERFACES_MAX: usize = 8;
-pub const BRIDGE_INPUT_DEVICES_MAX: usize = 4;
+pub const BRIDGE_INPUT_INTERFACES_MAX: usize = BRIDGE_USB_HID_INTERFACES_MAX;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UsbHidInterfaceRegistration {
@@ -214,9 +214,10 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
                     BridgeAction::BleNotify {
                         host_id,
                         report: BleHidReport::Keyboard(build.report),
-                        reason: if !previous_input.keyboard.keys().is_empty()
-                            && self.state.input.keyboard.keys().is_empty()
-                        {
+                        reason: if keyboard_contains_release(
+                            &previous_input.keyboard,
+                            &self.state.input.keyboard,
+                        ) {
                             NotifyReason::InputRelease
                         } else {
                             NotifyReason::Input
@@ -257,8 +258,10 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
                             visible_buttons,
                             mouse.movement,
                         )),
-                        reason: if released_buttons {
-                            NotifyReason::InputRelease
+                        reason: if released_buttons
+                            || previous_input.mouse.buttons != self.state.input.mouse.buttons
+                        {
+                            NotifyReason::InputEdge
                         } else {
                             NotifyReason::Input
                         },
@@ -401,11 +404,8 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
         out: &mut heapless::Vec<BridgeAction, ACTIONS>,
     ) -> Result<(), BridgeError> {
         let previous_input = self.state.input.clone();
-        let device_id = self.state.interface_device_id(interface_id);
         self.state.remove_usb_hid_interface(interface_id);
-        if let Some(device_id) = device_id {
-            self.state.input_devices.remove_device(device_id);
-        }
+        self.state.input_devices.remove_interface(interface_id);
         self.state.input = self.state.input_devices.aggregate().clone();
 
         if let Some(host_id) = self.state.hosts.active_target() {
@@ -629,7 +629,7 @@ impl<const HOSTS: usize> Default for Bridge<HOSTS> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BridgeState<const HOSTS: usize> {
     pub input: PhysicalInputState,
-    pub input_devices: InputAggregator<BRIDGE_INPUT_DEVICES_MAX>,
+    pub input_devices: InputAggregator<BRIDGE_INPUT_INTERFACES_MAX>,
     pub suppression: SuppressionState,
     pub usb_hid_interfaces:
         heapless::Vec<UsbHidInterfaceRegistration, BRIDGE_USB_HID_INTERFACES_MAX>,
@@ -686,13 +686,6 @@ impl<const HOSTS: usize> BridgeState<HOSTS> {
         {
             self.usb_hid_interfaces.swap_remove(index);
         }
-    }
-
-    fn interface_device_id(&self, interface_id: InterfaceId) -> Option<DeviceId> {
-        self.usb_hid_interfaces
-            .iter()
-            .find(|sink| sink.interface_id == interface_id)
-            .map(|sink| sink.device_id)
     }
 }
 
@@ -832,10 +825,24 @@ pub enum BridgeAction {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NotifyReason {
     Input,
+    /// An ordered mouse button transition. Both press and release edges use
+    /// the critical lane so movement and click ordering cannot be lost.
+    InputEdge,
     InputRelease,
     TargetSwitchRelease,
     UsbDeviceRemovedRelease,
     SafetyRelease,
+}
+
+fn keyboard_contains_release(
+    previous: &crate::input::PhysicalKeyboardState,
+    current: &crate::input::PhysicalKeyboardState,
+) -> bool {
+    previous
+        .keys()
+        .iter()
+        .any(|key| !current.keys().contains(key))
+        || !(previous.modifiers & !current.modifiers).is_empty()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -970,6 +977,101 @@ mod tests {
                 reason: NotifyReason::Input,
             }]
         );
+    }
+
+    #[test]
+    fn partial_key_release_is_critical() {
+        let mut bridge = ready_bridge();
+        let mut actions = heapless::Vec::<BridgeAction, 4>::new();
+        bridge
+            .handle_event(
+                BridgeEvent::InputFrame(InputFrame::Standard(keyboard_frame(&[0x04, 0x05]))),
+                &mut actions,
+            )
+            .unwrap();
+        actions.clear();
+
+        bridge
+            .handle_event(
+                BridgeEvent::InputFrame(InputFrame::Standard(keyboard_frame(&[0x05]))),
+                &mut actions,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            actions.as_slice(),
+            [BridgeAction::BleNotify {
+                reason: NotifyReason::InputRelease,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn modifier_only_release_is_critical_but_press_is_realtime() {
+        let mut bridge = ready_bridge();
+        let mut actions = heapless::Vec::<BridgeAction, 4>::new();
+        bridge
+            .handle_event(
+                BridgeEvent::InputFrame(InputFrame::Standard(keyboard_frame_with_modifiers(
+                    &[],
+                    ModifierState::LEFT_SHIFT,
+                ))),
+                &mut actions,
+            )
+            .unwrap();
+        assert!(matches!(
+            actions.as_slice(),
+            [BridgeAction::BleNotify {
+                reason: NotifyReason::Input,
+                ..
+            }]
+        ));
+        actions.clear();
+
+        bridge
+            .handle_event(
+                BridgeEvent::InputFrame(InputFrame::Standard(keyboard_frame(&[]))),
+                &mut actions,
+            )
+            .unwrap();
+        assert!(matches!(
+            actions.as_slice(),
+            [BridgeAction::BleNotify {
+                reason: NotifyReason::InputRelease,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn ctrl_release_while_a_is_held_is_critical() {
+        let mut bridge = ready_bridge();
+        let mut actions = heapless::Vec::<BridgeAction, 4>::new();
+        bridge
+            .handle_event(
+                BridgeEvent::InputFrame(InputFrame::Standard(keyboard_frame_with_modifiers(
+                    &[0x04],
+                    ModifierState::LEFT_CTRL,
+                ))),
+                &mut actions,
+            )
+            .unwrap();
+        actions.clear();
+
+        bridge
+            .handle_event(
+                BridgeEvent::InputFrame(InputFrame::Standard(keyboard_frame(&[0x04]))),
+                &mut actions,
+            )
+            .unwrap();
+        assert!(matches!(
+            actions.as_slice(),
+            [BridgeAction::BleNotify {
+                reason: NotifyReason::InputRelease,
+                ..
+            }]
+        ));
     }
 
     #[test]
@@ -1138,7 +1240,7 @@ mod tests {
                     mouse_buttons(&[MouseButton::Left]),
                     MouseMovement::neutral()
                 )),
-                reason: NotifyReason::Input,
+                reason: NotifyReason::InputEdge,
             }]
         );
     }
@@ -1238,6 +1340,7 @@ mod tests {
             .handle_event(
                 BridgeEvent::InputFrame(InputFrame::Standard(StandardInputFrame {
                     device_id: DEVICE,
+                    interface_id: InterfaceId(1),
                     keyboard: Some({
                         let mut frame = KeyboardFrame::new(ModifierState::empty());
                         frame.push_key(KeyUsage(0x04)).unwrap();
@@ -1320,6 +1423,7 @@ mod tests {
             .handle_event(
                 BridgeEvent::InputFrame(InputFrame::Standard(StandardInputFrame {
                     device_id: DeviceId(1),
+                    interface_id: InterfaceId(1),
                     keyboard: Some({
                         let mut frame = KeyboardFrame::new(ModifierState::empty());
                         frame.push_key(KeyUsage(0x04)).unwrap();
@@ -1335,6 +1439,7 @@ mod tests {
             .handle_event(
                 BridgeEvent::InputFrame(InputFrame::Standard(StandardInputFrame {
                     device_id: DeviceId(2),
+                    interface_id: InterfaceId(2),
                     keyboard: Some({
                         let mut frame = KeyboardFrame::new(ModifierState::LEFT_SHIFT);
                         frame.push_key(KeyUsage(0x05)).unwrap();
@@ -1903,6 +2008,7 @@ mod tests {
             .handle_event(
                 BridgeEvent::InputFrame(InputFrame::Standard(StandardInputFrame {
                     device_id: DEVICE,
+                    interface_id: InterfaceId(1),
                     keyboard: None,
                     mouse: Some(MouseFrame {
                         buttons: mouse_buttons(&[MouseButton::Right]),
@@ -2032,12 +2138,17 @@ mod tests {
     }
 
     fn keyboard_frame(keys: &[u8]) -> StandardInputFrame {
-        let mut keyboard = KeyboardFrame::new(ModifierState::empty());
+        keyboard_frame_with_modifiers(keys, ModifierState::empty())
+    }
+
+    fn keyboard_frame_with_modifiers(keys: &[u8], modifiers: ModifierState) -> StandardInputFrame {
+        let mut keyboard = KeyboardFrame::new(modifiers);
         for key in keys {
             keyboard.push_key(KeyUsage(*key)).unwrap();
         }
         StandardInputFrame {
             device_id: DEVICE,
+            interface_id: InterfaceId(1),
             keyboard: Some(keyboard),
             mouse: None,
             consumer: None,
@@ -2047,6 +2158,7 @@ mod tests {
     fn mouse_frame(buttons: MouseButtons, movement: MouseMovement) -> StandardInputFrame {
         StandardInputFrame {
             device_id: DEVICE,
+            interface_id: InterfaceId(1),
             keyboard: None,
             mouse: Some(MouseFrame { buttons, movement }),
             consumer: None,
@@ -2056,6 +2168,7 @@ mod tests {
     fn consumer_frame(active: Option<u16>) -> StandardInputFrame {
         StandardInputFrame {
             device_id: DEVICE,
+            interface_id: InterfaceId(1),
             keyboard: None,
             mouse: None,
             consumer: Some(ConsumerFrame {

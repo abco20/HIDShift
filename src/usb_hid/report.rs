@@ -49,13 +49,9 @@ impl ReportField {
             return None;
         }
 
-        self.usage_min.checked_add(index as u16).and_then(|usage| {
-            if usage <= self.usage_max {
-                Some(usage)
-            } else {
-                None
-            }
-        })
+        self.usage_min
+            .checked_add(index as u16)
+            .filter(|&usage| usage <= self.usage_max)
     }
 
     fn index_of_usage(self, usage: u16) -> Option<usize> {

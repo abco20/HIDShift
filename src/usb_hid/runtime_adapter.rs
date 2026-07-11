@@ -1,15 +1,17 @@
 use crate::bridge::BridgeEvent;
-use crate::ids::DeviceId;
+use crate::ids::{DeviceId, InterfaceId};
 use crate::runtime::message::RuntimeInputMessage;
 use crate::usb_hid::frame::{UsbInputFrameError, decode_standard_input_frame};
 use crate::usb_hid::report::HidReportDescriptor;
 
 pub fn runtime_input_from_usb_report<const FIELDS: usize, const EVENTS: usize>(
     device_id: DeviceId,
+    interface_id: InterfaceId,
     descriptor: &HidReportDescriptor<FIELDS>,
     report: &[u8],
 ) -> Result<RuntimeInputMessage, UsbInputFrameError> {
-    let frame = decode_standard_input_frame::<FIELDS, EVENTS>(device_id, descriptor, report)?;
+    let frame =
+        decode_standard_input_frame::<FIELDS, EVENTS>(device_id, interface_id, descriptor, report)?;
     Ok(RuntimeInputMessage::BridgeEvent(BridgeEvent::InputFrame(
         crate::input::InputFrame::Standard(frame),
     )))
@@ -28,6 +30,7 @@ mod tests {
     use crate::usb_hid::test_fixtures;
 
     const DEVICE: DeviceId = DeviceId(7);
+    const INTERFACE: InterfaceId = InterfaceId(3);
 
     #[test]
     fn usb_report_becomes_runtime_input_message() {
@@ -35,6 +38,7 @@ mod tests {
 
         let input = runtime_input_from_usb_report::<3, 8>(
             DEVICE,
+            INTERFACE,
             &descriptor,
             &[0, 0, 0x04, 0, 0, 0, 0, 0],
         )
@@ -59,6 +63,7 @@ mod tests {
         let descriptor = keyboard_descriptor();
         let input = runtime_input_from_usb_report::<3, 8>(
             DEVICE,
+            INTERFACE,
             &descriptor,
             &[0, 0, 0x04, 0, 0, 0, 0, 0],
         )
@@ -110,6 +115,7 @@ mod tests {
 
         let input = runtime_input_from_usb_report::<8, 8>(
             DEVICE,
+            INTERFACE,
             &descriptor,
             &test_fixtures::mouse_report(0b0000_0001, 4, -1, 0, -2),
         )

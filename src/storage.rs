@@ -14,6 +14,9 @@ pub const STORAGE_FLASH_SLOT_SIZE: usize = 4096;
 pub const STORAGE_FLASH_SLOT_COUNT: usize = 2;
 pub const STORAGE_FLASH_LEN: usize = STORAGE_FLASH_SLOT_SIZE * STORAGE_FLASH_SLOT_COUNT;
 pub const STORAGE_FLASH_RECORDS_PER_SLOT: usize = STORAGE_FLASH_SLOT_SIZE / STORAGE_IMAGE_LEN;
+pub const STORAGE_RETRY_BASE_MS: u64 = 1_000;
+pub const STORAGE_RETRY_MAX_MS: u64 = 60_000;
+pub const STORAGE_RETRY_FAILURE_LIMIT: u8 = 6;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StoredHostProfile {
@@ -246,6 +249,8 @@ pub struct StoragePersistence {
     pending_state: Option<StorageState>,
     pending_priority: Option<StoragePersistPriority>,
     deadline_ms: Option<u64>,
+    consecutive_failures: u8,
+    retry_suspended: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -277,10 +282,20 @@ impl StoragePersistence {
             pending_state: None,
             pending_priority: None,
             deadline_ms: None,
+            consecutive_failures: 0,
+            retry_suspended: false,
         }
     }
 
     pub fn stage(&mut self, state: StorageState, priority: StoragePersistPriority, now_ms: u64) {
+        let is_new_snapshot = self
+            .pending_state
+            .as_ref()
+            .is_none_or(|pending| pending.generation != state.generation);
+        if is_new_snapshot {
+            self.consecutive_failures = 0;
+            self.retry_suspended = false;
+        }
         let merged_priority = self
             .pending_priority
             .map(|current| current.max(priority))
@@ -298,6 +313,14 @@ impl StoragePersistence {
     }
 
     pub fn stage_quiesce_snapshot(&mut self, state: StorageState, now_ms: u64) {
+        if self
+            .pending_state
+            .as_ref()
+            .is_some_and(|pending| pending.generation == state.generation)
+        {
+            self.pending_state = Some(state);
+            return;
+        }
         self.stage(state, StoragePersistPriority::Critical, now_ms);
     }
 
@@ -324,9 +347,16 @@ impl StoragePersistence {
         let Some(state) = self.pending_state.clone() else {
             return Ok(None);
         };
-        let result = persist_storage_state(backend, &state)?;
-        self.clear_pending();
-        Ok(Some(result))
+        match persist_storage_state(backend, &state) {
+            Ok(result) => {
+                self.clear_pending();
+                Ok(Some(result))
+            }
+            Err(error) => {
+                self.record_failure(now_ms);
+                Err(error)
+            }
+        }
     }
 
     pub fn flush<B: StorageSlotBackend>(
@@ -350,6 +380,28 @@ impl StoragePersistence {
         Some(now_ms.saturating_sub(deadline_ms))
     }
 
+    pub const fn consecutive_failures(&self) -> u8 {
+        self.consecutive_failures
+    }
+
+    pub const fn retry_suspended(&self) -> bool {
+        self.retry_suspended
+    }
+
+    fn record_failure(&mut self, now_ms: u64) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        if self.consecutive_failures >= STORAGE_RETRY_FAILURE_LIMIT {
+            self.retry_suspended = true;
+            self.deadline_ms = None;
+            return;
+        }
+        let shift = u32::from(self.consecutive_failures.saturating_sub(1));
+        let delay = STORAGE_RETRY_BASE_MS
+            .saturating_mul(1u64.checked_shl(shift).unwrap_or(u64::MAX))
+            .min(STORAGE_RETRY_MAX_MS);
+        self.deadline_ms = Some(now_ms.saturating_add(delay));
+    }
+
     fn take_pending(&mut self) -> Option<StorageState> {
         self.deadline_ms = None;
         self.pending_priority = None;
@@ -358,6 +410,8 @@ impl StoragePersistence {
 
     fn clear_pending(&mut self) {
         let _ = self.take_pending();
+        self.consecutive_failures = 0;
+        self.retry_suspended = false;
     }
 
     const fn delay_for(&self, priority: StoragePersistPriority) -> u64 {
@@ -377,6 +431,9 @@ impl StorageTaskPolicy {
         active_ble_connections: usize,
     ) -> StorageTaskAction {
         if !persistence.is_pending() {
+            return StorageTaskAction::AwaitCommand;
+        }
+        if persistence.retry_suspended() {
             return StorageTaskAction::AwaitCommand;
         }
 
@@ -852,8 +909,8 @@ fn decode_host_settings(bytes: &[u8]) -> Result<HostSettings, StorageError> {
     if settings.keyboard_layout > 2
         || !(10..=400).contains(&settings.mouse_sensitivity_percent)
         || !(10..=400).contains(&settings.scroll_multiplier_percent)
-        || settings.consumer_from_usage > 4095
-        || settings.consumer_to_usage > 4095
+        || settings.consumer_from_usage > 1023
+        || settings.consumer_to_usage > 1023
     {
         return Err(StorageError::InvalidLength);
     }
@@ -1508,12 +1565,53 @@ mod tests {
         );
 
         let retried = persistence
-            .persist_due(&mut backend, 1_000)
+            .persist_due(&mut backend, 2_000)
             .unwrap()
             .unwrap();
         assert_eq!(retried.state.generation, 9);
         assert_eq!(backend.write_count, 2);
         assert!(!persistence.is_pending());
+    }
+
+    #[test]
+    fn persistent_failure_uses_backoff_then_suspends_until_new_snapshot() {
+        let mut backend = AlwaysFailBackend::new();
+        let mut persistence = StoragePersistence::new(100, 1_000);
+        persistence.stage(
+            StorageState::new(9),
+            StoragePersistPriority::Critical,
+            1_000,
+        );
+
+        let mut now = 1_000;
+        for failure in 1..=STORAGE_RETRY_FAILURE_LIMIT {
+            assert_eq!(
+                persistence.persist_due(&mut backend, now),
+                Err(StorageError::FlashWrite)
+            );
+            assert_eq!(persistence.consecutive_failures(), failure);
+            if failure < STORAGE_RETRY_FAILURE_LIMIT {
+                let delay = STORAGE_RETRY_BASE_MS
+                    .saturating_mul(1 << u32::from(failure - 1))
+                    .min(STORAGE_RETRY_MAX_MS);
+                assert_eq!(persistence.remaining_ms(now), Some(delay));
+                assert_eq!(persistence.persist_due(&mut backend, now), Ok(None));
+                now = now.saturating_add(delay);
+            }
+        }
+        assert!(persistence.retry_suspended());
+        let policy = StorageTaskPolicy {
+            active_ble_retry_ms: 250,
+            critical_force_quiesce_ms: 2_000,
+        };
+        assert_eq!(
+            policy.evaluate(&persistence, now.saturating_add(1_000_000), 0),
+            StorageTaskAction::AwaitCommand
+        );
+
+        persistence.stage(StorageState::new(10), StoragePersistPriority::Critical, now);
+        assert!(!persistence.retry_suspended());
+        assert_eq!(persistence.consecutive_failures(), 0);
     }
 
     #[test]
@@ -1833,6 +1931,33 @@ mod tests {
         inner: TestBackend,
         fail_next_write: bool,
         write_count: usize,
+    }
+
+    #[derive(Clone)]
+    struct AlwaysFailBackend {
+        inner: TestBackend,
+    }
+
+    impl AlwaysFailBackend {
+        fn new() -> Self {
+            Self {
+                inner: TestBackend::empty(),
+            }
+        }
+    }
+
+    impl StorageSlotBackend for AlwaysFailBackend {
+        fn slot(&self, index: StorageSlotIndex) -> &[u8; STORAGE_IMAGE_LEN] {
+            self.inner.slot(index)
+        }
+
+        fn write_slot(
+            &mut self,
+            _index: StorageSlotIndex,
+            _image: [u8; STORAGE_IMAGE_LEN],
+        ) -> Result<(), StorageError> {
+            Err(StorageError::FlashWrite)
+        }
     }
 
     #[derive(Clone)]

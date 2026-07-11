@@ -1,5 +1,10 @@
 use crate::ids::{DeviceId, InterfaceId};
 
+pub const fn tracked_hub_port_index<const PORTS: usize>(port: u8) -> Option<usize> {
+    let index = port as usize;
+    if index < PORTS { Some(index) } else { None }
+}
+
 pub const USB_TOPOLOGY_DEVICES_MAX: usize = 4;
 pub const USB_TOPOLOGY_INTERFACES_MAX: usize = 8;
 
@@ -297,6 +302,15 @@ impl<const DEVICES: usize, const INTERFACES: usize> Default
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hub_ports_outside_tracking_capacity_are_rejected() {
+        for port in 0..4 {
+            assert_eq!(tracked_hub_port_index::<4>(port), Some(port as usize));
+        }
+        assert_eq!(tracked_hub_port_index::<4>(4), None);
+        assert_eq!(tracked_hub_port_index::<4>(u8::MAX), None);
+    }
 
     #[test]
     fn interface_ids_are_unique_across_devices() {

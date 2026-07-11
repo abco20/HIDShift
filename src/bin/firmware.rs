@@ -50,6 +50,8 @@ static RUNTIME_INPUT_CHANNEL: Channel<
     RuntimeInputMessage,
     RUNTIME_INPUT_QUEUE_CAPACITY,
 > = Channel::new();
+static RUNTIME_TICK_PENDING: hidshift::runtime::RuntimeTickPending =
+    hidshift::runtime::RuntimeTickPending::new();
 static BLE_CONTROL_COMMAND_CHANNEL: Channel<
     CriticalSectionRawMutex,
     BleTaskCommand,
@@ -171,6 +173,7 @@ fn main() -> ! {
             &spawner,
             runtime_owner_task(
                 runtime_owner_receiver,
+                &RUNTIME_TICK_PENDING,
                 #[cfg(all(feature = "ble-hid", feature = "storage"))]
                 BLE_RUNTIME_BARRIER_REQUEST_CHANNEL.receiver(),
                 #[cfg(all(feature = "ble-hid", feature = "storage"))]
@@ -191,7 +194,11 @@ fn main() -> ! {
         }
         spawn_or_reset(
             &spawner,
-            control_task(RUNTIME_INPUT_CHANNEL.sender(), peripherals.GPIO0),
+            control_task(
+                RUNTIME_INPUT_CHANNEL.sender(),
+                &RUNTIME_TICK_PENDING,
+                peripherals.GPIO0,
+            ),
             "control",
         );
         spawn_or_reset(
@@ -317,6 +324,7 @@ async fn runtime_owner_task(
         RuntimeInputMessage,
         RUNTIME_INPUT_QUEUE_CAPACITY,
     >,
+    tick_pending: &'static hidshift::runtime::RuntimeTickPending,
     #[cfg(all(feature = "ble-hid", feature = "storage"))] barrier_request: Receiver<
         'static,
         CriticalSectionRawMutex,
@@ -382,6 +390,9 @@ async fn runtime_owner_task(
         };
         #[cfg(not(all(feature = "ble-hid", feature = "storage")))]
         let message = receiver.receive().await;
+        if matches!(message, RuntimeInputMessage::Tick { .. }) {
+            tick_pending.mark_processed();
+        }
         process_runtime_message(&mut owner, &mut sink, message).await;
     }
 }
@@ -409,6 +420,9 @@ async fn process_runtime_message(
         return;
     }
     *owner = next_owner;
+    for effect in owner.default_queues().effects.iter().copied() {
+        effect.apply();
+    }
 }
 
 #[embassy_executor::task]
@@ -593,9 +607,14 @@ impl ChannelTaskSink {
         Ok(())
     }
 
-    fn ensure_capacity(
+    fn ensure_capacity<
+        const BLE: usize,
+        const USB: usize,
+        const STORAGE: usize,
+        const STATUS: usize,
+    >(
         &self,
-        queues: &hidshift::DefaultRuntimeCommandQueues,
+        queues: &hidshift::RuntimeCommandQueues<BLE, USB, STORAGE, STATUS>,
     ) -> Result<(), ChannelTaskSendError> {
         let control = queues
             .ble
@@ -632,6 +651,32 @@ impl ChannelTaskSink {
         if self.status.free_capacity() < required_status {
             return Err(ChannelTaskSendError::StatusQueueFull);
         }
+        let mut new_pending = heapless::Vec::<
+            (hidshift::InterfaceId, hidshift::DeviceId),
+            RUNTIME_USB_COMMAND_QUEUE_CAPACITY,
+        >::new();
+        for command in queues.usb.iter().copied() {
+            let key = (command.interface_id, command.device_id);
+            if self
+                .pending_usb
+                .iter()
+                .flatten()
+                .any(|pending| (pending.interface_id, pending.device_id) == key)
+                || new_pending.contains(&key)
+            {
+                continue;
+            }
+            let _ = new_pending.push(key);
+        }
+        if self
+            .pending_usb
+            .iter()
+            .filter(|pending| pending.is_none())
+            .count()
+            < new_pending.len()
+        {
+            return Err(ChannelTaskSendError::UsbQueueFull);
+        }
         Ok(())
     }
 
@@ -645,21 +690,20 @@ impl ChannelTaskSink {
             reason: hidshift::NotifyReason::Input,
         } = command
         {
-            let _ = self.mouse.push(host_id, report);
+            debug_assert!(self.mouse.push(host_id, report));
             self.flush_mouse_accumulator();
             return Ok(());
         }
         if let BleTaskCommand::Notify {
             host_id,
-            reason:
-                hidshift::NotifyReason::InputRelease
-                | hidshift::NotifyReason::TargetSwitchRelease
-                | hidshift::NotifyReason::UsbDeviceRemovedRelease
-                | hidshift::NotifyReason::SafetyRelease,
-            ..
+            report: hidshift::reports::BleHidReport::Mouse(report),
+            reason: _,
         } = command
         {
-            self.mouse.discard(host_id);
+            // Drain movement under the old button state through the same
+            // ordered lane before publishing the edge/release report.
+            self.flush_mouse_accumulator_ordered(host_id).await;
+            let _ = self.mouse.set_buttons(host_id, report.as_bytes()[0]);
         }
         match command.lane() {
             BleCommandLane::Control => match command.class() {
@@ -693,6 +737,18 @@ impl ChannelTaskSink {
         }
     }
 
+    async fn flush_mouse_accumulator_ordered(&mut self, host_id: hidshift::HostId) {
+        while let Some(report) = self.mouse.take_next(host_id) {
+            self.ble_control
+                .send(BleTaskCommand::Notify {
+                    host_id,
+                    report: hidshift::reports::BleHidReport::Mouse(report),
+                    reason: hidshift::NotifyReason::Input,
+                })
+                .await;
+        }
+    }
+
     fn flush_mouse_accumulator(&mut self) {
         for host in 1..=4 {
             if self.ble_notify.free_capacity() == 0 {
@@ -722,7 +778,10 @@ impl ChannelTaskSink {
             .pending_usb
             .iter()
             .position(|pending| {
-                pending.is_some_and(|pending| pending.interface_id == command.interface_id)
+                pending.is_some_and(|pending| {
+                    pending.interface_id == command.interface_id
+                        && pending.device_id == command.device_id
+                })
             })
             .or_else(|| self.pending_usb.iter().position(Option::is_none))
             .ok_or(ChannelTaskSendError::UsbQueueFull)?;
@@ -818,7 +877,7 @@ impl BleNotificationSink for LoggingBleNotificationSink {
         &mut self,
         characteristic: hidshift::reports::BleHidCharacteristic,
         value: &[u8],
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), (hidshift::runtime::driver::RuntimeTaskKind, Self::Error)> {
         log::trace!(
             "firmware: ble_notification characteristic={:?} bytes={:?}",
             characteristic,
@@ -830,6 +889,34 @@ impl BleNotificationSink for LoggingBleNotificationSink {
 
 impl RuntimeTaskSink for ChannelTaskSink {
     type Error = ChannelTaskSendError;
+
+    fn reserve_batch<
+        const BLE: usize,
+        const USB: usize,
+        const STORAGE: usize,
+        const STATUS: usize,
+    >(
+        &mut self,
+        queues: &hidshift::RuntimeCommandQueues<BLE, USB, STORAGE, STATUS>,
+    ) -> Result<(), (hidshift::runtime::driver::RuntimeTaskKind, Self::Error)> {
+        self.ensure_capacity(queues).map_err(|error| {
+            let task = match error {
+                ChannelTaskSendError::BleQueueFull => {
+                    hidshift::runtime::driver::RuntimeTaskKind::Ble
+                }
+                ChannelTaskSendError::UsbQueueFull => {
+                    hidshift::runtime::driver::RuntimeTaskKind::Usb
+                }
+                ChannelTaskSendError::StorageQueueFull => {
+                    hidshift::runtime::driver::RuntimeTaskKind::Storage
+                }
+                ChannelTaskSendError::StatusQueueFull => {
+                    hidshift::runtime::driver::RuntimeTaskKind::Status
+                }
+            };
+            (task, error)
+        })
+    }
 
     fn send_ble(&mut self, command: BleTaskCommand) -> Result<(), Self::Error> {
         match command.lane() {
@@ -860,6 +947,10 @@ impl RuntimeTaskSink for ChannelTaskSink {
         self.status
             .try_send(command)
             .map_err(ChannelTaskSendError::from)
+    }
+
+    fn apply_effect(&mut self, effect: hidshift::runtime::RuntimeEffect) {
+        effect.apply();
     }
 }
 

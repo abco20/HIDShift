@@ -3,6 +3,7 @@ pub mod consumer;
 pub mod keyboard;
 pub mod leds;
 pub mod mouse;
+pub mod movement_queue;
 pub mod vendor;
 
 pub use aggregator::InputAggregator;
@@ -15,9 +16,12 @@ pub use leds::KeyboardLedState;
 pub use mouse::{
     MouseButton, MouseButtons, MouseFrame, MouseMovement, MouseReport, PhysicalMouseState,
 };
+pub use movement_queue::{
+    UsbMovementCoalescer, UsbMovementCoalescerError, UsbMovementCoalescerStats,
+};
 pub use vendor::{HidDirection, MAX_VENDOR_REPORT_SIZE, VendorHidFrame};
 
-use crate::ids::DeviceId;
+use crate::ids::{DeviceId, InterfaceId};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhysicalInputState {
@@ -51,6 +55,7 @@ pub enum InputFrame {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StandardInputFrame {
     pub device_id: DeviceId,
+    pub interface_id: InterfaceId,
     pub keyboard: Option<KeyboardFrame>,
     pub mouse: Option<MouseFrame>,
     pub consumer: Option<ConsumerFrame>,

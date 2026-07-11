@@ -8,7 +8,7 @@ use crate::management::{
     ManagementSchema, ManagementSetting, ManagementStatus, ManagementUsbDevice,
     ManagementUsbStatus,
 };
-use crate::reports::BleHidReport;
+use crate::reports::{BleConsumerReport, BleHidReport, BleKeyboard6KroReport, BleMouseReport};
 use crate::settings::{
     GlobalSettings, HostSettings, SETTING_COUNT, SETTINGS_SCHEMA_HASH, SETTINGS_SCHEMA_VERSION,
     SettingId, SettingScope, SettingTarget, setting_descriptor, validate_setting_value,
@@ -20,6 +20,7 @@ use crate::target_control::ButtonIntent;
 use crate::usb_hid::output::{
     KeyboardLedOutputBytes, KeyboardLedOutputError, KeyboardLedOutputReport,
 };
+use core::sync::atomic::{AtomicBool, Ordering};
 
 #[path = "runtime/bootstrap.rs"]
 pub mod bootstrap;
@@ -85,6 +86,41 @@ pub const DEFAULT_RUNTIME_CAPACITIES: RuntimeCapacities = RuntimeCapacities {
     status_command_queue: RUNTIME_STATUS_COMMAND_QUEUE_CAPACITY,
 };
 
+/// Coalesces periodic ticks without making their delivery depend on the input
+/// queue becoming completely empty.
+#[derive(Debug)]
+pub struct RuntimeTickPending {
+    pending: AtomicBool,
+}
+
+impl RuntimeTickPending {
+    pub const fn new() -> Self {
+        Self {
+            pending: AtomicBool::new(false),
+        }
+    }
+
+    pub fn try_mark_pending(&self) -> bool {
+        self.pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub fn mark_processed(&self) {
+        self.pending.store(false, Ordering::Release);
+    }
+
+    pub fn is_pending(&self) -> bool {
+        self.pending.load(Ordering::Acquire)
+    }
+}
+
+impl Default for RuntimeTickPending {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeInput<'a> {
     BridgeEvent(BridgeEvent),
@@ -145,6 +181,24 @@ pub struct BridgeRuntime<const HOSTS: usize, const USB_INTERFACES: usize> {
     pending_target_switch: Option<PendingTargetSwitch>,
     status_sequence: u64,
     counters: RuntimeCounters,
+    mouse_scale_remainders: [MouseScaleRemainders; HOSTS],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MouseScaleRemainders {
+    x: i32,
+    y: i32,
+    wheel: i32,
+    pan: i32,
+}
+
+impl MouseScaleRemainders {
+    const ZERO: Self = Self {
+        x: 0,
+        y: 0,
+        wheel: 0,
+        pan: 0,
+    };
 }
 
 impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_INTERFACES> {
@@ -175,6 +229,7 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             pending_target_switch: None,
             status_sequence: 0,
             counters: RuntimeCounters::new(),
+            mouse_scale_remainders: [MouseScaleRemainders::ZERO; HOSTS],
         }
     }
 
@@ -274,11 +329,14 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         self.storage_generation = storage.generation;
         self.diagnostics.flash_write_count = storage.generation.min(u8::MAX as u32) as u8;
         self.global_settings = storage.global_settings;
-        apply_log_level(self.global_settings.log_level);
         for (destination, source) in self.host_settings.iter_mut().zip(storage.host_settings) {
             *destination = source;
         }
         self.pairing_mode = None;
+        push_command(
+            commands,
+            RuntimeCommand::ApplyEffect(RuntimeEffect::SetLogLevel(self.global_settings.log_level)),
+        )?;
         Ok(())
     }
 
@@ -657,8 +715,15 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                 }
             }
             ManagementCommand::SetSetting { id, target, value } => {
+                let changed = self.setting_value(id, target) != Some(value);
                 if self.set_setting(id, target, value) {
                     self.push_storage_snapshot(commands, StoragePersistPriority::Critical)?;
+                    if changed && id == SettingId::LogLevel {
+                        push_command(
+                            commands,
+                            RuntimeCommand::ApplyEffect(RuntimeEffect::SetLogLevel(value as u8)),
+                        )?;
+                    }
                     ManagementResult::Ok
                 } else {
                     ManagementResult::InvalidSetting
@@ -929,7 +994,6 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             }
             (SettingId::LogLevel, SettingTarget::Global) => {
                 self.global_settings.log_level = value as u8;
-                apply_log_level(value as u8);
             }
             (id, SettingTarget::Host(host)) => {
                 let Some(settings) = host
@@ -1046,10 +1110,9 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
 
     fn handle_bridge_event_append<const COMMANDS: usize, const ACTIONS: usize>(
         &mut self,
-        mut event: BridgeEvent,
+        event: BridgeEvent,
         commands: &mut heapless::Vec<RuntimeCommand, COMMANDS>,
     ) -> Result<(), RuntimeError> {
-        self.apply_active_host_input_settings(&mut event)?;
         self.observe_bridge_event(&event);
         let persist_priority = storage_persist_priority_for_event(&event);
         let mut actions = heapless::Vec::<BridgeAction, ACTIONS>::new();
@@ -1059,64 +1122,6 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             self.dispatch_bridge_action(action, persist_priority, commands)?;
         }
 
-        Ok(())
-    }
-
-    fn apply_active_host_input_settings(
-        &self,
-        event: &mut BridgeEvent,
-    ) -> Result<(), RuntimeError> {
-        let BridgeEvent::InputFrame(crate::input::InputFrame::Standard(frame)) = event else {
-            return Ok(());
-        };
-        let Some(host) = self.bridge.state().hosts.active_target() else {
-            return Ok(());
-        };
-        let Some(settings) = host
-            .0
-            .checked_sub(1)
-            .and_then(|index| self.host_settings.get(index as usize))
-            .copied()
-        else {
-            return Ok(());
-        };
-        if let Some(keyboard) = frame.keyboard.as_mut() {
-            let mut remapped = crate::input::KeyboardFrame::new(keyboard.modifiers);
-            for key in keyboard.keys_down().iter().copied() {
-                let layout_usage = match (settings.keyboard_layout, key.0) {
-                    // USB HID International3 is the JIS Yen key. These mappings
-                    // normalize the most common physical US/JIS layout difference;
-                    // explicit remapping below remains available for other keys.
-                    (1, 0x89) => 0x35,
-                    (2, 0x35) => 0x89,
-                    _ => key.0,
-                };
-                let usage = if layout_usage == settings.remap_from_usage
-                    && settings.remap_from_usage != 0
-                {
-                    settings.remap_to_usage
-                } else {
-                    layout_usage
-                };
-                remapped
-                    .push_key(crate::input::KeyUsage(usage))
-                    .map_err(BridgeError::Input)?;
-            }
-            *keyboard = remapped;
-        }
-        if let Some(mouse) = frame.mouse.as_mut() {
-            mouse.movement.x = scale_i16(mouse.movement.x, settings.mouse_sensitivity_percent);
-            mouse.movement.y = scale_i16(mouse.movement.y, settings.mouse_sensitivity_percent);
-            mouse.movement.wheel =
-                scale_i8(mouse.movement.wheel, settings.scroll_multiplier_percent);
-            mouse.movement.pan = scale_i8(mouse.movement.pan, settings.scroll_multiplier_percent);
-        }
-        if let Some(consumer) = frame.consumer.as_mut()
-            && consumer.active.map(|usage| usage.0) == Some(settings.consumer_from_usage)
-            && settings.consumer_from_usage != 0
-        {
-            consumer.active = Some(crate::input::ConsumerUsage(settings.consumer_to_usage));
-        }
         Ok(())
     }
 
@@ -1240,6 +1245,12 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                         self.counters.critical_release_failures.saturating_add(1);
                 }
             }
+            RuntimeDiagnosticsEvent::BleManagementNotifyTimedOut => {
+                self.diagnostics.ble_notify_failure_count =
+                    self.diagnostics.ble_notify_failure_count.saturating_add(1);
+                self.counters.ble_notify_timeouts =
+                    self.counters.ble_notify_timeouts.saturating_add(1);
+            }
             RuntimeDiagnosticsEvent::UsbLedWriteTimedOut => {
                 self.counters.usb_led_write_timeouts =
                     self.counters.usb_led_write_timeouts.saturating_add(1);
@@ -1270,14 +1281,17 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                 host_id,
                 report,
                 reason,
-            } => push_command(
-                commands,
-                RuntimeCommand::BleCommand(BleTaskCommand::Notify {
-                    host_id,
-                    report,
-                    reason,
-                }),
-            ),
+            } => {
+                let report = self.apply_host_report_settings(host_id, report);
+                push_command(
+                    commands,
+                    RuntimeCommand::BleCommand(BleTaskCommand::Notify {
+                        host_id,
+                        report,
+                        reason,
+                    }),
+                )
+            }
             BridgeAction::AllowPairing { host_id } => push_command(
                 commands,
                 RuntimeCommand::BleCommand(BleTaskCommand::AllowPairing { host_id }),
@@ -1325,6 +1339,77 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                 }
                 let snapshot = self.next_status_snapshot(status);
                 push_command(commands, RuntimeCommand::StatusChanged(snapshot))
+            }
+        }
+    }
+
+    /// Raw USB usages remain owned by `Bridge`; host-specific conversion is
+    /// deliberately delayed until the BLE report leaves the runtime.
+    fn apply_host_report_settings(
+        &mut self,
+        host_id: HostId,
+        report: BleHidReport,
+    ) -> BleHidReport {
+        let Some(index) = host_id.0.checked_sub(1).map(usize::from) else {
+            return report;
+        };
+        let Some(settings) = self.host_settings.get(index).copied() else {
+            return report;
+        };
+        match report {
+            BleHidReport::Keyboard(report) => {
+                let mut bytes = *report.as_bytes();
+                for usage in &mut bytes[2..] {
+                    let layout_usage = match (settings.keyboard_layout, *usage) {
+                        (1, 0x89) => 0x35,
+                        (2, 0x35) => 0x89,
+                        _ => *usage,
+                    };
+                    *usage = if layout_usage == settings.remap_from_usage
+                        && settings.remap_from_usage != 0
+                    {
+                        settings.remap_to_usage
+                    } else {
+                        layout_usage
+                    };
+                }
+                BleHidReport::Keyboard(BleKeyboard6KroReport::from_bytes(bytes))
+            }
+            BleHidReport::Consumer(report) => {
+                let usage = u16::from_le_bytes(*report.as_bytes());
+                let usage =
+                    if usage == settings.consumer_from_usage && settings.consumer_from_usage != 0 {
+                        settings.consumer_to_usage
+                    } else {
+                        usage
+                    };
+                BleHidReport::Consumer(BleConsumerReport::from_usage_id(usage))
+            }
+            BleHidReport::Mouse(report) => {
+                let mut bytes = *report.as_bytes();
+                if let Some(remainders) = self.mouse_scale_remainders.get_mut(index) {
+                    bytes[1] = scale_axis_with_remainder(
+                        bytes[1] as i8,
+                        settings.mouse_sensitivity_percent,
+                        &mut remainders.x,
+                    ) as u8;
+                    bytes[2] = scale_axis_with_remainder(
+                        bytes[2] as i8,
+                        settings.mouse_sensitivity_percent,
+                        &mut remainders.y,
+                    ) as u8;
+                    bytes[3] = scale_axis_with_remainder(
+                        bytes[3] as i8,
+                        settings.scroll_multiplier_percent,
+                        &mut remainders.wheel,
+                    ) as u8;
+                    bytes[4] = scale_axis_with_remainder(
+                        bytes[4] as i8,
+                        settings.scroll_multiplier_percent,
+                        &mut remainders.pan,
+                    ) as u8;
+                }
+                BleHidReport::Mouse(BleMouseReport::from_bytes(bytes))
             }
         }
     }
@@ -1435,6 +1520,7 @@ pub enum RuntimeDiagnosticsEvent {
     BleDisconnected { host_id: HostId, reason: u8 },
     BleNotifyFailed,
     BleNotifyTimedOut { critical_release: bool },
+    BleManagementNotifyTimedOut,
     UsbLedWriteTimedOut,
     UsbError,
     FlashWrite { success: bool },
@@ -1558,6 +1644,20 @@ pub enum RuntimeCommand {
         destination: ManagementDestination,
         response: ManagementResponse,
     },
+    ApplyEffect(RuntimeEffect),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeEffect {
+    SetLogLevel(u8),
+}
+
+impl RuntimeEffect {
+    pub fn apply(self) {
+        match self {
+            Self::SetLogLevel(level) => apply_log_level(level),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1619,7 +1719,8 @@ impl BleTaskCommand {
         match self {
             Self::Notify { reason, .. } => match reason {
                 NotifyReason::Input => CommandClass::Realtime,
-                NotifyReason::InputRelease
+                NotifyReason::InputEdge
+                | NotifyReason::InputRelease
                 | NotifyReason::TargetSwitchRelease
                 | NotifyReason::UsbDeviceRemovedRelease
                 | NotifyReason::SafetyRelease => CommandClass::Critical,
@@ -1643,6 +1744,10 @@ pub struct UsbTaskCommand {
 impl UsbTaskCommand {
     pub const fn class(self) -> CommandClass {
         CommandClass::Realtime
+    }
+
+    pub fn matches_target(self, interface_id: InterfaceId, device_id: DeviceId) -> bool {
+        self.interface_id == interface_id && self.device_id == device_id
     }
 }
 
@@ -1687,6 +1792,7 @@ pub enum RuntimeDispatchError {
     UsbQueueCapacity,
     StorageQueueCapacity,
     StatusQueueCapacity,
+    EffectQueueCapacity,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1700,6 +1806,7 @@ pub struct RuntimeCommandQueues<
     pub usb: heapless::Vec<UsbTaskCommand, USB>,
     pub storage: heapless::Vec<StorageTaskCommand, STORAGE>,
     pub status: heapless::Vec<StatusTaskCommand, STATUS>,
+    pub effects: heapless::Vec<RuntimeEffect, STATUS>,
 }
 
 impl<const BLE: usize, const USB: usize, const STORAGE: usize, const STATUS: usize>
@@ -1711,6 +1818,7 @@ impl<const BLE: usize, const USB: usize, const STORAGE: usize, const STATUS: usi
             usb: heapless::Vec::new(),
             storage: heapless::Vec::new(),
             status: heapless::Vec::new(),
+            effects: heapless::Vec::new(),
         }
     }
 
@@ -1719,6 +1827,7 @@ impl<const BLE: usize, const USB: usize, const STORAGE: usize, const STATUS: usi
         self.usb.clear();
         self.storage.clear();
         self.status.clear();
+        self.effects.clear();
     }
 
     pub fn dispatch_from(
@@ -1789,6 +1898,10 @@ impl<const BLE: usize, const USB: usize, const STORAGE: usize, const STATUS: usi
                     }),
                 })
                 .map_err(|_| RuntimeDispatchError::StatusQueueCapacity),
+            RuntimeCommand::ApplyEffect(effect) => self
+                .effects
+                .push(*effect)
+                .map_err(|_| RuntimeDispatchError::EffectQueueCapacity),
         }
     }
 }
@@ -1867,12 +1980,15 @@ const fn storage_persist_priority_for_event(event: &BridgeEvent) -> Option<Stora
     }
 }
 
-fn scale_i16(value: i16, percent: u16) -> i16 {
-    (i32::from(value) * i32::from(percent) / 100).clamp(i16::MIN as i32, i16::MAX as i32) as i16
-}
-
-fn scale_i8(value: i8, percent: u16) -> i8 {
-    (i32::from(value) * i32::from(percent) / 100).clamp(i8::MIN as i32, i8::MAX as i32) as i8
+fn scale_axis_with_remainder(value: i8, percent: u16, remainder: &mut i32) -> i8 {
+    if value == 0 {
+        return 0;
+    }
+    let scaled = remainder.saturating_add(i32::from(value) * i32::from(percent));
+    let available = scaled / 100;
+    let output = available.clamp(i8::MIN as i32, i8::MAX as i32) as i8;
+    *remainder = scaled - i32::from(output) * 100;
+    output
 }
 
 fn apply_log_level(level: u8) {
@@ -2690,7 +2806,10 @@ mod tests {
             .handle_input::<8, 8, 2>(RuntimeInput::RestoreStorage(&storage), &mut commands)
             .unwrap();
         assert_eq!(runtime.storage_generation(), 77);
-        assert!(commands.is_empty());
+        assert_eq!(
+            commands.as_slice(),
+            &[RuntimeCommand::ApplyEffect(RuntimeEffect::SetLogLevel(2))]
+        );
     }
 
     #[test]
@@ -2793,29 +2912,302 @@ mod tests {
     fn keyboard_layout_normalizes_jis_yen_and_us_grave_usages() {
         let mut runtime = ready_runtime();
         runtime.host_settings[0].keyboard_layout = 1;
-        let mut us_event = BridgeEvent::InputFrame(crate::input::InputFrame::Standard(
-            keyboard_input(KeyUsage(0x89)),
-        ));
+        let mut commands = heapless::Vec::<RuntimeCommand, 8>::new();
         runtime
-            .apply_active_host_input_settings(&mut us_event)
+            .handle_input::<8, 8, 2>(
+                RuntimeInput::BridgeEvent(BridgeEvent::InputFrame(
+                    crate::input::InputFrame::Standard(keyboard_input(KeyUsage(0x89))),
+                )),
+                &mut commands,
+            )
             .unwrap();
-        let BridgeEvent::InputFrame(crate::input::InputFrame::Standard(us_frame)) = us_event else {
-            panic!("standard frame");
-        };
-        assert_eq!(us_frame.keyboard.unwrap().keys_down(), &[KeyUsage(0x35)]);
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            RuntimeCommand::BleCommand(BleTaskCommand::Notify {
+                report: BleHidReport::Keyboard(report),
+                ..
+            }) if report.as_bytes()[2] == 0x35
+        )));
+        assert_eq!(
+            runtime.bridge.state().input.keyboard.keys(),
+            &[KeyUsage(0x89)]
+        );
 
         runtime.host_settings[0].keyboard_layout = 2;
-        let mut jis_event = BridgeEvent::InputFrame(crate::input::InputFrame::Standard(
-            keyboard_input(KeyUsage(0x35)),
-        ));
         runtime
-            .apply_active_host_input_settings(&mut jis_event)
+            .handle_input::<8, 8, 2>(
+                RuntimeInput::BridgeEvent(BridgeEvent::InputFrame(
+                    crate::input::InputFrame::Standard(keyboard_input(KeyUsage(0x35))),
+                )),
+                &mut commands,
+            )
             .unwrap();
-        let BridgeEvent::InputFrame(crate::input::InputFrame::Standard(jis_frame)) = jis_event
-        else {
-            panic!("standard frame");
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            RuntimeCommand::BleCommand(BleTaskCommand::Notify {
+                report: BleHidReport::Keyboard(report),
+                ..
+            }) if report.as_bytes()[2] == 0x89
+        )));
+        assert_eq!(
+            runtime.bridge.state().input.keyboard.keys(),
+            &[KeyUsage(0x35)]
+        );
+    }
+
+    #[test]
+    fn mouse_scaling_preserves_signed_fractional_movement_per_host_and_axis() {
+        let mut runtime = BridgeRuntime::<2, 0>::new(0);
+        runtime.host_settings[0].mouse_sensitivity_percent = 50;
+        runtime.host_settings[0].scroll_multiplier_percent = 50;
+        runtime.host_settings[1].mouse_sensitivity_percent = 50;
+        runtime.host_settings[1].scroll_multiplier_percent = 50;
+
+        let input = BleHidReport::Mouse(BleMouseReport::from_bytes([0, 1, 255, 1, 255]));
+        let first = runtime.apply_host_report_settings(HostId(1), input);
+        let second = runtime.apply_host_report_settings(HostId(1), input);
+        let other_host_first = runtime.apply_host_report_settings(HostId(2), input);
+
+        let BleHidReport::Mouse(first) = first else {
+            panic!("mouse report");
         };
-        assert_eq!(jis_frame.keyboard.unwrap().keys_down(), &[KeyUsage(0x89)]);
+        let BleHidReport::Mouse(second) = second else {
+            panic!("mouse report");
+        };
+        let BleHidReport::Mouse(other_host_first) = other_host_first else {
+            panic!("mouse report");
+        };
+        assert_eq!(first.as_bytes(), &[0, 0, 0, 0, 0]);
+        assert_eq!(second.as_bytes(), &[0, 1, 255, 1, 255]);
+        assert_eq!(other_host_first.as_bytes(), &[0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn held_raw_usage_is_suppressed_across_hosts_with_different_maps() {
+        let mut runtime = ready_runtime();
+        let mut commands = heapless::Vec::<RuntimeCommand, 16>::new();
+        runtime.host_settings[0].keyboard_layout = 1;
+        runtime.host_settings[0].consumer_from_usage = 0x00e9;
+        runtime.host_settings[0].consumer_to_usage = 0x00cd;
+        for event in [
+            BridgeEvent::HostConnected { host_id: HostId(2) },
+            BridgeEvent::HostSecurityChanged {
+                host_id: HostId(2),
+                encrypted: true,
+                bonded: true,
+                bond: None,
+            },
+            BridgeEvent::CccdChanged {
+                host_id: HostId(2),
+                report: ReportKind::Keyboard,
+                enabled: true,
+            },
+            BridgeEvent::CccdChanged {
+                host_id: HostId(2),
+                report: ReportKind::Consumer,
+                enabled: true,
+            },
+        ] {
+            runtime
+                .handle_event::<16, 16>(event, &mut commands)
+                .unwrap();
+        }
+
+        runtime
+            .handle_event::<16, 16>(
+                BridgeEvent::InputFrame(crate::input::InputFrame::Standard(keyboard_input(
+                    KeyUsage(0x89),
+                ))),
+                &mut commands,
+            )
+            .unwrap();
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            RuntimeCommand::BleCommand(BleTaskCommand::Notify {
+                report: BleHidReport::Keyboard(report),
+                ..
+            }) if report.as_bytes()[2] == 0x35
+        )));
+        assert_eq!(
+            runtime.bridge.state().input.keyboard.keys(),
+            &[KeyUsage(0x89)]
+        );
+
+        runtime
+            .handle_event::<16, 16>(
+                BridgeEvent::SwitchTarget { target: HostId(2) },
+                &mut commands,
+            )
+            .unwrap();
+        runtime
+            .handle_event::<16, 16>(
+                BridgeEvent::InputFrame(crate::input::InputFrame::Standard(keyboard_input(
+                    KeyUsage(0x89),
+                ))),
+                &mut commands,
+            )
+            .unwrap();
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            RuntimeCommand::BleCommand(BleTaskCommand::Notify {
+                host_id: HostId(2),
+                report: BleHidReport::Keyboard(report),
+                ..
+            }) if report == &BleKeyboard6KroReport::release()
+        )));
+
+        let mut released = keyboard_input(KeyUsage(0x89));
+        released.keyboard = Some(KeyboardFrame::new(ModifierState::empty()));
+        runtime
+            .handle_event::<16, 16>(
+                BridgeEvent::InputFrame(crate::input::InputFrame::Standard(released)),
+                &mut commands,
+            )
+            .unwrap();
+        runtime
+            .handle_event::<16, 16>(
+                BridgeEvent::InputFrame(crate::input::InputFrame::Standard(keyboard_input(
+                    KeyUsage(0x89),
+                ))),
+                &mut commands,
+            )
+            .unwrap();
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            RuntimeCommand::BleCommand(BleTaskCommand::Notify {
+                host_id: HostId(2),
+                report: BleHidReport::Keyboard(report),
+                ..
+            }) if report.as_bytes()[2] == 0x89
+        )));
+    }
+
+    #[test]
+    fn held_consumer_usage_is_suppressed_across_hosts_with_different_maps() {
+        let mut runtime = ready_runtime();
+        let mut commands = heapless::Vec::<RuntimeCommand, 16>::new();
+        runtime.host_settings[0].consumer_from_usage = 0x00e9;
+        runtime.host_settings[0].consumer_to_usage = 0x00cd;
+        for event in [
+            BridgeEvent::HostConnected { host_id: HostId(2) },
+            BridgeEvent::HostSecurityChanged {
+                host_id: HostId(2),
+                encrypted: true,
+                bonded: true,
+                bond: None,
+            },
+            BridgeEvent::CccdChanged {
+                host_id: HostId(2),
+                report: ReportKind::Consumer,
+                enabled: true,
+            },
+        ] {
+            runtime
+                .handle_event::<16, 16>(event, &mut commands)
+                .unwrap();
+        }
+
+        runtime
+            .handle_event::<16, 16>(
+                BridgeEvent::InputFrame(crate::input::InputFrame::Standard(consumer_input(Some(
+                    0x00e9,
+                )))),
+                &mut commands,
+            )
+            .unwrap();
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            RuntimeCommand::BleCommand(BleTaskCommand::Notify {
+                host_id: HostId(1),
+                report: BleHidReport::Consumer(report),
+                ..
+            }) if report.as_bytes() == &0x00cdu16.to_le_bytes()
+        )));
+
+        runtime
+            .handle_event::<16, 16>(
+                BridgeEvent::SwitchTarget { target: HostId(2) },
+                &mut commands,
+            )
+            .unwrap();
+        runtime
+            .handle_event::<16, 16>(
+                BridgeEvent::InputFrame(crate::input::InputFrame::Standard(consumer_input(Some(
+                    0x00e9,
+                )))),
+                &mut commands,
+            )
+            .unwrap();
+        assert!(!commands.iter().any(|command| matches!(
+            command,
+            RuntimeCommand::BleCommand(BleTaskCommand::Notify {
+                host_id: HostId(2),
+                report: BleHidReport::Consumer(report),
+                ..
+            }) if report.as_bytes() != &[0, 0]
+        )));
+
+        runtime
+            .handle_event::<16, 16>(
+                BridgeEvent::InputFrame(crate::input::InputFrame::Standard(consumer_input(None))),
+                &mut commands,
+            )
+            .unwrap();
+        runtime
+            .handle_event::<16, 16>(
+                BridgeEvent::InputFrame(crate::input::InputFrame::Standard(consumer_input(Some(
+                    0x00e9,
+                )))),
+                &mut commands,
+            )
+            .unwrap();
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            RuntimeCommand::BleCommand(BleTaskCommand::Notify {
+                host_id: HostId(2),
+                report: BleHidReport::Consumer(report),
+                ..
+            }) if report.as_bytes() == &0x00e9u16.to_le_bytes()
+        )));
+    }
+
+    #[test]
+    fn one_hundred_fifty_percent_scaling_preserves_small_report_sum() {
+        let mut remainder = 0;
+        let output: i32 = (0..4)
+            .map(|_| i32::from(scale_axis_with_remainder(1, 150, &mut remainder)))
+            .sum();
+        assert_eq!(output, 6);
+        assert_eq!(remainder, 0);
+    }
+
+    #[test]
+    fn notify_timeout_is_counted_once_in_each_applicable_counter() {
+        let mut runtime = BridgeRuntime::<1, 0>::new(0);
+        runtime.apply_diagnostics_event(RuntimeDiagnosticsEvent::BleNotifyTimedOut {
+            critical_release: true,
+        });
+
+        assert_eq!(runtime.diagnostics.ble_notify_failure_count, 1);
+        assert_eq!(runtime.counters.ble_notify_timeouts, 1);
+        assert_eq!(runtime.counters.critical_release_failures, 1);
+        assert_eq!(runtime.counters.ble_notify_dropped, 0);
+
+        runtime.apply_diagnostics_event(RuntimeDiagnosticsEvent::BleNotifyFailed);
+        assert_eq!(runtime.diagnostics.ble_notify_failure_count, 2);
+        assert_eq!(runtime.counters.ble_notify_dropped, 1);
+    }
+
+    #[test]
+    fn tick_pending_coalesces_duplicates_and_rearms_after_processing() {
+        let pending = RuntimeTickPending::new();
+        assert!(pending.try_mark_pending());
+        assert!(pending.is_pending());
+        for _ in 0..100 {
+            assert!(!pending.try_mark_pending());
+        }
+        pending.mark_processed();
+        assert!(pending.try_mark_pending());
     }
 
     #[test]
@@ -3283,6 +3675,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn usb_led_command_rejects_reused_interface_for_a_different_device() {
+        let command = UsbTaskCommand {
+            interface_id: InterfaceId(3),
+            device_id: DeviceId(7),
+            bytes: KeyboardLedOutputReport::boot_keyboard()
+                .build(crate::input::KeyboardLedState::empty())
+                .unwrap(),
+        };
+        assert!(command.matches_target(InterfaceId(3), DeviceId(7)));
+        assert!(!command.matches_target(InterfaceId(3), DeviceId(8)));
+        assert!(!command.matches_target(InterfaceId(4), DeviceId(7)));
+    }
+
     fn ready_runtime() -> BridgeRuntime<2, 1> {
         let mut runtime = BridgeRuntime::new(0);
         let mut commands = heapless::Vec::<RuntimeCommand, 8>::new();
@@ -3334,9 +3740,22 @@ mod tests {
         frame.push_key(key).unwrap();
         crate::input::StandardInputFrame {
             device_id: DeviceId(1),
+            interface_id: InterfaceId(1),
             keyboard: Some(frame),
             mouse: None,
             consumer: None,
+        }
+    }
+
+    fn consumer_input(active: Option<u16>) -> crate::input::StandardInputFrame {
+        crate::input::StandardInputFrame {
+            device_id: DeviceId(1),
+            interface_id: InterfaceId(2),
+            keyboard: None,
+            mouse: None,
+            consumer: Some(crate::input::ConsumerFrame {
+                active: active.map(crate::input::ConsumerUsage),
+            }),
         }
     }
 }

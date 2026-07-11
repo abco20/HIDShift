@@ -369,6 +369,7 @@ mod tests {
             ble_limited.process_input(RuntimeInput::BridgeEvent(BridgeEvent::InputFrame(
                 crate::input::InputFrame::Standard(crate::input::StandardInputFrame {
                     device_id: DeviceId(7),
+                    interface_id: InterfaceId(1),
                     keyboard: Some(keyboard),
                     mouse: None,
                     consumer: None,

@@ -138,14 +138,49 @@ async fn forward_usb_input(
         RuntimeInputMessage,
         RUNTIME_INPUT_QUEUE_CAPACITY,
     >,
+    movement_queue: &mut hidshift::input::UsbMovementCoalescer<MAX_ACTIVE_USB_INTERFACES>,
     message: RuntimeInputMessage,
     movement_only: bool,
 ) {
+    while sender.free_capacity() > 0 {
+        let Some(frame) = movement_queue.take_next() else {
+            break;
+        };
+        if sender
+            .try_send(RuntimeInputMessage::BridgeEvent(
+                hidshift::BridgeEvent::InputFrame(hidshift::input::InputFrame::Standard(
+                    frame.clone(),
+                )),
+            ))
+            .is_err()
+        {
+            let _ = movement_queue.push(&frame);
+            break;
+        }
+    }
     if movement_only {
-        if sender.try_send(message).is_err() {
-            log::debug!("firmware: coalescible mouse input dropped at full runtime queue");
+        if sender.try_send(message.clone()).is_err() {
+            let RuntimeInputMessage::BridgeEvent(hidshift::BridgeEvent::InputFrame(
+                hidshift::input::InputFrame::Standard(frame),
+            )) = &message
+            else {
+                return;
+            };
+            if let Err(error) = movement_queue.push(frame) {
+                log::warn!(
+                    "firmware: mouse movement coalescer rejected input: {:?}",
+                    error
+                );
+            }
         }
     } else {
+        while let Some(frame) = movement_queue.take_next() {
+            sender
+                .send(RuntimeInputMessage::BridgeEvent(
+                    hidshift::BridgeEvent::InputFrame(hidshift::input::InputFrame::Standard(frame)),
+                ))
+                .await;
+        }
         sender.send(message).await;
     }
 }
@@ -167,6 +202,16 @@ async fn handle_hub_device_detected<'d>(
     port: u8,
     speed: embassy_usb_driver::Speed,
 ) {
+    let Some(port_index) =
+        hidshift::usb_hid::topology::tracked_hub_port_index::<MAX_HUB_PORTS>(port)
+    else {
+        log::warn!(
+            "firmware: rejecting hub child outside tracked port range port={} max={}",
+            port,
+            MAX_HUB_PORTS
+        );
+        return;
+    };
     const ATTACH_ATTEMPTS: usize = 2;
     let mut attach_attempt = 0usize;
     loop {
@@ -205,7 +250,7 @@ async fn handle_hub_device_detected<'d>(
                 .is_ok()
                 {
                     if (port as usize) < MAX_HUB_PORTS {
-                        hub_port_devices[port as usize] = Some(child_device_id);
+                        hub_port_devices[port_index] = Some(child_device_id);
                     }
                     Timer::after_millis(500).await;
                     return;
@@ -256,8 +301,10 @@ async fn handle_hub_device_removed<'d>(
     port: u8,
 ) {
     log::info!("firmware: hub device removed port={}", port);
-    if (port as usize) < MAX_HUB_PORTS {
-        if let Some(child_device_id) = hub_port_devices[port as usize].take() {
+    if let Some(port_index) =
+        hidshift::usb_hid::topology::tracked_hub_port_index::<MAX_HUB_PORTS>(port)
+    {
+        if let Some(child_device_id) = hub_port_devices[port_index].take() {
             let _ = remove_device_and_notify(
                 sender,
                 bus_handle,
@@ -398,6 +445,8 @@ pub async fn usb_input_task(
     let (mut bus_controller, bus_handle) = embassy_usb_host::bus(host, &BUS_STATE);
     let mut config_buf = [0u8; CONFIG_DESCRIPTOR_BUF_LEN];
     let mut topology = DefaultUsbTopologyManager::new();
+    let mut movement_queue =
+        hidshift::input::UsbMovementCoalescer::<MAX_ACTIVE_USB_INTERFACES>::new();
 
     loop {
         let speed = bus_controller.wait_for_connection().await;
@@ -607,7 +656,8 @@ pub async fn usb_input_task(
                         message,
                         movement_only,
                     }) => {
-                        forward_usb_input(&sender, message, movement_only).await;
+                        forward_usb_input(&sender, &mut movement_queue, message, movement_only)
+                            .await;
                     }
                     Either3::Second(UsbSlotReadResult::Fatal {
                         device_id: failed_device_id,
@@ -635,8 +685,9 @@ pub async fn usb_input_task(
                     }
                     Either3::Third(command) => {
                         let Some(slot) = active_slots.iter_mut().find_map(|slot| {
-                            slot.as_mut()
-                                .filter(|slot| slot.interface_id == command.interface_id)
+                            slot.as_mut().filter(|slot| {
+                                command.matches_target(slot.interface_id, slot.session.device_id())
+                            })
                         }) else {
                             log::warn!(
                                 "firmware: usb command interface missing got={}",
@@ -728,7 +779,7 @@ pub async fn usb_input_task(
                     message,
                     movement_only,
                 }) => {
-                    forward_usb_input(&sender, message, movement_only).await;
+                    forward_usb_input(&sender, &mut movement_queue, message, movement_only).await;
                 }
                 Either::First(UsbSlotReadResult::Fatal {
                     device_id: failed_device_id,
@@ -757,8 +808,9 @@ pub async fn usb_input_task(
                 }
                 Either::Second(command) => {
                     let Some(slot) = active_slots.iter_mut().find_map(|slot| {
-                        slot.as_mut()
-                            .filter(|slot| slot.interface_id == command.interface_id)
+                        slot.as_mut().filter(|slot| {
+                            command.matches_target(slot.interface_id, slot.session.device_id())
+                        })
                     }) else {
                         log::warn!(
                             "firmware: usb command interface missing got={}",

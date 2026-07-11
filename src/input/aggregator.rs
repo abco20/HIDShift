@@ -1,4 +1,4 @@
-use crate::ids::DeviceId;
+use crate::ids::{DeviceId, InterfaceId};
 
 use super::{
     ConsumerState, InputError, MouseButtons, PhysicalInputState, PhysicalKeyboardState,
@@ -8,6 +8,7 @@ use super::{
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DeviceInputState {
     device_id: DeviceId,
+    interface_id: InterfaceId,
     keyboard: PhysicalKeyboardState,
     mouse_buttons: MouseButtons,
     consumer: ConsumerState,
@@ -15,9 +16,10 @@ struct DeviceInputState {
 }
 
 impl DeviceInputState {
-    const fn new(device_id: DeviceId) -> Self {
+    const fn new(device_id: DeviceId, interface_id: InterfaceId) -> Self {
         Self {
             device_id,
+            interface_id,
             keyboard: PhysicalKeyboardState::new(),
             mouse_buttons: MouseButtons::empty(),
             consumer: ConsumerState::new(),
@@ -49,7 +51,7 @@ impl<const DEVICES: usize> InputAggregator<DEVICES> {
     pub fn apply_frame(&mut self, frame: &StandardInputFrame) -> Result<(), InputError> {
         // Relative movement is deliberately not persistent aggregator state.
         // An otherwise empty movement frame must not consume a device slot.
-        let existing_index = device_index(&self.devices, frame.device_id);
+        let existing_index = interface_index(&self.devices, frame.interface_id);
         let existing_buttons = existing_index
             .and_then(|index| self.devices[index].as_ref())
             .map(|entry| entry.mouse_buttons)
@@ -71,7 +73,8 @@ impl<const DEVICES: usize> InputAggregator<DEVICES> {
                 .ok_or(InputError::DeviceCapacity)?,
         };
 
-        let entry = devices[index].get_or_insert(DeviceInputState::new(frame.device_id));
+        let entry = devices[index]
+            .get_or_insert(DeviceInputState::new(frame.device_id, frame.interface_id));
 
         if let Some(keyboard) = &frame.keyboard {
             entry.keyboard.replace_with_frame(keyboard)?;
@@ -103,7 +106,33 @@ impl<const DEVICES: usize> InputAggregator<DEVICES> {
     }
 
     pub fn remove_device(&mut self, device_id: DeviceId) -> bool {
-        let Some(index) = self.device_index(device_id) else {
+        if !self
+            .devices
+            .iter()
+            .flatten()
+            .any(|entry| entry.device_id == device_id)
+        {
+            return false;
+        }
+        let mut devices = self.devices.clone();
+        for entry in &mut devices {
+            if entry
+                .as_ref()
+                .is_some_and(|entry| entry.device_id == device_id)
+            {
+                *entry = None;
+            }
+        }
+        let Ok(aggregate) = rebuild_aggregate(&devices) else {
+            return false;
+        };
+        self.devices = devices;
+        self.aggregate = aggregate;
+        true
+    }
+
+    pub fn remove_interface(&mut self, interface_id: InterfaceId) -> bool {
+        let Some(index) = interface_index(&self.devices, interface_id) else {
             return false;
         };
         let mut devices = self.devices.clone();
@@ -115,18 +144,15 @@ impl<const DEVICES: usize> InputAggregator<DEVICES> {
         self.aggregate = aggregate;
         true
     }
-
-    fn device_index(&self, device_id: DeviceId) -> Option<usize> {
-        self.devices
-            .iter()
-            .position(|entry| matches!(entry, Some(entry) if entry.device_id == device_id))
-    }
 }
 
-fn device_index(devices: &[Option<DeviceInputState>], device_id: DeviceId) -> Option<usize> {
+fn interface_index(
+    devices: &[Option<DeviceInputState>],
+    interface_id: InterfaceId,
+) -> Option<usize> {
     devices
         .iter()
-        .position(|entry| matches!(entry, Some(entry) if entry.device_id == device_id))
+        .position(|entry| matches!(entry, Some(entry) if entry.interface_id == interface_id))
 }
 
 fn rebuild_aggregate(
@@ -218,6 +244,7 @@ mod tests {
         aggregator
             .apply_frame(&StandardInputFrame {
                 device_id: DeviceId(1),
+                interface_id: InterfaceId(1),
                 keyboard: Some(keyboard_a),
                 mouse: None,
                 consumer: None,
@@ -229,6 +256,7 @@ mod tests {
         aggregator
             .apply_frame(&StandardInputFrame {
                 device_id: DeviceId(2),
+                interface_id: InterfaceId(2),
                 keyboard: Some(keyboard_b),
                 mouse: None,
                 consumer: None,
@@ -251,6 +279,7 @@ mod tests {
         aggregator
             .apply_frame(&StandardInputFrame {
                 device_id: DeviceId(1),
+                interface_id: InterfaceId(1),
                 keyboard: Some({
                     let mut frame = KeyboardFrame::new(ModifierState::empty());
                     frame.push_key(KeyUsage(0x04)).unwrap();
@@ -266,6 +295,7 @@ mod tests {
         aggregator
             .apply_frame(&StandardInputFrame {
                 device_id: DeviceId(2),
+                interface_id: InterfaceId(2),
                 keyboard: Some({
                     let mut frame = KeyboardFrame::new(ModifierState::empty());
                     frame.push_key(KeyUsage(0x05)).unwrap();
@@ -294,6 +324,7 @@ mod tests {
         aggregator
             .apply_frame(&StandardInputFrame {
                 device_id: DeviceId(1),
+                interface_id: InterfaceId(1),
                 keyboard: None,
                 mouse: None,
                 consumer: Some(ConsumerFrame {
@@ -304,6 +335,7 @@ mod tests {
         aggregator
             .apply_frame(&StandardInputFrame {
                 device_id: DeviceId(2),
+                interface_id: InterfaceId(2),
                 keyboard: None,
                 mouse: None,
                 consumer: Some(ConsumerFrame {
@@ -331,6 +363,7 @@ mod tests {
             aggregator
                 .apply_frame(&StandardInputFrame {
                     device_id: DeviceId(device_id),
+                    interface_id: InterfaceId(device_id),
                     keyboard: None,
                     mouse: None,
                     consumer: Some(ConsumerFrame {
@@ -343,6 +376,7 @@ mod tests {
         aggregator
             .apply_frame(&StandardInputFrame {
                 device_id: DeviceId(1),
+                interface_id: InterfaceId(1),
                 keyboard: Some(KeyboardFrame::new(ModifierState::empty())),
                 mouse: Some(MouseFrame {
                     buttons: MouseButtons::LEFT,
@@ -370,6 +404,7 @@ mod tests {
             aggregator
                 .apply_frame(&StandardInputFrame {
                     device_id: DeviceId(device_id),
+                    interface_id: InterfaceId(device_id),
                     keyboard: None,
                     mouse: Some(MouseFrame {
                         buttons: MouseButtons::empty(),
@@ -395,6 +430,7 @@ mod tests {
             aggregator
                 .apply_frame(&StandardInputFrame {
                     device_id: DeviceId(device_id),
+                    interface_id: InterfaceId(device_id),
                     keyboard: None,
                     mouse: None,
                     consumer: Some(ConsumerFrame {
@@ -419,6 +455,7 @@ mod tests {
         aggregator
             .apply_frame(&StandardInputFrame {
                 device_id: DeviceId(1),
+                interface_id: InterfaceId(1),
                 keyboard: Some(first),
                 mouse: None,
                 consumer: None,
@@ -433,6 +470,7 @@ mod tests {
         assert_eq!(
             aggregator.apply_frame(&StandardInputFrame {
                 device_id: DeviceId(2),
+                interface_id: InterfaceId(2),
                 keyboard: Some(second),
                 mouse: None,
                 consumer: None,
@@ -440,5 +478,43 @@ mod tests {
             Err(InputError::KeyCapacity)
         );
         assert_eq!(aggregator, before);
+    }
+
+    #[test]
+    fn same_device_keyboard_interfaces_are_aggregated_independently() {
+        let mut aggregator = InputAggregator::<2>::new();
+        for (interface, usage) in [(1, 0x04), (2, 0x05)] {
+            let mut keyboard = KeyboardFrame::new(ModifierState::empty());
+            keyboard.push_key(KeyUsage(usage)).unwrap();
+            aggregator
+                .apply_frame(&StandardInputFrame {
+                    device_id: DeviceId(7),
+                    interface_id: InterfaceId(interface),
+                    keyboard: Some(keyboard),
+                    mouse: None,
+                    consumer: None,
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            aggregator.aggregate().keyboard.keys(),
+            &[KeyUsage(0x04), KeyUsage(0x05)]
+        );
+
+        aggregator
+            .apply_frame(&StandardInputFrame {
+                device_id: DeviceId(7),
+                interface_id: InterfaceId(1),
+                keyboard: Some(KeyboardFrame::new(ModifierState::empty())),
+                mouse: None,
+                consumer: None,
+            })
+            .unwrap();
+        assert_eq!(aggregator.aggregate().keyboard.keys(), &[KeyUsage(0x05)]);
+
+        assert!(aggregator.remove_interface(InterfaceId(1)));
+        assert_eq!(aggregator.aggregate().keyboard.keys(), &[KeyUsage(0x05)]);
+        assert!(aggregator.remove_device(DeviceId(7)));
+        assert!(aggregator.aggregate().keyboard.keys().is_empty());
     }
 }

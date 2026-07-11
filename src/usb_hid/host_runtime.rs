@@ -126,7 +126,12 @@ impl<const FIELDS: usize, const EVENTS: usize> UsbHidInterfaceRuntimeSession<FIE
     }
 
     pub fn input_message(&self, report: &[u8]) -> Result<RuntimeInputMessage, UsbInputFrameError> {
-        runtime_input_from_usb_report::<FIELDS, EVENTS>(self.device_id, &self.descriptor, report)
+        runtime_input_from_usb_report::<FIELDS, EVENTS>(
+            self.device_id,
+            self.interface_id,
+            &self.descriptor,
+            report,
+        )
     }
 }
 
