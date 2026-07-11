@@ -773,9 +773,9 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                 history_capacity: RUNTIME_HISTORY_CAPACITY as u8,
                 usb_capacity: USB_INTERFACES.min(u8::MAX as usize) as u8,
                 hash: SETTINGS_SCHEMA_HASH,
-                firmware_major: 0,
-                firmware_minor: 1,
-                firmware_patch: 0,
+                firmware_major: crate::FIRMWARE_VERSION_MAJOR,
+                firmware_minor: crate::FIRMWARE_VERSION_MINOR,
+                firmware_patch: crate::FIRMWARE_VERSION_PATCH,
             }),
             ManagementCommand::GetSetting { id, target }
             | ManagementCommand::SetSetting { id, target, .. }

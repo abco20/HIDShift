@@ -110,6 +110,12 @@ command and option reference.
 
 ### Web UI
 
+The hosted manager is available at
+[abco20.github.io/HIDShift](https://abco20.github.io/HIDShift/). Web Bluetooth
+is primarily supported by Chromium-based browsers. Web Serial also requires a
+compatible browser and a secure context; use the local build if browser or
+platform policy prevents either API from being exposed.
+
 Install Trunk and the WebAssembly target, then run the browser client locally:
 
 ```sh
@@ -129,6 +135,59 @@ trunk build --release
 ```
 
 `web/dist/` is generated and ignored by Git.
+
+The `main` branch is automatically deployed to GitHub Pages. Repository
+administrators must select **GitHub Actions** as the Pages source in the
+repository settings before the first deployment.
+
+## Releases
+
+Tagged releases contain the production ESP32-S3 firmware and `hidshiftctl` for
+Linux x86_64, Windows x86_64, Intel macOS, and Apple Silicon macOS. Download the
+archive for the required target from the
+[GitHub Releases page](https://github.com/abco20/HIDShift/releases).
+
+The firmware archive contains two images:
+
+- `hidshift.elf` is the recommended image for `espflash flash`; it preserves
+  symbols and lets espflash prepare the image for the connected board.
+- `hidshift-factory.bin` is a merged image starting at address `0x0`, generated
+  for boards with at least 4 MiB of flash. It includes the bootloader, partition
+  table, and factory application for factory provisioning tools.
+
+To flash the release ELF after extracting the archive:
+
+```sh
+espflash flash \
+  --chip esp32s3 \
+  --partition-table bridge.csv \
+  --target-app-partition factory \
+  hidshift.elf
+```
+
+Verify downloaded files against the release checksum before use:
+
+```sh
+sha256sum --check SHA256SUMS --ignore-missing
+```
+
+Every archive includes the project license and the relevant generated
+third-party dependency license report.
+
+### Creating a release
+
+Update the version in the root, firmware, `hidshift-client`, `hidshiftctl`, and
+Web manifests, update their lockfiles, and add the matching `CHANGELOG.md`
+entry. After the normal CI passes, create and push the tag:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Tags must use `vX.Y.Z` or `vX.Y.Z-suffix`. A suffix such as `-rc.1` creates a
+GitHub prerelease. The release workflow rejects tags whose base version does
+not match every package manifest and the changelog.
 
 ## Logs
 

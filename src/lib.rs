@@ -1,5 +1,32 @@
 #![cfg_attr(not(test), no_std)]
 
+const fn parse_version_component(value: &str) -> u8 {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    let mut result = 0u8;
+    while index < bytes.len() {
+        let digit = bytes[index];
+        assert!(digit >= b'0' && digit <= b'9', "invalid package version");
+        result = match result.checked_mul(10) {
+            Some(value) => value,
+            None => panic!("package version component exceeds u8"),
+        };
+        result = match result.checked_add(digit - b'0') {
+            Some(value) => value,
+            None => panic!("package version component exceeds u8"),
+        };
+        index += 1;
+    }
+    result
+}
+
+/// Firmware version reported through the management protocol.
+pub const FIRMWARE_VERSION_MAJOR: u8 = parse_version_component(env!("CARGO_PKG_VERSION_MAJOR"));
+/// Firmware version reported through the management protocol.
+pub const FIRMWARE_VERSION_MINOR: u8 = parse_version_component(env!("CARGO_PKG_VERSION_MINOR"));
+/// Firmware version reported through the management protocol.
+pub const FIRMWARE_VERSION_PATCH: u8 = parse_version_component(env!("CARGO_PKG_VERSION_PATCH"));
+
 pub mod ble;
 pub mod ble_connection;
 pub mod ble_notify;
@@ -123,3 +150,15 @@ pub use usb_hid::topology::{
     UsbDeviceRoute, UsbDeviceTopologyEntry, UsbInterfaceTopologyEntry, UsbTopologyError,
     UsbTopologyManager, UsbTopologyRemoval,
 };
+
+#[cfg(test)]
+mod version_tests {
+    use super::{FIRMWARE_VERSION_MAJOR, FIRMWARE_VERSION_MINOR, FIRMWARE_VERSION_PATCH};
+
+    #[test]
+    fn firmware_version_comes_from_the_package_version() {
+        assert_eq!(FIRMWARE_VERSION_MAJOR, 0);
+        assert_eq!(FIRMWARE_VERSION_MINOR, 1);
+        assert_eq!(FIRMWARE_VERSION_PATCH, 0);
+    }
+}

@@ -33,6 +33,8 @@ jobs:
       - run: cargo fmt --check --manifest-path tools/hidshift-client/Cargo.toml
       - run: cargo fmt --check --manifest-path tools/hidshiftctl/Cargo.toml
       - run: cargo fmt --check --manifest-path web/Cargo.toml
+      - name: Test release version validation
+        run: python3 -m unittest discover -s tools/release -p 'test_*.py'
 
   firmware:
     runs-on: ubuntu-latest

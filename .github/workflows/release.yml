@@ -1,0 +1,196 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vX.Y.Z tag to release
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - name: Validate tag and package versions
+        run: python3 tools/release/check_release_version.py "$RELEASE_TAG"
+      - name: Test release validation
+        run: python3 -m unittest discover -s tools/release -p 'test_*.py'
+
+  firmware:
+    needs: [validate, licenses]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - name: Install ESP Xtensa Rust toolchain
+        uses: esp-rs/xtensa-toolchain@v1.7.0
+        with:
+          buildtargets: esp32s3
+          default: false
+          ldproxy: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-esp32s3
+      - uses: actions/download-artifact@v4
+        with:
+          name: licenses
+          path: licenses
+      - name: Build production firmware
+        run: >-
+          cargo +esp build --locked -Zbuild-std=core,alloc --release
+          --manifest-path firmware/Cargo.toml --bin firmware
+          --target xtensa-esp32s3-none-elf
+      - name: Install espflash
+        uses: taiki-e/install-action@v2
+        with:
+          tool: espflash@4.4.0
+      - name: Package firmware
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          package="hidshift-firmware-${version}-esp32s3"
+          mkdir -p "dist/${package}"
+          cp target/xtensa-esp32s3-none-elf/release/firmware "dist/${package}/hidshift.elf"
+          cp partitions/bridge.csv README.md LICENSE THIRD_PARTY_NOTICES.md "dist/${package}/"
+          cp licenses/THIRD_PARTY_LICENSES_FIRMWARE.html "dist/${package}/THIRD_PARTY_LICENSES.html"
+          espflash save-image --chip esp32s3 --merge --skip-padding \
+            --flash-size 4mb --partition-table partitions/bridge.csv \
+            --target-app-partition factory \
+            "dist/${package}/hidshift.elf" "dist/${package}/hidshift-factory.bin"
+          tar -C dist -czf "dist/${package}.tar.gz" "${package}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  licenses:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.8.2
+      - name: Generate dependency license reports
+        run: |
+          mkdir -p dist
+          cargo about generate --locked --manifest-path firmware/Cargo.toml --target xtensa-esp32s3-none-elf about.hbs -o dist/THIRD_PARTY_LICENSES_FIRMWARE.html
+          cargo about generate --locked --manifest-path tools/hidshiftctl/Cargo.toml about.hbs -o dist/THIRD_PARTY_LICENSES_HIDSHIFTCTL.html
+      - uses: actions/upload-artifact@v4
+        with:
+          name: licenses
+          path: dist/*.html
+          if-no-files-found: error
+
+  cli:
+    needs: [validate, licenses]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+          - runner: macos-13
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            archive: tar.gz
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/hidshiftctl
+          key: release-${{ matrix.target }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: licenses
+          path: licenses
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes libdbus-1-dev pkg-config
+      - name: Build hidshiftctl
+        run: cargo build --locked --release --manifest-path tools/hidshiftctl/Cargo.toml --target ${{ matrix.target }}
+      - name: Verify hidshiftctl version
+        shell: bash
+        run: |
+          executable="tools/hidshiftctl/target/${{ matrix.target }}/release/hidshiftctl"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then executable="${executable}.exe"; fi
+          version="${RELEASE_TAG#v}"
+          "${executable}" --version | grep -F "${version%%-*}"
+      - name: Package hidshiftctl
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          package="hidshiftctl-${version}-${{ matrix.target }}"
+          mkdir -p "dist/${package}"
+          executable="tools/hidshiftctl/target/${{ matrix.target }}/release/hidshiftctl"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then executable="${executable}.exe"; fi
+          cp "${executable}" README.md LICENSE THIRD_PARTY_NOTICES.md "dist/${package}/"
+          cp licenses/THIRD_PARTY_LICENSES_HIDSHIFTCTL.html "dist/${package}/THIRD_PARTY_LICENSES.html"
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            powershell -NoProfile -Command "Compress-Archive -Path 'dist/${package}' -DestinationPath 'dist/${package}.zip'"
+          else
+            tar -C dist -czf "dist/${package}.tar.gz" "${package}"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  publish:
+    needs: [firmware, licenses, cli]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Add checksums
+        run: |
+          cd dist
+          sha256sum *.tar.gz *.zip *.html > SHA256SUMS
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=()
+          if [[ "${RELEASE_TAG#v}" == *-* ]]; then prerelease+=(--prerelease); fi
+          gh release create "$RELEASE_TAG" dist/* --verify-tag --generate-notes --title "HIDShift ${RELEASE_TAG#v}" "${prerelease[@]}"
