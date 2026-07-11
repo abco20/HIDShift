@@ -1,12 +1,13 @@
 use crate::ids::HostId;
+use crate::settings::{GlobalSettings, HostSettings};
 
 pub const MAX_HOST_NAME_LEN: usize = 32;
 pub const STORED_HOSTS_MAX: usize = 4;
 pub const STORAGE_MAGIC: [u8; 4] = *b"E32B";
-pub const STORAGE_SCHEMA_VERSION: u16 = 3;
+pub const STORAGE_SCHEMA_VERSION: u16 = 4;
 pub const STORAGE_IMAGE_LEN: usize = 512;
 pub const STORAGE_HEADER_LEN: usize = 16;
-pub const STORAGE_BODY_PREFIX_LEN: usize = 8;
+pub const STORAGE_BODY_PREFIX_LEN: usize = 64;
 pub const STORED_HOST_RECORD_LEN: usize = 88;
 pub const STORED_BOND_LEN: usize = 48;
 pub const STORAGE_FLASH_SLOT_SIZE: usize = 4096;
@@ -93,6 +94,8 @@ impl FixedName {
 pub struct StorageState {
     pub generation: u32,
     pub last_active_host: Option<HostId>,
+    pub global_settings: GlobalSettings,
+    pub host_settings: [HostSettings; STORED_HOSTS_MAX],
     hosts: heapless::Vec<StoredHostProfile, STORED_HOSTS_MAX>,
 }
 
@@ -101,6 +104,8 @@ impl StorageState {
         Self {
             generation,
             last_active_host: None,
+            global_settings: GlobalSettings::DEFAULT,
+            host_settings: [HostSettings::DEFAULT; STORED_HOSTS_MAX],
             hosts: heapless::Vec::new(),
         }
     }
@@ -407,6 +412,11 @@ pub fn encode_storage_image(state: &StorageState) -> Result<[u8; STORAGE_IMAGE_L
     write_u32(&mut image[8..12], state.generation);
     image[16] = state.hosts.len() as u8;
     image[17] = state.last_active_host.map_or(0xff, |host| host.0);
+    encode_global_settings(state.global_settings, &mut image[18..30]);
+    for (index, settings) in state.host_settings.iter().copied().enumerate() {
+        let offset = 32 + index * 12;
+        encode_host_settings(settings, &mut image[offset..offset + 12]);
+    }
 
     for (index, host) in state.hosts.iter().copied().enumerate() {
         let offset = STORAGE_HEADER_LEN + STORAGE_BODY_PREFIX_LEN + index * STORED_HOST_RECORD_LEN;
@@ -427,6 +437,9 @@ pub fn decode_storage_image(image: &[u8]) -> Result<StorageState, StorageError> 
     }
 
     let version = read_u16(&image[4..6]);
+    if version == 3 {
+        return decode_storage_v3(image);
+    }
     if version != STORAGE_SCHEMA_VERSION {
         return Err(StorageError::UnsupportedVersion);
     }
@@ -456,6 +469,11 @@ pub fn decode_storage_image(image: &[u8]) -> Result<StorageState, StorageError> 
         0xff => None,
         id => Some(HostId(id)),
     };
+    state.global_settings = decode_global_settings(&image[18..30])?;
+    for index in 0..STORED_HOSTS_MAX {
+        let offset = 32 + index * 12;
+        state.host_settings[index] = decode_host_settings(&image[offset..offset + 12])?;
+    }
 
     for index in 0..host_count {
         let offset = STORAGE_HEADER_LEN + STORAGE_BODY_PREFIX_LEN + index * STORED_HOST_RECORD_LEN;
@@ -466,6 +484,35 @@ pub fn decode_storage_image(image: &[u8]) -> Result<StorageState, StorageError> 
 
     state.validate()?;
 
+    Ok(state)
+}
+
+fn decode_storage_v3(image: &[u8]) -> Result<StorageState, StorageError> {
+    const V3_BODY_PREFIX_LEN: usize = 8;
+    let body_len = read_u16(&image[6..8]) as usize;
+    let host_count = image[16] as usize;
+    if host_count > STORED_HOSTS_MAX
+        || body_len != V3_BODY_PREFIX_LEN + host_count * STORED_HOST_RECORD_LEN
+        || STORAGE_HEADER_LEN + body_len > STORAGE_IMAGE_LEN
+    {
+        return Err(StorageError::InvalidLength);
+    }
+    let total_len = STORAGE_HEADER_LEN + body_len;
+    if read_u32(&image[12..16]) != crc32_without_header_crc(&image[..total_len]) {
+        return Err(StorageError::CrcMismatch);
+    }
+    let mut state = StorageState::new(read_u32(&image[8..12]));
+    state.last_active_host = match image[17] {
+        0xff => None,
+        id => Some(HostId(id)),
+    };
+    for index in 0..host_count {
+        let offset = STORAGE_HEADER_LEN + V3_BODY_PREFIX_LEN + index * STORED_HOST_RECORD_LEN;
+        state.push_host(decode_host_record(
+            &image[offset..offset + STORED_HOST_RECORD_LEN],
+        )?)?;
+    }
+    state.validate()?;
     Ok(state)
 }
 
@@ -766,6 +813,73 @@ fn encode_host_record(host: StoredHostProfile, out: &mut [u8]) -> Result<(), Sto
     Ok(())
 }
 
+fn encode_global_settings(settings: GlobalSettings, out: &mut [u8]) {
+    out.fill(0);
+    out[0] = settings.boot_target;
+    out[1] = bool_byte(settings.restore_last_target);
+    out[2] = bool_byte(settings.auto_reconnect);
+    write_u16(&mut out[3..5], settings.switch_release_delay_ms);
+    out[5] = settings.button_short_action;
+    out[6] = settings.button_long_action;
+    out[7] = settings.button_very_long_action;
+    out[8] = settings.log_level;
+}
+
+fn decode_global_settings(bytes: &[u8]) -> Result<GlobalSettings, StorageError> {
+    let settings = GlobalSettings {
+        boot_target: bytes[0],
+        restore_last_target: bytes[1] != 0,
+        auto_reconnect: bytes[2] != 0,
+        switch_release_delay_ms: read_u16(&bytes[3..5]),
+        button_short_action: bytes[5],
+        button_long_action: bytes[6],
+        button_very_long_action: bytes[7],
+        log_level: bytes[8],
+    };
+    if settings.boot_target > 4
+        || settings.switch_release_delay_ms > 1000
+        || settings.button_short_action > 3
+        || settings.button_long_action > 3
+        || settings.button_very_long_action > 3
+        || settings.log_level > 4
+    {
+        return Err(StorageError::InvalidLength);
+    }
+    Ok(settings)
+}
+
+fn encode_host_settings(settings: HostSettings, out: &mut [u8]) {
+    out.fill(0);
+    out[0] = settings.keyboard_layout;
+    out[1] = settings.remap_from_usage;
+    out[2] = settings.remap_to_usage;
+    write_u16(&mut out[4..6], settings.mouse_sensitivity_percent);
+    write_u16(&mut out[6..8], settings.scroll_multiplier_percent);
+    write_u16(&mut out[8..10], settings.consumer_from_usage);
+    write_u16(&mut out[10..12], settings.consumer_to_usage);
+}
+
+fn decode_host_settings(bytes: &[u8]) -> Result<HostSettings, StorageError> {
+    let settings = HostSettings {
+        keyboard_layout: bytes[0],
+        remap_from_usage: bytes[1],
+        remap_to_usage: bytes[2],
+        mouse_sensitivity_percent: read_u16(&bytes[4..6]),
+        scroll_multiplier_percent: read_u16(&bytes[6..8]),
+        consumer_from_usage: read_u16(&bytes[8..10]),
+        consumer_to_usage: read_u16(&bytes[10..12]),
+    };
+    if settings.keyboard_layout > 2
+        || !(10..=400).contains(&settings.mouse_sensitivity_percent)
+        || !(10..=400).contains(&settings.scroll_multiplier_percent)
+        || settings.consumer_from_usage > 4095
+        || settings.consumer_to_usage > 4095
+    {
+        return Err(StorageError::InvalidLength);
+    }
+    Ok(settings)
+}
+
 fn decode_host_record(record: &[u8]) -> Result<StoredHostProfile, StorageError> {
     let name_len = record[6] as usize;
     if name_len > MAX_HOST_NAME_LEN {
@@ -965,6 +1079,61 @@ mod tests {
 
         assert_eq!(decoded, state);
         assert_eq!(&image[0..4], &STORAGE_MAGIC);
+    }
+
+    #[test]
+    fn storage_image_round_trips_generated_global_and_host_settings() {
+        let mut state = StorageState::new(8);
+        state.global_settings.auto_reconnect = false;
+        state.global_settings.switch_release_delay_ms = 125;
+        state.global_settings.log_level = 3;
+        state.host_settings[1].keyboard_layout = 2;
+        state.host_settings[1].mouse_sensitivity_percent = 175;
+        state.host_settings[1].consumer_from_usage = 0x0e9;
+        state.host_settings[1].consumer_to_usage = 0x0ea;
+
+        assert_eq!(
+            decode_storage_image(&encode_storage_image(&state).unwrap()),
+            Ok(state)
+        );
+    }
+
+    #[test]
+    fn version_three_images_migrate_with_default_settings_and_preserved_bond() {
+        const V3_PREFIX: usize = 8;
+        let host = StoredHostProfile {
+            host_id: HostId(1),
+            bonded: true,
+            keyboard_cccd_enabled: true,
+            mouse_cccd_enabled: false,
+            consumer_cccd_enabled: true,
+            keyboard_output_cccd_enabled: false,
+            name: FixedName::from_ascii("old laptop").unwrap(),
+            bond: None,
+        };
+        let mut image = [0u8; STORAGE_IMAGE_LEN];
+        image[0..4].copy_from_slice(&STORAGE_MAGIC);
+        write_u16(&mut image[4..6], 3);
+        let body_len = V3_PREFIX + STORED_HOST_RECORD_LEN;
+        write_u16(&mut image[6..8], body_len as u16);
+        write_u32(&mut image[8..12], 17);
+        image[16] = 1;
+        image[17] = 1;
+        encode_host_record(
+            host,
+            &mut image[STORAGE_HEADER_LEN + V3_PREFIX
+                ..STORAGE_HEADER_LEN + V3_PREFIX + STORED_HOST_RECORD_LEN],
+        )
+        .unwrap();
+        let crc = crc32_without_header_crc(&image[..STORAGE_HEADER_LEN + body_len]);
+        write_u32(&mut image[12..16], crc);
+
+        let migrated = decode_storage_image(&image).unwrap();
+        assert_eq!(migrated.generation, 17);
+        assert_eq!(migrated.last_active_host, Some(HostId(1)));
+        assert_eq!(migrated.hosts(), &[host]);
+        assert_eq!(migrated.global_settings, GlobalSettings::DEFAULT);
+        assert_eq!(migrated.host_settings, [HostSettings::DEFAULT; 4]);
     }
 
     #[test]

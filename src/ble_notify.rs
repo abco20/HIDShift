@@ -58,7 +58,8 @@ where
         BleTaskCommand::Notify { report, .. } => dispatch_input_report_notifications(report, sink),
         BleTaskCommand::AllowPairing { .. }
         | BleTaskCommand::RejectPairing { .. }
-        | BleTaskCommand::ClearBond { .. } => Ok(()),
+        | BleTaskCommand::ClearBond { .. }
+        | BleTaskCommand::ManagementResponse { .. } => Ok(()),
     }
 }
 

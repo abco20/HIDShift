@@ -1,9 +1,20 @@
 use crate::ble::{BleHostAdapterError, BleHostAdapterEvent, bridge_events_from_ble_host_event};
 use crate::bridge::{Bridge, BridgeAction, BridgeError, BridgeEvent, BridgeStatus, NotifyReason};
 use crate::ids::{DeviceId, HostId, InterfaceId};
+use crate::management::{
+    ManagementCommand, ManagementDestination, ManagementDiagnostics, ManagementHistoryEvent,
+    ManagementHostInfo, ManagementHostName, ManagementHostStatus, ManagementHostTiming,
+    ManagementRequest, ManagementResponse, ManagementResponsePayload, ManagementResult,
+    ManagementSchema, ManagementSetting, ManagementStatus, ManagementUsbDevice,
+    ManagementUsbStatus,
+};
 use crate::reports::BleHidReport;
+use crate::settings::{
+    GlobalSettings, HostSettings, SETTING_COUNT, SETTINGS_SCHEMA_HASH, SETTINGS_SCHEMA_VERSION,
+    SettingId, SettingScope, SettingTarget, setting_descriptor, validate_setting_value,
+};
 use crate::storage::{
-    STORED_HOSTS_MAX, StorageError, StoragePersistPriority, StorageState, StoredBond,
+    FixedName, STORED_HOSTS_MAX, StorageError, StoragePersistPriority, StorageState, StoredBond,
 };
 use crate::target_control::ButtonIntent;
 use crate::usb_hid::output::{
@@ -21,6 +32,7 @@ pub mod owner;
 
 pub const RUNTIME_HOSTS_MAX: usize = STORED_HOSTS_MAX;
 pub const RUNTIME_USB_INTERFACES_MAX: usize = 8;
+pub const RUNTIME_HISTORY_CAPACITY: usize = 16;
 pub const RUNTIME_BRIDGE_ACTION_CAPACITY: usize = 12;
 pub const RUNTIME_COMMAND_CAPACITY: usize = 12;
 pub const RUNTIME_BLE_EVENT_CAPACITY: usize = 2;
@@ -76,6 +88,11 @@ pub enum RuntimeInput<'a> {
         intent: ButtonIntent,
         now_ms: u64,
     },
+    ManagementRequest {
+        destination: ManagementDestination,
+        request: ManagementRequest,
+        now_ms: u64,
+    },
     Tick {
         now_ms: u64,
     },
@@ -91,6 +108,18 @@ pub enum RuntimeInput<'a> {
     UsbHidInterfaceDisconnected {
         interface_id: InterfaceId,
     },
+    UsbDeviceMetadataUpdated {
+        device_id: DeviceId,
+        vendor_id: u16,
+        product_id: u16,
+        name: FixedName,
+        flags: u8,
+    },
+    HostNameDiscovered {
+        host_id: HostId,
+        name: FixedName,
+    },
+    DiagnosticsEvent(RuntimeDiagnosticsEvent),
     RestoreStorage(&'a StorageState),
 }
 
@@ -100,6 +129,16 @@ pub struct BridgeRuntime<const HOSTS: usize, const USB_INTERFACES: usize> {
     usb_interfaces: [Option<UsbHidInterfaceRuntimeState>; USB_INTERFACES],
     storage_generation: u32,
     pairing_mode: Option<PairingModeState>,
+    global_settings: GlobalSettings,
+    host_settings: [HostSettings; HOSTS],
+    now_ms: u64,
+    diagnostics: ManagementDiagnostics,
+    history: heapless::Deque<ManagementHistoryEvent, RUNTIME_HISTORY_CAPACITY>,
+    next_history_sequence: u16,
+    host_last_connected_seconds: [u32; HOSTS],
+    host_last_disconnected_seconds: [u32; HOSTS],
+    host_last_disconnect_reason: [u8; HOSTS],
+    pending_target_switch: Option<PendingTargetSwitch>,
 }
 
 impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_INTERFACES> {
@@ -109,6 +148,25 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             usb_interfaces: [None; USB_INTERFACES],
             storage_generation,
             pairing_mode: None,
+            global_settings: GlobalSettings::DEFAULT,
+            host_settings: [HostSettings::DEFAULT; HOSTS],
+            now_ms: 0,
+            diagnostics: ManagementDiagnostics {
+                uptime_seconds: 0,
+                reset_reason: 0,
+                brownout_count: 0,
+                ble_disconnect_count: 0,
+                ble_notify_failure_count: 0,
+                usb_error_count: 0,
+                flash_write_count: 0,
+                flash_failure_count: 0,
+            },
+            history: heapless::Deque::new(),
+            next_history_sequence: 0,
+            host_last_connected_seconds: [0; HOSTS],
+            host_last_disconnected_seconds: [0; HOSTS],
+            host_last_disconnect_reason: [0; HOSTS],
+            pending_target_switch: None,
         }
     }
 
@@ -124,6 +182,15 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         self.pairing_mode
     }
 
+    pub fn storage_state(&self) -> Result<StorageState, StorageError> {
+        let mut state = self.bridge.storage_state(self.storage_generation)?;
+        state.global_settings = self.global_settings;
+        for (destination, source) in state.host_settings.iter_mut().zip(self.host_settings) {
+            *destination = source;
+        }
+        Ok(state)
+    }
+
     pub fn restore_storage_state<const COMMANDS: usize>(
         &mut self,
         storage: &StorageState,
@@ -131,8 +198,27 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
     ) -> Result<(), RuntimeError> {
         commands.clear();
         let mut actions = heapless::Vec::<BridgeAction, 1>::new();
-        self.bridge.restore_storage_state(storage, &mut actions)?;
+        let mut restored = storage.clone();
+        restored.last_active_host = if restored.global_settings.boot_target != 0 {
+            let requested = HostId(restored.global_settings.boot_target);
+            restored
+                .hosts()
+                .iter()
+                .any(|host| host.host_id == requested)
+                .then_some(requested)
+        } else if restored.global_settings.restore_last_target {
+            restored.last_active_host
+        } else {
+            None
+        };
+        self.bridge.restore_storage_state(&restored, &mut actions)?;
         self.storage_generation = storage.generation;
+        self.diagnostics.flash_write_count = storage.generation.min(u8::MAX as u32) as u8;
+        self.global_settings = storage.global_settings;
+        apply_log_level(self.global_settings.log_level);
+        for (destination, source) in self.host_settings.iter_mut().zip(storage.host_settings) {
+            *destination = source;
+        }
         self.pairing_mode = None;
         Ok(())
     }
@@ -149,7 +235,20 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             RuntimeInput::ButtonIntent { intent, now_ms } => {
                 self.handle_button_intent::<COMMANDS, ACTIONS>(intent, now_ms, commands)
             }
+            RuntimeInput::ManagementRequest {
+                destination,
+                request,
+                now_ms,
+            } => self.handle_management_request::<COMMANDS, ACTIONS>(
+                destination,
+                request,
+                now_ms,
+                commands,
+            ),
             RuntimeInput::Tick { now_ms } => {
+                self.now_ms = now_ms;
+                self.diagnostics.uptime_seconds =
+                    now_ms.saturating_div(1000).min(u32::MAX as u64) as u32;
                 self.handle_tick::<COMMANDS, ACTIONS>(now_ms, commands)
             }
             RuntimeInput::BleHostEvent { host_id, event } => {
@@ -168,6 +267,43 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             RuntimeInput::UsbHidInterfaceDisconnected { interface_id } => {
                 self.unregister_usb_device::<COMMANDS, ACTIONS>(interface_id, commands)
             }
+            RuntimeInput::UsbDeviceMetadataUpdated {
+                device_id,
+                vendor_id,
+                product_id,
+                name,
+                flags,
+            } => {
+                commands.clear();
+                for interface in self.usb_interfaces.iter_mut().flatten() {
+                    if interface.device_id == device_id {
+                        interface.vendor_id = vendor_id;
+                        interface.product_id = product_id;
+                        interface.name = name;
+                        interface.flags |= flags;
+                    }
+                }
+                if let Some(last) = self.history.back_mut()
+                    && last.kind == 3
+                    && last.subject == device_id.0
+                {
+                    last.vendor_id = vendor_id;
+                    last.product_id = product_id;
+                }
+                Ok(())
+            }
+            RuntimeInput::HostNameDiscovered { host_id, name } => {
+                commands.clear();
+                self.bridge
+                    .set_discovered_host_name(host_id, name)
+                    .map_err(BridgeError::HostState)?;
+                Ok(())
+            }
+            RuntimeInput::DiagnosticsEvent(event) => {
+                commands.clear();
+                self.apply_diagnostics_event(event);
+                Ok(())
+            }
             RuntimeInput::RestoreStorage(storage) => {
                 self.restore_storage_state::<COMMANDS>(storage, commands)
             }
@@ -181,15 +317,24 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         led_output: Option<KeyboardLedOutputReport>,
         commands: &mut heapless::Vec<RuntimeCommand, COMMANDS>,
     ) -> Result<(), RuntimeError> {
+        let first_interface_for_device = !self
+            .usb_interfaces
+            .iter()
+            .flatten()
+            .any(|interface| interface.device_id == device_id);
         self.upsert_usb_hid_interface(interface_id, device_id, led_output)?;
-        self.handle_event::<COMMANDS, ACTIONS>(
+        let result = self.handle_event::<COMMANDS, ACTIONS>(
             BridgeEvent::UsbHidInterfaceConnected {
                 interface_id,
                 device_id,
                 keyboard_led_sink: led_output.is_some(),
             },
             commands,
-        )
+        );
+        if first_interface_for_device {
+            self.record_history(3, device_id.0, 0, 0, 0);
+        }
+        result
     }
 
     pub fn unregister_usb_device<const COMMANDS: usize, const ACTIONS: usize>(
@@ -197,13 +342,26 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         interface_id: InterfaceId,
         commands: &mut heapless::Vec<RuntimeCommand, COMMANDS>,
     ) -> Result<(), RuntimeError> {
+        let removed_device = self
+            .usb_hid_interface_index(interface_id)
+            .and_then(|index| self.usb_interfaces[index].map(|state| state.device_id));
         if let Some(index) = self.usb_hid_interface_index(interface_id) {
             self.usb_interfaces[index] = None;
         }
-        self.handle_event::<COMMANDS, ACTIONS>(
+        let result = self.handle_event::<COMMANDS, ACTIONS>(
             BridgeEvent::UsbDeviceRemoved { interface_id },
             commands,
-        )
+        );
+        if let Some(device_id) = removed_device
+            && !self
+                .usb_interfaces
+                .iter()
+                .flatten()
+                .any(|interface| interface.device_id == device_id)
+        {
+            self.record_history(4, device_id.0, 0, 0, 0);
+        }
+        result
     }
 
     pub fn handle_event<const COMMANDS: usize, const ACTIONS: usize>(
@@ -242,16 +400,31 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         now_ms: u64,
         commands: &mut heapless::Vec<RuntimeCommand, COMMANDS>,
     ) -> Result<(), RuntimeError> {
+        let configured_action = match intent {
+            ButtonIntent::NextConnectedTarget => self.global_settings.button_short_action,
+            ButtonIntent::EnterPairingMode => self.global_settings.button_long_action,
+            ButtonIntent::ClearActiveHostBond => self.global_settings.button_very_long_action,
+        };
+        let intent = match configured_action {
+            0 => {
+                commands.clear();
+                return Ok(());
+            }
+            1 => ButtonIntent::NextConnectedTarget,
+            2 => ButtonIntent::EnterPairingMode,
+            3 => ButtonIntent::ClearActiveHostBond,
+            _ => {
+                commands.clear();
+                return Ok(());
+            }
+        };
         match intent {
             ButtonIntent::NextConnectedTarget => {
                 let Some(target) = self.bridge.state().hosts.next_connected_target() else {
                     commands.clear();
                     return Ok(());
                 };
-                self.handle_bridge_event::<COMMANDS, ACTIONS>(
-                    BridgeEvent::SwitchTarget { target },
-                    commands,
-                )
+                self.request_target_switch::<COMMANDS, ACTIONS>(target, now_ms, commands)
             }
             ButtonIntent::EnterPairingMode => {
                 let Some(host_id) = self.bridge.state().hosts.pairing_candidate() else {
@@ -283,26 +456,507 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         }
     }
 
+    fn handle_management_request<const COMMANDS: usize, const ACTIONS: usize>(
+        &mut self,
+        destination: ManagementDestination,
+        request: ManagementRequest,
+        now_ms: u64,
+        commands: &mut heapless::Vec<RuntimeCommand, COMMANDS>,
+    ) -> Result<(), RuntimeError> {
+        commands.clear();
+        let result = match request.command {
+            ManagementCommand::GetStatus => ManagementResult::Ok,
+            ManagementCommand::SelectHost(host_id) => {
+                if !valid_management_host::<HOSTS>(host_id) {
+                    ManagementResult::InvalidHost
+                } else if self.bridge.state().hosts.host(host_id).is_none() {
+                    ManagementResult::HostNotFound
+                } else {
+                    self.request_target_switch_append::<COMMANDS, ACTIONS>(
+                        host_id, now_ms, commands,
+                    )?;
+                    ManagementResult::Ok
+                }
+            }
+            ManagementCommand::StartPairing(host_id) => {
+                if !valid_management_host::<HOSTS>(host_id) {
+                    ManagementResult::InvalidHost
+                } else if self
+                    .bridge
+                    .state()
+                    .hosts
+                    .host(host_id)
+                    .is_some_and(|host| host.bonded || host.bond.is_some())
+                {
+                    ManagementResult::HostAlreadyBonded
+                } else {
+                    self.pairing_mode = Some(PairingModeState {
+                        host_id,
+                        deadline_ms: now_ms.saturating_add(PAIRING_MODE_TIMEOUT_MS),
+                    });
+                    self.handle_bridge_event_append::<COMMANDS, ACTIONS>(
+                        BridgeEvent::EnterPairingMode { host_id },
+                        commands,
+                    )?;
+                    ManagementResult::Ok
+                }
+            }
+            ManagementCommand::ForgetHost(host_id) => {
+                if !valid_management_host::<HOSTS>(host_id) {
+                    ManagementResult::InvalidHost
+                } else if self.bridge.state().hosts.host(host_id).is_none() {
+                    ManagementResult::HostNotFound
+                } else {
+                    self.handle_bridge_event_append::<COMMANDS, ACTIONS>(
+                        BridgeEvent::ClearHost { host_id },
+                        commands,
+                    )?;
+                    ManagementResult::Ok
+                }
+            }
+            ManagementCommand::GetHostInfo(host_id) => {
+                if !valid_management_host::<HOSTS>(host_id) {
+                    ManagementResult::InvalidHost
+                } else if self.bridge.state().hosts.host(host_id).is_none() {
+                    ManagementResult::HostNotFound
+                } else {
+                    ManagementResult::Ok
+                }
+            }
+            ManagementCommand::SetHostName { host_id, name } => {
+                if !valid_management_host::<HOSTS>(host_id) {
+                    ManagementResult::InvalidHost
+                } else if self.bridge.state().hosts.host(host_id).is_none() {
+                    ManagementResult::HostNotFound
+                } else {
+                    let name = core::str::from_utf8(name.as_bytes())
+                        .ok()
+                        .and_then(FixedName::from_ascii);
+                    if let Some(name) = name {
+                        self.handle_bridge_event_append::<COMMANDS, ACTIONS>(
+                            BridgeEvent::SetHostName { host_id, name },
+                            commands,
+                        )?;
+                        ManagementResult::Ok
+                    } else {
+                        ManagementResult::InvalidName
+                    }
+                }
+            }
+            ManagementCommand::CancelPairing => {
+                if let Some(pairing) = self.pairing_mode.take() {
+                    self.handle_bridge_event_append::<COMMANDS, ACTIONS>(
+                        BridgeEvent::PairingModeExpired {
+                            host_id: pairing.host_id,
+                        },
+                        commands,
+                    )?;
+                    ManagementResult::Ok
+                } else {
+                    ManagementResult::NotFound
+                }
+            }
+            ManagementCommand::GetUsbDevice { index, .. } => {
+                if self.management_usb_device(index, 0).is_some() {
+                    ManagementResult::Ok
+                } else {
+                    ManagementResult::NotFound
+                }
+            }
+            ManagementCommand::GetDiagnostics
+            | ManagementCommand::GetHistory { .. }
+            | ManagementCommand::GetSchema => ManagementResult::Ok,
+            ManagementCommand::GetHostTiming(host_id) => {
+                if valid_management_host::<HOSTS>(host_id) {
+                    ManagementResult::Ok
+                } else {
+                    ManagementResult::InvalidHost
+                }
+            }
+            ManagementCommand::GetSetting { id, target } => {
+                if self.setting_value(id, target).is_some() {
+                    ManagementResult::Ok
+                } else {
+                    ManagementResult::InvalidSetting
+                }
+            }
+            ManagementCommand::SetSetting { id, target, value } => {
+                if self.set_setting(id, target, value) {
+                    self.push_storage_snapshot(commands, StoragePersistPriority::Critical)?;
+                    ManagementResult::Ok
+                } else {
+                    ManagementResult::InvalidSetting
+                }
+            }
+        };
+
+        let payload = match request.command {
+            ManagementCommand::GetHostInfo(host_id)
+            | ManagementCommand::SetHostName { host_id, .. }
+                if result == ManagementResult::Ok =>
+            {
+                self.management_host_info(host_id)
+                    .map(ManagementResponsePayload::HostInfo)
+                    .unwrap_or(ManagementResponsePayload::None)
+            }
+            ManagementCommand::GetUsbDevice { index, name_offset }
+                if result == ManagementResult::Ok =>
+            {
+                self.management_usb_device(index, name_offset)
+                    .map(ManagementResponsePayload::UsbDevice)
+                    .unwrap_or(ManagementResponsePayload::None)
+            }
+            ManagementCommand::GetDiagnostics => {
+                ManagementResponsePayload::Diagnostics(self.diagnostics)
+            }
+            ManagementCommand::GetHostTiming(host_id) if result == ManagementResult::Ok => {
+                let index = host_id.0.saturating_sub(1) as usize;
+                ManagementResponsePayload::HostTiming(ManagementHostTiming {
+                    host_id,
+                    last_connected_seconds: self.host_last_connected_seconds[index],
+                    last_disconnected_seconds: self.host_last_disconnected_seconds[index],
+                    last_disconnect_reason: self.host_last_disconnect_reason[index],
+                })
+            }
+            ManagementCommand::GetHistory { index } => self
+                .history
+                .iter()
+                .rev()
+                .nth(index as usize)
+                .copied()
+                .map(ManagementResponsePayload::History)
+                .unwrap_or(ManagementResponsePayload::None),
+            ManagementCommand::GetSchema => ManagementResponsePayload::Schema(ManagementSchema {
+                version: SETTINGS_SCHEMA_VERSION,
+                setting_count: SETTING_COUNT as u8,
+                history_capacity: RUNTIME_HISTORY_CAPACITY as u8,
+                usb_capacity: USB_INTERFACES.min(u8::MAX as usize) as u8,
+                hash: SETTINGS_SCHEMA_HASH,
+                firmware_major: 0,
+                firmware_minor: 1,
+                firmware_patch: 0,
+            }),
+            ManagementCommand::GetSetting { id, target }
+            | ManagementCommand::SetSetting { id, target, .. }
+                if result == ManagementResult::Ok =>
+            {
+                ManagementResponsePayload::Setting(ManagementSetting {
+                    id,
+                    target,
+                    value: self.setting_value(id, target).unwrap_or_default(),
+                })
+            }
+            _ => ManagementResponsePayload::Status(self.management_status()),
+        };
+
+        push_command(
+            commands,
+            RuntimeCommand::ManagementResponse {
+                destination,
+                response: ManagementResponse {
+                    request_id: request.request_id,
+                    result,
+                    payload,
+                },
+            },
+        )
+    }
+
+    pub fn management_status(&self) -> ManagementStatus {
+        let mut status = ManagementStatus::empty(u8::try_from(HOSTS.min(4)).unwrap_or(4));
+        status.active_host = self.bridge.state().hosts.active_target();
+        status.pairing_host = self.bridge.state().pairable_host;
+        status.usb = self.management_usb_status();
+        for index in 0..HOSTS.min(4) {
+            let host_id = HostId((index + 1) as u8);
+            if let Some(host) = self.bridge.state().hosts.host(host_id) {
+                status.hosts[index] = ManagementHostStatus {
+                    known: true,
+                    connected: host.connected,
+                    encrypted: host.encrypted,
+                    bonded: host.bonded || host.bond.is_some(),
+                };
+            }
+        }
+        status
+    }
+
+    fn management_host_info(&self, host_id: HostId) -> Option<ManagementHostInfo> {
+        let host = self.bridge.state().hosts.host(host_id)?;
+        let (selected_name, name_source) = if host.name.as_bytes().is_empty() {
+            (host.discovered_name, 1)
+        } else {
+            (host.name, 2)
+        };
+        let name = core::str::from_utf8(selected_name.as_bytes())
+            .ok()
+            .and_then(|name| ManagementHostName::from_ascii(name).ok())
+            .unwrap_or_else(ManagementHostName::empty);
+        Some(ManagementHostInfo {
+            host_id,
+            status: ManagementHostStatus {
+                known: true,
+                connected: host.connected,
+                encrypted: host.encrypted,
+                bonded: host.bonded || host.bond.is_some(),
+            },
+            name,
+            name_source,
+        })
+    }
+
+    fn management_usb_status(&self) -> ManagementUsbStatus {
+        let mut devices = [None; USB_INTERFACES];
+        let mut device_count = 0usize;
+        let mut interface_count = 0usize;
+        let mut keyboard_devices = [None; USB_INTERFACES];
+        let mut keyboard_count = 0usize;
+        for interface in self.usb_interfaces.iter().flatten() {
+            interface_count += 1;
+            if (interface.flags & 0x02 != 0 || interface.led_output.is_some())
+                && !keyboard_devices[..keyboard_count].contains(&Some(interface.device_id))
+            {
+                keyboard_devices[keyboard_count] = Some(interface.device_id);
+                keyboard_count += 1;
+            }
+            if !devices[..device_count].contains(&Some(interface.device_id)) {
+                devices[device_count] = Some(interface.device_id);
+                device_count += 1;
+            }
+        }
+        ManagementUsbStatus {
+            device_count: device_count.min(u8::MAX as usize) as u8,
+            interface_count: interface_count.min(u8::MAX as usize) as u8,
+            keyboard_count: keyboard_count.min(u8::MAX as usize) as u8,
+        }
+    }
+
+    fn management_usb_device(
+        &self,
+        requested_index: u8,
+        name_offset: u8,
+    ) -> Option<ManagementUsbDevice> {
+        let mut seen = [None; USB_INTERFACES];
+        let mut count = 0usize;
+        let mut selected = None;
+        for interface in self.usb_interfaces.iter().flatten() {
+            if seen[..count].contains(&Some(interface.device_id)) {
+                continue;
+            }
+            seen[count] = Some(interface.device_id);
+            if count == requested_index as usize {
+                selected = Some(*interface);
+                break;
+            }
+            count += 1;
+        }
+        let selected = selected?;
+        let name = selected.name.as_bytes();
+        let offset = (name_offset as usize).min(name.len());
+        let chunk_len = (name.len() - offset).min(5);
+        let mut name_chunk = [0; 5];
+        name_chunk[..chunk_len].copy_from_slice(&name[offset..offset + chunk_len]);
+        let mut flags = selected.flags | 0x01;
+        for interface in self.usb_interfaces.iter().flatten() {
+            if interface.device_id == selected.device_id {
+                flags |= interface.flags;
+            }
+        }
+        Some(ManagementUsbDevice {
+            index: requested_index,
+            device_id: selected.device_id.0,
+            flags,
+            vendor_id: selected.vendor_id,
+            product_id: selected.product_id,
+            name_len: name.len().min(u8::MAX as usize) as u8,
+            name_offset,
+            name_chunk_len: chunk_len as u8,
+            name_chunk,
+        })
+    }
+
+    fn setting_value(&self, id: SettingId, target: SettingTarget) -> Option<i32> {
+        let descriptor = setting_descriptor(id);
+        if descriptor.scope
+            != match target {
+                SettingTarget::Global => SettingScope::Global,
+                SettingTarget::Host(_) => SettingScope::Host,
+            }
+        {
+            return None;
+        }
+        Some(match (id, target) {
+            (SettingId::BootTarget, SettingTarget::Global) => {
+                self.global_settings.boot_target as i32
+            }
+            (SettingId::RestoreLastTarget, SettingTarget::Global) => {
+                self.global_settings.restore_last_target as i32
+            }
+            (SettingId::AutoReconnect, SettingTarget::Global) => {
+                self.global_settings.auto_reconnect as i32
+            }
+            (SettingId::SwitchReleaseDelayMs, SettingTarget::Global) => {
+                self.global_settings.switch_release_delay_ms as i32
+            }
+            (SettingId::ButtonShortAction, SettingTarget::Global) => {
+                self.global_settings.button_short_action as i32
+            }
+            (SettingId::ButtonLongAction, SettingTarget::Global) => {
+                self.global_settings.button_long_action as i32
+            }
+            (SettingId::ButtonVeryLongAction, SettingTarget::Global) => {
+                self.global_settings.button_very_long_action as i32
+            }
+            (SettingId::LogLevel, SettingTarget::Global) => self.global_settings.log_level as i32,
+            (id, SettingTarget::Host(host)) => {
+                let settings = self.host_settings.get(host.0.checked_sub(1)? as usize)?;
+                match id {
+                    SettingId::KeyboardLayout => settings.keyboard_layout as i32,
+                    SettingId::RemapFromUsage => settings.remap_from_usage as i32,
+                    SettingId::RemapToUsage => settings.remap_to_usage as i32,
+                    SettingId::MouseSensitivityPercent => settings.mouse_sensitivity_percent as i32,
+                    SettingId::ScrollMultiplierPercent => settings.scroll_multiplier_percent as i32,
+                    SettingId::ConsumerFromUsage => settings.consumer_from_usage as i32,
+                    SettingId::ConsumerToUsage => settings.consumer_to_usage as i32,
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        })
+    }
+
+    fn set_setting(&mut self, id: SettingId, target: SettingTarget, value: i32) -> bool {
+        if !validate_setting_value(id, value) || self.setting_value(id, target).is_none() {
+            return false;
+        }
+        match (id, target) {
+            (SettingId::BootTarget, SettingTarget::Global) => {
+                self.global_settings.boot_target = value as u8
+            }
+            (SettingId::RestoreLastTarget, SettingTarget::Global) => {
+                self.global_settings.restore_last_target = value != 0
+            }
+            (SettingId::AutoReconnect, SettingTarget::Global) => {
+                self.global_settings.auto_reconnect = value != 0
+            }
+            (SettingId::SwitchReleaseDelayMs, SettingTarget::Global) => {
+                self.global_settings.switch_release_delay_ms = value as u16
+            }
+            (SettingId::ButtonShortAction, SettingTarget::Global) => {
+                self.global_settings.button_short_action = value as u8
+            }
+            (SettingId::ButtonLongAction, SettingTarget::Global) => {
+                self.global_settings.button_long_action = value as u8
+            }
+            (SettingId::ButtonVeryLongAction, SettingTarget::Global) => {
+                self.global_settings.button_very_long_action = value as u8
+            }
+            (SettingId::LogLevel, SettingTarget::Global) => {
+                self.global_settings.log_level = value as u8;
+                apply_log_level(value as u8);
+            }
+            (id, SettingTarget::Host(host)) => {
+                let Some(settings) = host
+                    .0
+                    .checked_sub(1)
+                    .and_then(|index| self.host_settings.get_mut(index as usize))
+                else {
+                    return false;
+                };
+                match id {
+                    SettingId::KeyboardLayout => settings.keyboard_layout = value as u8,
+                    SettingId::RemapFromUsage => settings.remap_from_usage = value as u8,
+                    SettingId::RemapToUsage => settings.remap_to_usage = value as u8,
+                    SettingId::MouseSensitivityPercent => {
+                        settings.mouse_sensitivity_percent = value as u16
+                    }
+                    SettingId::ScrollMultiplierPercent => {
+                        settings.scroll_multiplier_percent = value as u16
+                    }
+                    SettingId::ConsumerFromUsage => settings.consumer_from_usage = value as u16,
+                    SettingId::ConsumerToUsage => settings.consumer_to_usage = value as u16,
+                    _ => return false,
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn push_storage_snapshot<const COMMANDS: usize>(
+        &mut self,
+        commands: &mut heapless::Vec<RuntimeCommand, COMMANDS>,
+        priority: StoragePersistPriority,
+    ) -> Result<(), RuntimeError> {
+        self.storage_generation = self.storage_generation.wrapping_add(1);
+        let mut state = self.bridge.storage_state(self.storage_generation)?;
+        state.global_settings = self.global_settings;
+        for (destination, source) in state.host_settings.iter_mut().zip(self.host_settings) {
+            *destination = source;
+        }
+        push_command(commands, RuntimeCommand::PersistStorage { state, priority })
+    }
+
     fn handle_tick<const COMMANDS: usize, const ACTIONS: usize>(
         &mut self,
         now_ms: u64,
         commands: &mut heapless::Vec<RuntimeCommand, COMMANDS>,
     ) -> Result<(), RuntimeError> {
-        let Some(pairing_mode) = self.pairing_mode else {
-            commands.clear();
-            return Ok(());
-        };
-        if now_ms < pairing_mode.deadline_ms {
-            commands.clear();
-            return Ok(());
+        commands.clear();
+        if let Some(pending) = self.pending_target_switch
+            && now_ms >= pending.deadline_ms
+        {
+            self.pending_target_switch = None;
+            self.handle_bridge_event_append::<COMMANDS, ACTIONS>(
+                BridgeEvent::SwitchTarget {
+                    target: pending.target,
+                },
+                commands,
+            )?;
         }
-        self.pairing_mode = None;
-        self.handle_bridge_event::<COMMANDS, ACTIONS>(
-            BridgeEvent::PairingModeExpired {
-                host_id: pairing_mode.host_id,
-            },
-            commands,
-        )
+        if let Some(pairing_mode) = self.pairing_mode
+            && now_ms >= pairing_mode.deadline_ms
+        {
+            self.pairing_mode = None;
+            self.handle_bridge_event_append::<COMMANDS, ACTIONS>(
+                BridgeEvent::PairingModeExpired {
+                    host_id: pairing_mode.host_id,
+                },
+                commands,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn request_target_switch<const COMMANDS: usize, const ACTIONS: usize>(
+        &mut self,
+        target: HostId,
+        now_ms: u64,
+        commands: &mut heapless::Vec<RuntimeCommand, COMMANDS>,
+    ) -> Result<(), RuntimeError> {
+        commands.clear();
+        self.request_target_switch_append::<COMMANDS, ACTIONS>(target, now_ms, commands)
+    }
+
+    fn request_target_switch_append<const COMMANDS: usize, const ACTIONS: usize>(
+        &mut self,
+        target: HostId,
+        now_ms: u64,
+        commands: &mut heapless::Vec<RuntimeCommand, COMMANDS>,
+    ) -> Result<(), RuntimeError> {
+        let delay_ms = self.global_settings.switch_release_delay_ms as u64;
+        if delay_ms == 0 {
+            self.pending_target_switch = None;
+            return self.handle_bridge_event_append::<COMMANDS, ACTIONS>(
+                BridgeEvent::SwitchTarget { target },
+                commands,
+            );
+        }
+        self.pending_target_switch = Some(PendingTargetSwitch {
+            target,
+            deadline_ms: now_ms.saturating_add(delay_ms),
+        });
+        Ok(())
     }
 
     fn handle_bridge_event<const COMMANDS: usize, const ACTIONS: usize>(
@@ -316,9 +970,10 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
 
     fn handle_bridge_event_append<const COMMANDS: usize, const ACTIONS: usize>(
         &mut self,
-        event: BridgeEvent,
+        mut event: BridgeEvent,
         commands: &mut heapless::Vec<RuntimeCommand, COMMANDS>,
     ) -> Result<(), RuntimeError> {
+        self.apply_active_host_input_settings(&mut event)?;
         self.observe_bridge_event(&event);
         let persist_priority = storage_persist_priority_for_event(&event);
         let mut actions = heapless::Vec::<BridgeAction, ACTIONS>::new();
@@ -331,7 +986,90 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         Ok(())
     }
 
+    fn apply_active_host_input_settings(
+        &self,
+        event: &mut BridgeEvent,
+    ) -> Result<(), RuntimeError> {
+        let BridgeEvent::InputFrame(crate::input::InputFrame::Standard(frame)) = event else {
+            return Ok(());
+        };
+        let Some(host) = self.bridge.state().hosts.active_target() else {
+            return Ok(());
+        };
+        let Some(settings) = host
+            .0
+            .checked_sub(1)
+            .and_then(|index| self.host_settings.get(index as usize))
+            .copied()
+        else {
+            return Ok(());
+        };
+        if let Some(keyboard) = frame.keyboard.as_mut() {
+            let mut remapped = crate::input::KeyboardFrame::new(keyboard.modifiers);
+            for key in keyboard.keys_down().iter().copied() {
+                let layout_usage = match (settings.keyboard_layout, key.0) {
+                    // USB HID International3 is the JIS Yen key. These mappings
+                    // normalize the most common physical US/JIS layout difference;
+                    // explicit remapping below remains available for other keys.
+                    (1, 0x89) => 0x35,
+                    (2, 0x35) => 0x89,
+                    _ => key.0,
+                };
+                let usage = if layout_usage == settings.remap_from_usage
+                    && settings.remap_from_usage != 0
+                {
+                    settings.remap_to_usage
+                } else {
+                    layout_usage
+                };
+                remapped
+                    .push_key(crate::input::KeyUsage(usage))
+                    .map_err(BridgeError::Input)?;
+            }
+            *keyboard = remapped;
+        }
+        if let Some(mouse) = frame.mouse.as_mut() {
+            mouse.movement.x = scale_i16(mouse.movement.x, settings.mouse_sensitivity_percent);
+            mouse.movement.y = scale_i16(mouse.movement.y, settings.mouse_sensitivity_percent);
+            mouse.movement.wheel =
+                scale_i8(mouse.movement.wheel, settings.scroll_multiplier_percent);
+            mouse.movement.pan = scale_i8(mouse.movement.pan, settings.scroll_multiplier_percent);
+        }
+        if let Some(consumer) = frame.consumer.as_mut()
+            && consumer.active.map(|usage| usage.0) == Some(settings.consumer_from_usage)
+            && settings.consumer_from_usage != 0
+        {
+            consumer.active = Some(crate::input::ConsumerUsage(settings.consumer_to_usage));
+        }
+        Ok(())
+    }
+
     fn observe_bridge_event(&mut self, event: &BridgeEvent) {
+        match event {
+            BridgeEvent::HostConnected { host_id } => {
+                if let Some(value) = host_id
+                    .0
+                    .checked_sub(1)
+                    .and_then(|index| self.host_last_connected_seconds.get_mut(index as usize))
+                {
+                    *value = self.now_ms.saturating_div(1000).min(u32::MAX as u64) as u32;
+                }
+                self.record_history(1, host_id.0, 0, 0, 0)
+            }
+            BridgeEvent::HostDisconnected { host_id } => {
+                if let Some(value) = host_id
+                    .0
+                    .checked_sub(1)
+                    .and_then(|index| self.host_last_disconnected_seconds.get_mut(index as usize))
+                {
+                    *value = self.now_ms.saturating_div(1000).min(u32::MAX as u64) as u32;
+                }
+                self.record_history(2, host_id.0, 0, 0, 0);
+            }
+            BridgeEvent::SwitchTarget { target } => self.record_history(5, target.0, 0, 0, 0),
+            BridgeEvent::EnterPairingMode { host_id } => self.record_history(6, host_id.0, 0, 0, 0),
+            _ => {}
+        }
         match event {
             BridgeEvent::EnterPairingMode { host_id }
                 if self.pairing_mode.map(|state| state.host_id) != Some(*host_id) =>
@@ -358,6 +1096,74 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                 self.pairing_mode = None;
             }
             _ => {}
+        }
+    }
+
+    fn record_history(
+        &mut self,
+        kind: u8,
+        subject: u8,
+        detail: u8,
+        vendor_id: u16,
+        product_id: u16,
+    ) {
+        if self.history.is_full() {
+            let _ = self.history.pop_front();
+        }
+        let event = ManagementHistoryEvent {
+            kind,
+            sequence: self.next_history_sequence,
+            timestamp_seconds: self.now_ms.saturating_div(1000).min(u32::MAX as u64) as u32,
+            subject,
+            detail,
+            vendor_id,
+            product_id,
+        };
+        self.next_history_sequence = self.next_history_sequence.wrapping_add(1);
+        let _ = self.history.push_back(event);
+    }
+
+    fn apply_diagnostics_event(&mut self, event: RuntimeDiagnosticsEvent) {
+        match event {
+            RuntimeDiagnosticsEvent::ResetReason(reason) => self.diagnostics.reset_reason = reason,
+            RuntimeDiagnosticsEvent::Brownout => {
+                self.diagnostics.brownout_count = self.diagnostics.brownout_count.saturating_add(1)
+            }
+            RuntimeDiagnosticsEvent::BleDisconnected { host_id, reason } => {
+                self.diagnostics.ble_disconnect_count =
+                    self.diagnostics.ble_disconnect_count.saturating_add(1);
+                if let Some(last) = self.history.back_mut()
+                    && last.kind == 2
+                    && last.subject == host_id.0
+                {
+                    last.detail = reason;
+                } else {
+                    self.record_history(2, host_id.0, reason, 0, 0);
+                }
+                if let Some(value) = host_id
+                    .0
+                    .checked_sub(1)
+                    .and_then(|index| self.host_last_disconnect_reason.get_mut(index as usize))
+                {
+                    *value = reason;
+                }
+            }
+            RuntimeDiagnosticsEvent::BleNotifyFailed => {
+                self.diagnostics.ble_notify_failure_count =
+                    self.diagnostics.ble_notify_failure_count.saturating_add(1)
+            }
+            RuntimeDiagnosticsEvent::UsbError => {
+                self.diagnostics.usb_error_count =
+                    self.diagnostics.usb_error_count.saturating_add(1)
+            }
+            RuntimeDiagnosticsEvent::FlashWrite { success: true } => {
+                self.diagnostics.flash_write_count =
+                    self.diagnostics.flash_write_count.saturating_add(1)
+            }
+            RuntimeDiagnosticsEvent::FlashWrite { success: false } => {
+                self.diagnostics.flash_failure_count =
+                    self.diagnostics.flash_failure_count.saturating_add(1)
+            }
         }
     }
 
@@ -413,17 +1219,10 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                     },
                 )
             }
-            BridgeAction::PersistProfiles => {
-                self.storage_generation = self.storage_generation.wrapping_add(1);
-                let state = self.bridge.storage_state(self.storage_generation)?;
-                push_command(
-                    commands,
-                    RuntimeCommand::PersistStorage {
-                        state,
-                        priority: persist_priority.unwrap_or(StoragePersistPriority::Normal),
-                    },
-                )
-            }
+            BridgeAction::PersistProfiles => self.push_storage_snapshot(
+                commands,
+                persist_priority.unwrap_or(StoragePersistPriority::Normal),
+            ),
             BridgeAction::StatusChanged(status) => {
                 if status.pairable_host.is_none() {
                     self.pairing_mode = None;
@@ -444,6 +1243,10 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                 interface_id,
                 device_id,
                 led_output,
+                vendor_id: 0,
+                product_id: 0,
+                name: FixedName::empty(),
+                flags: if led_output.is_some() { 0x02 } else { 0 },
             });
             return Ok(());
         }
@@ -455,6 +1258,10 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             interface_id,
             device_id,
             led_output,
+            vendor_id: 0,
+            product_id: 0,
+            name: FixedName::empty(),
+            flags: if led_output.is_some() { 0x02 } else { 0 },
         });
         Ok(())
     }
@@ -498,6 +1305,20 @@ pub struct UsbHidInterfaceRuntimeState {
     pub interface_id: InterfaceId,
     pub device_id: DeviceId,
     pub led_output: Option<KeyboardLedOutputReport>,
+    pub vendor_id: u16,
+    pub product_id: u16,
+    pub name: FixedName,
+    pub flags: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeDiagnosticsEvent {
+    ResetReason(u8),
+    Brownout,
+    BleDisconnected { host_id: HostId, reason: u8 },
+    BleNotifyFailed,
+    UsbError,
+    FlashWrite { success: bool },
 }
 
 pub const PAIRING_MODE_TIMEOUT_MS: u64 = 60_000;
@@ -506,6 +1327,12 @@ pub const PAIRING_MODE_TIMEOUT_MS: u64 = 60_000;
 pub struct PairingModeState {
     pub host_id: HostId,
     pub deadline_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingTargetSwitch {
+    target: HostId,
+    deadline_ms: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -523,6 +1350,10 @@ pub enum RuntimeCommand {
         priority: StoragePersistPriority,
     },
     StatusChanged(BridgeStatus),
+    ManagementResponse {
+        destination: ManagementDestination,
+        response: ManagementResponse,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -555,15 +1386,20 @@ pub enum BleTaskCommand {
         host_id: HostId,
         bond: Option<StoredBond>,
     },
+    ManagementResponse {
+        host_id: HostId,
+        response: ManagementResponse,
+    },
 }
 
 impl BleTaskCommand {
     pub const fn lane(self) -> BleCommandLane {
         match self {
             Self::Notify { .. } => BleCommandLane::Notify,
-            Self::AllowPairing { .. } | Self::RejectPairing { .. } | Self::ClearBond { .. } => {
-                BleCommandLane::Control
-            }
+            Self::AllowPairing { .. }
+            | Self::RejectPairing { .. }
+            | Self::ClearBond { .. }
+            | Self::ManagementResponse { .. } => BleCommandLane::Control,
         }
     }
 
@@ -575,9 +1411,10 @@ impl BleTaskCommand {
                 | NotifyReason::UsbDeviceRemovedRelease
                 | NotifyReason::SafetyRelease => CommandClass::Critical,
             },
-            Self::AllowPairing { .. } | Self::RejectPairing { .. } | Self::ClearBond { .. } => {
-                CommandClass::Critical
-            }
+            Self::AllowPairing { .. }
+            | Self::RejectPairing { .. }
+            | Self::ClearBond { .. }
+            | Self::ManagementResponse { .. } => CommandClass::Critical,
         }
     }
 }
@@ -610,12 +1447,23 @@ impl StorageTaskCommand {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StatusTaskCommand {
     pub status: BridgeStatus,
+    pub management: Option<ManagementTaskResponse>,
 }
 
 impl StatusTaskCommand {
     pub const fn class(self) -> CommandClass {
-        CommandClass::BestEffort
+        if self.management.is_some() {
+            CommandClass::Critical
+        } else {
+            CommandClass::BestEffort
+        }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ManagementTaskResponse {
+    pub destination: ManagementDestination,
+    pub response: ManagementResponse,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -696,10 +1544,39 @@ impl<const BLE: usize, const USB: usize, const STORAGE: usize, const STATUS: usi
                 .map_err(|_| RuntimeDispatchError::StorageQueueCapacity),
             RuntimeCommand::StatusChanged(status) => self
                 .status
-                .push(StatusTaskCommand { status: *status })
+                .push(StatusTaskCommand {
+                    status: *status,
+                    management: None,
+                })
+                .map_err(|_| RuntimeDispatchError::StatusQueueCapacity),
+            RuntimeCommand::ManagementResponse {
+                destination,
+                response,
+            } => self
+                .status
+                .push(StatusTaskCommand {
+                    status: match response.payload {
+                        ManagementResponsePayload::Status(status) => BridgeStatus {
+                            active_target: status.active_host,
+                            pairable_host: status.pairing_host,
+                        },
+                        _ => BridgeStatus {
+                            active_target: None,
+                            pairable_host: None,
+                        },
+                    },
+                    management: Some(ManagementTaskResponse {
+                        destination: *destination,
+                        response: *response,
+                    }),
+                })
                 .map_err(|_| RuntimeDispatchError::StatusQueueCapacity),
         }
     }
+}
+
+const fn valid_management_host<const HOSTS: usize>(host_id: HostId) -> bool {
+    host_id.0 != 0 && (host_id.0 as usize) <= HOSTS && (host_id.0 as usize) <= 4
 }
 
 impl<const BLE: usize, const USB: usize, const STORAGE: usize, const STATUS: usize> Default
@@ -763,13 +1640,34 @@ fn push_command<const COMMANDS: usize>(
 
 const fn storage_persist_priority_for_event(event: &BridgeEvent) -> Option<StoragePersistPriority> {
     match event {
-        BridgeEvent::HostSecurityChanged { .. } | BridgeEvent::ClearHost { .. } => {
-            Some(StoragePersistPriority::Critical)
-        }
+        BridgeEvent::HostSecurityChanged { .. }
+        | BridgeEvent::ClearHost { .. }
+        | BridgeEvent::SetHostName { .. } => Some(StoragePersistPriority::Critical),
         BridgeEvent::CccdChanged { .. } => Some(StoragePersistPriority::Normal),
         BridgeEvent::SwitchTarget { .. } => Some(StoragePersistPriority::Lazy),
         _ => None,
     }
+}
+
+fn scale_i16(value: i16, percent: u16) -> i16 {
+    (i32::from(value) * i32::from(percent) / 100).clamp(i16::MIN as i32, i16::MAX as i32) as i16
+}
+
+fn scale_i8(value: i8, percent: u16) -> i8 {
+    (i32::from(value) * i32::from(percent) / 100).clamp(i8::MIN as i32, i8::MAX as i32) as i8
+}
+
+fn apply_log_level(level: u8) {
+    #[cfg(feature = "firmware")]
+    log::set_max_level(match level {
+        0 => log::LevelFilter::Error,
+        1 => log::LevelFilter::Warn,
+        2 => log::LevelFilter::Info,
+        3 => log::LevelFilter::Debug,
+        _ => log::LevelFilter::Trace,
+    });
+    #[cfg(not(feature = "firmware"))]
+    let _ = level;
 }
 
 #[cfg(test)]
@@ -779,6 +1677,484 @@ mod tests {
     use crate::input::{KeyUsage, KeyboardFrame, KeyboardLedState, ModifierState};
     use crate::reports::{BleKeyboard6KroReport, ReportKind};
     use crate::storage::{FixedName, StoredHostProfile};
+
+    fn management_request(command: ManagementCommand, request_id: u8) -> RuntimeInput<'static> {
+        RuntimeInput::ManagementRequest {
+            destination: ManagementDestination::Wired,
+            request: ManagementRequest {
+                request_id,
+                command,
+            },
+            now_ms: 1_000,
+        }
+    }
+
+    fn management_response(commands: &[RuntimeCommand]) -> ManagementResponse {
+        commands
+            .iter()
+            .find_map(|command| match command {
+                RuntimeCommand::ManagementResponse { response, .. } => Some(*response),
+                _ => None,
+            })
+            .expect("management response")
+    }
+
+    fn management_status(commands: &[RuntimeCommand]) -> ManagementStatus {
+        match management_response(commands).payload {
+            ManagementResponsePayload::Status(status) => status,
+            payload => panic!("expected management status, got {payload:?}"),
+        }
+    }
+
+    #[test]
+    fn management_status_reports_all_slots_and_live_state() {
+        let mut runtime = BridgeRuntime::<4, 1>::new(0);
+        let mut commands = heapless::Vec::<RuntimeCommand, 12>::new();
+        runtime
+            .handle_event::<12, 12>(
+                BridgeEvent::HostConnected { host_id: HostId(2) },
+                &mut commands,
+            )
+            .unwrap();
+        runtime
+            .handle_event::<12, 12>(
+                BridgeEvent::HostSecurityChanged {
+                    host_id: HostId(2),
+                    encrypted: true,
+                    bonded: true,
+                    bond: None,
+                },
+                &mut commands,
+            )
+            .unwrap();
+        runtime
+            .handle_input::<12, 12, 2>(
+                management_request(ManagementCommand::GetStatus, 7),
+                &mut commands,
+            )
+            .unwrap();
+
+        let response = management_response(&commands);
+        assert_eq!(response.request_id, 7);
+        assert_eq!(response.result, ManagementResult::Ok);
+        let status = match response.payload {
+            ManagementResponsePayload::Status(status) => status,
+            _ => panic!("expected status"),
+        };
+        assert_eq!(status.host_count, 4);
+        assert_eq!(
+            status.hosts[1],
+            ManagementHostStatus {
+                known: true,
+                connected: true,
+                encrypted: true,
+                bonded: true,
+            }
+        );
+    }
+
+    #[test]
+    fn management_generated_settings_validate_persist_and_restore() {
+        let mut runtime = BridgeRuntime::<4, 1>::new(0);
+        let mut commands = heapless::Vec::<RuntimeCommand, 12>::new();
+        let target = SettingTarget::Host(HostId(2));
+        runtime
+            .handle_input::<12, 12, 2>(
+                management_request(
+                    ManagementCommand::SetSetting {
+                        id: SettingId::MouseSensitivityPercent,
+                        target,
+                        value: 175,
+                    },
+                    1,
+                ),
+                &mut commands,
+            )
+            .unwrap();
+        assert!(matches!(
+            management_response(&commands).payload,
+            ManagementResponsePayload::Setting(ManagementSetting { value: 175, .. })
+        ));
+        let snapshot = commands
+            .iter()
+            .find_map(|command| match command {
+                RuntimeCommand::PersistStorage { state, .. } => Some(state.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(snapshot.host_settings[1].mouse_sensitivity_percent, 175);
+
+        runtime
+            .handle_input::<12, 12, 2>(
+                management_request(
+                    ManagementCommand::SetSetting {
+                        id: SettingId::MouseSensitivityPercent,
+                        target,
+                        value: 401,
+                    },
+                    2,
+                ),
+                &mut commands,
+            )
+            .unwrap();
+        assert_eq!(
+            management_response(&commands).result,
+            ManagementResult::InvalidSetting
+        );
+
+        let mut restored = BridgeRuntime::<4, 1>::new(0);
+        restored
+            .restore_storage_state(&snapshot, &mut commands)
+            .unwrap();
+        restored
+            .handle_input::<12, 12, 2>(
+                management_request(
+                    ManagementCommand::GetSetting {
+                        id: SettingId::MouseSensitivityPercent,
+                        target,
+                    },
+                    3,
+                ),
+                &mut commands,
+            )
+            .unwrap();
+        assert!(matches!(
+            management_response(&commands).payload,
+            ManagementResponsePayload::Setting(ManagementSetting { value: 175, .. })
+        ));
+    }
+
+    #[test]
+    fn management_reports_usb_product_name_diagnostics_and_history() {
+        let mut runtime = BridgeRuntime::<4, 2>::new(0);
+        let mut commands = heapless::Vec::<RuntimeCommand, 12>::new();
+        runtime
+            .handle_input::<12, 12, 2>(
+                RuntimeInput::UsbHidInterfaceConnected {
+                    interface_id: InterfaceId(1),
+                    device_id: DeviceId(9),
+                    led_output: None,
+                },
+                &mut commands,
+            )
+            .unwrap();
+        runtime
+            .handle_input::<12, 12, 2>(
+                RuntimeInput::UsbDeviceMetadataUpdated {
+                    device_id: DeviceId(9),
+                    vendor_id: 0x1234,
+                    product_id: 0xabcd,
+                    name: FixedName::from_ascii("Mechanical Keyboard").unwrap(),
+                    flags: 0x02,
+                },
+                &mut commands,
+            )
+            .unwrap();
+        runtime
+            .handle_input::<12, 12, 2>(
+                RuntimeInput::UsbHidInterfaceConnected {
+                    interface_id: InterfaceId(2),
+                    device_id: DeviceId(9),
+                    led_output: None,
+                },
+                &mut commands,
+            )
+            .unwrap();
+        runtime
+            .handle_input::<12, 12, 2>(RuntimeInput::Tick { now_ms: 12_345 }, &mut commands)
+            .unwrap();
+        runtime
+            .handle_input::<12, 12, 2>(
+                RuntimeInput::DiagnosticsEvent(RuntimeDiagnosticsEvent::UsbError),
+                &mut commands,
+            )
+            .unwrap();
+
+        runtime
+            .handle_input::<12, 12, 2>(
+                management_request(
+                    ManagementCommand::GetUsbDevice {
+                        index: 0,
+                        name_offset: 5,
+                    },
+                    4,
+                ),
+                &mut commands,
+            )
+            .unwrap();
+        let ManagementResponsePayload::UsbDevice(device) = management_response(&commands).payload
+        else {
+            panic!()
+        };
+        assert_eq!(device.vendor_id, 0x1234);
+        assert_eq!(device.product_id, 0xabcd);
+        assert_eq!(device.name_chunk(), b"nical");
+
+        runtime
+            .handle_input::<12, 12, 2>(
+                management_request(ManagementCommand::GetDiagnostics, 5),
+                &mut commands,
+            )
+            .unwrap();
+        let ManagementResponsePayload::Diagnostics(diagnostics) =
+            management_response(&commands).payload
+        else {
+            panic!()
+        };
+        assert_eq!(diagnostics.uptime_seconds, 12);
+        assert_eq!(diagnostics.usb_error_count, 1);
+
+        runtime
+            .handle_input::<12, 12, 2>(
+                management_request(ManagementCommand::GetHistory { index: 0 }, 6),
+                &mut commands,
+            )
+            .unwrap();
+        let ManagementResponsePayload::History(event) = management_response(&commands).payload
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (event.kind, event.vendor_id, event.product_id),
+            (3, 0x1234, 0xabcd)
+        );
+        runtime
+            .handle_input::<12, 12, 2>(
+                management_request(ManagementCommand::GetHistory { index: 1 }, 7),
+                &mut commands,
+            )
+            .unwrap();
+        assert_eq!(
+            management_response(&commands).payload,
+            ManagementResponsePayload::None
+        );
+    }
+
+    #[test]
+    fn automatically_discovered_ble_name_is_used_until_manually_overridden() {
+        let mut runtime = BridgeRuntime::<4, 0>::new(0);
+        let mut commands = heapless::Vec::<RuntimeCommand, 12>::new();
+        runtime
+            .handle_input::<12, 12, 2>(
+                RuntimeInput::BridgeEvent(BridgeEvent::HostConnected { host_id: HostId(1) }),
+                &mut commands,
+            )
+            .unwrap();
+        runtime
+            .handle_input::<12, 12, 2>(
+                RuntimeInput::HostNameDiscovered {
+                    host_id: HostId(1),
+                    name: FixedName::from_ascii("BLE-AABBCC").unwrap(),
+                },
+                &mut commands,
+            )
+            .unwrap();
+        runtime
+            .handle_input::<12, 12, 2>(
+                management_request(ManagementCommand::GetHostInfo(HostId(1)), 1),
+                &mut commands,
+            )
+            .unwrap();
+        let ManagementResponsePayload::HostInfo(info) = management_response(&commands).payload
+        else {
+            panic!()
+        };
+        assert_eq!(info.name.as_bytes(), b"BLE-AABBCC");
+        assert_eq!(info.name_source, 1);
+
+        runtime
+            .handle_input::<12, 12, 2>(
+                management_request(
+                    ManagementCommand::SetHostName {
+                        host_id: HostId(1),
+                        name: ManagementHostName::from_ascii("Work PC").unwrap(),
+                    },
+                    2,
+                ),
+                &mut commands,
+            )
+            .unwrap();
+        let ManagementResponsePayload::HostInfo(info) = management_response(&commands).payload
+        else {
+            panic!()
+        };
+        assert_eq!(info.name.as_bytes(), b"Work PC");
+        assert_eq!(info.name_source, 2);
+    }
+
+    #[test]
+    fn management_can_pair_select_and_forget_a_host() {
+        let mut runtime = BridgeRuntime::<4, 1>::new(0);
+        let mut commands = heapless::Vec::<RuntimeCommand, 12>::new();
+
+        runtime
+            .handle_input::<12, 12, 2>(
+                management_request(ManagementCommand::StartPairing(HostId(3)), 1),
+                &mut commands,
+            )
+            .unwrap();
+        assert!(
+            commands.contains(&RuntimeCommand::BleCommand(BleTaskCommand::AllowPairing {
+                host_id: HostId(3)
+            }))
+        );
+        assert_eq!(management_status(&commands).pairing_host, Some(HostId(3)));
+
+        runtime
+            .handle_input::<12, 12, 2>(
+                management_request(ManagementCommand::SelectHost(HostId(3)), 2),
+                &mut commands,
+            )
+            .unwrap();
+        assert_eq!(management_status(&commands).active_host, Some(HostId(3)));
+
+        runtime
+            .handle_input::<12, 12, 2>(
+                management_request(ManagementCommand::ForgetHost(HostId(3)), 3),
+                &mut commands,
+            )
+            .unwrap();
+        let response = management_response(&commands);
+        assert_eq!(response.result, ManagementResult::Ok);
+        let status = management_status(&commands);
+        assert_eq!(status.active_host, None);
+        assert_eq!(status.pairing_host, None);
+        assert!(!status.hosts[2].known);
+    }
+
+    #[test]
+    fn management_rejects_invalid_or_destructive_slot_requests() {
+        let mut runtime = BridgeRuntime::<4, 1>::new(0);
+        let mut commands = heapless::Vec::<RuntimeCommand, 12>::new();
+
+        runtime
+            .handle_input::<12, 12, 2>(
+                management_request(ManagementCommand::SelectHost(HostId(0)), 1),
+                &mut commands,
+            )
+            .unwrap();
+        assert_eq!(
+            management_response(&commands).result,
+            ManagementResult::InvalidHost
+        );
+
+        runtime
+            .handle_event::<12, 12>(
+                BridgeEvent::HostSecurityChanged {
+                    host_id: HostId(1),
+                    encrypted: true,
+                    bonded: true,
+                    bond: None,
+                },
+                &mut commands,
+            )
+            .unwrap();
+        runtime
+            .handle_input::<12, 12, 2>(
+                management_request(ManagementCommand::StartPairing(HostId(1)), 2),
+                &mut commands,
+            )
+            .unwrap();
+        assert_eq!(
+            management_response(&commands).result,
+            ManagementResult::HostAlreadyBonded
+        );
+    }
+
+    #[test]
+    fn management_reports_usb_devices_interfaces_and_keyboards() {
+        let mut runtime = BridgeRuntime::<4, 4>::new(0);
+        let mut commands = heapless::Vec::<RuntimeCommand, 12>::new();
+        runtime
+            .register_usb_hid_interface::<12, 12>(
+                InterfaceId(1),
+                DeviceId(1),
+                Some(KeyboardLedOutputReport::boot_keyboard()),
+                &mut commands,
+            )
+            .unwrap();
+        runtime
+            .register_usb_hid_interface::<12, 12>(InterfaceId(2), DeviceId(1), None, &mut commands)
+            .unwrap();
+        runtime
+            .register_usb_hid_interface::<12, 12>(InterfaceId(3), DeviceId(2), None, &mut commands)
+            .unwrap();
+        runtime
+            .handle_input::<12, 12, 2>(
+                management_request(ManagementCommand::GetStatus, 8),
+                &mut commands,
+            )
+            .unwrap();
+
+        assert_eq!(
+            management_status(&commands).usb,
+            ManagementUsbStatus {
+                device_count: 2,
+                interface_count: 3,
+                keyboard_count: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn management_host_name_is_returned_and_persisted() {
+        let mut runtime = BridgeRuntime::<4, 1>::new(4);
+        let mut commands = heapless::Vec::<RuntimeCommand, 12>::new();
+        runtime
+            .handle_event::<12, 12>(
+                BridgeEvent::HostConnected { host_id: HostId(2) },
+                &mut commands,
+            )
+            .unwrap();
+        let name = ManagementHostName::from_ascii("Work laptop").unwrap();
+        runtime
+            .handle_input::<12, 12, 2>(
+                management_request(
+                    ManagementCommand::SetHostName {
+                        host_id: HostId(2),
+                        name,
+                    },
+                    9,
+                ),
+                &mut commands,
+            )
+            .unwrap();
+        let persisted = commands.iter().find_map(|command| match command {
+            RuntimeCommand::PersistStorage { state, priority } => Some((state, priority)),
+            _ => None,
+        });
+        assert_eq!(
+            persisted.map(|(_, priority)| *priority),
+            Some(StoragePersistPriority::Critical)
+        );
+        assert_eq!(
+            persisted
+                .and_then(|(state, _)| state.hosts().iter().find(|host| host.host_id == HostId(2)))
+                .map(|host| host.name.as_bytes()),
+            Some(b"Work laptop".as_slice())
+        );
+
+        runtime
+            .handle_input::<12, 12, 2>(
+                management_request(ManagementCommand::GetHostInfo(HostId(2)), 10),
+                &mut commands,
+            )
+            .unwrap();
+        assert_eq!(
+            management_response(&commands).payload,
+            ManagementResponsePayload::HostInfo(ManagementHostInfo {
+                host_id: HostId(2),
+                status: ManagementHostStatus {
+                    known: true,
+                    connected: true,
+                    encrypted: false,
+                    bonded: false,
+                },
+                name,
+                name_source: 2,
+            })
+        );
+    }
 
     #[test]
     fn input_event_becomes_ble_notify_command() {
@@ -1174,6 +2550,15 @@ mod tests {
             )
             .unwrap();
 
+        assert!(commands.is_empty());
+        runtime
+            .handle_input::<8, 8, 2>(RuntimeInput::Tick { now_ms: 119 }, &mut commands)
+            .unwrap();
+        assert!(commands.is_empty());
+        runtime
+            .handle_input::<8, 8, 2>(RuntimeInput::Tick { now_ms: 120 }, &mut commands)
+            .unwrap();
+
         assert!(commands.iter().any(|command| {
             matches!(
                 command,
@@ -1183,6 +2568,35 @@ mod tests {
                 })
             )
         }));
+    }
+
+    #[test]
+    fn keyboard_layout_normalizes_jis_yen_and_us_grave_usages() {
+        let mut runtime = ready_runtime();
+        runtime.host_settings[0].keyboard_layout = 1;
+        let mut us_event = BridgeEvent::InputFrame(crate::input::InputFrame::Standard(
+            keyboard_input(KeyUsage(0x89)),
+        ));
+        runtime
+            .apply_active_host_input_settings(&mut us_event)
+            .unwrap();
+        let BridgeEvent::InputFrame(crate::input::InputFrame::Standard(us_frame)) = us_event else {
+            panic!("standard frame");
+        };
+        assert_eq!(us_frame.keyboard.unwrap().keys_down(), &[KeyUsage(0x35)]);
+
+        runtime.host_settings[0].keyboard_layout = 2;
+        let mut jis_event = BridgeEvent::InputFrame(crate::input::InputFrame::Standard(
+            keyboard_input(KeyUsage(0x35)),
+        ));
+        runtime
+            .apply_active_host_input_settings(&mut jis_event)
+            .unwrap();
+        let BridgeEvent::InputFrame(crate::input::InputFrame::Standard(jis_frame)) = jis_event
+        else {
+            panic!("standard frame");
+        };
+        assert_eq!(jis_frame.keyboard.unwrap().keys_down(), &[KeyUsage(0x89)]);
     }
 
     #[test]
@@ -1352,9 +2766,28 @@ mod tests {
                     active_target: None,
                     pairable_host: None,
                 },
+                management: None,
             }
             .class(),
             CommandClass::BestEffort
+        );
+        assert_eq!(
+            StatusTaskCommand {
+                status: BridgeStatus {
+                    active_target: None,
+                    pairable_host: None,
+                },
+                management: Some(ManagementTaskResponse {
+                    destination: ManagementDestination::Wired,
+                    response: ManagementResponse {
+                        request_id: 1,
+                        result: ManagementResult::Ok,
+                        payload: ManagementResponsePayload::Status(ManagementStatus::empty(4)),
+                    },
+                }),
+            }
+            .class(),
+            CommandClass::Critical
         );
     }
 

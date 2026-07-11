@@ -187,13 +187,21 @@ pub async fn storage_command_task(
                 let usb_interrupt_guard = UsbInterruptQuiesceGuard::new();
                 let persisted = persist_due_storage_snapshot(&mut persistence, &mut backend);
                 drop(usb_interrupt_guard);
-                resume_ble_after_flash_write(
-                    #[cfg(all(feature = "ble-hid", feature = "storage"))]
-                    ble_quiesce_done,
-                )
-                .await;
                 if persisted {
                     reset_after_flash_write_if_required();
+                } else {
+                    runtime_input
+                        .send(RuntimeInputMessage::DiagnosticsEvent(
+                            hidshift::runtime::RuntimeDiagnosticsEvent::FlashWrite {
+                                success: false,
+                            },
+                        ))
+                        .await;
+                    resume_ble_after_flash_write(
+                        #[cfg(all(feature = "ble-hid", feature = "storage"))]
+                        ble_quiesce_done,
+                    )
+                    .await;
                 }
             }
         }

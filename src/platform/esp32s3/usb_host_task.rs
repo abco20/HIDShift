@@ -4,9 +4,11 @@ use embassy_futures::select::{Either, Either3, Either4, select, select3, select4
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::{Receiver, Sender};
 use embassy_time::{Duration, Timer, with_timeout};
-use embassy_usb_driver::host::PipeError;
+use embassy_usb_driver::host::{PipeError, UsbHostAllocator, UsbPipe, pipe};
+use embassy_usb_driver::{Direction, EndpointAddress, EndpointInfo, EndpointType};
 use embassy_usb_host::class::hid::{HidError, PROTOCOL_REPORT, ReportDescriptor};
 use embassy_usb_host::class::hub::{HubEvent, HubHandler};
+use embassy_usb_host::control::{ControlType, Recipient, RequestType, SetupPacket};
 use embassy_usb_host::handler::HandlerEvent;
 use embassy_usb_host::{BusRoute, BusState};
 use embassy_usb_synopsys_otg::PhyType;
@@ -20,8 +22,10 @@ use hidshift::ids::{DeviceId, InterfaceId};
 use hidshift::input::KeyboardLedState;
 use hidshift::runtime::message::RuntimeInputMessage;
 use hidshift::runtime::{
-    RUNTIME_INPUT_QUEUE_CAPACITY, RUNTIME_USB_COMMAND_QUEUE_CAPACITY, UsbTaskCommand,
+    RUNTIME_INPUT_QUEUE_CAPACITY, RUNTIME_USB_COMMAND_QUEUE_CAPACITY, RuntimeDiagnosticsEvent,
+    UsbTaskCommand,
 };
+use hidshift::storage::FixedName;
 use hidshift::usb_hid::host_interface::{
     HidInterfaceInfo, UsbHidControl, UsbHidReader, config_descriptor_has_interface_class,
     find_hid_interfaces,
@@ -361,6 +365,11 @@ pub async fn usb_input_task(
             }
             Err(error) => {
                 log::warn!("firmware: usb enumerate failed: {:?}", error);
+                sender
+                    .send(RuntimeInputMessage::DiagnosticsEvent(
+                        RuntimeDiagnosticsEvent::UsbError,
+                    ))
+                    .await;
                 continue;
             }
         };
@@ -536,6 +545,11 @@ pub async fn usb_input_task(
                             interface_id.0,
                             error
                         );
+                        sender
+                            .send(RuntimeInputMessage::DiagnosticsEvent(
+                                RuntimeDiagnosticsEvent::UsbError,
+                            ))
+                            .await;
                         let _ = remove_device_and_notify(
                             &sender,
                             &bus_handle,
@@ -629,6 +643,11 @@ pub async fn usb_input_task(
                         interface_id.0,
                         error
                     );
+                    sender
+                        .send(RuntimeInputMessage::DiagnosticsEvent(
+                            RuntimeDiagnosticsEvent::UsbError,
+                        ))
+                        .await;
                     let _ = remove_device_and_notify(
                         &sender,
                         &bus_handle,
@@ -777,6 +796,9 @@ async fn attach_hid_interfaces_for_device<'d>(
     enum_info: &embassy_usb_host::handler::EnumerationInfo,
     config_desc: &[u8],
 ) -> Result<(), ()> {
+    let product_name = read_usb_product_name(bus_handle, enum_info)
+        .await
+        .unwrap_or_else(FixedName::empty);
     let hid_interfaces = match find_hid_interfaces::<8>(config_desc) {
         Ok(interfaces) if !interfaces.is_empty() => interfaces,
         Ok(_) => {
@@ -817,20 +839,35 @@ async fn attach_hid_interfaces_for_device<'d>(
                 return Err(());
             }
         };
-        if let Err(error) = control.set_idle(0, 0).await {
-            log::debug!(
+        match with_timeout(Duration::from_millis(500), control.set_idle(0, 0)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => log::debug!(
                 "firmware: usb set_idle failed interface={} err={:?}",
                 interface_id.0,
                 error
-            );
+            ),
+            Err(_) => log::debug!(
+                "firmware: usb set_idle timed out interface={}",
+                interface_id.0
+            ),
         }
         if hid_info.supports_set_protocol() {
-            if let Err(error) = control.ensure_protocol(PROTOCOL_REPORT).await {
-                log::debug!(
+            match with_timeout(
+                Duration::from_millis(500),
+                control.ensure_protocol(PROTOCOL_REPORT),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => log::debug!(
                     "firmware: usb set_protocol(report) failed interface={} err={:?}",
                     interface_id.0,
                     error
-                );
+                ),
+                Err(_) => log::debug!(
+                    "firmware: usb set_protocol(report) timed out interface={}",
+                    interface_id.0
+                ),
             }
         }
 
@@ -938,6 +975,15 @@ async fn attach_hid_interfaces_for_device<'d>(
                 led_output: led_output.then(|| session.led_output()).flatten(),
             })
             .await;
+        sender
+            .send(RuntimeInputMessage::UsbDeviceMetadataUpdated {
+                device_id,
+                vendor_id: enum_info.device_desc.vendor_id,
+                product_id: enum_info.device_desc.product_id,
+                name: product_name,
+                flags: session.device_kind_flags(),
+            })
+            .await;
         active_slots[slot_index] = Some(ActiveUsbInterfaceSlot {
             interface_id,
             reader,
@@ -950,6 +996,90 @@ async fn attach_hid_interfaces_for_device<'d>(
     }
 
     Ok(())
+}
+
+async fn read_usb_product_name<'d>(
+    bus_handle: &FirmwareBusHandle<'d>,
+    enum_info: &embassy_usb_host::handler::EnumerationInfo,
+) -> Option<FixedName> {
+    let string_index = enum_info.device_desc.product;
+    if string_index == 0 {
+        return None;
+    }
+    let endpoint = EndpointInfo {
+        addr: EndpointAddress::from_parts(0, embassy_usb_driver::Direction::In),
+        ep_type: EndpointType::Control,
+        max_packet_size: enum_info.device_desc.max_packet_size0 as u16,
+        interval_ms: 0,
+    };
+    let mut control = bus_handle
+        .alloc_pipe::<pipe::Control, pipe::InOut>(
+            enum_info.device_address,
+            &endpoint,
+            enum_info.split(),
+        )
+        .ok()?;
+    let language_request = SetupPacket {
+        request_type: RequestType {
+            direction: Direction::In,
+            control_type: ControlType::Standard,
+            recipient: Recipient::Device,
+        },
+        request: 6,
+        value: 0x0300,
+        index: 0,
+        length: 4,
+    };
+    let mut language = [0u8; 4];
+    let language_id = match control
+        .control_in(&language_request.to_bytes(), &mut language)
+        .await
+    {
+        Ok(length) if length >= 4 && language[1] == 3 => {
+            u16::from_le_bytes([language[2], language[3]])
+        }
+        _ => 0x0409,
+    };
+    let request = SetupPacket {
+        request_type: RequestType {
+            direction: Direction::In,
+            control_type: ControlType::Standard,
+            recipient: Recipient::Device,
+        },
+        request: 6,
+        value: 0x0300 | string_index as u16,
+        index: language_id,
+        length: 66,
+    };
+    let mut descriptor = [0u8; 66];
+    let length = control
+        .control_in(&request.to_bytes(), &mut descriptor)
+        .await
+        .ok()?;
+    if length < 2 || descriptor[1] != 3 {
+        return None;
+    }
+    let descriptor_len = usize::from(descriptor[0]).min(length).min(descriptor.len());
+    let mut ascii = [0u8; hidshift::storage::MAX_HOST_NAME_LEN];
+    let mut ascii_len = 0usize;
+    for unit in descriptor[2..descriptor_len].chunks_exact(2) {
+        if ascii_len == ascii.len() {
+            break;
+        }
+        let code = u16::from_le_bytes([unit[0], unit[1]]);
+        if code == 0 {
+            break;
+        }
+        ascii[ascii_len] = if (0x20..=0x7e).contains(&code) {
+            code as u8
+        } else {
+            b'?'
+        };
+        ascii_len += 1;
+    }
+    core::str::from_utf8(&ascii[..ascii_len])
+        .ok()
+        .and_then(FixedName::from_ascii)
 }
 
 async fn fetch_report_descriptor_with_retries<'d>(

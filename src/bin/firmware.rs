@@ -34,7 +34,8 @@ use hidshift::runtime::{
     BleCommandLane, BleTaskCommand, RUNTIME_BLE_CONTROL_COMMAND_QUEUE_CAPACITY,
     RUNTIME_BLE_NOTIFY_COMMAND_QUEUE_CAPACITY, RUNTIME_INPUT_QUEUE_CAPACITY,
     RUNTIME_STATUS_COMMAND_QUEUE_CAPACITY, RUNTIME_STORAGE_COMMAND_QUEUE_CAPACITY,
-    RUNTIME_USB_COMMAND_QUEUE_CAPACITY, StatusTaskCommand, StorageTaskCommand, UsbTaskCommand,
+    RUNTIME_USB_COMMAND_QUEUE_CAPACITY, RuntimeDiagnosticsEvent, StatusTaskCommand,
+    StorageTaskCommand, UsbTaskCommand,
 };
 #[cfg(feature = "ble-hid")]
 use hidshift::storage::StorageState;
@@ -89,6 +90,8 @@ static BLE_RUNTIME_BARRIER_REQUEST_CHANNEL: Channel<CriticalSectionRawMutex, usi
 #[cfg(all(feature = "ble-hid", feature = "storage"))]
 static BLE_RUNTIME_BARRIER_DONE_CHANNEL: Channel<CriticalSectionRawMutex, BleRuntimeSnapshot, 1> =
     Channel::new();
+#[cfg(all(feature = "ble-hid", feature = "storage"))]
+static BLE_RUNTIME_BARRIER_RESUME_CHANNEL: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
 static STATUS_COMMAND_CHANNEL: Channel<
     CriticalSectionRawMutex,
     StatusTaskCommand,
@@ -123,6 +126,12 @@ fn main() -> ! {
         esp_alloc::heap_allocator!(size: 72 * 1024);
     }
 
+    let reset_reason = esp_hal::system::reset_reason();
+    let reset_reason_code = reset_reason.map_or(0, |reason| reason as u8);
+    let was_brownout = matches!(
+        reset_reason,
+        Some(esp_hal::rtc_cntl::SocResetReason::SysBrownOut)
+    );
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
@@ -160,24 +169,33 @@ fn main() -> ! {
                 BLE_RUNTIME_BARRIER_REQUEST_CHANNEL.receiver(),
                 #[cfg(all(feature = "ble-hid", feature = "storage"))]
                 BLE_RUNTIME_BARRIER_DONE_CHANNEL.sender(),
+                #[cfg(all(feature = "ble-hid", feature = "storage"))]
+                BLE_RUNTIME_BARRIER_RESUME_CHANNEL.receiver(),
                 sink,
             ),
             "runtime-owner",
         );
+        let _ = RUNTIME_INPUT_CHANNEL.try_send(RuntimeInputMessage::DiagnosticsEvent(
+            RuntimeDiagnosticsEvent::ResetReason(reset_reason_code),
+        ));
+        if was_brownout {
+            let _ = RUNTIME_INPUT_CHANNEL.try_send(RuntimeInputMessage::DiagnosticsEvent(
+                RuntimeDiagnosticsEvent::Brownout,
+            ));
+        }
         spawn_or_reset(
             &spawner,
             control_task(RUNTIME_INPUT_CHANNEL.sender(), peripherals.GPIO0),
             "control",
         );
-        #[cfg(feature = "diagnostic-input")]
         spawn_or_reset(
             &spawner,
-            esp32s3_platform::serial_diagnostic_task::serial_diagnostic_task(
+            esp32s3_platform::serial_management_task::serial_management_task(
                 RUNTIME_INPUT_CHANNEL.sender(),
                 peripherals.UART0,
                 peripherals.GPIO44,
             ),
-            "serial-diagnostic",
+            "serial-management",
         );
         spawn_or_reset(
             &spawner,
@@ -220,6 +238,8 @@ fn main() -> ! {
                 BLE_RUNTIME_BARRIER_REQUEST_CHANNEL.sender(),
                 #[cfg(feature = "storage")]
                 BLE_RUNTIME_BARRIER_DONE_CHANNEL.receiver(),
+                #[cfg(feature = "storage")]
+                BLE_RUNTIME_BARRIER_RESUME_CHANNEL.sender(),
                 peripherals.BT,
                 peripherals.RNG,
                 peripherals.ADC1,
@@ -274,7 +294,10 @@ fn main() -> ! {
         );
         spawn_or_reset(
             &spawner,
-            status_command_task(STATUS_COMMAND_CHANNEL.receiver()),
+            status_command_task(
+                STATUS_COMMAND_CHANNEL.receiver(),
+                BLE_CONTROL_COMMAND_CHANNEL.sender(),
+            ),
             "status-command",
         );
     })
@@ -298,6 +321,12 @@ async fn runtime_owner_task(
         'static,
         CriticalSectionRawMutex,
         BleRuntimeSnapshot,
+        1,
+    >,
+    #[cfg(all(feature = "ble-hid", feature = "storage"))] barrier_resume: Receiver<
+        'static,
+        CriticalSectionRawMutex,
+        (),
         1,
     >,
     mut sink: ChannelTaskSink,
@@ -325,7 +354,7 @@ async fn runtime_owner_task(
                     }
                 }
                 let runtime = owner.runtime();
-                let storage = match runtime.bridge().storage_state(runtime.storage_generation()) {
+                let storage = match runtime.storage_state() {
                     Ok(storage) => Some(storage),
                     Err(error) => {
                         log::error!("firmware: runtime barrier snapshot failed {:?}", error);
@@ -338,6 +367,7 @@ async fn runtime_owner_task(
                         pairable_host: runtime.pairing_mode().map(|state| state.host_id),
                     })
                     .await;
+                barrier_resume.receive().await;
                 continue;
             }
         };
@@ -434,12 +464,61 @@ async fn status_command_task(
         StatusTaskCommand,
         RUNTIME_STATUS_COMMAND_QUEUE_CAPACITY,
     >,
+    ble_sender: Sender<
+        'static,
+        CriticalSectionRawMutex,
+        BleTaskCommand,
+        RUNTIME_BLE_CONTROL_COMMAND_QUEUE_CAPACITY,
+    >,
 ) {
     log::info!("firmware: status command task boot");
     loop {
         let command = receiver.receive().await;
-        log::info!("firmware: status_command {:?}", command);
+        if let Some(management) = command.management {
+            match management.destination {
+                hidshift::ManagementDestination::Wired => {
+                    print_wired_management_response(management.response);
+                }
+                hidshift::ManagementDestination::Ble(host_id) => {
+                    ble_sender
+                        .send(BleTaskCommand::ManagementResponse {
+                            host_id,
+                            response: management.response,
+                        })
+                        .await;
+                }
+            }
+        } else {
+            log::info!("firmware: status_command {:?}", command);
+        }
     }
+}
+
+fn print_wired_management_response(response: hidshift::ManagementResponse) {
+    let bytes = response.encode();
+    esp_println::println!(
+        "@HIDSHIFT:{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15],
+        bytes[16],
+        bytes[17],
+        bytes[18],
+        bytes[19]
+    );
 }
 
 struct ChannelTaskSink {

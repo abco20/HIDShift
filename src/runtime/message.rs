@@ -1,11 +1,12 @@
 use crate::ble::{BleHidAttribute, BleHostAdapterEvent};
 use crate::bridge::BridgeEvent;
 use crate::ids::{DeviceId, HostId, InterfaceId};
+use crate::management::{ManagementDestination, ManagementRequest};
 use crate::storage::{StorageState, StoredBond};
 use crate::target_control::ButtonIntent;
 use crate::usb_hid::output::KeyboardLedOutputReport;
 
-use super::{RUNTIME_BLE_GATT_WRITE_MAX_LEN, RuntimeInput};
+use super::{RUNTIME_BLE_GATT_WRITE_MAX_LEN, RuntimeDiagnosticsEvent, RuntimeInput};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 // Fixed-capacity no_std messages deliberately carry storage snapshots inline.
@@ -14,6 +15,11 @@ pub enum RuntimeInputMessage {
     BridgeEvent(BridgeEvent),
     ButtonIntent {
         intent: ButtonIntent,
+        now_ms: u64,
+    },
+    ManagementRequest {
+        destination: ManagementDestination,
+        request: ManagementRequest,
         now_ms: u64,
     },
     Tick {
@@ -31,6 +37,18 @@ pub enum RuntimeInputMessage {
     UsbHidInterfaceDisconnected {
         interface_id: InterfaceId,
     },
+    UsbDeviceMetadataUpdated {
+        device_id: DeviceId,
+        vendor_id: u16,
+        product_id: u16,
+        name: crate::storage::FixedName,
+        flags: u8,
+    },
+    HostNameDiscovered {
+        host_id: HostId,
+        name: crate::storage::FixedName,
+    },
+    DiagnosticsEvent(RuntimeDiagnosticsEvent),
     RestoreStorage(StorageState),
 }
 
@@ -40,6 +58,15 @@ impl RuntimeInputMessage {
             Self::BridgeEvent(event) => RuntimeInput::BridgeEvent(event.clone()),
             Self::ButtonIntent { intent, now_ms } => RuntimeInput::ButtonIntent {
                 intent: *intent,
+                now_ms: *now_ms,
+            },
+            Self::ManagementRequest {
+                destination,
+                request,
+                now_ms,
+            } => RuntimeInput::ManagementRequest {
+                destination: *destination,
+                request: *request,
                 now_ms: *now_ms,
             },
             Self::Tick { now_ms } => RuntimeInput::Tick { now_ms: *now_ms },
@@ -61,6 +88,24 @@ impl RuntimeInputMessage {
                     interface_id: *interface_id,
                 }
             }
+            Self::UsbDeviceMetadataUpdated {
+                device_id,
+                vendor_id,
+                product_id,
+                name,
+                flags,
+            } => RuntimeInput::UsbDeviceMetadataUpdated {
+                device_id: *device_id,
+                vendor_id: *vendor_id,
+                product_id: *product_id,
+                name: *name,
+                flags: *flags,
+            },
+            Self::HostNameDiscovered { host_id, name } => RuntimeInput::HostNameDiscovered {
+                host_id: *host_id,
+                name: *name,
+            },
+            Self::DiagnosticsEvent(event) => RuntimeInput::DiagnosticsEvent(*event),
             Self::RestoreStorage(storage) => RuntimeInput::RestoreStorage(storage),
         }
     }
@@ -75,6 +120,15 @@ impl TryFrom<RuntimeInput<'_>> for RuntimeInputMessage {
             RuntimeInput::ButtonIntent { intent, now_ms } => {
                 Ok(Self::ButtonIntent { intent, now_ms })
             }
+            RuntimeInput::ManagementRequest {
+                destination,
+                request,
+                now_ms,
+            } => Ok(Self::ManagementRequest {
+                destination,
+                request,
+                now_ms,
+            }),
             RuntimeInput::Tick { now_ms } => Ok(Self::Tick { now_ms }),
             RuntimeInput::BleHostEvent { host_id, event } => Ok(Self::BleHostEvent {
                 host_id,
@@ -92,6 +146,23 @@ impl TryFrom<RuntimeInput<'_>> for RuntimeInputMessage {
             RuntimeInput::UsbHidInterfaceDisconnected { interface_id } => {
                 Ok(Self::UsbHidInterfaceDisconnected { interface_id })
             }
+            RuntimeInput::UsbDeviceMetadataUpdated {
+                device_id,
+                vendor_id,
+                product_id,
+                name,
+                flags,
+            } => Ok(Self::UsbDeviceMetadataUpdated {
+                device_id,
+                vendor_id,
+                product_id,
+                name,
+                flags,
+            }),
+            RuntimeInput::HostNameDiscovered { host_id, name } => {
+                Ok(Self::HostNameDiscovered { host_id, name })
+            }
+            RuntimeInput::DiagnosticsEvent(event) => Ok(Self::DiagnosticsEvent(event)),
             RuntimeInput::RestoreStorage(storage) => Ok(Self::RestoreStorage(storage.clone())),
         }
     }

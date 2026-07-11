@@ -1,4 +1,5 @@
 use alloc::boxed::Box;
+use core::fmt::Write;
 use core::future::pending;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -6,7 +7,7 @@ use embassy_futures::join::join;
 use embassy_futures::select::{Either, Either3, Either4, select, select3, select4};
 use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
 use embassy_sync::channel::{Receiver, Sender};
-use embassy_time::Timer;
+use embassy_time::{Instant, Timer};
 use esp_hal::rng::{Trng, TrngSource};
 use esp_radio::ble::controller::BleConnector;
 use hidshift::ble_runtime::{
@@ -14,6 +15,9 @@ use hidshift::ble_runtime::{
     security_changed_message,
 };
 use hidshift::ids::HostId;
+use hidshift::management::{
+    MANAGEMENT_REQUEST_LEN, MANAGEMENT_RESPONSE_LEN, ManagementDestination, ManagementRequest,
+};
 use hidshift::reports::{
     HID_INFORMATION, INPUT_REPORT_TYPE, KEYBOARD_REPORT_ID, OUTPUT_REPORT_TYPE,
     V1_CONSUMER_REPORT_MAP, V1_KEYBOARD_REPORT_MAP, V1_MOUSE_REPORT_MAP,
@@ -22,8 +26,9 @@ use hidshift::runtime::message::RuntimeInputMessage;
 use hidshift::runtime::{
     BleTaskCommand, RUNTIME_BLE_CONTROL_COMMAND_QUEUE_CAPACITY,
     RUNTIME_BLE_NOTIFY_COMMAND_QUEUE_CAPACITY, RUNTIME_HOSTS_MAX, RUNTIME_INPUT_QUEUE_CAPACITY,
+    RuntimeDiagnosticsEvent,
 };
-use hidshift::storage::{StorageState, StoredBond, StoredSecurityLevel};
+use hidshift::storage::{FixedName, StorageState, StoredBond, StoredSecurityLevel};
 use hidshift::{
     BLE_HID_NOTIFICATIONS_PER_REPORT_MAX, BleConnectionSlots, BlePeerIdentity,
     notifications_for_input_report, resolve_ble_host_id, typed_notification,
@@ -34,7 +39,10 @@ const BLE_DEVICE_NAME: &str = "HIDShift";
 const BLE_CONNECTIONS_MAX: usize = 4;
 // One ATT bearer plus one spare control/data lane per connection.
 const BLE_L2CAP_CHANNELS_MAX: usize = BLE_CONNECTIONS_MAX * 2;
-const BLE_ATTRIBUTE_TABLE_SIZE: usize = 64;
+const BLE_ATTRIBUTE_TABLE_SIZE: usize = 72;
+const MANAGEMENT_SERVICE_UUID_LE: [u8; 16] = [
+    0x01, 0x00, 0x3a, 0x4f, 0x6d, 0x5b, 0x4b, 0x9f, 0x0d, 0x4f, 0x15, 0x1b, 0x00, 0x00, 0x51, 0x7f,
+];
 
 static BLE_ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 static BLE_ACTIVE_HOST_MASK: AtomicUsize = AtomicUsize::new(0);
@@ -56,6 +64,27 @@ struct Server {
     mouse_hid: MouseHidService,
     consumer_hid: ConsumerHidService,
     device_information: DeviceInformationService,
+    management: ManagementService,
+}
+
+#[gatt_service(uuid = "7f510000-1b15-4f0d-9f4b-5b6d4f3a0001")]
+struct ManagementService {
+    #[characteristic(
+        uuid = "7f510001-1b15-4f0d-9f4b-5b6d4f3a0001",
+        write,
+        write_without_response,
+        permissions(encrypted),
+        value = [0; MANAGEMENT_REQUEST_LEN]
+    )]
+    request: [u8; MANAGEMENT_REQUEST_LEN],
+    #[characteristic(
+        uuid = "7f510002-1b15-4f0d-9f4b-5b6d4f3a0001",
+        read,
+        notify,
+        permissions(encrypted),
+        value = [0; MANAGEMENT_RESPONSE_LEN]
+    )]
+    response: [u8; MANAGEMENT_RESPONSE_LEN],
 }
 
 #[gatt_service(uuid = "00001812-0000-1000-8000-00805f9b34fb")]
@@ -182,6 +211,12 @@ pub async fn ble_host_event_task(
         BleRuntimeSnapshot,
         1,
     >,
+    #[cfg(feature = "storage")] runtime_barrier_resume: Sender<
+        'static,
+        CriticalSectionRawMutex,
+        (),
+        1,
+    >,
     bt: esp_hal::peripherals::BT<'static>,
     rng: esp_hal::peripherals::RNG<'static>,
     adc1: esp_hal::peripherals::ADC1<'static>,
@@ -277,6 +312,7 @@ pub async fn ble_host_event_task(
                 log::info!("firmware: ble quiesced for flash write");
                 quiesce_ready.send(snapshot.storage).await;
                 quiesce_done.receive().await;
+                runtime_barrier_resume.send(()).await;
             }
             Either3::Third(()) => {
                 let snapshot = disconnect_runtime_hosts_before_quiesce(
@@ -291,6 +327,7 @@ pub async fn ble_host_event_task(
                 log::info!("firmware: ble quiesced for usb enumeration");
                 usb_quiesce_ready.send(()).await;
                 usb_quiesce_done.receive().await;
+                runtime_barrier_resume.send(()).await;
             }
         }
 
@@ -452,6 +489,7 @@ fn trouble_bond_from_stored(bond: StoredBond) -> Option<BondInformation> {
 
 fn retain_gatt_service_fields(server: &Server) {
     let _ = &server.device_information;
+    let _ = &server.management;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -481,7 +519,7 @@ impl BleControlState {
 
     fn apply_command(&mut self, command: BleTaskCommand) {
         match command {
-            BleTaskCommand::Notify { .. } => {}
+            BleTaskCommand::Notify { .. } | BleTaskCommand::ManagementResponse { .. } => {}
             BleTaskCommand::AllowPairing { host_id } => self.set_pairing_allowed(host_id, true),
             BleTaskCommand::RejectPairing { host_id } => self.set_pairing_allowed(host_id, false),
             BleTaskCommand::ClearBond { host_id, .. } => {
@@ -553,7 +591,12 @@ where
     P: PacketPool,
 {
     let peer_identity = connection_peer_identity(conn);
-    resolve_ble_host_id(restored_state, peer_identity, control.pairing_host())
+    let resolved = resolve_ble_host_id(restored_state, peer_identity, control.pairing_host())?;
+    let is_pairing = control.pairing_allowed(resolved);
+    let reconnect_enabled = restored_state
+        .map(|state| state.global_settings.auto_reconnect)
+        .unwrap_or(true);
+    (is_pairing || reconnect_enabled).then_some(resolved)
 }
 
 async fn accept_ble_connections<'values, 'server, C>(
@@ -1019,7 +1062,16 @@ async fn dispatch_ble_command_to_connected_slot(
             }
         }
         BleTaskCommand::Notify { .. } => {
-            dispatch_ble_command_to_slot(server, conn, command).await;
+            if !dispatch_ble_command_to_slot(server, conn, command).await {
+                sender
+                    .send(RuntimeInputMessage::DiagnosticsEvent(
+                        RuntimeDiagnosticsEvent::BleNotifyFailed,
+                    ))
+                    .await;
+            }
+        }
+        BleTaskCommand::ManagementResponse { .. } => {
+            let _ = dispatch_ble_command_to_slot(server, conn, command).await;
         }
     }
 }
@@ -1033,7 +1085,8 @@ fn ble_command_host_id(command: BleTaskCommand) -> HostId {
         BleTaskCommand::Notify { host_id, .. }
         | BleTaskCommand::AllowPairing { host_id }
         | BleTaskCommand::RejectPairing { host_id }
-        | BleTaskCommand::ClearBond { host_id, .. } => host_id,
+        | BleTaskCommand::ClearBond { host_id, .. }
+        | BleTaskCommand::ManagementResponse { host_id, .. } => host_id,
     }
 }
 
@@ -1063,6 +1116,12 @@ fn log_ble_command_without_connection(command: BleTaskCommand) {
         BleTaskCommand::ClearBond { host_id, .. } => {
             log::info!("firmware: clear bond requested for host={}", host_id.0);
         }
+        BleTaskCommand::ManagementResponse { host_id, .. } => {
+            log::debug!(
+                "firmware: dropping management response without connection host={}",
+                host_id.0
+            );
+        }
     }
 }
 
@@ -1082,6 +1141,11 @@ async fn configure_ble_connection<P>(
     P: PacketPool,
 {
     sender.send(connected_message(host_id)).await;
+    if let Some(name) = fallback_ble_peer_name(conn) {
+        sender
+            .send(RuntimeInputMessage::HostNameDiscovered { host_id, name })
+            .await;
+    }
     mark_host_connected(host_id);
     let active = BLE_ACTIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
     log::info!(
@@ -1125,6 +1189,21 @@ async fn configure_ble_connection<P>(
     }
 }
 
+fn fallback_ble_peer_name<P>(conn: &GattConnection<'_, '_, P>) -> Option<FixedName>
+where
+    P: PacketPool,
+{
+    let address = conn.raw().peer_identity().bd_addr.into_inner();
+    let mut name = heapless::String::<16>::new();
+    write!(
+        name,
+        "BLE-{:02X}{:02X}{:02X}",
+        address[3], address[4], address[5]
+    )
+    .ok()?;
+    FixedName::from_ascii(name.as_str())
+}
+
 async fn ble_runner_task<C, P>(mut runner: Runner<'_, C, P>)
 where
     C: Controller,
@@ -1153,13 +1232,18 @@ where
         ],
         &mut adv_data,
     )?;
+    let mut scan_data = [0; 31];
+    let scan_len = AdStructure::encode_slice(
+        &[AdStructure::ServiceUuids128(&[MANAGEMENT_SERVICE_UUID_LE])],
+        &mut scan_data,
+    )?;
 
     let advertiser = peripheral
         .advertise(
             &Default::default(),
             Advertisement::ConnectableScannableUndirected {
                 adv_data: &adv_data[..len],
-                scan_data: &[],
+                scan_data: &scan_data[..scan_len],
             },
         )
         .await?;
@@ -1191,7 +1275,6 @@ where
     P: PacketPool,
 {
     let event = conn.next().await;
-    report_encryption_if_ready(slot, conn, sender, host_id, encryption_reported).await;
     match event {
         GattConnectionEvent::Disconnected { reason } => {
             let active = decrement_active_ble_connections();
@@ -1202,33 +1285,78 @@ where
                 active
             );
             sender.send(disconnected_message(host_id)).await;
+            sender
+                .send(RuntimeInputMessage::DiagnosticsEvent(
+                    RuntimeDiagnosticsEvent::BleDisconnected {
+                        host_id,
+                        reason: u8::from(reason),
+                    },
+                ))
+                .await;
             mark_host_disconnected(host_id);
             ConnectionProgress::Disconnected
         }
         GattConnectionEvent::Gatt { event } => {
-            let reply = match event {
-                GattEvent::Read(event) => event.accept(),
-                GattEvent::Write(event) => {
-                    let handles = ble_hid_attribute_handles(server);
-                    match gatt_write_message(host_id, handles, event.handle(), event.data()) {
-                        Ok(message) => sender.send(message).await,
-                        Err(err) => {
-                            log::warn!(
-                                "firmware: ble gatt write adapter failed slot={} handle={} err={:?}",
-                                slot,
-                                event.handle(),
-                                err
-                            );
-                        }
+            // ATT has a short response deadline. Never wait for the shared runtime
+            // queue before acknowledging a GATT request: USB input can legitimately
+            // fill that queue and used to stall descriptor reads and CCCD writes.
+            let runtime_message = match event {
+                GattEvent::Read(event) => {
+                    if let Ok(reply) = event.accept() {
+                        reply.send().await;
                     }
-                    event.accept()
+                    None
                 }
-                _ => event.accept(),
+                GattEvent::Write(event) => {
+                    let message = if event.handle() == server.management.request.handle {
+                        match ManagementRequest::decode(event.data()) {
+                            Ok(request) => Some(RuntimeInputMessage::ManagementRequest {
+                                destination: ManagementDestination::Ble(host_id),
+                                request,
+                                now_ms: Instant::now().as_millis(),
+                            }),
+                            Err(err) => {
+                                log::warn!(
+                                    "firmware: invalid management request slot={} err={:?}",
+                                    slot,
+                                    err
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        let handles = ble_hid_attribute_handles(server);
+                        match gatt_write_message(host_id, handles, event.handle(), event.data()) {
+                            Ok(message) => Some(message),
+                            Err(err) => {
+                                log::warn!(
+                                    "firmware: ble gatt write adapter failed slot={} handle={} err={:?}",
+                                    slot,
+                                    event.handle(),
+                                    err
+                                );
+                                None
+                            }
+                        }
+                    };
+                    if let Ok(reply) = event.accept() {
+                        reply.send().await;
+                    }
+                    message
+                }
+                _ => {
+                    if let Ok(reply) = event.accept() {
+                        reply.send().await;
+                    }
+                    None
+                }
             };
 
-            if let Ok(reply) = reply {
-                reply.send().await;
+            // Once the peer has its ATT response, backpressure here is safe.
+            if let Some(message) = runtime_message {
+                sender.send(message).await;
             }
+            report_encryption_if_ready(slot, conn, sender, host_id, encryption_reported).await;
             ConnectionProgress::Stay
         }
         GattConnectionEvent::PairingComplete {
@@ -1327,7 +1455,8 @@ async fn dispatch_ble_command_to_slot<P>(
     server: &Server<'_>,
     conn: &GattConnection<'_, '_, P>,
     command: BleTaskCommand,
-) where
+) -> bool
+where
     P: PacketPool,
 {
     match command {
@@ -1342,16 +1471,36 @@ async fn dispatch_ble_command_to_slot<P>(
                     host_id.0,
                     reason
                 );
+                return false;
             }
+            true
         }
         BleTaskCommand::AllowPairing { host_id } => {
             log::info!("firmware: pairing enabled for host={}", host_id.0);
+            true
         }
         BleTaskCommand::RejectPairing { host_id } => {
             log::info!("firmware: pairing disabled for host={}", host_id.0);
+            true
         }
         BleTaskCommand::ClearBond { host_id, .. } => {
             log::info!("firmware: clear bond requested for host={}", host_id.0);
+            true
+        }
+        BleTaskCommand::ManagementResponse { host_id, response } => {
+            let success = server
+                .management
+                .response
+                .notify(conn, &response.encode())
+                .await
+                .is_ok();
+            if !success {
+                log::warn!(
+                    "firmware: management response notify failed host={}",
+                    host_id.0
+                );
+            }
+            success
         }
     }
 }

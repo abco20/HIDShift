@@ -7,9 +7,11 @@ pub mod ble_runtime;
 pub mod bridge;
 pub mod ids;
 pub mod input;
+pub mod management;
 pub mod reports;
 pub mod routing;
 pub mod runtime;
+pub mod settings;
 pub mod storage;
 pub mod target_control;
 pub mod usb_hid;
@@ -44,6 +46,15 @@ pub use input::{
     MouseMovement, MouseReport, PhysicalInputState, PhysicalKeyboardState, PhysicalMouseState,
     StandardInputFrame, VisibleKeyboardState,
 };
+pub use management::{
+    MANAGEMENT_PROTOCOL_VERSION, MANAGEMENT_REQUEST_LEN, MANAGEMENT_REQUEST_UUID,
+    MANAGEMENT_RESPONSE_LEN, MANAGEMENT_RESPONSE_UUID, MANAGEMENT_SERVICE_UUID, ManagementCommand,
+    ManagementDestination, ManagementDiagnostics, ManagementHistoryEvent, ManagementHostInfo,
+    ManagementHostName, ManagementHostStatus, ManagementHostTiming, ManagementProtocolError,
+    ManagementRequest, ManagementResponse, ManagementResponsePayload, ManagementResult,
+    ManagementSchema, ManagementSetting, ManagementStatus, ManagementUsbDevice,
+    ManagementUsbStatus,
+};
 pub use reports::{
     BLE_HID_INPUT_REPORT_MAX_LEN, BLE_HID_NOTIFICATIONS_PER_REPORT_MAX, BLE_HID_NOTIFY_MAX_LEN,
     BleConsumerReport, BleHidCharacteristic, BleHidInputReport, BleHidNotification,
@@ -57,16 +68,16 @@ pub use routing::{ActiveTargetError, HostRouter};
 pub use runtime::{
     BleCommandLane, BleTaskCommand, BleTaskCommandVec, BridgeRuntime, CommandClass,
     DEFAULT_RUNTIME_CAPACITIES, DefaultBridgeRuntime, DefaultRuntimeCommandQueues,
-    PairingModeState, RUNTIME_BLE_COMMAND_QUEUE_CAPACITY,
+    ManagementTaskResponse, PairingModeState, RUNTIME_BLE_COMMAND_QUEUE_CAPACITY,
     RUNTIME_BLE_CONTROL_COMMAND_QUEUE_CAPACITY, RUNTIME_BLE_EVENT_CAPACITY,
     RUNTIME_BLE_GATT_WRITE_MAX_LEN, RUNTIME_BLE_NOTIFY_COMMAND_QUEUE_CAPACITY,
     RUNTIME_BRIDGE_ACTION_CAPACITY, RUNTIME_COMMAND_CAPACITY, RUNTIME_HOSTS_MAX,
     RUNTIME_INPUT_QUEUE_CAPACITY, RUNTIME_STATUS_COMMAND_QUEUE_CAPACITY,
     RUNTIME_STORAGE_COMMAND_QUEUE_CAPACITY, RUNTIME_USB_COMMAND_QUEUE_CAPACITY,
     RUNTIME_USB_INTERFACES_MAX, RuntimeCapacities, RuntimeCommand, RuntimeCommandQueues,
-    RuntimeCommandVec, RuntimeDispatchError, RuntimeError, RuntimeInput, StatusTaskCommand,
-    StatusTaskCommandVec, StorageTaskCommand, StorageTaskCommandVec, UsbHidInterfaceRuntimeState,
-    UsbTaskCommand, UsbTaskCommandVec,
+    RuntimeCommandVec, RuntimeDiagnosticsEvent, RuntimeDispatchError, RuntimeError, RuntimeInput,
+    StatusTaskCommand, StatusTaskCommandVec, StorageTaskCommand, StorageTaskCommandVec,
+    UsbHidInterfaceRuntimeState, UsbTaskCommand, UsbTaskCommandVec,
     bootstrap::prepare_ready_host,
     driver::{
         RuntimeDriverError, RuntimeTaskKind, RuntimeTaskSink, dispatch_runtime_queues,
@@ -76,6 +87,11 @@ pub use runtime::{
         RuntimeBleGattWrite, RuntimeBleHostEvent, RuntimeInputMessage, RuntimeInputMessageError,
     },
     owner::{DefaultRuntimeOwner, RuntimeOwner, RuntimeOwnerError},
+};
+pub use settings::{
+    GlobalSettings, HostSettings, SETTING_COUNT, SETTING_DESCRIPTORS, SETTINGS_SCHEMA_HASH,
+    SETTINGS_SCHEMA_VERSION, SettingChoice, SettingDescriptor, SettingId, SettingScope,
+    SettingTarget, SettingValueKind, setting_by_key, setting_descriptor, validate_setting_value,
 };
 pub use storage::{
     FixedName, NorFlashStorageBackend, STORAGE_FLASH_LEN, STORAGE_FLASH_SLOT_COUNT,

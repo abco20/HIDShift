@@ -58,6 +58,70 @@ Actions are applied when the GPIO0 button is released.
 
 The pairing window remains open for 60 seconds or until pairing succeeds.
 
+## Management
+
+HIDShift can be managed over Bluetooth LE or a serial connection. Management
+includes host selection, pairing, saved-host removal, device status,
+diagnostics, and persistent settings. The GPIO0 button remains available as a
+fallback.
+
+Two clients are included:
+
+- `tools/hidshiftctl`: command-line client
+- `web`: browser client using Web Bluetooth or Web Serial
+
+The management protocol is still under development and may change without
+backward compatibility. See [the protocol documentation](docs/management-protocol.md)
+for its current definition.
+
+### Rust CLI
+
+Build the command-line client with:
+
+```sh
+cargo build --release --manifest-path tools/hidshiftctl/Cargo.toml
+```
+
+Specify a serial port and a command:
+
+```sh
+tools/hidshiftctl/target/release/hidshiftctl --serial <PORT> status
+tools/hidshiftctl/target/release/hidshiftctl --serial <PORT> pair 2
+tools/hidshiftctl/target/release/hidshiftctl --serial <PORT> settings list
+```
+
+Alternatively, use BLE. Omitting the address scans for a device named
+`HIDShift`:
+
+```sh
+tools/hidshiftctl/target/release/hidshiftctl --ble status
+```
+
+Run `hidshiftctl --help` or `hidshiftctl <COMMAND> --help` for the complete
+command and option reference.
+
+### Web UI
+
+Install Trunk and the WebAssembly target, then run the browser client locally:
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install trunk --locked
+cd web
+trunk serve --open
+```
+
+The page supports Web Bluetooth and Web Serial when those APIs are available in
+the browser. Browser security requirements may require serving the page from a
+secure context. Build deployable static assets with:
+
+```sh
+cd web
+trunk build --release
+```
+
+`web/dist/` is generated and ignored by Git.
+
 ## Logs
 
 Production builds emit logs at `info` level and above. Set `ESP_LOG` while
@@ -80,6 +144,9 @@ Run the host-side checks before submitting changes:
 cargo test
 cargo fmt --check
 cargo check --lib
+cargo test --manifest-path tools/hidshift-client/Cargo.toml
+cargo test --manifest-path tools/hidshiftctl/Cargo.toml
+cargo check --manifest-path web/Cargo.toml --target wasm32-unknown-unknown
 ```
 
 ## License

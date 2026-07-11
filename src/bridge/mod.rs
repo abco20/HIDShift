@@ -41,6 +41,14 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
         &self.state
     }
 
+    pub fn set_discovered_host_name(
+        &mut self,
+        host_id: HostId,
+        name: crate::storage::FixedName,
+    ) -> Result<bool, HostStateError> {
+        self.state.hosts.set_discovered_name(host_id, name)
+    }
+
     pub fn handle_event<const ACTIONS: usize>(
         &mut self,
         event: BridgeEvent,
@@ -104,6 +112,12 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
                 } else {
                     Ok(())
                 }
+            }
+            BridgeEvent::SetHostName { host_id, name } => {
+                if self.state.hosts.set_name(host_id, name)? {
+                    push_action(out, BridgeAction::PersistProfiles)?;
+                }
+                self.push_status(out)
             }
             BridgeEvent::EnterPairingMode { host_id } => self.enter_pairing_mode(host_id, out),
             BridgeEvent::PairingModeExpired { host_id } => self.expire_pairing_mode(host_id, out),
@@ -699,6 +713,10 @@ pub enum BridgeEvent {
     HostKeyboardLedChanged {
         host_id: HostId,
         leds: KeyboardLedState,
+    },
+    SetHostName {
+        host_id: HostId,
+        name: crate::storage::FixedName,
     },
     EnterPairingMode {
         host_id: HostId,
@@ -1774,7 +1792,7 @@ mod tests {
                 mouse_cccd_enabled: false,
                 consumer_cccd_enabled: true,
                 keyboard_output_cccd_enabled: true,
-                name: crate::storage::FixedName::empty(),
+                name: crate::storage::FixedName::from_ascii("desktop").unwrap(),
                 bond: None,
             }]
         );

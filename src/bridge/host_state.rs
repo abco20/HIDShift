@@ -121,6 +121,8 @@ impl<const HOSTS: usize> BleHostStateMachine<HOSTS> {
             };
             host.session_report_ready = ReportReady::default();
             host.keyboard_leds = None;
+            host.name = stored_host.name;
+            host.discovered_name = FixedName::empty();
             host.bond = stored_host.bond;
         }
 
@@ -139,7 +141,7 @@ impl<const HOSTS: usize> BleHostStateMachine<HOSTS> {
                 mouse_cccd_enabled: host.stored_report_ready.mouse,
                 consumer_cccd_enabled: host.stored_report_ready.consumer,
                 keyboard_output_cccd_enabled: host.stored_report_ready.keyboard_output,
-                name: FixedName::empty(),
+                name: host.name,
                 bond: host.bond,
             })?;
         }
@@ -161,6 +163,24 @@ impl<const HOSTS: usize> BleHostStateMachine<HOSTS> {
     pub fn host_mut(&mut self, host_id: HostId) -> Option<&mut HostRuntimeState> {
         self.host_index(host_id)
             .and_then(|index| self.hosts[index].as_mut())
+    }
+
+    pub fn set_name(&mut self, host_id: HostId, name: FixedName) -> Result<bool, HostStateError> {
+        let host = self.upsert_host(host_id)?;
+        let changed = host.name != name;
+        host.name = name;
+        Ok(changed)
+    }
+
+    pub fn set_discovered_name(
+        &mut self,
+        host_id: HostId,
+        name: FixedName,
+    ) -> Result<bool, HostStateError> {
+        let host = self.upsert_host(host_id)?;
+        let changed = host.discovered_name != name;
+        host.discovered_name = name;
+        Ok(changed)
     }
 
     pub fn next_connected_target(&self) -> Option<HostId> {
@@ -247,6 +267,8 @@ pub struct HostRuntimeState {
     pub stored_report_ready: ReportReady,
     pub session_report_ready: ReportReady,
     pub keyboard_leds: Option<KeyboardLedState>,
+    pub name: FixedName,
+    pub discovered_name: FixedName,
     pub bond: Option<StoredBond>,
 }
 
@@ -270,6 +292,8 @@ impl Default for HostRuntimeState {
             stored_report_ready: ReportReady::default(),
             session_report_ready: ReportReady::default(),
             keyboard_leds: None,
+            name: FixedName::empty(),
+            discovered_name: FixedName::empty(),
             bond: None,
         }
     }

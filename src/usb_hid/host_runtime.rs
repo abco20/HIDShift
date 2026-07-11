@@ -2,7 +2,10 @@ use crate::ids::{DeviceId, InterfaceId};
 use crate::runtime::message::RuntimeInputMessage;
 use crate::usb_hid::frame::UsbInputFrameError;
 use crate::usb_hid::output::{KeyboardLedOutputError, KeyboardLedOutputReport};
-use crate::usb_hid::report::{HidReportDescriptor, HidReportError, USAGE_PAGE_KEYBOARD};
+use crate::usb_hid::report::{
+    HidReportDescriptor, HidReportError, USAGE_PAGE_BUTTON, USAGE_PAGE_CONSUMER,
+    USAGE_PAGE_GENERIC_DESKTOP, USAGE_PAGE_KEYBOARD,
+};
 use crate::usb_hid::runtime_adapter::runtime_input_from_usb_report;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,6 +97,24 @@ impl<const FIELDS: usize, const EVENTS: usize> UsbHidInterfaceRuntimeSession<FIE
 
     pub const fn led_output(&self) -> Option<KeyboardLedOutputReport> {
         self.led_output
+    }
+
+    /// Management device kind bits: keyboard, mouse, consumer control.
+    pub fn device_kind_flags(&self) -> u8 {
+        let mut flags = 0;
+        for field in self
+            .descriptor
+            .fields()
+            .filter(|field| !field.is_constant())
+        {
+            match field.usage_page {
+                USAGE_PAGE_KEYBOARD => flags |= 0x02,
+                USAGE_PAGE_BUTTON | USAGE_PAGE_GENERIC_DESKTOP => flags |= 0x04,
+                USAGE_PAGE_CONSUMER => flags |= 0x08,
+                _ => {}
+            }
+        }
+        flags
     }
 
     pub fn connected_message(&self) -> RuntimeInputMessage {
@@ -209,6 +230,28 @@ mod tests {
         .unwrap();
 
         assert_eq!(session.led_output(), None);
+    }
+
+    #[test]
+    fn device_kind_flags_are_derived_from_report_fields_not_led_support() {
+        let keyboard = UsbHidInterfaceRuntimeSession::<2, 8>::from_core_descriptor(
+            InterfaceId(1),
+            DeviceId(3),
+            descriptor_with_keyboard_only(),
+            &[],
+            false,
+        )
+        .unwrap();
+        let mouse = UsbHidInterfaceRuntimeSession::<1, 8>::from_core_descriptor(
+            InterfaceId(2),
+            DeviceId(4),
+            descriptor_with_mouse_only(),
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(keyboard.device_kind_flags(), 0x02);
+        assert_eq!(mouse.device_kind_flags(), 0x04);
     }
 
     #[test]

@@ -1,13 +1,15 @@
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Sender;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use esp_hal::gpio::{Input, InputConfig, Pull};
 use hidshift::runtime::RUNTIME_INPUT_QUEUE_CAPACITY;
 use hidshift::runtime::message::RuntimeInputMessage;
 use hidshift::target_control::TargetSwitchControl;
 
 pub const TARGET_BUTTON_SAMPLE_MS: u64 = 5;
-pub const TARGET_BUTTON_TICK_MS: u64 = 250;
+// Runtime deadlines include a configurable target-switch delay as short as 5 ms.
+// A 10 ms tick keeps that setting responsive without flooding the input queue.
+pub const TARGET_BUTTON_TICK_MS: u64 = 10;
 
 #[embassy_executor::task]
 pub async fn control_task(
@@ -25,8 +27,7 @@ pub async fn control_task(
     let button = Input::new(button_pin, button_config);
     let mut target_control = TargetSwitchControl::new();
 
-    let mut now_ms = 0u64;
-    let mut tick_accum_ms = 0u64;
+    let mut next_tick = Instant::now() + Duration::from_millis(TARGET_BUTTON_TICK_MS);
     let mut last_pressed = button.is_low();
     log::debug!(
         "firmware: target button GPIO0 initial_pressed={}",
@@ -34,6 +35,8 @@ pub async fn control_task(
     );
 
     loop {
+        let now = Instant::now();
+        let now_ms = now.as_millis();
         let pressed = button.is_low();
         if pressed != last_pressed {
             log::debug!(
@@ -51,11 +54,19 @@ pub async fn control_task(
         }
 
         Timer::after(Duration::from_millis(TARGET_BUTTON_SAMPLE_MS)).await;
-        now_ms = now_ms.saturating_add(TARGET_BUTTON_SAMPLE_MS);
-        tick_accum_ms = tick_accum_ms.saturating_add(TARGET_BUTTON_SAMPLE_MS);
-        if tick_accum_ms >= TARGET_BUTTON_TICK_MS {
-            tick_accum_ms = 0;
-            sender.send(RuntimeInputMessage::Tick { now_ms }).await;
+        let now = Instant::now();
+        if now >= next_tick {
+            next_tick = now + Duration::from_millis(TARGET_BUTTON_TICK_MS);
+            // Runtime ownership is deliberately paused while BLE is quiesced for USB
+            // enumeration or flash writes. Coalesce periodic deadline hints to at most
+            // one queued message so they cannot consume capacity needed by the operation
+            // which will resume the runtime. Dropping ticks is safe: deadlines are
+            // absolute and the next accepted tick evaluates them again.
+            if sender.free_capacity() == RUNTIME_INPUT_QUEUE_CAPACITY {
+                let _ = sender.try_send(RuntimeInputMessage::Tick {
+                    now_ms: now.as_millis(),
+                });
+            }
         }
     }
 }
