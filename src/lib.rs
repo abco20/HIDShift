@@ -8,6 +8,7 @@ pub mod bridge;
 pub mod ids;
 pub mod input;
 pub mod management;
+pub mod mouse_accumulator;
 pub mod reports;
 pub mod routing;
 pub mod runtime;
@@ -22,7 +23,7 @@ pub use ble::{
 };
 pub use ble_connection::{
     BleConnectionEntry, BleConnectionSlot, BleConnectionSlotError, BleConnectionSlots,
-    BlePeerIdentity, resolve_host_id as resolve_ble_host_id,
+    BleInputGate, BlePeerIdentity, resolve_host_id as resolve_ble_host_id,
 };
 pub use ble_notify::{
     BleNotificationDispatchError, BleNotificationSink, BleTypedNotification,
@@ -39,7 +40,10 @@ pub use bridge::{
     HostRuntimeState, HostStateError, NotifyReason, PairingMode, PairingSession, ReportReady,
     keyboard_led_event_from_ble_output,
 };
-pub use ids::{DeviceId, HostId, InterfaceId, ReportId, SlotId};
+pub use ids::{
+    DeviceId, HOST_SLOT_MAX, HOST_SLOT_MIN, HostId, HostSlot, InterfaceId, InvalidHostSlot,
+    ReportId, SlotId,
+};
 pub use input::{
     ConsumerUsage, InputEvent, KeyCode, KeyUsage, KeyboardEvent, KeyboardFrame, KeyboardLedState,
     KeyboardSuppression, Modifier, ModifierState, MouseButton, MouseButtons, MouseFrame,
@@ -75,9 +79,10 @@ pub use runtime::{
     RUNTIME_INPUT_QUEUE_CAPACITY, RUNTIME_STATUS_COMMAND_QUEUE_CAPACITY,
     RUNTIME_STORAGE_COMMAND_QUEUE_CAPACITY, RUNTIME_USB_COMMAND_QUEUE_CAPACITY,
     RUNTIME_USB_INTERFACES_MAX, RuntimeCapacities, RuntimeCommand, RuntimeCommandQueues,
-    RuntimeCommandVec, RuntimeDiagnosticsEvent, RuntimeDispatchError, RuntimeError, RuntimeInput,
-    StatusTaskCommand, StatusTaskCommandVec, StorageTaskCommand, StorageTaskCommandVec,
-    UsbHidInterfaceRuntimeState, UsbTaskCommand, UsbTaskCommandVec,
+    RuntimeCommandVec, RuntimeCounters, RuntimeDiagnosticsEvent, RuntimeDispatchError,
+    RuntimeError, RuntimeInput, StatusSnapshot, StatusTaskCommand, StatusTaskCommandVec,
+    StorageTaskCommand, StorageTaskCommandVec, UsbHidInterfaceRuntimeState, UsbTaskCommand,
+    UsbTaskCommandVec,
     bootstrap::prepare_ready_host,
     driver::{
         RuntimeDriverError, RuntimeTaskKind, RuntimeTaskSink, dispatch_runtime_queues,

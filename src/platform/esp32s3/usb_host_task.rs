@@ -43,8 +43,10 @@ const MAX_REPORT_EVENTS: usize = 32;
 const MAX_ACTIVE_USB_INTERFACES: usize = 8;
 const MAX_HUB_PORTS: usize = 4;
 const HUB_CHILD_ENUMERATION_TIMEOUT_MS: u64 = 5_000;
+const HUB_ENUMERATION_TOTAL_TIMEOUT_MS: u64 = 8_000;
 const HUB_QUIESCED_EVENT_DRAIN_MS: u64 = 750;
 const HID_REPORT_DESCRIPTOR_TIMEOUT_MS: u64 = 2_000;
+const USB_LED_WRITE_TIMEOUT_MS: u64 = 20;
 
 static HOST_STATE: HostStateStorage<HOST_CHANNELS> = HostStateStorage::new();
 static BUS_STATE: BusState = BusState::new();
@@ -59,10 +61,15 @@ struct ActiveUsbInterfaceSlot<'d> {
     enum_info: embassy_usb_host::handler::EnumerationInfo,
     session: UsbHidInterfaceRuntimeSession<MAX_REPORT_FIELDS, MAX_REPORT_EVENTS>,
     report_buf: [u8; REPORT_BUF_LEN],
+    last_mouse_buttons: hidshift::input::MouseButtons,
+    last_led_bytes: Option<hidshift::usb_hid::output::KeyboardLedOutputBytes>,
 }
 
 enum UsbSlotReadResult {
-    Input(RuntimeInputMessage),
+    Input {
+        message: RuntimeInputMessage,
+        movement_only: bool,
+    },
     Fatal {
         device_id: DeviceId,
         interface_id: InterfaceId,
@@ -75,7 +82,14 @@ impl<'d> ActiveUsbInterfaceSlot<'d> {
         loop {
             match self.reader.read(&mut self.report_buf).await {
                 Ok(n) => match self.session.input_message(&self.report_buf[..n]) {
-                    Ok(message) => return UsbSlotReadResult::Input(message),
+                    Ok(message) => {
+                        let movement_only =
+                            movement_only_message(&message, &mut self.last_mouse_buttons);
+                        return UsbSlotReadResult::Input {
+                            message,
+                            movement_only,
+                        };
+                    }
                     Err(error) => {
                         log::debug!(
                             "firmware: usb input frame decode failed interface={} err={:?}",
@@ -93,6 +107,46 @@ impl<'d> ActiveUsbInterfaceSlot<'d> {
                 }
             }
         }
+    }
+}
+
+fn movement_only_message(
+    message: &RuntimeInputMessage,
+    previous_buttons: &mut hidshift::input::MouseButtons,
+) -> bool {
+    let RuntimeInputMessage::BridgeEvent(hidshift::BridgeEvent::InputFrame(
+        hidshift::input::InputFrame::Standard(frame),
+    )) = message
+    else {
+        return false;
+    };
+    let Some(mouse) = frame.mouse else {
+        return false;
+    };
+    let buttons_unchanged = mouse.buttons == *previous_buttons;
+    *previous_buttons = mouse.buttons;
+    frame.keyboard.is_none()
+        && frame.consumer.is_none()
+        && buttons_unchanged
+        && mouse.movement != hidshift::input::MouseMovement::neutral()
+}
+
+async fn forward_usb_input(
+    sender: &Sender<
+        'static,
+        CriticalSectionRawMutex,
+        RuntimeInputMessage,
+        RUNTIME_INPUT_QUEUE_CAPACITY,
+    >,
+    message: RuntimeInputMessage,
+    movement_only: bool,
+) {
+    if movement_only {
+        if sender.try_send(message).is_err() {
+            log::debug!("firmware: coalescible mouse input dropped at full runtime queue");
+        }
+    } else {
+        sender.send(message).await;
     }
 }
 
@@ -421,19 +475,26 @@ pub async fn usb_input_task(
                             ble_quiesce_ready,
                         )
                         .await;
-                        handle_hub_device_detected(
-                            &sender,
-                            &bus_handle,
-                            &mut topology,
-                            &mut active_slots,
-                            &mut hub_port_devices,
-                            &mut hub,
-                            &mut config_buf,
-                            device_id,
-                            port,
-                            speed,
+                        if with_timeout(
+                            Duration::from_millis(HUB_ENUMERATION_TOTAL_TIMEOUT_MS),
+                            handle_hub_device_detected(
+                                &sender,
+                                &bus_handle,
+                                &mut topology,
+                                &mut active_slots,
+                                &mut hub_port_devices,
+                                &mut hub,
+                                &mut config_buf,
+                                device_id,
+                                port,
+                                speed,
+                            ),
                         )
-                        .await;
+                        .await
+                        .is_err()
+                        {
+                            log::warn!("firmware: hub child attach total timeout port={}", port);
+                        }
                         let mut hub_failed = false;
                         loop {
                             match with_timeout(
@@ -451,19 +512,29 @@ pub async fn usb_input_task(
                                         port,
                                         speed
                                     );
-                                    handle_hub_device_detected(
-                                        &sender,
-                                        &bus_handle,
-                                        &mut topology,
-                                        &mut active_slots,
-                                        &mut hub_port_devices,
-                                        &mut hub,
-                                        &mut config_buf,
-                                        device_id,
-                                        port,
-                                        speed,
+                                    if with_timeout(
+                                        Duration::from_millis(HUB_ENUMERATION_TOTAL_TIMEOUT_MS),
+                                        handle_hub_device_detected(
+                                            &sender,
+                                            &bus_handle,
+                                            &mut topology,
+                                            &mut active_slots,
+                                            &mut hub_port_devices,
+                                            &mut hub,
+                                            &mut config_buf,
+                                            device_id,
+                                            port,
+                                            speed,
+                                        ),
                                     )
-                                    .await;
+                                    .await
+                                    .is_err()
+                                    {
+                                        log::warn!(
+                                            "firmware: hub child attach total timeout port={}",
+                                            port
+                                        );
+                                    }
                                 }
                                 Ok(Ok(HandlerEvent::HandlerEvent(HubEvent::DeviceRemoved {
                                     port,
@@ -532,8 +603,11 @@ pub async fn usb_input_task(
                         .await;
                         break;
                     }
-                    Either3::Second(UsbSlotReadResult::Input(message)) => {
-                        sender.send(message).await;
+                    Either3::Second(UsbSlotReadResult::Input {
+                        message,
+                        movement_only,
+                    }) => {
+                        forward_usb_input(&sender, message, movement_only).await;
                     }
                     Either3::Second(UsbSlotReadResult::Fatal {
                         device_id: failed_device_id,
@@ -570,6 +644,9 @@ pub async fn usb_input_task(
                             );
                             continue;
                         };
+                        if slot.last_led_bytes == Some(command.bytes) {
+                            continue;
+                        }
                         if slot.led_output {
                             match UsbKeyboardLedWriter::new_for_interface(
                                 &bus_handle,
@@ -577,12 +654,29 @@ pub async fn usb_input_task(
                                 &slot.enum_info,
                             ) {
                                 Ok(mut led_writer) => {
-                                    if let Err(error) = led_writer.write_leds(command.bytes).await {
-                                        log::warn!(
+                                    match with_timeout(
+                                        Duration::from_millis(USB_LED_WRITE_TIMEOUT_MS),
+                                        led_writer.write_leds(command.bytes),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(())) => slot.last_led_bytes = Some(command.bytes),
+                                        Ok(Err(error)) => log::warn!(
                                             "firmware: usb led write failed interface={} err={:?}",
                                             slot.interface_id.0,
                                             error
-                                        );
+                                        ),
+                                        Err(_) => {
+                                            log::warn!(
+                                                "firmware: usb led write timeout interface={}",
+                                                slot.interface_id.0
+                                            );
+                                            let _ =
+                                                sender
+                                                    .try_send(RuntimeInputMessage::DiagnosticsEvent(
+                                                    RuntimeDiagnosticsEvent::UsbLedWriteTimedOut,
+                                                ));
+                                        }
                                     }
                                 }
                                 Err(error) => {
@@ -630,8 +724,11 @@ pub async fn usb_input_task(
 
         loop {
             match select(poll_active_slots(&mut active_slots), receiver.receive()).await {
-                Either::First(UsbSlotReadResult::Input(message)) => {
-                    sender.send(message).await;
+                Either::First(UsbSlotReadResult::Input {
+                    message,
+                    movement_only,
+                }) => {
+                    forward_usb_input(&sender, message, movement_only).await;
                 }
                 Either::First(UsbSlotReadResult::Fatal {
                     device_id: failed_device_id,
@@ -669,6 +766,9 @@ pub async fn usb_input_task(
                         );
                         continue;
                     };
+                    if slot.last_led_bytes == Some(command.bytes) {
+                        continue;
+                    }
                     if slot.led_output {
                         match UsbKeyboardLedWriter::new_for_interface(
                             &bus_handle,
@@ -676,12 +776,28 @@ pub async fn usb_input_task(
                             &slot.enum_info,
                         ) {
                             Ok(mut led_writer) => {
-                                if let Err(error) = led_writer.write_leds(command.bytes).await {
-                                    log::warn!(
+                                match with_timeout(
+                                    Duration::from_millis(USB_LED_WRITE_TIMEOUT_MS),
+                                    led_writer.write_leds(command.bytes),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(())) => slot.last_led_bytes = Some(command.bytes),
+                                    Ok(Err(error)) => log::warn!(
                                         "firmware: usb led write failed interface={} err={:?}",
                                         slot.interface_id.0,
                                         error
-                                    );
+                                    ),
+                                    Err(_) => {
+                                        log::warn!(
+                                            "firmware: usb led write timeout interface={}",
+                                            slot.interface_id.0
+                                        );
+                                        let _ =
+                                            sender.try_send(RuntimeInputMessage::DiagnosticsEvent(
+                                                RuntimeDiagnosticsEvent::UsbLedWriteTimedOut,
+                                            ));
+                                    }
                                 }
                             }
                             Err(error) => {
@@ -992,6 +1108,8 @@ async fn attach_hid_interfaces_for_device<'d>(
             enum_info: *enum_info,
             session,
             report_buf: [0u8; REPORT_BUF_LEN],
+            last_mouse_buttons: hidshift::input::MouseButtons::empty(),
+            last_led_bytes: None,
         });
     }
 

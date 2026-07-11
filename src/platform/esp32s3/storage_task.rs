@@ -188,7 +188,18 @@ pub async fn storage_command_task(
                 let persisted = persist_due_storage_snapshot(&mut persistence, &mut backend);
                 drop(usb_interrupt_guard);
                 if persisted {
-                    reset_after_flash_write_if_required();
+                    runtime_input
+                        .send(RuntimeInputMessage::DiagnosticsEvent(
+                            hidshift::runtime::RuntimeDiagnosticsEvent::FlashWrite {
+                                success: true,
+                            },
+                        ))
+                        .await;
+                    resume_ble_after_flash_write(
+                        #[cfg(all(feature = "ble-hid", feature = "storage"))]
+                        ble_quiesce_done,
+                    )
+                    .await;
                 } else {
                     runtime_input
                         .send(RuntimeInputMessage::DiagnosticsEvent(
@@ -245,14 +256,6 @@ async fn resume_ble_after_flash_write(
     #[cfg(all(feature = "ble-hid", feature = "storage"))]
     {
         ble_quiesce_done.send(()).await;
-    }
-}
-
-fn reset_after_flash_write_if_required() {
-    #[cfg(all(feature = "ble-hid", feature = "storage"))]
-    {
-        log::info!("firmware: storage_command reset after flash write");
-        esp_hal::system::software_reset();
     }
 }
 

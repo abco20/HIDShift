@@ -2,8 +2,52 @@ use crate::ids::HostId;
 use crate::storage::{StorageState, StoredBond};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BleInputGate<const HOSTS: usize> {
+    blocked: [bool; HOSTS],
+}
+
+impl<const HOSTS: usize> BleInputGate<HOSTS> {
+    pub const fn new() -> Self {
+        Self {
+            blocked: [false; HOSTS],
+        }
+    }
+
+    pub fn block(&mut self, host_id: HostId) {
+        if let Some(index) = host_index::<HOSTS>(host_id) {
+            self.blocked[index] = true;
+        }
+    }
+
+    pub fn activate(&mut self, host_id: HostId) {
+        if let Some(index) = host_index::<HOSTS>(host_id) {
+            self.blocked[index] = false;
+        }
+    }
+
+    pub fn should_drop_input(&self, host_id: HostId) -> bool {
+        host_index::<HOSTS>(host_id)
+            .and_then(|index| self.blocked.get(index))
+            .copied()
+            .unwrap_or(true)
+    }
+}
+
+impl<const HOSTS: usize> Default for BleInputGate<HOSTS> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn host_index<const HOSTS: usize>(host_id: HostId) -> Option<usize> {
+    let index = host_id.validated().ok()?.get().checked_sub(1)? as usize;
+    (index < HOSTS).then_some(index)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BleConnectionSlotError {
     InvalidSlot,
+    InvalidHost,
     NoFreeSlot,
     DuplicateHost,
     DuplicatePeer,
@@ -58,6 +102,9 @@ impl<const SLOTS: usize> BleConnectionSlots<SLOTS> {
         host_id: HostId,
         peer_identity: BlePeerIdentity,
     ) -> Result<BleConnectionSlot, BleConnectionSlotError> {
+        host_id
+            .validated()
+            .map_err(|_| BleConnectionSlotError::InvalidHost)?;
         self.ensure_unique(host_id, peer_identity, None)?;
         for slot in 0..SLOTS {
             if self.entries[slot].is_none() {
@@ -78,6 +125,9 @@ impl<const SLOTS: usize> BleConnectionSlots<SLOTS> {
         peer_identity: BlePeerIdentity,
     ) -> Result<BleConnectionSlot, BleConnectionSlotError> {
         self.slot(slot)?;
+        host_id
+            .validated()
+            .map_err(|_| BleConnectionSlotError::InvalidHost)?;
         self.ensure_unique(host_id, peer_identity, Some(slot))?;
         self.entries[slot] = Some(BleConnectionEntry {
             host_id,
@@ -442,5 +492,19 @@ mod tests {
             slots.connect_first_free(HostId(2), rotated_peer),
             Err(BleConnectionSlotError::DuplicatePeer)
         );
+    }
+
+    #[test]
+    fn target_release_blocks_stale_input_until_explicit_reactivation() {
+        let mut gate = BleInputGate::<4>::new();
+        gate.block(HostId(1));
+        gate.activate(HostId(2));
+
+        assert!(gate.should_drop_input(HostId(1)));
+        assert!(!gate.should_drop_input(HostId(2)));
+
+        gate.activate(HostId(1));
+        assert!(!gate.should_drop_input(HostId(1)));
+        assert!(gate.should_drop_input(HostId(0)));
     }
 }

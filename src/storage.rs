@@ -4,7 +4,7 @@ use crate::settings::{GlobalSettings, HostSettings};
 pub const MAX_HOST_NAME_LEN: usize = 32;
 pub const STORED_HOSTS_MAX: usize = 4;
 pub const STORAGE_MAGIC: [u8; 4] = *b"E32B";
-pub const STORAGE_SCHEMA_VERSION: u16 = 4;
+pub const STORAGE_SCHEMA_VERSION: u16 = 1;
 pub const STORAGE_IMAGE_LEN: usize = 512;
 pub const STORAGE_HEADER_LEN: usize = 16;
 pub const STORAGE_BODY_PREFIX_LEN: usize = 64;
@@ -163,6 +163,7 @@ pub enum StorageError {
     FlashRead,
     FlashErase,
     FlashWrite,
+    FlashVerify,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -437,9 +438,6 @@ pub fn decode_storage_image(image: &[u8]) -> Result<StorageState, StorageError> 
     }
 
     let version = read_u16(&image[4..6]);
-    if version == 3 {
-        return decode_storage_v3(image);
-    }
     if version != STORAGE_SCHEMA_VERSION {
         return Err(StorageError::UnsupportedVersion);
     }
@@ -484,35 +482,6 @@ pub fn decode_storage_image(image: &[u8]) -> Result<StorageState, StorageError> 
 
     state.validate()?;
 
-    Ok(state)
-}
-
-fn decode_storage_v3(image: &[u8]) -> Result<StorageState, StorageError> {
-    const V3_BODY_PREFIX_LEN: usize = 8;
-    let body_len = read_u16(&image[6..8]) as usize;
-    let host_count = image[16] as usize;
-    if host_count > STORED_HOSTS_MAX
-        || body_len != V3_BODY_PREFIX_LEN + host_count * STORED_HOST_RECORD_LEN
-        || STORAGE_HEADER_LEN + body_len > STORAGE_IMAGE_LEN
-    {
-        return Err(StorageError::InvalidLength);
-    }
-    let total_len = STORAGE_HEADER_LEN + body_len;
-    if read_u32(&image[12..16]) != crc32_without_header_crc(&image[..total_len]) {
-        return Err(StorageError::CrcMismatch);
-    }
-    let mut state = StorageState::new(read_u32(&image[8..12]));
-    state.last_active_host = match image[17] {
-        0xff => None,
-        id => Some(HostId(id)),
-    };
-    for index in 0..host_count {
-        let offset = STORAGE_HEADER_LEN + V3_BODY_PREFIX_LEN + index * STORED_HOST_RECORD_LEN;
-        state.push_host(decode_host_record(
-            &image[offset..offset + STORED_HOST_RECORD_LEN],
-        )?)?;
-    }
-    state.validate()?;
     Ok(state)
 }
 
@@ -576,6 +545,10 @@ pub fn persist_storage_state<B: StorageSlotBackend>(
 
     let image = encode_storage_image(state)?;
     backend.write_slot(target, image)?;
+    let verified = backend.slot(target);
+    if verified != &image || decode_storage_image(verified).as_ref() != Ok(state) {
+        return Err(StorageError::FlashVerify);
+    }
 
     Ok(StorageWriteResult {
         index: target,
@@ -738,6 +711,13 @@ where
         self.flash
             .write(offset, &image)
             .map_err(|_| StorageError::FlashWrite)?;
+        let mut verified = [0u8; STORAGE_IMAGE_LEN];
+        self.flash
+            .read(offset, &mut verified)
+            .map_err(|_| StorageError::FlashRead)?;
+        if verified != image || decode_storage_image(&verified).is_err() {
+            return Err(StorageError::FlashVerify);
+        }
         self.slots[slot_number] = image;
         self.next_record[slot_number] = record_index + 1;
         Ok(())
@@ -1099,44 +1079,6 @@ mod tests {
     }
 
     #[test]
-    fn version_three_images_migrate_with_default_settings_and_preserved_bond() {
-        const V3_PREFIX: usize = 8;
-        let host = StoredHostProfile {
-            host_id: HostId(1),
-            bonded: true,
-            keyboard_cccd_enabled: true,
-            mouse_cccd_enabled: false,
-            consumer_cccd_enabled: true,
-            keyboard_output_cccd_enabled: false,
-            name: FixedName::from_ascii("old laptop").unwrap(),
-            bond: None,
-        };
-        let mut image = [0u8; STORAGE_IMAGE_LEN];
-        image[0..4].copy_from_slice(&STORAGE_MAGIC);
-        write_u16(&mut image[4..6], 3);
-        let body_len = V3_PREFIX + STORED_HOST_RECORD_LEN;
-        write_u16(&mut image[6..8], body_len as u16);
-        write_u32(&mut image[8..12], 17);
-        image[16] = 1;
-        image[17] = 1;
-        encode_host_record(
-            host,
-            &mut image[STORAGE_HEADER_LEN + V3_PREFIX
-                ..STORAGE_HEADER_LEN + V3_PREFIX + STORED_HOST_RECORD_LEN],
-        )
-        .unwrap();
-        let crc = crc32_without_header_crc(&image[..STORAGE_HEADER_LEN + body_len]);
-        write_u32(&mut image[12..16], crc);
-
-        let migrated = decode_storage_image(&image).unwrap();
-        assert_eq!(migrated.generation, 17);
-        assert_eq!(migrated.last_active_host, Some(HostId(1)));
-        assert_eq!(migrated.hosts(), &[host]);
-        assert_eq!(migrated.global_settings, GlobalSettings::DEFAULT);
-        assert_eq!(migrated.host_settings, [HostSettings::DEFAULT; 4]);
-    }
-
-    #[test]
     fn storage_image_round_trips_bond_payload() {
         let mut state = StorageState::new(7);
         state
@@ -1194,6 +1136,15 @@ mod tests {
 
         assert_eq!(selected.index, StorageSlotIndex::B);
         assert_eq!(selected.state.generation, 2);
+    }
+
+    #[test]
+    fn storage_slot_generation_order_survives_wrap() {
+        let before_wrap = encode_storage_image(&StorageState::new(u32::MAX)).unwrap();
+        let after_wrap = encode_storage_image(&StorageState::new(0)).unwrap();
+        let selected = select_newest_valid_storage_image(&before_wrap, &after_wrap).unwrap();
+        assert_eq!(selected.index, StorageSlotIndex::B);
+        assert_eq!(selected.state.generation, 0);
     }
 
     #[test]
@@ -1566,6 +1517,22 @@ mod tests {
     }
 
     #[test]
+    fn read_back_mismatch_is_rejected_and_previous_slot_remains_selected() {
+        let mut backend = CorruptingBackend::new();
+        let old = StorageState::new(1);
+        backend
+            .inner
+            .write_slot(StorageSlotIndex::A, encode_storage_image(&old).unwrap())
+            .unwrap();
+
+        assert_eq!(
+            persist_storage_state(&mut backend, &StorageState::new(2)),
+            Err(StorageError::FlashVerify)
+        );
+        assert_eq!(restore_latest_storage_state(&backend), Some(old));
+    }
+
+    #[test]
     fn storage_task_policy_waits_for_command_without_pending_snapshot() {
         let persistence = StoragePersistence::new(100, 1_000);
         let policy = StorageTaskPolicy {
@@ -1866,6 +1833,34 @@ mod tests {
         inner: TestBackend,
         fail_next_write: bool,
         write_count: usize,
+    }
+
+    #[derive(Clone)]
+    struct CorruptingBackend {
+        inner: TestBackend,
+    }
+
+    impl CorruptingBackend {
+        fn new() -> Self {
+            Self {
+                inner: TestBackend::empty(),
+            }
+        }
+    }
+
+    impl StorageSlotBackend for CorruptingBackend {
+        fn slot(&self, index: StorageSlotIndex) -> &[u8; STORAGE_IMAGE_LEN] {
+            self.inner.slot(index)
+        }
+
+        fn write_slot(
+            &mut self,
+            index: StorageSlotIndex,
+            mut image: [u8; STORAGE_IMAGE_LEN],
+        ) -> Result<(), StorageError> {
+            image[20] ^= 1;
+            self.inner.write_slot(index, image)
+        }
     }
 
     impl FailOnceBackend {

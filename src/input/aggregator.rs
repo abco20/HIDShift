@@ -11,17 +11,17 @@ struct DeviceInputState {
     keyboard: PhysicalKeyboardState,
     mouse_buttons: MouseButtons,
     consumer: ConsumerState,
-    generation: u32,
+    consumer_generation: u64,
 }
 
 impl DeviceInputState {
-    const fn new(device_id: DeviceId, generation: u32) -> Self {
+    const fn new(device_id: DeviceId) -> Self {
         Self {
             device_id,
             keyboard: PhysicalKeyboardState::new(),
             mouse_buttons: MouseButtons::empty(),
             consumer: ConsumerState::new(),
-            generation,
+            consumer_generation: 0,
         }
     }
 }
@@ -30,7 +30,7 @@ impl DeviceInputState {
 pub struct InputAggregator<const DEVICES: usize> {
     devices: [Option<DeviceInputState>; DEVICES],
     aggregate: PhysicalInputState,
-    next_generation: u32,
+    next_consumer_generation: u64,
 }
 
 impl<const DEVICES: usize> InputAggregator<DEVICES> {
@@ -38,7 +38,7 @@ impl<const DEVICES: usize> InputAggregator<DEVICES> {
         Self {
             devices: [const { None }; DEVICES],
             aggregate: PhysicalInputState::new(),
-            next_generation: 1,
+            next_consumer_generation: 1,
         }
     }
 
@@ -47,8 +47,22 @@ impl<const DEVICES: usize> InputAggregator<DEVICES> {
     }
 
     pub fn apply_frame(&mut self, frame: &StandardInputFrame) -> Result<(), InputError> {
+        // Relative movement is deliberately not persistent aggregator state.
+        // An otherwise empty movement frame must not consume a device slot.
+        let existing_index = device_index(&self.devices, frame.device_id);
+        let existing_buttons = existing_index
+            .and_then(|index| self.devices[index].as_ref())
+            .map(|entry| entry.mouse_buttons)
+            .unwrap_or_else(MouseButtons::empty);
+        let buttons_changed = frame
+            .mouse
+            .is_some_and(|mouse| mouse.buttons != existing_buttons);
+        if frame.keyboard.is_none() && frame.consumer.is_none() && !buttons_changed {
+            return Ok(());
+        }
+
         let mut devices = self.devices.clone();
-        let index = match device_index(&devices, frame.device_id) {
+        let index = match existing_index {
             Some(index) => index,
             None => self
                 .devices
@@ -57,10 +71,7 @@ impl<const DEVICES: usize> InputAggregator<DEVICES> {
                 .ok_or(InputError::DeviceCapacity)?,
         };
 
-        let generation = self.next_generation;
-        let entry =
-            devices[index].get_or_insert(DeviceInputState::new(frame.device_id, generation));
-        entry.generation = generation;
+        let entry = devices[index].get_or_insert(DeviceInputState::new(frame.device_id));
 
         if let Some(keyboard) = &frame.keyboard {
             entry.keyboard.replace_with_frame(keyboard)?;
@@ -70,12 +81,24 @@ impl<const DEVICES: usize> InputAggregator<DEVICES> {
         }
         if let Some(consumer) = frame.consumer {
             entry.consumer.active = consumer.active;
+            entry.consumer_generation = self.next_consumer_generation;
         }
 
-        let aggregate = rebuild_aggregate(&devices)?;
+        let mut aggregate = self.aggregate.clone();
+        if frame.keyboard.is_some() {
+            rebuild_keyboard(&devices, &mut aggregate)?;
+        }
+        if buttons_changed {
+            rebuild_mouse_buttons(&devices, &mut aggregate);
+        }
+        if frame.consumer.is_some() {
+            rebuild_consumer(&devices, &mut aggregate);
+        }
         self.devices = devices;
         self.aggregate = aggregate;
-        self.next_generation = self.next_generation.wrapping_add(1);
+        if frame.consumer.is_some() {
+            self.next_consumer_generation = self.next_consumer_generation.wrapping_add(1);
+        }
         Ok(())
     }
 
@@ -110,7 +133,7 @@ fn rebuild_aggregate(
     devices: &[Option<DeviceInputState>],
 ) -> Result<PhysicalInputState, InputError> {
     let mut aggregate = PhysicalInputState::new();
-    let mut newest_consumer_generation = 0u32;
+    let mut newest_consumer_generation = None;
     for entry in devices.iter().filter_map(|entry| entry.as_ref()) {
         aggregate.keyboard.modifiers |= entry.keyboard.modifiers;
         for key in entry.keyboard.keys().iter().copied() {
@@ -119,12 +142,58 @@ fn rebuild_aggregate(
         aggregate.mouse.buttons = MouseButtons::from_bits_truncate(
             aggregate.mouse.buttons.bits() | entry.mouse_buttons.bits(),
         );
-        if entry.consumer.active.is_some() && entry.generation >= newest_consumer_generation {
+        if entry.consumer.active.is_some()
+            && newest_consumer_generation.is_none_or(|generation| {
+                generation_is_newer_or_equal(entry.consumer_generation, generation)
+            })
+        {
             aggregate.consumer = entry.consumer;
-            newest_consumer_generation = entry.generation;
+            newest_consumer_generation = Some(entry.consumer_generation);
         }
     }
     Ok(aggregate)
+}
+
+fn rebuild_keyboard(
+    devices: &[Option<DeviceInputState>],
+    aggregate: &mut PhysicalInputState,
+) -> Result<(), InputError> {
+    aggregate.keyboard = PhysicalKeyboardState::new();
+    for entry in devices.iter().filter_map(|entry| entry.as_ref()) {
+        aggregate.keyboard.modifiers |= entry.keyboard.modifiers;
+        for key in entry.keyboard.keys().iter().copied() {
+            aggregate.keyboard.press_key(key)?;
+        }
+    }
+    Ok(())
+}
+
+fn rebuild_mouse_buttons(devices: &[Option<DeviceInputState>], aggregate: &mut PhysicalInputState) {
+    aggregate.mouse.buttons = MouseButtons::empty();
+    for entry in devices.iter().filter_map(|entry| entry.as_ref()) {
+        aggregate.mouse.buttons = MouseButtons::from_bits_truncate(
+            aggregate.mouse.buttons.bits() | entry.mouse_buttons.bits(),
+        );
+    }
+}
+
+fn rebuild_consumer(devices: &[Option<DeviceInputState>], aggregate: &mut PhysicalInputState) {
+    aggregate.consumer = ConsumerState::new();
+    let mut newest_generation = None;
+    for entry in devices.iter().filter_map(|entry| entry.as_ref()) {
+        if entry.consumer.active.is_some()
+            && newest_generation.is_none_or(|generation| {
+                generation_is_newer_or_equal(entry.consumer_generation, generation)
+            })
+        {
+            aggregate.consumer = entry.consumer;
+            newest_generation = Some(entry.consumer_generation);
+        }
+    }
+}
+
+const fn generation_is_newer_or_equal(left: u64, right: u64) -> bool {
+    left.wrapping_sub(right) < (1u64 << 63)
 }
 
 impl<const DEVICES: usize> Default for InputAggregator<DEVICES> {
@@ -252,6 +321,91 @@ mod tests {
         assert_eq!(
             aggregator.aggregate().consumer.active,
             Some(ConsumerUsage(0x00e9))
+        );
+    }
+
+    #[test]
+    fn keyboard_and_mouse_frames_do_not_change_consumer_priority() {
+        let mut aggregator = InputAggregator::<4>::new();
+        for (device_id, usage) in [(1, 0x00e9), (2, 0x00cd)] {
+            aggregator
+                .apply_frame(&StandardInputFrame {
+                    device_id: DeviceId(device_id),
+                    keyboard: None,
+                    mouse: None,
+                    consumer: Some(ConsumerFrame {
+                        active: Some(ConsumerUsage(usage)),
+                    }),
+                })
+                .unwrap();
+        }
+
+        aggregator
+            .apply_frame(&StandardInputFrame {
+                device_id: DeviceId(1),
+                keyboard: Some(KeyboardFrame::new(ModifierState::empty())),
+                mouse: Some(MouseFrame {
+                    buttons: MouseButtons::LEFT,
+                    movement: MouseMovement {
+                        x: 1,
+                        y: 0,
+                        wheel: 0,
+                        pan: 0,
+                    },
+                }),
+                consumer: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            aggregator.aggregate().consumer.active,
+            Some(ConsumerUsage(0x00cd))
+        );
+    }
+
+    #[test]
+    fn movement_only_frames_do_not_consume_device_capacity() {
+        let mut aggregator = InputAggregator::<1>::new();
+        for device_id in 1..=8 {
+            aggregator
+                .apply_frame(&StandardInputFrame {
+                    device_id: DeviceId(device_id),
+                    keyboard: None,
+                    mouse: Some(MouseFrame {
+                        buttons: MouseButtons::empty(),
+                        movement: MouseMovement {
+                            x: 1,
+                            y: -1,
+                            wheel: 0,
+                            pan: 0,
+                        },
+                    }),
+                    consumer: None,
+                })
+                .unwrap();
+        }
+        assert!(aggregator.devices.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn consumer_generation_comparison_survives_wrap() {
+        let mut aggregator = InputAggregator::<2>::new();
+        aggregator.next_consumer_generation = u64::MAX;
+        for (device_id, usage) in [(1, 0x00e9), (2, 0x00cd)] {
+            aggregator
+                .apply_frame(&StandardInputFrame {
+                    device_id: DeviceId(device_id),
+                    keyboard: None,
+                    mouse: None,
+                    consumer: Some(ConsumerFrame {
+                        active: Some(ConsumerUsage(usage)),
+                    }),
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            aggregator.aggregate().consumer.active,
+            Some(ConsumerUsage(0x00cd))
         );
     }
 

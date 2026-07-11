@@ -7,6 +7,9 @@ on:
 permissions:
   contents: read
 
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
 jobs:
   host:
     runs-on: ubuntu-latest
@@ -28,3 +31,39 @@ jobs:
       - run: cargo fmt --check --manifest-path tools/hidshift-client/Cargo.toml
       - run: cargo fmt --check --manifest-path tools/hidshiftctl/Cargo.toml
       - run: cargo fmt --check --manifest-path web/Cargo.toml
+
+  firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ESP Xtensa Rust toolchain
+        uses: esp-rs/xtensa-toolchain@v1.7.0
+        with:
+          buildtargets: esp32s3
+          default: false
+          ldproxy: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: esp32s3
+      - name: Build production firmware
+        run: >-
+          cargo +esp build --locked -Zbuild-std=core,alloc --release
+          --bin firmware --features usb-host,ble-hid,storage
+          --target xtensa-esp32s3-none-elf
+      - name: Record firmware size
+        run: stat --printf='firmware_bytes=%s\n' target/xtensa-esp32s3-none-elf/release/firmware
+      - name: Check diagnostic firmware
+        run: >-
+          cargo +esp check --locked -Zbuild-std=core,alloc
+          --bin firmware --features usb-host,ble-hid,storage,diagnostic-input
+          --target xtensa-esp32s3-none-elf
+      - name: Check without storage
+        run: >-
+          cargo +esp check --locked -Zbuild-std=core,alloc
+          --bin firmware --features usb-host,ble-hid
+          --target xtensa-esp32s3-none-elf
+      - name: Check without BLE HID
+        run: >-
+          cargo +esp check --locked -Zbuild-std=core,alloc
+          --bin firmware --features usb-host,storage
+          --target xtensa-esp32s3-none-elf

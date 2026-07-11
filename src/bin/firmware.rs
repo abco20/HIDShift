@@ -23,9 +23,11 @@ use esp32s3_platform::button_task::control_task;
 use esp32s3_platform::storage_task::storage_command_task;
 use esp32s3_platform::usb_host_task::usb_input_task;
 use hidshift::DefaultRuntimeOwner;
+#[cfg(not(feature = "ble-hid"))]
 use hidshift::ble_notify::BleNotificationSink;
 #[cfg(not(feature = "ble-hid"))]
 use hidshift::ble_notify::dispatch_ble_task_command;
+use hidshift::mouse_accumulator::MouseReportAccumulator;
 #[cfg(all(feature = "ble-hid", feature = "storage"))]
 use hidshift::runtime::RUNTIME_HOSTS_MAX;
 use hidshift::runtime::driver::RuntimeTaskSink;
@@ -159,6 +161,10 @@ fn main() -> ! {
             usb: USB_COMMAND_CHANNEL.sender(),
             storage: STORAGE_COMMAND_CHANNEL.sender(),
             status: STATUS_COMMAND_CHANNEL.sender(),
+            mouse: MouseReportAccumulator::new(),
+            pending_usb: [None; RUNTIME_USB_COMMAND_QUEUE_CAPACITY],
+            pending_status: None,
+            status_updates_dropped: 0,
         };
 
         spawn_or_reset(
@@ -336,21 +342,24 @@ async fn runtime_owner_task(
     log::info!("firmware: runtime owner task boot");
 
     loop {
+        owner.observe_transport_metrics(
+            receiver.len(),
+            sink.mouse.stats(),
+            sink.status_updates_dropped,
+        );
         #[cfg(all(feature = "ble-hid", feature = "storage"))]
         let message = match select(receiver.receive(), barrier_request.receive()).await {
             Either::First(message) => message,
             Either::Second(active_host_mask) => {
-                while let Ok(message) = receiver.try_receive() {
-                    process_runtime_message_state_only(&mut owner, &message);
+                if let Err(error) = owner.prepare_for_quiesce() {
+                    log::error!("firmware: runtime quiesce preparation failed {:?}", error);
                 }
+                sink.discard_transient_input();
                 for host_index in 0..RUNTIME_HOSTS_MAX {
                     if active_host_mask & (1usize << host_index) != 0 {
-                        process_runtime_message_state_only(
-                            &mut owner,
-                            &hidshift::ble_runtime::disconnected_message(hidshift::HostId(
-                                (host_index + 1) as u8,
-                            )),
-                        );
+                        owner.mark_host_disconnected_for_quiesce(hidshift::HostId(
+                            (host_index + 1) as u8,
+                        ));
                     }
                 }
                 let runtime = owner.runtime();
@@ -377,17 +386,6 @@ async fn runtime_owner_task(
     }
 }
 
-#[cfg(all(feature = "ble-hid", feature = "storage"))]
-fn process_runtime_message_state_only(
-    owner: &mut DefaultRuntimeOwner,
-    message: &RuntimeInputMessage,
-) {
-    log::debug!("firmware: runtime quiesce input {:?}", message);
-    if let Err(error) = owner.process_message_state_only(message) {
-        log::error!("firmware: runtime quiesce state error {:?}", error);
-    }
-}
-
 async fn process_runtime_message(
     owner: &mut DefaultRuntimeOwner,
     sink: &mut ChannelTaskSink,
@@ -395,17 +393,22 @@ async fn process_runtime_message(
 ) {
     log::trace!("firmware: runtime_input {:?}", message);
 
-    let queues = match owner.process_message(&message) {
-        Ok(queues) => queues,
+    let next_owner = match owner.staged_message(&message) {
+        Ok(owner) => owner,
         Err(error) => {
             log::error!("firmware: runtime owner error {:?}", error);
             return;
         }
     };
 
-    if let Err(error) = sink.dispatch_runtime_queues(queues).await {
+    if let Err(error) = sink
+        .dispatch_runtime_queues(next_owner.default_queues())
+        .await
+    {
         log::error!("firmware: runtime drive error {:?}", error);
+        return;
     }
+    *owner = next_owner;
 }
 
 #[embassy_executor::task]
@@ -489,7 +492,7 @@ async fn status_command_task(
                 }
             }
         } else {
-            log::info!("firmware: status_command {:?}", command);
+            log::debug!("firmware: status_command {:?}", command);
         }
     }
 }
@@ -552,13 +555,26 @@ struct ChannelTaskSink {
         StatusTaskCommand,
         RUNTIME_STATUS_COMMAND_QUEUE_CAPACITY,
     >,
+    mouse: MouseReportAccumulator<4>,
+    pending_usb: [Option<UsbTaskCommand>; RUNTIME_USB_COMMAND_QUEUE_CAPACITY],
+    pending_status: Option<StatusTaskCommand>,
+    status_updates_dropped: u32,
 }
 
 impl ChannelTaskSink {
+    #[cfg(all(feature = "ble-hid", feature = "storage"))]
+    fn discard_transient_input(&mut self) {
+        self.mouse.discard_all();
+    }
+
     async fn dispatch_runtime_queues(
         &mut self,
         queues: &hidshift::DefaultRuntimeCommandQueues,
     ) -> Result<(), ChannelTaskSendError> {
+        self.flush_mouse_accumulator();
+        self.flush_usb_commands();
+        self.flush_status_snapshot();
+        self.ensure_capacity(queues)?;
         for command in queues.ble.iter().copied() {
             self.send_ble_with_policy(command).await?;
         }
@@ -571,6 +587,51 @@ impl ChannelTaskSink {
         for command in queues.status.iter().copied() {
             self.send_status_with_policy(command).await?;
         }
+        self.flush_mouse_accumulator();
+        self.flush_usb_commands();
+        self.flush_status_snapshot();
+        Ok(())
+    }
+
+    fn ensure_capacity(
+        &self,
+        queues: &hidshift::DefaultRuntimeCommandQueues,
+    ) -> Result<(), ChannelTaskSendError> {
+        let control = queues
+            .ble
+            .iter()
+            .filter(|command| command.lane() == BleCommandLane::Control)
+            .count();
+        let notify = queues.ble.len() - control;
+        let coalesced_mouse = queues
+            .ble
+            .iter()
+            .filter(|command| {
+                matches!(
+                    command,
+                    BleTaskCommand::Notify {
+                        report: hidshift::reports::BleHidReport::Mouse(_),
+                        reason: hidshift::NotifyReason::Input,
+                        ..
+                    }
+                )
+            })
+            .count();
+        let notify = notify.saturating_sub(coalesced_mouse);
+        if self.ble_control.free_capacity() < control || self.ble_notify.free_capacity() < notify {
+            return Err(ChannelTaskSendError::BleQueueFull);
+        }
+        if self.storage.free_capacity() < queues.storage.len() {
+            return Err(ChannelTaskSendError::StorageQueueFull);
+        }
+        let required_status = queues
+            .status
+            .iter()
+            .filter(|command| command.class() != hidshift::CommandClass::BestEffort)
+            .count();
+        if self.status.free_capacity() < required_status {
+            return Err(ChannelTaskSendError::StatusQueueFull);
+        }
         Ok(())
     }
 
@@ -578,6 +639,28 @@ impl ChannelTaskSink {
         &mut self,
         command: BleTaskCommand,
     ) -> Result<(), ChannelTaskSendError> {
+        if let BleTaskCommand::Notify {
+            host_id,
+            report: hidshift::reports::BleHidReport::Mouse(report),
+            reason: hidshift::NotifyReason::Input,
+        } = command
+        {
+            let _ = self.mouse.push(host_id, report);
+            self.flush_mouse_accumulator();
+            return Ok(());
+        }
+        if let BleTaskCommand::Notify {
+            host_id,
+            reason:
+                hidshift::NotifyReason::InputRelease
+                | hidshift::NotifyReason::TargetSwitchRelease
+                | hidshift::NotifyReason::UsbDeviceRemovedRelease
+                | hidshift::NotifyReason::SafetyRelease,
+            ..
+        } = command
+        {
+            self.mouse.discard(host_id);
+        }
         match command.lane() {
             BleCommandLane::Control => match command.class() {
                 hidshift::CommandClass::Critical => {
@@ -610,22 +693,55 @@ impl ChannelTaskSink {
         }
     }
 
+    fn flush_mouse_accumulator(&mut self) {
+        for host in 1..=4 {
+            if self.ble_notify.free_capacity() == 0 {
+                break;
+            }
+            let host_id = hidshift::HostId(host);
+            let Some(report) = self.mouse.take_next(host_id) else {
+                continue;
+            };
+            let command = BleTaskCommand::Notify {
+                host_id,
+                report: hidshift::reports::BleHidReport::Mouse(report),
+                reason: hidshift::NotifyReason::Input,
+            };
+            if self.ble_notify.try_send(command).is_err() {
+                let _ = self.mouse.push(host_id, report);
+                break;
+            }
+        }
+    }
+
     async fn send_usb_with_policy(
         &mut self,
         command: UsbTaskCommand,
     ) -> Result<(), ChannelTaskSendError> {
-        match command.class() {
-            hidshift::CommandClass::Critical => {
-                self.usb.send(command).await;
-                Ok(())
+        let slot = self
+            .pending_usb
+            .iter()
+            .position(|pending| {
+                pending.is_some_and(|pending| pending.interface_id == command.interface_id)
+            })
+            .or_else(|| self.pending_usb.iter().position(Option::is_none))
+            .ok_or(ChannelTaskSendError::UsbQueueFull)?;
+        self.pending_usb[slot] = Some(command);
+        self.flush_usb_commands();
+        Ok(())
+    }
+
+    fn flush_usb_commands(&mut self) {
+        for pending in &mut self.pending_usb {
+            if self.usb.free_capacity() == 0 {
+                break;
             }
-            hidshift::CommandClass::Realtime => self
-                .usb
-                .try_send(command)
-                .map_err(ChannelTaskSendError::from),
-            hidshift::CommandClass::BestEffort => {
-                let _ = self.usb.try_send(command);
-                Ok(())
+            let Some(command) = pending.take() else {
+                continue;
+            };
+            if self.usb.try_send(command).is_err() {
+                *pending = Some(command);
+                break;
             }
         }
     }
@@ -654,6 +770,14 @@ impl ChannelTaskSink {
         &mut self,
         command: StatusTaskCommand,
     ) -> Result<(), ChannelTaskSendError> {
+        if command.management.is_none() {
+            if self.pending_status.is_some() {
+                self.status_updates_dropped = self.status_updates_dropped.saturating_add(1);
+            }
+            self.pending_status = Some(command);
+            self.flush_status_snapshot();
+            return Ok(());
+        }
         match command.class() {
             hidshift::CommandClass::Critical => {
                 self.status.send(command).await;
@@ -669,11 +793,24 @@ impl ChannelTaskSink {
             }
         }
     }
+
+    fn flush_status_snapshot(&mut self) {
+        if self.status.free_capacity() == 0 {
+            return;
+        }
+        let Some(command) = self.pending_status.take() else {
+            return;
+        };
+        if self.status.try_send(command).is_err() {
+            self.pending_status = Some(command);
+        }
+    }
 }
 
-#[allow(dead_code)]
+#[cfg(not(feature = "ble-hid"))]
 struct LoggingBleNotificationSink;
 
+#[cfg(not(feature = "ble-hid"))]
 impl BleNotificationSink for LoggingBleNotificationSink {
     type Error = core::convert::Infallible;
 

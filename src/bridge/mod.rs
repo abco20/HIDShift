@@ -8,7 +8,7 @@ use crate::input::{
 };
 use crate::reports::{
     BleConsumerReport, BleHidReport, BleKeyboard6KroReport, BleKeyboardLedOutputReport,
-    BleKeyboardOutputError, BleMouseReport, ReportKind,
+    BleKeyboardOutputError, BleMouseReport, KEYBOARD_6KRO_KEY_CAPACITY, ReportKind,
 };
 use crate::storage::{StorageError, StorageState, StoredBond};
 
@@ -41,6 +41,23 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
         &self.state
     }
 
+    /// Quiesce is the one path that intentionally changes only BLE session
+    /// state. Normal runtime inputs must continue through `handle_event` so
+    /// their actions cannot be discarded.
+    pub fn mark_host_disconnected_for_quiesce(&mut self, host_id: HostId) {
+        self.state.hosts.on_disconnected(host_id);
+    }
+
+    pub fn prepare_for_quiesce(&mut self) -> Result<(), BridgeError> {
+        self.state
+            .suppression
+            .keyboard
+            .capture_from(&self.state.input.keyboard)?;
+        self.state.suppression.mouse_buttons = self.state.input.mouse.buttons;
+        self.state.suppression.consumer = self.state.input.consumer;
+        Ok(())
+    }
+
     pub fn set_discovered_host_name(
         &mut self,
         host_id: HostId,
@@ -54,8 +71,19 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
         event: BridgeEvent,
         out: &mut heapless::Vec<BridgeAction, ACTIONS>,
     ) -> Result<(), BridgeError> {
-        out.clear();
+        let mut next = self.clone();
+        let mut next_actions = heapless::Vec::new();
+        next.handle_event_in_place(event, &mut next_actions)?;
+        *self = next;
+        *out = next_actions;
+        Ok(())
+    }
 
+    pub(crate) fn handle_event_in_place<const ACTIONS: usize>(
+        &mut self,
+        event: BridgeEvent,
+        out: &mut heapless::Vec<BridgeAction, ACTIONS>,
+    ) -> Result<(), BridgeError> {
         match event {
             BridgeEvent::InputFrame(frame) => self.handle_input_frame(frame, out),
             BridgeEvent::HostConnected { host_id } => {
@@ -148,6 +176,7 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
         frame: StandardInputFrame,
         out: &mut heapless::Vec<BridgeAction, ACTIONS>,
     ) -> Result<(), BridgeError> {
+        let previous_input = self.state.input.clone();
         self.state.input_devices.apply_frame(&frame)?;
         let aggregate = self.state.input_devices.aggregate().clone();
 
@@ -159,6 +188,19 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
                 .keyboard
                 .apply_frame(&keyboard, &mut self.state.suppression.keyboard)?;
 
+            let suppressed = self
+                .state
+                .suppression
+                .keyboard
+                .suppress_visible_after(&self.state.input.keyboard, KEYBOARD_6KRO_KEY_CAPACITY)?;
+            if suppressed != 0 {
+                self.state.stats.keyboard_reports_truncated = self
+                    .state
+                    .stats
+                    .keyboard_reports_truncated
+                    .saturating_add(1);
+            }
+
             if let Some(host_id) = self.ready_active_host(ReportKind::Keyboard) {
                 let visible = self
                     .state
@@ -166,19 +208,19 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
                     .keyboard
                     .visible_against(&self.state.suppression.keyboard);
                 let build = BleKeyboard6KroReport::from_visible_state(&visible);
-                if build.truncated {
-                    self.state.stats.keyboard_reports_truncated = self
-                        .state
-                        .stats
-                        .keyboard_reports_truncated
-                        .saturating_add(1);
-                }
+                debug_assert!(!build.truncated);
                 push_action(
                     out,
                     BridgeAction::BleNotify {
                         host_id,
                         report: BleHidReport::Keyboard(build.report),
-                        reason: NotifyReason::Input,
+                        reason: if !previous_input.keyboard.keys().is_empty()
+                            && self.state.input.keyboard.keys().is_empty()
+                        {
+                            NotifyReason::InputRelease
+                        } else {
+                            NotifyReason::Input
+                        },
                     },
                 )?;
             } else {
@@ -204,6 +246,9 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
                 .buttons
                 .without(self.state.suppression.mouse_buttons);
             if let Some(host_id) = self.ready_active_host(ReportKind::Mouse) {
+                let released_buttons = previous_input.mouse.buttons.bits()
+                    & !self.state.input.mouse.buttons.bits()
+                    != 0;
                 push_action(
                     out,
                     BridgeAction::BleNotify {
@@ -212,7 +257,11 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
                             visible_buttons,
                             mouse.movement,
                         )),
-                        reason: NotifyReason::Input,
+                        reason: if released_buttons {
+                            NotifyReason::InputRelease
+                        } else {
+                            NotifyReason::Input
+                        },
                     },
                 )?;
             } else if mouse.movement != MouseMovement::neutral() {
@@ -243,7 +292,13 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
                     BridgeAction::BleNotify {
                         host_id,
                         report: BleHidReport::Consumer(report),
-                        reason: NotifyReason::Input,
+                        reason: if previous_input.consumer.active.is_some()
+                            && self.state.input.consumer.active.is_none()
+                        {
+                            NotifyReason::InputRelease
+                        } else {
+                            NotifyReason::Input
+                        },
                     },
                 )?;
             }
@@ -257,19 +312,7 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
         target: HostId,
         out: &mut heapless::Vec<BridgeAction, ACTIONS>,
     ) -> Result<(), BridgeError> {
-        if let Some(old_host) = self.state.hosts.active_target() {
-            self.push_release_reports(old_host, NotifyReason::TargetSwitchRelease, out)?;
-        }
-
-        self.state
-            .suppression
-            .keyboard
-            .capture_from(&self.state.input.keyboard)?;
-        self.state.suppression.mouse_buttons = self.state.input.mouse.buttons;
-        self.state.suppression.consumer = self.state.input.consumer;
-        self.state.hosts.set_active_target(target)?;
-        self.apply_active_host_leds(out)?;
-        push_action(out, BridgeAction::PersistProfiles)?;
+        self.activate_target(target, NotifyReason::TargetSwitchRelease, out)?;
         self.push_status(out)
     }
 
@@ -278,7 +321,7 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
         host_id: HostId,
         out: &mut heapless::Vec<BridgeAction, ACTIONS>,
     ) -> Result<(), BridgeError> {
-        self.state.hosts.set_active_target(host_id)?;
+        self.activate_target(host_id, NotifyReason::TargetSwitchRelease, out)?;
         if let Some(previous) = self.state.pairable_host.replace(host_id)
             && previous != host_id
         {
@@ -286,6 +329,31 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
         }
         push_action(out, BridgeAction::AllowPairing { host_id })?;
         self.push_status(out)
+    }
+
+    fn activate_target<const ACTIONS: usize>(
+        &mut self,
+        target: HostId,
+        release_reason: NotifyReason,
+        out: &mut heapless::Vec<BridgeAction, ACTIONS>,
+    ) -> Result<bool, BridgeError> {
+        if self.state.hosts.active_target() == Some(target) {
+            return Ok(false);
+        }
+        if let Some(old_host) = self.state.hosts.active_target() {
+            self.push_release_reports(old_host, release_reason, out)?;
+        }
+        self.state
+            .suppression
+            .keyboard
+            .capture_from(&self.state.input.keyboard)?;
+        self.state.suppression.mouse_buttons = self.state.input.mouse.buttons;
+        self.state.suppression.consumer = self.state.input.consumer;
+        self.state.hosts.set_active_target(target)?;
+        push_action(out, BridgeAction::ActivateInput { host_id: target })?;
+        self.apply_active_host_leds(out)?;
+        push_action(out, BridgeAction::PersistProfiles)?;
+        Ok(true)
     }
 
     fn expire_pairing_mode<const ACTIONS: usize>(
@@ -754,6 +822,9 @@ pub enum BridgeAction {
         host_id: HostId,
         bond: Option<StoredBond>,
     },
+    ActivateInput {
+        host_id: HostId,
+    },
     PersistProfiles,
     StatusChanged(BridgeStatus),
 }
@@ -761,6 +832,7 @@ pub enum BridgeAction {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NotifyReason {
     Input,
+    InputRelease,
     TargetSwitchRelease,
     UsbDeviceRemovedRelease,
     SafetyRelease,
@@ -1681,9 +1753,10 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(
-            actions.as_slice()[0],
-            BridgeAction::RejectPairing { host_id: HOST_A }
+        assert!(
+            actions
+                .as_slice()
+                .contains(&BridgeAction::RejectPairing { host_id: HOST_A })
         );
         assert!(
             actions
@@ -1801,7 +1874,9 @@ mod tests {
     #[test]
     fn restore_storage_state_errors_when_profile_count_exceeds_bridge_capacity() {
         let mut stored = StorageState::new(11);
-        stored.push_host(StoredHostProfile::empty()).unwrap();
+        let mut first = StoredHostProfile::empty();
+        first.host_id = HOST_A;
+        stored.push_host(first).unwrap();
         let mut second = StoredHostProfile::empty();
         second.host_id = HOST_B;
         stored.push_host(second).unwrap();
@@ -1856,6 +1931,52 @@ mod tests {
             Some(ConsumerUsage(0x00ea))
         );
         assert_eq!(bridge.state().stats.mouse_movements_dropped, 1);
+    }
+
+    #[test]
+    fn seventh_key_stays_suppressed_until_its_physical_release() {
+        let mut bridge = ready_bridge();
+        let mut actions = heapless::Vec::<BridgeAction, 4>::new();
+        bridge
+            .handle_event(
+                BridgeEvent::InputFrame(InputFrame::Standard(keyboard_frame(&[
+                    0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
+                ]))),
+                &mut actions,
+            )
+            .unwrap();
+        let first = match actions[0] {
+            BridgeAction::BleNotify {
+                report: BleHidReport::Keyboard(report),
+                ..
+            } => report,
+            _ => panic!("expected keyboard notification"),
+        };
+        assert_eq!(first.as_bytes(), &[0, 0, 4, 5, 6, 7, 8, 9]);
+
+        bridge
+            .handle_event(
+                BridgeEvent::InputFrame(InputFrame::Standard(keyboard_frame(&[
+                    0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
+                ]))),
+                &mut actions,
+            )
+            .unwrap();
+        let after_release = match actions[0] {
+            BridgeAction::BleNotify {
+                report: BleHidReport::Keyboard(report),
+                ..
+            } => report,
+            _ => panic!("expected keyboard notification"),
+        };
+        assert_eq!(after_release.as_bytes(), &[0, 0, 5, 6, 7, 8, 9, 0]);
+        assert!(
+            bridge
+                .state()
+                .suppression
+                .keyboard
+                .contains_key(KeyUsage(0x0a))
+        );
     }
 
     fn ready_bridge() -> Bridge<2> {

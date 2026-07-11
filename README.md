@@ -58,6 +58,9 @@ Actions are applied when the GPIO0 button is released.
 
 The pairing window remains open for 60 seconds or until pairing succeeds.
 
+The BLE keyboard report remains boot-compatible 6KRO. When more than six keys
+are held, overflow keys are ignored until they are released.
+
 ## Management
 
 HIDShift can be managed over Bluetooth LE or a serial connection. Management

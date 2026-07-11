@@ -33,8 +33,12 @@ pub mod owner;
 pub const RUNTIME_HOSTS_MAX: usize = STORED_HOSTS_MAX;
 pub const RUNTIME_USB_INTERFACES_MAX: usize = 8;
 pub const RUNTIME_HISTORY_CAPACITY: usize = 16;
-pub const RUNTIME_BRIDGE_ACTION_CAPACITY: usize = 12;
-pub const RUNTIME_COMMAND_CAPACITY: usize = 12;
+pub const RELEASE_REPORTS_MAX: usize = 3;
+pub const USB_LED_ACTIONS_MAX: usize = RUNTIME_USB_INTERFACES_MAX;
+pub const TARGET_CONTROL_ACTIONS_MAX: usize = 4;
+pub const RUNTIME_BRIDGE_ACTION_CAPACITY: usize =
+    RELEASE_REPORTS_MAX + USB_LED_ACTIONS_MAX + TARGET_CONTROL_ACTIONS_MAX + 1;
+pub const RUNTIME_COMMAND_CAPACITY: usize = RUNTIME_BRIDGE_ACTION_CAPACITY;
 pub const RUNTIME_BLE_EVENT_CAPACITY: usize = 2;
 pub const RUNTIME_INPUT_QUEUE_CAPACITY: usize = 16;
 pub const RUNTIME_BLE_GATT_WRITE_MAX_LEN: usize = 2;
@@ -139,6 +143,8 @@ pub struct BridgeRuntime<const HOSTS: usize, const USB_INTERFACES: usize> {
     host_last_disconnected_seconds: [u32; HOSTS],
     host_last_disconnect_reason: [u8; HOSTS],
     pending_target_switch: Option<PendingTargetSwitch>,
+    status_sequence: u64,
+    counters: RuntimeCounters,
 }
 
 impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_INTERFACES> {
@@ -167,6 +173,8 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             host_last_disconnected_seconds: [0; HOSTS],
             host_last_disconnect_reason: [0; HOSTS],
             pending_target_switch: None,
+            status_sequence: 0,
+            counters: RuntimeCounters::new(),
         }
     }
 
@@ -180,6 +188,57 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
 
     pub const fn pairing_mode(&self) -> Option<PairingModeState> {
         self.pairing_mode
+    }
+
+    pub fn mark_host_disconnected_for_quiesce(&mut self, host_id: HostId) {
+        self.bridge.mark_host_disconnected_for_quiesce(host_id);
+    }
+
+    pub fn prepare_for_quiesce(&mut self) -> Result<(), RuntimeError> {
+        self.bridge.prepare_for_quiesce()?;
+        Ok(())
+    }
+
+    pub const fn counters(&self) -> RuntimeCounters {
+        self.counters
+    }
+
+    pub fn observe_outbox_usage(&mut self, ble: usize, usb: usize, storage: usize, status: usize) {
+        self.counters.ble_control_queue_high_watermark = self
+            .counters
+            .ble_control_queue_high_watermark
+            .max(ble.min(u16::MAX as usize) as u16);
+        self.counters.ble_notify_queue_high_watermark = self
+            .counters
+            .ble_notify_queue_high_watermark
+            .max(ble.min(u16::MAX as usize) as u16);
+        self.counters.usb_command_queue_high_watermark = self
+            .counters
+            .usb_command_queue_high_watermark
+            .max(usb.min(u16::MAX as usize) as u16);
+        self.counters.storage_queue_high_watermark = self
+            .counters
+            .storage_queue_high_watermark
+            .max(storage.min(u16::MAX as usize) as u16);
+        self.counters.status_queue_high_watermark = self
+            .counters
+            .status_queue_high_watermark
+            .max(status.min(u16::MAX as usize) as u16);
+    }
+
+    pub fn observe_transport_metrics(
+        &mut self,
+        runtime_input_depth: usize,
+        mouse: crate::mouse_accumulator::MouseAccumulatorStats,
+        status_updates_dropped: u32,
+    ) {
+        self.counters.runtime_input_queue_high_watermark = self
+            .counters
+            .runtime_input_queue_high_watermark
+            .max(runtime_input_depth.min(u16::MAX as usize) as u16);
+        self.counters.mouse_reports_coalesced = mouse.reports_coalesced;
+        self.counters.mouse_movement_saturated = mouse.movement_saturated;
+        self.counters.status_updates_dropped = status_updates_dropped;
     }
 
     pub fn storage_state(&self) -> Result<StorageState, StorageError> {
@@ -224,6 +283,23 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
     }
 
     pub fn handle_input<const COMMANDS: usize, const ACTIONS: usize, const EVENTS: usize>(
+        &mut self,
+        input: RuntimeInput<'_>,
+        commands: &mut heapless::Vec<RuntimeCommand, COMMANDS>,
+    ) -> Result<(), RuntimeError> {
+        let mut next = self.clone();
+        let mut next_commands = heapless::Vec::new();
+        next.handle_input_in_place::<COMMANDS, ACTIONS, EVENTS>(input, &mut next_commands)?;
+        *self = next;
+        *commands = next_commands;
+        Ok(())
+    }
+
+    pub(crate) fn handle_input_in_place<
+        const COMMANDS: usize,
+        const ACTIONS: usize,
+        const EVENTS: usize,
+    >(
         &mut self,
         input: RuntimeInput<'_>,
         commands: &mut heapless::Vec<RuntimeCommand, COMMANDS>,
@@ -977,7 +1053,7 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         self.observe_bridge_event(&event);
         let persist_priority = storage_persist_priority_for_event(&event);
         let mut actions = heapless::Vec::<BridgeAction, ACTIONS>::new();
-        self.bridge.handle_event(event, &mut actions)?;
+        self.bridge.handle_event_in_place(event, &mut actions)?;
 
         for action in actions {
             self.dispatch_bridge_action(action, persist_priority, commands)?;
@@ -1150,7 +1226,23 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             }
             RuntimeDiagnosticsEvent::BleNotifyFailed => {
                 self.diagnostics.ble_notify_failure_count =
-                    self.diagnostics.ble_notify_failure_count.saturating_add(1)
+                    self.diagnostics.ble_notify_failure_count.saturating_add(1);
+                self.counters.ble_notify_dropped =
+                    self.counters.ble_notify_dropped.saturating_add(1);
+            }
+            RuntimeDiagnosticsEvent::BleNotifyTimedOut { critical_release } => {
+                self.diagnostics.ble_notify_failure_count =
+                    self.diagnostics.ble_notify_failure_count.saturating_add(1);
+                self.counters.ble_notify_timeouts =
+                    self.counters.ble_notify_timeouts.saturating_add(1);
+                if critical_release {
+                    self.counters.critical_release_failures =
+                        self.counters.critical_release_failures.saturating_add(1);
+                }
+            }
+            RuntimeDiagnosticsEvent::UsbLedWriteTimedOut => {
+                self.counters.usb_led_write_timeouts =
+                    self.counters.usb_led_write_timeouts.saturating_add(1);
             }
             RuntimeDiagnosticsEvent::UsbError => {
                 self.diagnostics.usb_error_count =
@@ -1198,6 +1290,10 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                 commands,
                 RuntimeCommand::BleCommand(BleTaskCommand::ClearBond { host_id, bond }),
             ),
+            BridgeAction::ActivateInput { host_id } => push_command(
+                commands,
+                RuntimeCommand::BleCommand(BleTaskCommand::ActivateInput { host_id }),
+            ),
             BridgeAction::UsbSetKeyboardLeds {
                 interface_id,
                 device_id,
@@ -1227,8 +1323,29 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                 if status.pairable_host.is_none() {
                     self.pairing_mode = None;
                 }
-                push_command(commands, RuntimeCommand::StatusChanged(status))
+                let snapshot = self.next_status_snapshot(status);
+                push_command(commands, RuntimeCommand::StatusChanged(snapshot))
             }
+        }
+    }
+
+    fn next_status_snapshot(&mut self, status: BridgeStatus) -> StatusSnapshot {
+        self.status_sequence = self.status_sequence.wrapping_add(1);
+        let mut connected_hosts = 0u8;
+        for host in self.bridge.state().hosts.hosts().iter().flatten() {
+            if host.connected && (1..=8).contains(&host.host_id.0) {
+                connected_hosts |= 1 << (host.host_id.0 - 1);
+            }
+        }
+        StatusSnapshot {
+            sequence: self.status_sequence,
+            active_host: status.active_target,
+            connected_hosts,
+            pairing_host: status.pairable_host,
+            usb_interface_count: self.usb_interfaces.iter().flatten().count() as u8,
+            quiescing: false,
+            bridge_stats: self.bridge.state().stats,
+            runtime_counters: self.counters,
         }
     }
 
@@ -1317,8 +1434,95 @@ pub enum RuntimeDiagnosticsEvent {
     Brownout,
     BleDisconnected { host_id: HostId, reason: u8 },
     BleNotifyFailed,
+    BleNotifyTimedOut { critical_release: bool },
+    UsbLedWriteTimedOut,
     UsbError,
     FlashWrite { success: bool },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RuntimeCounters {
+    pub runtime_input_queue_high_watermark: u16,
+    pub ble_control_queue_high_watermark: u16,
+    pub ble_notify_queue_high_watermark: u16,
+    pub usb_command_queue_high_watermark: u16,
+    pub storage_queue_high_watermark: u16,
+    pub status_queue_high_watermark: u16,
+    pub ble_notify_dropped: u32,
+    pub ble_notify_timeouts: u32,
+    pub critical_release_failures: u32,
+    pub mouse_reports_coalesced: u32,
+    pub mouse_movement_saturated: u32,
+    pub runtime_input_dropped: u32,
+    pub status_updates_dropped: u32,
+    pub usb_led_write_timeouts: u32,
+    pub runtime_processing_max_us: u32,
+    pub usb_to_ble_latency_max_us: u32,
+    pub ble_notify_max_us: u32,
+}
+
+impl RuntimeCounters {
+    pub const fn new() -> Self {
+        Self {
+            runtime_input_queue_high_watermark: 0,
+            ble_control_queue_high_watermark: 0,
+            ble_notify_queue_high_watermark: 0,
+            usb_command_queue_high_watermark: 0,
+            storage_queue_high_watermark: 0,
+            status_queue_high_watermark: 0,
+            ble_notify_dropped: 0,
+            ble_notify_timeouts: 0,
+            critical_release_failures: 0,
+            mouse_reports_coalesced: 0,
+            mouse_movement_saturated: 0,
+            runtime_input_dropped: 0,
+            status_updates_dropped: 0,
+            usb_led_write_timeouts: 0,
+            runtime_processing_max_us: 0,
+            usb_to_ble_latency_max_us: 0,
+            ble_notify_max_us: 0,
+        }
+    }
+}
+
+impl Default for RuntimeCounters {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StatusSnapshot {
+    pub sequence: u64,
+    pub active_host: Option<HostId>,
+    pub connected_hosts: u8,
+    pub pairing_host: Option<HostId>,
+    pub usb_interface_count: u8,
+    pub quiescing: bool,
+    pub bridge_stats: crate::bridge::BridgeStats,
+    pub runtime_counters: RuntimeCounters,
+}
+
+impl StatusSnapshot {
+    pub const fn empty() -> Self {
+        Self {
+            sequence: 0,
+            active_host: None,
+            connected_hosts: 0,
+            pairing_host: None,
+            usb_interface_count: 0,
+            quiescing: false,
+            bridge_stats: crate::bridge::BridgeStats::new(),
+            runtime_counters: RuntimeCounters::new(),
+        }
+    }
+
+    pub const fn bridge_status(self) -> BridgeStatus {
+        BridgeStatus {
+            active_target: self.active_host,
+            pairable_host: self.pairing_host,
+        }
+    }
 }
 
 pub const PAIRING_MODE_TIMEOUT_MS: u64 = 60_000;
@@ -1349,7 +1553,7 @@ pub enum RuntimeCommand {
         state: StorageState,
         priority: StoragePersistPriority,
     },
-    StatusChanged(BridgeStatus),
+    StatusChanged(StatusSnapshot),
     ManagementResponse {
         destination: ManagementDestination,
         response: ManagementResponse,
@@ -1386,6 +1590,9 @@ pub enum BleTaskCommand {
         host_id: HostId,
         bond: Option<StoredBond>,
     },
+    ActivateInput {
+        host_id: HostId,
+    },
     ManagementResponse {
         host_id: HostId,
         response: ManagementResponse,
@@ -1395,10 +1602,15 @@ pub enum BleTaskCommand {
 impl BleTaskCommand {
     pub const fn lane(self) -> BleCommandLane {
         match self {
-            Self::Notify { .. } => BleCommandLane::Notify,
+            Self::Notify {
+                reason: NotifyReason::Input,
+                ..
+            } => BleCommandLane::Notify,
+            Self::Notify { .. } => BleCommandLane::Control,
             Self::AllowPairing { .. }
             | Self::RejectPairing { .. }
             | Self::ClearBond { .. }
+            | Self::ActivateInput { .. }
             | Self::ManagementResponse { .. } => BleCommandLane::Control,
         }
     }
@@ -1406,7 +1618,8 @@ impl BleTaskCommand {
     pub const fn class(self) -> CommandClass {
         match self {
             Self::Notify { reason, .. } => match reason {
-                NotifyReason::Input
+                NotifyReason::Input => CommandClass::Realtime,
+                NotifyReason::InputRelease
                 | NotifyReason::TargetSwitchRelease
                 | NotifyReason::UsbDeviceRemovedRelease
                 | NotifyReason::SafetyRelease => CommandClass::Critical,
@@ -1414,6 +1627,7 @@ impl BleTaskCommand {
             Self::AllowPairing { .. }
             | Self::RejectPairing { .. }
             | Self::ClearBond { .. }
+            | Self::ActivateInput { .. }
             | Self::ManagementResponse { .. } => CommandClass::Critical,
         }
     }
@@ -1447,6 +1661,7 @@ impl StorageTaskCommand {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StatusTaskCommand {
     pub status: BridgeStatus,
+    pub snapshot: StatusSnapshot,
     pub management: Option<ManagementTaskResponse>,
 }
 
@@ -1510,10 +1725,11 @@ impl<const BLE: usize, const USB: usize, const STORAGE: usize, const STATUS: usi
         &mut self,
         commands: &[RuntimeCommand],
     ) -> Result<(), RuntimeDispatchError> {
-        self.clear();
+        let mut next = Self::new();
         for command in commands {
-            self.dispatch_one(command)?;
+            next.dispatch_one(command)?;
         }
+        *self = next;
         Ok(())
     }
 
@@ -1545,7 +1761,8 @@ impl<const BLE: usize, const USB: usize, const STORAGE: usize, const STATUS: usi
             RuntimeCommand::StatusChanged(status) => self
                 .status
                 .push(StatusTaskCommand {
-                    status: *status,
+                    status: status.bridge_status(),
+                    snapshot: *status,
                     management: None,
                 })
                 .map_err(|_| RuntimeDispatchError::StatusQueueCapacity),
@@ -1565,6 +1782,7 @@ impl<const BLE: usize, const USB: usize, const STORAGE: usize, const STATUS: usi
                             pairable_host: None,
                         },
                     },
+                    snapshot: StatusSnapshot::empty(),
                     management: Some(ManagementTaskResponse {
                         destination: *destination,
                         response: *response,
@@ -2490,9 +2708,10 @@ mod tests {
         assert!(commands.iter().any(|command| {
             matches!(
                 command,
-                RuntimeCommand::StatusChanged(BridgeStatus {
-                    active_target: Some(HostId(2)),
-                    pairable_host: None,
+                RuntimeCommand::StatusChanged(StatusSnapshot {
+                    active_host: Some(HostId(2)),
+                    pairing_host: None,
+                    ..
                 })
             )
         }));
@@ -2562,8 +2781,8 @@ mod tests {
         assert!(commands.iter().any(|command| {
             matches!(
                 command,
-                RuntimeCommand::StatusChanged(BridgeStatus {
-                    active_target: Some(HostId(3)),
+                RuntimeCommand::StatusChanged(StatusSnapshot {
+                    active_host: Some(HostId(3)),
                     ..
                 })
             )
@@ -2745,7 +2964,7 @@ mod tests {
                 reason: NotifyReason::Input,
             }
             .class(),
-            CommandClass::Critical
+            CommandClass::Realtime
         );
         assert_eq!(
             BleTaskCommand::Notify {
@@ -2766,6 +2985,7 @@ mod tests {
                     active_target: None,
                     pairable_host: None,
                 },
+                snapshot: StatusSnapshot::empty(),
                 management: None,
             }
             .class(),
@@ -2777,6 +2997,7 @@ mod tests {
                     active_target: None,
                     pairable_host: None,
                 },
+                snapshot: StatusSnapshot::empty(),
                 management: Some(ManagementTaskResponse {
                     destination: ManagementDestination::Wired,
                     response: ManagementResponse {
@@ -2798,14 +3019,14 @@ mod tests {
             RuntimeCapacities {
                 hosts: STORED_HOSTS_MAX,
                 usb_interfaces: 8,
-                bridge_actions: 12,
-                commands: 12,
+                bridge_actions: RUNTIME_BRIDGE_ACTION_CAPACITY,
+                commands: RUNTIME_COMMAND_CAPACITY,
                 ble_events: 2,
                 input_queue: 16,
-                ble_command_queue: 12,
-                usb_command_queue: 12,
-                storage_command_queue: 12,
-                status_command_queue: 12,
+                ble_command_queue: RUNTIME_BLE_COMMAND_QUEUE_CAPACITY,
+                usb_command_queue: RUNTIME_USB_COMMAND_QUEUE_CAPACITY,
+                storage_command_queue: RUNTIME_STORAGE_COMMAND_QUEUE_CAPACITY,
+                status_command_queue: RUNTIME_STATUS_COMMAND_QUEUE_CAPACITY,
             }
         );
 
@@ -2852,16 +3073,18 @@ mod tests {
                 )
                 .unwrap();
         }
-        runtime
-            .handle_default_input(
-                RuntimeInput::UsbHidInterfaceConnected {
-                    interface_id: InterfaceId(1),
-                    device_id: DeviceId(7),
-                    led_output: Some(KeyboardLedOutputReport::boot_keyboard()),
-                },
-                &mut commands,
-            )
-            .unwrap();
+        for id in 1..=RUNTIME_USB_INTERFACES_MAX as u8 {
+            runtime
+                .handle_default_input(
+                    RuntimeInput::UsbHidInterfaceConnected {
+                        interface_id: InterfaceId(id),
+                        device_id: DeviceId(id),
+                        led_output: Some(KeyboardLedOutputReport::boot_keyboard()),
+                    },
+                    &mut commands,
+                )
+                .unwrap();
+        }
         commands.clear();
 
         runtime
@@ -2871,7 +3094,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(commands.len(), 6);
+        assert_eq!(commands.len(), 14);
         assert!(matches!(
             commands[0],
             RuntimeCommand::BleCommand(BleTaskCommand::Notify {
@@ -2895,25 +3118,96 @@ mod tests {
         ));
         assert!(matches!(
             commands[3],
-            RuntimeCommand::UsbKeyboardLedWrite { .. }
+            RuntimeCommand::BleCommand(BleTaskCommand::ActivateInput { host_id: HostId(2) })
         ));
         assert!(matches!(
             commands[4],
+            RuntimeCommand::UsbKeyboardLedWrite { .. }
+        ));
+        assert!(
+            commands[4..12]
+                .iter()
+                .all(|command| matches!(command, RuntimeCommand::UsbKeyboardLedWrite { .. }))
+        );
+        assert!(matches!(
+            commands[12],
             RuntimeCommand::PersistStorage {
                 priority: StoragePersistPriority::Lazy,
                 ..
             }
         ));
-        assert!(matches!(commands[5], RuntimeCommand::StatusChanged(_)));
+        assert!(matches!(commands[13], RuntimeCommand::StatusChanged(_)));
 
         let mut queues = DefaultRuntimeCommandQueues::new();
         queues.dispatch_from(commands.as_slice()).unwrap();
 
-        assert_eq!(queues.ble.len(), 3);
-        assert_eq!(queues.usb.len(), 1);
+        assert_eq!(queues.ble.len(), 4);
+        assert_eq!(queues.usb.len(), RUNTIME_USB_INTERFACES_MAX);
         assert_eq!(queues.storage.len(), 1);
         assert_eq!(queues.status.len(), 1);
-        assert_eq!(queues.usb[0].device_id, DeviceId(7));
+        assert_eq!(queues.usb[0].device_id, DeviceId(1));
+
+        runtime
+            .handle_default_input(
+                RuntimeInput::BridgeEvent(BridgeEvent::SwitchTarget { target: HostId(1) }),
+                &mut commands,
+            )
+            .unwrap();
+        runtime
+            .handle_default_input(
+                RuntimeInput::BridgeEvent(BridgeEvent::EnterPairingMode { host_id: HostId(1) }),
+                &mut commands,
+            )
+            .unwrap();
+        runtime
+            .handle_default_input(
+                RuntimeInput::BridgeEvent(BridgeEvent::ClearHost { host_id: HostId(1) }),
+                &mut commands,
+            )
+            .unwrap();
+        assert_eq!(commands.len(), 15);
+        let mut queues = DefaultRuntimeCommandQueues::new();
+        queues.dispatch_from(commands.as_slice()).unwrap();
+        assert_eq!(queues.ble.len(), 5);
+        assert_eq!(queues.usb.len(), RUNTIME_USB_INTERFACES_MAX);
+        assert_eq!(queues.storage.len(), 1);
+        assert_eq!(queues.status.len(), 1);
+    }
+
+    #[test]
+    fn status_snapshots_are_monotonic_latest_state_values() {
+        let mut runtime = BridgeRuntime::<2, 2>::new(0);
+        let mut commands = heapless::Vec::<RuntimeCommand, 8>::new();
+        runtime
+            .handle_input::<8, 8, 2>(
+                RuntimeInput::BridgeEvent(BridgeEvent::HostConnected { host_id: HostId(1) }),
+                &mut commands,
+            )
+            .unwrap();
+        let connected = commands
+            .iter()
+            .find_map(|command| match command {
+                RuntimeCommand::StatusChanged(snapshot) => Some(*snapshot),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(connected.connected_hosts, 1);
+
+        runtime
+            .handle_input::<8, 8, 2>(
+                RuntimeInput::BridgeEvent(BridgeEvent::HostDisconnected { host_id: HostId(1) }),
+                &mut commands,
+            )
+            .unwrap();
+        let disconnected = commands
+            .iter()
+            .find_map(|command| match command {
+                RuntimeCommand::StatusChanged(snapshot) => Some(*snapshot),
+                _ => None,
+            })
+            .unwrap();
+        assert!(disconnected.sequence > connected.sequence);
+        assert_eq!(disconnected.connected_hosts, 0);
     }
 
     #[test]

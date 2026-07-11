@@ -9,6 +9,9 @@ pub struct BleMouseReport {
 }
 
 impl BleMouseReport {
+    pub const fn from_bytes(bytes: [u8; MOUSE_REPORT_LEN]) -> Self {
+        Self { bytes }
+    }
     pub const fn from_mouse(report: MouseReport) -> Self {
         Self {
             bytes: [

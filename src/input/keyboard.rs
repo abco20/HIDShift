@@ -218,6 +218,29 @@ impl KeyboardSuppression {
         self.keys.contains(&key)
     }
 
+    /// Keep a stable 6KRO window: keys beyond `limit` remain suppressed until
+    /// their physical release instead of appearing halfway through a chord.
+    pub fn suppress_visible_after(
+        &mut self,
+        state: &PhysicalKeyboardState,
+        limit: usize,
+    ) -> Result<usize, InputError> {
+        let mut visible = 0usize;
+        let mut added = 0usize;
+        for key in state.keys().iter().copied() {
+            if self.contains_key(key) {
+                continue;
+            }
+            if visible < limit {
+                visible += 1;
+                continue;
+            }
+            self.keys.push(key).map_err(|_| InputError::KeyCapacity)?;
+            added += 1;
+        }
+        Ok(added)
+    }
+
     fn release_key(&mut self, key: KeyUsage) {
         remove_key(&mut self.keys, key);
     }

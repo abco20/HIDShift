@@ -80,10 +80,21 @@ impl<
         &mut self,
         input: RuntimeInput<'_>,
     ) -> Result<&RuntimeCommandQueues<BLE, USB, STORAGE, STATUS>, RuntimeOwnerError> {
-        self.queues.clear();
-        self.runtime
-            .handle_input::<COMMANDS, ACTIONS, EVENTS>(input, &mut self.commands)?;
-        self.queues.dispatch_from(self.commands.as_slice())?;
+        let mut next_runtime = self.runtime.clone();
+        let mut next_commands = heapless::Vec::new();
+        let mut next_queues = RuntimeCommandQueues::new();
+        next_runtime
+            .handle_input_in_place::<COMMANDS, ACTIONS, EVENTS>(input, &mut next_commands)?;
+        next_queues.dispatch_from(next_commands.as_slice())?;
+        next_runtime.observe_outbox_usage(
+            next_queues.ble.len(),
+            next_queues.usb.len(),
+            next_queues.storage.len(),
+            next_queues.status.len(),
+        );
+        self.runtime = next_runtime;
+        self.commands = next_commands;
+        self.queues = next_queues;
         Ok(&self.queues)
     }
 
@@ -94,25 +105,52 @@ impl<
         self.process_input(message.as_runtime_input())
     }
 
-    pub fn process_input_state_only(
-        &mut self,
-        input: RuntimeInput<'_>,
-    ) -> Result<(), RuntimeOwnerError> {
-        self.commands.clear();
-        self.queues.clear();
-        let result = self
-            .runtime
-            .handle_input::<COMMANDS, ACTIONS, EVENTS>(input, &mut self.commands);
-        self.commands.clear();
-        self.queues.clear();
-        result.map_err(RuntimeOwnerError::from)
+    pub fn staged_message(&self, message: &RuntimeInputMessage) -> Result<Self, RuntimeOwnerError> {
+        let mut next = self.clone();
+        next.process_message_in_place(message)?;
+        Ok(next)
     }
 
-    pub fn process_message_state_only(
+    fn process_message_in_place(
         &mut self,
         message: &RuntimeInputMessage,
     ) -> Result<(), RuntimeOwnerError> {
-        self.process_input_state_only(message.as_runtime_input())
+        let mut next_commands = heapless::Vec::new();
+        let mut next_queues = RuntimeCommandQueues::new();
+        self.runtime
+            .handle_input_in_place::<COMMANDS, ACTIONS, EVENTS>(
+                message.as_runtime_input(),
+                &mut next_commands,
+            )?;
+        next_queues.dispatch_from(next_commands.as_slice())?;
+        self.runtime.observe_outbox_usage(
+            next_queues.ble.len(),
+            next_queues.usb.len(),
+            next_queues.storage.len(),
+            next_queues.status.len(),
+        );
+        self.commands = next_commands;
+        self.queues = next_queues;
+        Ok(())
+    }
+
+    pub fn mark_host_disconnected_for_quiesce(&mut self, host_id: crate::ids::HostId) {
+        self.runtime.mark_host_disconnected_for_quiesce(host_id);
+    }
+
+    pub fn prepare_for_quiesce(&mut self) -> Result<(), RuntimeOwnerError> {
+        self.runtime.prepare_for_quiesce()?;
+        Ok(())
+    }
+
+    pub fn observe_transport_metrics(
+        &mut self,
+        runtime_input_depth: usize,
+        mouse: crate::mouse_accumulator::MouseAccumulatorStats,
+        status_updates_dropped: u32,
+    ) {
+        self.runtime
+            .observe_transport_metrics(runtime_input_depth, mouse, status_updates_dropped);
     }
 
     pub fn into_inner(self) -> BridgeRuntime<HOSTS, USB_KEYBOARDS> {
@@ -170,7 +208,7 @@ impl From<RuntimeDispatchError> for RuntimeOwnerError {
 mod tests {
     use super::*;
     use crate::ble::BleHidAttribute;
-    use crate::bridge::{BridgeEvent, BridgeStatus};
+    use crate::bridge::{BridgeError, BridgeEvent, BridgeStatus};
     use crate::ids::{DeviceId, HostId, InterfaceId};
     use crate::input::KeyboardLedState;
     use crate::reports::ReportKind;
@@ -229,6 +267,7 @@ mod tests {
     #[test]
     fn owner_reports_dispatch_errors_at_task_boundary() {
         let mut owner = RuntimeOwner::<2, 1, 8, 8, 2, 8, 8, 0, 8>::new(0);
+        let before = owner.clone();
 
         let err = owner
             .process_input(RuntimeInput::BridgeEvent(BridgeEvent::SwitchTarget {
@@ -240,18 +279,117 @@ mod tests {
             err,
             RuntimeOwnerError::Dispatch(RuntimeDispatchError::StorageQueueCapacity)
         );
+        assert_eq!(owner, before);
     }
 
     #[test]
-    fn state_only_processing_updates_runtime_without_dispatching_outboxes() {
-        let mut owner = RuntimeOwner::<2, 1, 8, 8, 2, 0, 0, 0, 0>::new(0);
+    fn action_and_command_capacity_errors_roll_back_the_owner() {
+        let mut action_limited = RuntimeOwner::<2, 1, 16, 0, 2, 16, 16, 16, 16>::new(0);
+        let before = action_limited.clone();
+        assert!(matches!(
+            action_limited.process_input(RuntimeInput::BridgeEvent(BridgeEvent::SwitchTarget {
+                target: HostId(1)
+            })),
+            Err(RuntimeOwnerError::Runtime(RuntimeError::Bridge(
+                BridgeError::ActionCapacity
+            )))
+        ));
+        assert_eq!(action_limited, before);
+
+        let mut command_limited = RuntimeOwner::<2, 1, 0, 16, 2, 16, 16, 16, 16>::new(0);
+        let before = command_limited.clone();
+        assert_eq!(
+            command_limited.process_input(RuntimeInput::BridgeEvent(BridgeEvent::SwitchTarget {
+                target: HostId(1)
+            })),
+            Err(RuntimeOwnerError::Runtime(RuntimeError::CommandCapacity))
+        );
+        assert_eq!(command_limited, before);
+    }
+
+    #[test]
+    fn every_task_outbox_capacity_error_rolls_back_runtime_state() {
+        let mut status_limited = RuntimeOwner::<2, 1, 16, 16, 2, 16, 16, 16, 0>::new(0);
+        let before = status_limited.clone();
+        assert!(matches!(
+            status_limited.process_input(RuntimeInput::BridgeEvent(BridgeEvent::HostConnected {
+                host_id: HostId(1)
+            })),
+            Err(RuntimeOwnerError::Dispatch(
+                RuntimeDispatchError::StatusQueueCapacity
+            ))
+        ));
+        assert_eq!(status_limited, before);
+
+        let mut usb_limited = RuntimeOwner::<2, 1, 16, 16, 2, 16, 0, 16, 16>::new(0);
+        usb_limited
+            .process_input(RuntimeInput::BridgeEvent(BridgeEvent::SwitchTarget {
+                target: HostId(1),
+            }))
+            .unwrap();
+        let before = usb_limited.clone();
+        assert!(matches!(
+            usb_limited.process_input(RuntimeInput::UsbHidInterfaceConnected {
+                interface_id: InterfaceId(1),
+                device_id: DeviceId(7),
+                led_output: Some(KeyboardLedOutputReport::boot_keyboard()),
+            }),
+            Err(RuntimeOwnerError::Dispatch(
+                RuntimeDispatchError::UsbQueueCapacity
+            ))
+        ));
+        assert_eq!(usb_limited, before);
+
+        let mut setup = RuntimeOwner::<2, 1, 16, 16, 2, 16, 16, 16, 16>::new(0);
+        for event in [
+            BridgeEvent::SwitchTarget { target: HostId(1) },
+            BridgeEvent::HostConnected { host_id: HostId(1) },
+            BridgeEvent::HostSecurityChanged {
+                host_id: HostId(1),
+                encrypted: true,
+                bonded: true,
+                bond: None,
+            },
+            BridgeEvent::CccdChanged {
+                host_id: HostId(1),
+                report: ReportKind::Keyboard,
+                enabled: true,
+            },
+        ] {
+            setup
+                .process_input(RuntimeInput::BridgeEvent(event))
+                .unwrap();
+        }
+        let mut ble_limited =
+            RuntimeOwner::<2, 1, 16, 16, 2, 0, 16, 16, 16>::from_runtime(setup.into_inner());
+        let before = ble_limited.clone();
+        let mut keyboard = crate::input::KeyboardFrame::new(crate::input::ModifierState::empty());
+        keyboard.push_key(crate::input::KeyUsage(4)).unwrap();
+        assert!(matches!(
+            ble_limited.process_input(RuntimeInput::BridgeEvent(BridgeEvent::InputFrame(
+                crate::input::InputFrame::Standard(crate::input::StandardInputFrame {
+                    device_id: DeviceId(7),
+                    keyboard: Some(keyboard),
+                    mouse: None,
+                    consumer: None,
+                })
+            ))),
+            Err(RuntimeOwnerError::Dispatch(
+                RuntimeDispatchError::BleQueueCapacity
+            ))
+        ));
+        assert_eq!(ble_limited, before);
+    }
+
+    #[test]
+    fn quiesce_disconnect_only_clears_ble_session_state() {
+        let mut owner = TestOwner::new(0);
 
         owner
-            .process_input_state_only(RuntimeInput::BridgeEvent(BridgeEvent::HostConnected {
+            .process_input(RuntimeInput::BridgeEvent(BridgeEvent::HostConnected {
                 host_id: HostId(1),
             }))
             .unwrap();
-
         assert!(
             owner
                 .runtime()
@@ -262,18 +400,10 @@ mod tests {
                 .unwrap()
                 .connected
         );
-        assert!(owner.commands().is_empty());
-        assert!(owner.queues().ble.is_empty());
-        assert!(owner.queues().usb.is_empty());
-        assert!(owner.queues().storage.is_empty());
-        assert!(owner.queues().status.is_empty());
+        let commands = owner.commands().clone();
+        let queues = owner.queues().clone();
 
-        owner
-            .process_input_state_only(RuntimeInput::BridgeEvent(BridgeEvent::HostDisconnected {
-                host_id: HostId(1),
-            }))
-            .unwrap();
-
+        owner.mark_host_disconnected_for_quiesce(HostId(1));
         assert!(
             !owner
                 .runtime()
@@ -284,6 +414,8 @@ mod tests {
                 .unwrap()
                 .connected
         );
+        assert_eq!(owner.commands(), &commands);
+        assert_eq!(owner.queues(), &queues);
     }
 
     #[test]

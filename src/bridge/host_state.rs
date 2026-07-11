@@ -227,6 +227,9 @@ impl<const HOSTS: usize> BleHostStateMachine<HOSTS> {
     }
 
     fn upsert_host(&mut self, host_id: HostId) -> Result<&mut HostRuntimeState, HostStateError> {
+        let _slot = host_id
+            .validated()
+            .map_err(|_| HostStateError::InvalidHostId)?;
         if let Some(index) = self.host_index(host_id) {
             return self.hosts[index]
                 .as_mut()
@@ -329,6 +332,7 @@ impl ReportReady {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostStateError {
+    InvalidHostId,
     HostCapacity,
 }
 

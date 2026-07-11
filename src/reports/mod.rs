@@ -13,7 +13,8 @@ pub use ble_hid::{
 };
 pub use ble_keyboard::{
     BleKeyboard6KroReport, BleKeyboardLedOutputReport, BleKeyboardOutputError, BleKeyboardReport,
-    KEYBOARD_LED_OUTPUT_REPORT_LEN, KEYBOARD_REPORT_ID, KEYBOARD_REPORT_LEN, KeyboardReportBuild,
+    KEYBOARD_6KRO_KEY_CAPACITY, KEYBOARD_LED_OUTPUT_REPORT_LEN, KEYBOARD_REPORT_ID,
+    KEYBOARD_REPORT_LEN, KeyboardReportBuild,
 };
 pub use ble_mouse::{BleMouseReport, MOUSE_REPORT_ID, MOUSE_REPORT_LEN};
 

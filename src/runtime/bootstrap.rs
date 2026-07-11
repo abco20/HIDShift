@@ -71,8 +71,7 @@ pub fn initial_pairing_host(storage: &StorageState, default_host: HostId) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::BridgeStatus;
-    use crate::runtime::RuntimeCommand;
+    use crate::runtime::{RuntimeCommand, StatusSnapshot};
 
     #[test]
     fn prepare_ready_host_marks_target_ready_for_all_requested_reports() {
@@ -96,9 +95,10 @@ mod tests {
         assert!(runtime.bridge().can_send(HostId(1), ReportKind::Consumer));
         assert!(matches!(
             commands.last(),
-            Some(RuntimeCommand::StatusChanged(BridgeStatus {
-                active_target: Some(HostId(1)),
-                pairable_host: None,
+            Some(RuntimeCommand::StatusChanged(StatusSnapshot {
+                active_host: Some(HostId(1)),
+                pairing_host: None,
+                ..
             }))
         ));
     }

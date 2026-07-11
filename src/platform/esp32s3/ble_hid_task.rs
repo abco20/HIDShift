@@ -7,7 +7,7 @@ use embassy_futures::join::join;
 use embassy_futures::select::{Either, Either3, Either4, select, select3, select4};
 use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
 use embassy_sync::channel::{Receiver, Sender};
-use embassy_time::{Instant, Timer};
+use embassy_time::{Duration, Instant, Timer, with_timeout};
 use esp_hal::rng::{Trng, TrngSource};
 use esp_radio::ble::controller::BleConnector;
 use hidshift::ble_runtime::{
@@ -30,7 +30,7 @@ use hidshift::runtime::{
 };
 use hidshift::storage::{FixedName, StorageState, StoredBond, StoredSecurityLevel};
 use hidshift::{
-    BLE_HID_NOTIFICATIONS_PER_REPORT_MAX, BleConnectionSlots, BlePeerIdentity,
+    BLE_HID_NOTIFICATIONS_PER_REPORT_MAX, BleConnectionSlots, BleInputGate, BlePeerIdentity,
     notifications_for_input_report, resolve_ble_host_id, typed_notification,
 };
 use trouble_host::prelude::*;
@@ -40,6 +40,7 @@ const BLE_CONNECTIONS_MAX: usize = 4;
 // One ATT bearer plus one spare control/data lane per connection.
 const BLE_L2CAP_CHANNELS_MAX: usize = BLE_CONNECTIONS_MAX * 2;
 const BLE_ATTRIBUTE_TABLE_SIZE: usize = 72;
+const BLE_NOTIFY_TIMEOUT_MS: u64 = 30;
 const MANAGEMENT_SERVICE_UUID_LE: [u8; 16] = [
     0x01, 0x00, 0x3a, 0x4f, 0x6d, 0x5b, 0x4b, 0x9f, 0x0d, 0x4f, 0x15, 0x1b, 0x00, 0x00, 0x51, 0x7f,
 ];
@@ -53,6 +54,8 @@ pub struct BleRuntimeSnapshot {
     pub storage: Option<StorageState>,
     pub pairable_host: Option<HostId>,
 }
+// The GATT macro generates service fields that are consumed through generated
+// attribute metadata, which rustc's dead-code analysis cannot see.
 #[allow(dead_code)]
 #[gatt_server(
     connections_max = BLE_CONNECTIONS_MAX,
@@ -300,6 +303,7 @@ pub async fn ble_host_event_task(
         {
             Either3::First(()) => {}
             Either3::Second(()) => {
+                while notify_receiver.try_receive().is_ok() {}
                 let snapshot = disconnect_runtime_hosts_before_quiesce(
                     runtime_barrier_request,
                     runtime_barrier_done,
@@ -315,6 +319,7 @@ pub async fn ble_host_event_task(
                 runtime_barrier_resume.send(()).await;
             }
             Either3::Third(()) => {
+                while notify_receiver.try_receive().is_ok() {}
                 let snapshot = disconnect_runtime_hosts_before_quiesce(
                     runtime_barrier_request,
                     runtime_barrier_done,
@@ -496,6 +501,7 @@ fn retain_gatt_service_fields(server: &Server) {
 struct BleControlState {
     pairing_allowed: [bool; RUNTIME_HOSTS_MAX],
     restored_bond: [bool; RUNTIME_HOSTS_MAX],
+    input_gate: BleInputGate<RUNTIME_HOSTS_MAX>,
 }
 
 impl BleControlState {
@@ -503,6 +509,7 @@ impl BleControlState {
         let mut state = Self {
             pairing_allowed: [false; RUNTIME_HOSTS_MAX],
             restored_bond: [false; RUNTIME_HOSTS_MAX],
+            input_gate: BleInputGate::new(),
         };
         if let Some(storage) = restored_state {
             for host in storage.hosts() {
@@ -519,7 +526,14 @@ impl BleControlState {
 
     fn apply_command(&mut self, command: BleTaskCommand) {
         match command {
+            BleTaskCommand::Notify {
+                host_id,
+                reason:
+                    hidshift::NotifyReason::TargetSwitchRelease | hidshift::NotifyReason::SafetyRelease,
+                ..
+            } => self.input_gate.block(host_id),
             BleTaskCommand::Notify { .. } | BleTaskCommand::ManagementResponse { .. } => {}
+            BleTaskCommand::ActivateInput { host_id } => self.input_gate.activate(host_id),
             BleTaskCommand::AllowPairing { host_id } => self.set_pairing_allowed(host_id, true),
             BleTaskCommand::RejectPairing { host_id } => self.set_pairing_allowed(host_id, false),
             BleTaskCommand::ClearBond { host_id, .. } => {
@@ -534,6 +548,18 @@ impl BleControlState {
             .and_then(|index| self.pairing_allowed.get(index))
             .copied()
             .unwrap_or(false)
+    }
+
+    fn should_drop(&self, command: BleTaskCommand) -> bool {
+        let BleTaskCommand::Notify {
+            host_id,
+            reason: hidshift::NotifyReason::Input,
+            ..
+        } = command
+        else {
+            return false;
+        };
+        self.input_gate.should_drop_input(host_id)
     }
 
     fn restored_bond(&self, host_id: HostId) -> bool {
@@ -801,6 +827,10 @@ async fn manage_ble_connections<'values, 'server, C>(
             }
             Either3::Third(command) => {
                 control.apply_command(command);
+                if control.should_drop(command) {
+                    log::debug!("firmware: dropping stale notify after target release");
+                    continue;
+                }
                 dispatch_ble_command_to_connected_slot(
                     server,
                     &mut slots,
@@ -1061,8 +1091,33 @@ async fn dispatch_ble_command_to_connected_slot(
                 log::warn!("firmware: ble set_bondable(true) failed: {:?}", err);
             }
         }
+        BleTaskCommand::ActivateInput { .. } => {}
         BleTaskCommand::Notify { .. } => {
-            if !dispatch_ble_command_to_slot(server, conn, command).await {
+            let critical_release = !matches!(
+                command,
+                BleTaskCommand::Notify {
+                    reason: hidshift::NotifyReason::Input,
+                    ..
+                }
+            );
+            let sent = match with_timeout(
+                Duration::from_millis(BLE_NOTIFY_TIMEOUT_MS),
+                dispatch_ble_command_to_slot(server, conn, command),
+            )
+            .await
+            {
+                Ok(sent) => sent,
+                Err(_) => {
+                    log::warn!("firmware: ble notify timeout host={}", host_id.0);
+                    sender
+                        .send(RuntimeInputMessage::DiagnosticsEvent(
+                            RuntimeDiagnosticsEvent::BleNotifyTimedOut { critical_release },
+                        ))
+                        .await;
+                    false
+                }
+            };
+            if !sent {
                 sender
                     .send(RuntimeInputMessage::DiagnosticsEvent(
                         RuntimeDiagnosticsEvent::BleNotifyFailed,
@@ -1086,6 +1141,7 @@ fn ble_command_host_id(command: BleTaskCommand) -> HostId {
         | BleTaskCommand::AllowPairing { host_id }
         | BleTaskCommand::RejectPairing { host_id }
         | BleTaskCommand::ClearBond { host_id, .. }
+        | BleTaskCommand::ActivateInput { host_id }
         | BleTaskCommand::ManagementResponse { host_id, .. } => host_id,
     }
 }
@@ -1115,6 +1171,9 @@ fn log_ble_command_without_connection(command: BleTaskCommand) {
         }
         BleTaskCommand::ClearBond { host_id, .. } => {
             log::info!("firmware: clear bond requested for host={}", host_id.0);
+        }
+        BleTaskCommand::ActivateInput { host_id } => {
+            log::debug!("firmware: input activated for host={}", host_id.0);
         }
         BleTaskCommand::ManagementResponse { host_id, .. } => {
             log::debug!(
@@ -1485,6 +1544,10 @@ where
         }
         BleTaskCommand::ClearBond { host_id, .. } => {
             log::info!("firmware: clear bond requested for host={}", host_id.0);
+            true
+        }
+        BleTaskCommand::ActivateInput { host_id } => {
+            log::debug!("firmware: input activated for host={}", host_id.0);
             true
         }
         BleTaskCommand::ManagementResponse { host_id, response } => {

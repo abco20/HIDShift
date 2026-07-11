@@ -289,7 +289,7 @@ mod tests {
             &[BridgeAction::BleNotify {
                 host_id: HOST,
                 report: BleHidReport::Keyboard(BleKeyboard6KroReport::release()),
-                reason: NotifyReason::Input,
+                reason: NotifyReason::InputRelease,
             }]
         );
     }
