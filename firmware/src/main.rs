@@ -8,6 +8,8 @@ use embassy_futures::select::{Either, select};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::{Channel, Receiver, Sender, TrySendError};
 use esp_backtrace as _;
+#[cfg(feature = "hardware-e2e")]
+mod e2e_telemetry;
 mod platform;
 use esp_hal::clock::CpuClock;
 use esp_hal::interrupt::software::SoftwareInterruptControl;
@@ -309,6 +311,13 @@ async fn process_runtime_message(
     sink: &mut ChannelTaskSink,
     message: RuntimeInputMessage,
 ) {
+    #[cfg(feature = "hardware-e2e")]
+    if matches!(
+        message,
+        RuntimeInputMessage::BridgeEvent(hidshift::BridgeEvent::InputFrame(_))
+    ) {
+        crate::e2e_telemetry::record_runtime(embassy_time::Instant::now().as_micros());
+    }
     log::trace!("firmware: runtime_input {:?}", message);
 
     let next_owner = match owner.staged_message(&message) {
@@ -318,6 +327,14 @@ async fn process_runtime_message(
             return;
         }
     };
+
+    #[cfg(feature = "hardware-e2e")]
+    if matches!(
+        message,
+        RuntimeInputMessage::BridgeEvent(hidshift::BridgeEvent::InputFrame(_))
+    ) {
+        crate::e2e_telemetry::record_runtime_dispatch(embassy_time::Instant::now().as_micros());
+    }
 
     if let Err(error) = sink
         .dispatch_runtime_queues(next_owner.default_queues())
@@ -449,6 +466,16 @@ impl ChannelTaskSink {
         self.ensure_capacity(queues)?;
         for command in queues.ble.iter().copied() {
             self.send_ble_with_policy(command).await?;
+            #[cfg(feature = "hardware-e2e")]
+            if matches!(command, BleTaskCommand::Notify { .. }) {
+                crate::e2e_telemetry::record_ble_queued(embassy_time::Instant::now().as_micros());
+            }
+            if command.class() == hidshift::CommandClass::Realtime {
+                // Channel wakeups only mark the BLE task runnable. Yield here
+                // before lower-priority USB/storage/status dispatch so the
+                // executor can begin the GATT notification immediately.
+                embassy_futures::yield_now().await;
+            }
         }
         for command in queues.usb.iter().copied() {
             self.send_usb_with_policy(command).await?;
@@ -548,8 +575,18 @@ impl ChannelTaskSink {
             reason: hidshift::NotifyReason::Input,
         } = command
         {
-            debug_assert!(self.mouse.push(host_id, report));
-            self.flush_mouse_accumulator();
+            if self.mouse.push(host_id, report) {
+                self.flush_mouse_accumulator();
+            } else {
+                // A button edge cannot be merged into movement accumulated
+                // under the old button state. Drain the old state and place
+                // the edge on the same ordered lane; ignoring push(false)
+                // here used to drop clicks and subsequent 1px movement in
+                // release builds.
+                self.flush_mouse_accumulator_ordered(host_id).await;
+                let _ = self.mouse.set_buttons(host_id, report.as_bytes()[0]);
+                self.ble_control.send(command).await;
+            }
             return Ok(());
         }
         if let BleTaskCommand::Notify {

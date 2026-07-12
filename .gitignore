@@ -6,3 +6,7 @@ dist/
 *.elf
 *.bin
 !third_party/hidreport-fixtures/tests/data/*.hid.bin
+
+# Hardware E2E output is a local measurement artifact. Keep the checked-in
+# performance reference separate from timestamped run results.
+/e2e/results/

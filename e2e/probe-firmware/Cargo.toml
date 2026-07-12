@@ -1,0 +1,33 @@
+[package]
+name = "hidshift-e2e-probe"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "hidshift-e2e-probe"
+path = "src/main.rs"
+
+[dependencies]
+embassy-executor = "0.10.0"
+embassy-futures = "0.1.2"
+embassy-time = "0.5.1"
+esp-alloc = { version = "0.10.0", default-features = false, features = ["compat", "esp32", "global-allocator"] }
+esp-backtrace = { version = "0.19.0", default-features = false, features = ["esp32", "panic-handler", "println"] }
+esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32"] }
+esp-hal = { version = "1.1.1", default-features = false, features = ["__bluetooth", "esp32", "unstable"] }
+esp-println = { version = "0.17.0", default-features = false, features = ["esp32", "log-04", "uart"] }
+esp-radio = { version = "1.0.0-beta.0", default-features = false, features = ["ble", "esp-alloc", "esp32", "log-04", "unstable"] }
+esp-rtos = { version = "0.3.0", features = ["embassy", "esp-alloc", "esp-radio", "esp32"] }
+log = "0.4.33"
+hidshift = { path = "../.." }
+static_cell = "2.1.1"
+trouble-host = { version = "0.6.0", default-features = false, features = ["central", "default-packet-pool", "gatt", "gatt-client-notification-max-subscribers-4", "gatt-client-notification-queue-size-32", "log", "security"] }
+
+[profile.release]
+codegen-units = 1
+debug = 2
+lto = "fat"
+opt-level = "s"

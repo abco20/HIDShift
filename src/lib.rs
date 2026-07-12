@@ -32,6 +32,7 @@ pub mod ble_connection;
 pub mod ble_notify;
 pub mod ble_runtime;
 pub mod bridge;
+pub mod e2e;
 pub mod ids;
 pub mod input;
 pub mod management;

@@ -3,6 +3,8 @@ use core::fmt::Write;
 use core::future::pending;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use bt_hci::cmd::le::{LeAddDeviceToFilterAcceptList, LeClearFilterAcceptList};
+use bt_hci::controller::ControllerCmdSync;
 use embassy_futures::join::join;
 use embassy_futures::select::{Either, Either3, Either4, select, select3, select4};
 use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
@@ -90,73 +92,53 @@ struct ManagementService {
     response: [u8; MANAGEMENT_RESPONSE_LEN],
 }
 
-#[gatt_service(uuid = "00001812-0000-1000-8000-00805f9b34fb")]
+#[gatt_service(uuid = "1812")]
 struct KeyboardHidService {
-    #[characteristic(uuid = "00002a4a-0000-1000-8000-00805f9b34fb", read, value = HID_INFORMATION)]
+    #[characteristic(uuid = "2a4a", read, value = HID_INFORMATION)]
     hid_information: [u8; 4],
-    #[characteristic(uuid = "00002a4b-0000-1000-8000-00805f9b34fb", read, value = V1_KEYBOARD_REPORT_MAP)]
+    #[characteristic(uuid = "2a4b", read, value = V1_KEYBOARD_REPORT_MAP)]
     report_map: &'static [u8],
-    #[characteristic(
-        uuid = "00002a4c-0000-1000-8000-00805f9b34fb",
-        write_without_response,
-        value = 0
-    )]
+    #[characteristic(uuid = "2a4c", write_without_response, value = 0)]
     control_point: u8,
-    #[descriptor(uuid = "00002908-0000-1000-8000-00805f9b34fb", read, value = [KEYBOARD_REPORT_ID, INPUT_REPORT_TYPE])]
-    #[characteristic(uuid = "00002a4d-0000-1000-8000-00805f9b34fb", read, notify, value = [0; 8])]
+    #[descriptor(uuid = "2908", read, value = [KEYBOARD_REPORT_ID, INPUT_REPORT_TYPE])]
+    #[characteristic(uuid = "2a4d", read, notify, value = [0; 8])]
     input_report: [u8; 8],
-    #[descriptor(uuid = "00002908-0000-1000-8000-00805f9b34fb", read, value = [KEYBOARD_REPORT_ID, OUTPUT_REPORT_TYPE])]
-    #[characteristic(uuid = "00002a4d-0000-1000-8000-00805f9b34fb", read, write, write_without_response, value = [0])]
+    #[descriptor(uuid = "2908", read, value = [KEYBOARD_REPORT_ID, OUTPUT_REPORT_TYPE])]
+    #[characteristic(uuid = "2a4d", read, write, write_without_response, value = [0])]
     output_report: [u8; 1],
 }
 
-#[gatt_service(uuid = "00001812-0000-1000-8000-00805f9b34fb")]
+#[gatt_service(uuid = "1812")]
 struct MouseHidService {
-    #[characteristic(uuid = "00002a4a-0000-1000-8000-00805f9b34fb", read, value = HID_INFORMATION)]
+    #[characteristic(uuid = "2a4a", read, value = HID_INFORMATION)]
     hid_information: [u8; 4],
-    #[characteristic(uuid = "00002a4b-0000-1000-8000-00805f9b34fb", read, value = V1_MOUSE_REPORT_MAP)]
+    #[characteristic(uuid = "2a4b", read, value = V1_MOUSE_REPORT_MAP)]
     report_map: &'static [u8],
-    #[characteristic(
-        uuid = "00002a4c-0000-1000-8000-00805f9b34fb",
-        write_without_response,
-        value = 0
-    )]
+    #[characteristic(uuid = "2a4c", write_without_response, value = 0)]
     control_point: u8,
-    #[descriptor(uuid = "00002908-0000-1000-8000-00805f9b34fb", read, value = [0, INPUT_REPORT_TYPE])]
-    #[characteristic(uuid = "00002a4d-0000-1000-8000-00805f9b34fb", read, notify, value = [0; 5])]
+    #[descriptor(uuid = "2908", read, value = [0, INPUT_REPORT_TYPE])]
+    #[characteristic(uuid = "2a4d", read, notify, value = [0; 5])]
     input_report: [u8; 5],
 }
 
-#[gatt_service(uuid = "00001812-0000-1000-8000-00805f9b34fb")]
+#[gatt_service(uuid = "1812")]
 struct ConsumerHidService {
-    #[characteristic(uuid = "00002a4a-0000-1000-8000-00805f9b34fb", read, value = HID_INFORMATION)]
+    #[characteristic(uuid = "2a4a", read, value = HID_INFORMATION)]
     hid_information: [u8; 4],
-    #[characteristic(uuid = "00002a4b-0000-1000-8000-00805f9b34fb", read, value = V1_CONSUMER_REPORT_MAP)]
+    #[characteristic(uuid = "2a4b", read, value = V1_CONSUMER_REPORT_MAP)]
     report_map: &'static [u8],
-    #[characteristic(
-        uuid = "00002a4c-0000-1000-8000-00805f9b34fb",
-        write_without_response,
-        value = 0
-    )]
+    #[characteristic(uuid = "2a4c", write_without_response, value = 0)]
     control_point: u8,
-    #[descriptor(uuid = "00002908-0000-1000-8000-00805f9b34fb", read, value = [0, INPUT_REPORT_TYPE])]
-    #[characteristic(uuid = "00002a4d-0000-1000-8000-00805f9b34fb", read, notify, value = [0; 2])]
+    #[descriptor(uuid = "2908", read, value = [0, INPUT_REPORT_TYPE])]
+    #[characteristic(uuid = "2a4d", read, notify, value = [0; 2])]
     input_report: [u8; 2],
 }
 
-#[gatt_service(uuid = "0000180a-0000-1000-8000-00805f9b34fb")]
+#[gatt_service(uuid = "180a")]
 struct DeviceInformationService {
-    #[characteristic(
-        uuid = "00002a29-0000-1000-8000-00805f9b34fb",
-        read,
-        value = "HIDShift"
-    )]
+    #[characteristic(uuid = "2a29", read, value = "HIDShift")]
     manufacturer_name: &'static str,
-    #[characteristic(
-        uuid = "00002a24-0000-1000-8000-00805f9b34fb",
-        read,
-        value = "firmware"
-    )]
+    #[characteristic(uuid = "2a24", read, value = "firmware")]
     model_number: &'static str,
 }
 
@@ -340,7 +322,9 @@ async fn run_ble_host_events<'server, C>(
     restored_state: Option<&StorageState>,
     pairable_host: Option<HostId>,
 ) where
-    C: Controller,
+    C: Controller
+        + ControllerCmdSync<LeClearFilterAcceptList>
+        + ControllerCmdSync<LeAddDeviceToFilterAcceptList>,
 {
     let mut resources: HostResources<
         DefaultPacketPool,
@@ -569,6 +553,12 @@ fn resolve_connection_host_id<P>(
 where
     P: PacketPool,
 {
+    #[cfg(feature = "hardware-e2e")]
+    if control.pairing_host() == Some(HostId(1))
+        && conn.raw().peer_address().into_inner() != hidshift::e2e::E2E_PROBE_BLE_ADDRESS_RAW
+    {
+        return None;
+    }
     let peer_identity = connection_peer_identity(conn);
     let resolved = resolve_ble_host_id(restored_state, peer_identity, control.pairing_host())?;
     let is_pairing = control.pairing_allowed(resolved);
@@ -576,6 +566,21 @@ where
         .map(|state| state.global_settings.auto_reconnect)
         .unwrap_or(true);
     (is_pairing || reconnect_enabled).then_some(resolved)
+}
+
+#[cfg(feature = "hardware-e2e")]
+fn e2e_linux_address() -> Option<BdAddr> {
+    let value = option_env!("HIDSHIFT_E2E_LINUX_ADDRESS")?;
+    let mut visible = [0u8; 6];
+    let mut parts = value.split(':');
+    for byte in &mut visible {
+        *byte = u8::from_str_radix(parts.next()?, 16).ok()?;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    visible.reverse();
+    Some(BdAddr::new(visible))
 }
 
 async fn accept_ble_connections<'values, 'server, C>(
@@ -603,12 +608,44 @@ async fn accept_ble_connections<'values, 'server, C>(
     restored_state: Option<&StorageState>,
     pairable_host: Option<HostId>,
 ) where
-    C: Controller,
+    C: Controller
+        + ControllerCmdSync<LeClearFilterAcceptList>
+        + ControllerCmdSync<LeAddDeviceToFilterAcceptList>,
 {
     let mut control = BleControlState::new(restored_state, pairable_host);
+    #[cfg(feature = "hardware-e2e")]
+    {
+        if let Err(error) = stack.command(LeClearFilterAcceptList::new()).await {
+            log::error!("firmware: E2E accept-list clear failed: {:?}", error);
+        }
+        let address = BdAddr::new(hidshift::e2e::E2E_PROBE_BLE_ADDRESS_RAW);
+        if let Err(error) = stack
+            .command(LeAddDeviceToFilterAcceptList::new(
+                AddrKind::RANDOM,
+                address,
+            ))
+            .await
+        {
+            log::error!("firmware: E2E accept-list add failed: {:?}", error);
+        }
+        match e2e_linux_address() {
+            Some(address) => {
+                if let Err(error) = stack
+                    .command(LeAddDeviceToFilterAcceptList::new(
+                        AddrKind::PUBLIC,
+                        address,
+                    ))
+                    .await
+                {
+                    log::error!("firmware: E2E Linux accept-list add failed: {:?}", error);
+                }
+            }
+            None => log::error!("firmware: E2E Linux controller address is missing"),
+        }
+    }
     loop {
         match select(
-            advertise_ble(peripheral, server),
+            advertise_ble(peripheral, server, cfg!(feature = "hardware-e2e")),
             receive_ble_command(control_receiver, notify_receiver),
         )
         .await
@@ -720,13 +757,21 @@ async fn manage_ble_connections<'values, 'server, C>(
         }
 
         match select3(
-            advertise_if_slot_available(peripheral, server, slots.should_advertise()),
-            process_slot_events(&mut connection_slots, &slots, server, sender),
             receive_ble_command(control_receiver, notify_receiver),
+            process_slot_events(&mut connection_slots, &slots, server, sender),
+            advertise_if_slot_available(
+                peripheral,
+                server,
+                slots.should_advertise(),
+                cfg!(feature = "hardware-e2e"),
+            ),
         )
         .await
         {
-            Either3::First(Ok(conn)) => {
+            // HID reports are realtime traffic. embassy-futures select3 is
+            // deliberately biased by argument order, so command reception
+            // must be first rather than behind GATT and advertising work.
+            Either3::Third(Ok(conn)) => {
                 let Some(host_id) = resolve_connection_host_id(&conn, restored_state, control)
                 else {
                     log::warn!(
@@ -766,7 +811,7 @@ async fn manage_ble_connections<'values, 'server, C>(
                     }
                 }
             }
-            Either3::First(Err(err)) => {
+            Either3::Third(Err(err)) => {
                 log::warn!("firmware: ble advertising failed: {:?}", err);
             }
             Either3::Second(slot_event) => {
@@ -778,7 +823,11 @@ async fn manage_ble_connections<'values, 'server, C>(
                     clear_connection_slot(&mut connection_slots, slot);
                 }
             }
-            Either3::Third(command) => {
+            Either3::First(command) => {
+                #[cfg(feature = "hardware-e2e")]
+                if matches!(command, BleTaskCommand::Notify { .. }) {
+                    crate::e2e_telemetry::record_ble_receive(Instant::now().as_micros());
+                }
                 control.apply_command(command);
                 if control.should_drop(command) {
                     log::debug!("firmware: dropping stale notify after target release");
@@ -841,12 +890,13 @@ async fn advertise_if_slot_available<'values, 'server, C>(
     peripheral: &mut Peripheral<'values, C, DefaultPacketPool>,
     server: &'server Server<'server>,
     should_advertise: bool,
+    restrict_to_accept_list: bool,
 ) -> Result<GattConnection<'values, 'server, DefaultPacketPool>, BleHostError<C::Error>>
 where
     C: Controller,
 {
     if should_advertise {
-        advertise_ble(peripheral, server).await
+        advertise_ble(peripheral, server, restrict_to_accept_list).await
     } else {
         pending().await
     }
@@ -1240,6 +1290,7 @@ where
 async fn advertise_ble<'values, 'server, C>(
     peripheral: &mut Peripheral<'values, C, DefaultPacketPool>,
     server: &'server Server<'server>,
+    restrict_to_accept_list: bool,
 ) -> Result<GattConnection<'values, 'server, DefaultPacketPool>, BleHostError<C::Error>>
 where
     C: Controller,
@@ -1259,9 +1310,17 @@ where
         &mut scan_data,
     )?;
 
+    let parameters = AdvertisementParameters {
+        filter_policy: if restrict_to_accept_list {
+            AdvFilterPolicy::FilterConn
+        } else {
+            AdvFilterPolicy::Unfiltered
+        },
+        ..Default::default()
+    };
     let advertiser = peripheral
         .advertise(
-            &Default::default(),
+            &parameters,
             Advertisement::ConnectableScannableUndirected {
                 adv_data: &adv_data[..len],
                 scan_data: &scan_data[..scan_len],
@@ -1269,7 +1328,7 @@ where
         )
         .await?;
 
-    log::info!("firmware: waiting for BLE connection");
+    log::debug!("firmware: waiting for BLE connection");
     Ok(advertiser.accept().await?.with_attribute_server(server)?)
 }
 
@@ -1538,6 +1597,8 @@ async fn send_ble_hid_report<P>(
 where
     P: PacketPool,
 {
+    #[cfg(feature = "hardware-e2e")]
+    crate::e2e_telemetry::record_notify_start(Instant::now().as_micros());
     let mut notifications = heapless::Vec::<_, BLE_HID_NOTIFICATIONS_PER_REPORT_MAX>::new();
     if notifications_for_input_report(report, &mut notifications).is_err() {
         return false;
@@ -1577,6 +1638,8 @@ where
         );
     }
 
+    #[cfg(feature = "hardware-e2e")]
+    crate::e2e_telemetry::record_notify_done(Instant::now().as_micros());
     true
 }
 

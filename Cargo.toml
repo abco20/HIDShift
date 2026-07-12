@@ -12,7 +12,13 @@ publish = false
 [workspace]
 members = ["firmware"]
 default-members = ["."]
-exclude = ["tools/hidshift-client", "tools/hidshiftctl", "web"]
+exclude = [
+    "e2e/probe-firmware",
+    "e2e/runner",
+    "tools/hidshift-client",
+    "tools/hidshiftctl",
+    "web",
+]
 resolver = "3"
 
 [lib]

@@ -13,8 +13,10 @@ path = "src/main.rs"
 [features]
 default = []
 diagnostic-input = []
+hardware-e2e = []
 
 [dependencies]
+bt-hci = "0.8.1"
 embassy-executor = "0.10.0"
 embassy-futures = "0.1.2"
 embassy-sync = "0.7.2"
@@ -34,5 +36,8 @@ esp-synopsys-usb-otg = "0.4.2"
 hidshift = { path = ".." }
 heapless = "0.9.2"
 log = "0.4.33"
+# Hardware-E2E stores a 64-bit ingress timestamp without blocking the input
+# path; Xtensa has no native AtomicU64, so portable-atomic supplies the fallback.
+portable-atomic = "1.13.1"
 static_cell = "2.1.1"
 trouble-host = { version = "0.6.0", default-features = false, features = ["default-packet-pool", "derive", "gatt", "log", "peripheral", "security"] }

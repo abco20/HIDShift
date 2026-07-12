@@ -50,7 +50,13 @@ impl<const HOSTS: usize> MouseReportAccumulator<HOSTS> {
         // Button transitions are ordered events and must never be coalesced
         // into movement that happened under the previous button state.
         if bytes[0] != state.buttons {
-            return false;
+            if state.pending {
+                return false;
+            }
+            // With no older movement to preserve, the report itself is the
+            // correctly ordered button transition. Accept it instead of
+            // requiring the transport adapter to synthesize separate state.
+            state.buttons = bytes[0];
         }
         if state.pending {
             self.stats.reports_coalesced = self.stats.reports_coalesced.saturating_add(1);
@@ -184,6 +190,17 @@ mod tests {
             accumulator.take_next(HostId(1)).unwrap().as_bytes(),
             &[0, 100, 0, 0, 0]
         );
+    }
+
+    #[test]
+    fn button_change_with_no_pending_movement_is_not_dropped() {
+        let mut accumulator = MouseReportAccumulator::<4>::new();
+        assert!(accumulator.push(HostId(1), BleMouseReport::from_bytes([3, 1, 0, 0, 0])));
+        assert_eq!(
+            accumulator.take_next(HostId(1)).unwrap().as_bytes(),
+            &[3, 1, 0, 0, 0]
+        );
+        assert_eq!(accumulator.buttons(HostId(1)), Some(3));
     }
 
     #[test]

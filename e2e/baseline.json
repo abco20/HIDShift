@@ -1,0 +1,20 @@
+{
+  "schema_version": 2,
+  "metric": "dut_ingress_to_probe_clock_synchronized",
+  "keyboard": {
+    "samples": 20,
+    "mean_ms": 18.423115,
+    "p50_ms": 18.366715,
+    "p95_ms": 24.428715,
+    "p99_ms": 24.428715,
+    "max_ms": 24.428715
+  },
+  "mouse": {
+    "samples": 10,
+    "mean_ms": 18.917715,
+    "p50_ms": 19.418715,
+    "p95_ms": 24.934715,
+    "p99_ms": 24.934715,
+    "max_ms": 24.934715
+  }
+}

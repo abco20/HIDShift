@@ -205,6 +205,17 @@ ESP_LOG=debug cargo +esp build \
 
 ## Development Checks
 
+### Two-ESP hardware E2E
+
+The two-ESP hardware E2E suite and its Linux setup are documented in
+[e2e/README.md](e2e/README.md).
+
+```sh
+source ~/export-esp.sh
+cargo run --manifest-path e2e/runner/Cargo.toml -- \
+  --latency-samples 200 --stability-seconds 120
+```
+
 Run the host-side checks before submitting changes:
 
 ```sh

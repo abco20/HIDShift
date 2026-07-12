@@ -7,6 +7,9 @@ use hidshift::management::{MANAGEMENT_REQUEST_LEN, ManagementDestination, Manage
 use hidshift::runtime::RUNTIME_INPUT_QUEUE_CAPACITY;
 use hidshift::runtime::message::RuntimeInputMessage;
 
+#[cfg(feature = "hardware-e2e")]
+use hidshift::e2e::{E2eCommand, E2ePacket};
+
 const REQUEST_PREFIX: &[u8] = b"@HIDSHIFT:";
 const REQUEST_LINE_LEN: usize = REQUEST_PREFIX.len() + MANAGEMENT_REQUEST_LEN * 2;
 
@@ -31,6 +34,8 @@ pub async fn serial_management_task(
     let mut byte = [0u8; 1];
 
     log::info!("firmware: wired management ready on UART0 RX GPIO44");
+    #[cfg(feature = "hardware-e2e")]
+    log::info!("@HIDSHIFT-E2E:READY,1");
     loop {
         match uart.read_async(&mut byte).await {
             Ok(1) if byte[0] == b'\n' || byte[0] == b'\r' => {
@@ -42,6 +47,54 @@ pub async fn serial_management_task(
                             now_ms: Instant::now().as_millis(),
                         })
                         .await;
+                }
+                #[cfg(feature = "hardware-e2e")]
+                if let Ok(packet) = E2ePacket::decode_line(&line[..line_len]) {
+                    let sequence = packet.sequence;
+                    let acknowledge = packet.requests_acknowledgement();
+                    let ingress_us = Instant::now().as_micros();
+                    if packet.carries_input() {
+                        crate::e2e_telemetry::record_ingress(sequence, ingress_us);
+                    }
+                    if matches!(packet.command, E2eCommand::ReadTimestamp) {
+                        let snapshot = crate::e2e_telemetry::snapshot();
+                        log::info!(
+                            "@HIDSHIFT-E2E:STAMP,{},{},{},{},{},{},{},{},{},{},{},{}",
+                            sequence,
+                            snapshot.sequence,
+                            snapshot.ingress_us,
+                            snapshot.runtime_us,
+                            snapshot.runtime_dispatch_us,
+                            snapshot.ble_queued_us,
+                            snapshot.ble_receive_us,
+                            snapshot.notify_start_us,
+                            snapshot.notify_done_us,
+                            snapshot.input_count,
+                            snapshot.ble_queued_count,
+                            snapshot.notify_done_count
+                        );
+                    }
+                    match packet.input_frames() {
+                        Ok(frames) => {
+                            for frame in frames.into_iter().flatten() {
+                                sender
+                                    .send(RuntimeInputMessage::BridgeEvent(
+                                        hidshift::BridgeEvent::InputFrame(frame),
+                                    ))
+                                    .await;
+                            }
+                            if acknowledge {
+                                log::info!(
+                                    "@HIDSHIFT-E2E:QUEUED,{},{}",
+                                    sequence,
+                                    Instant::now().as_micros()
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            log::warn!("@HIDSHIFT-E2E:ERROR,{},payload,{:?}", sequence, error)
+                        }
+                    }
                 }
                 line_len = 0;
             }
