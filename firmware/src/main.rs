@@ -11,13 +11,25 @@ use esp_backtrace as _;
 #[cfg(feature = "hardware-e2e")]
 mod e2e_telemetry;
 mod platform;
+mod wired_management;
 use esp_hal::clock::CpuClock;
+#[cfg(feature = "espnow")]
+use esp_hal::interrupt::software::SoftwareInterrupt;
 use esp_hal::interrupt::software::SoftwareInterruptControl;
+#[cfg(feature = "espnow")]
+use esp_hal::ram;
+#[cfg(feature = "espnow")]
+use esp_hal::system::Stack;
 use esp_hal::timer::timg::TimerGroup;
+#[cfg(feature = "espnow")]
+use esp_radio::ble::controller::BleConnector;
 use esp32s3_platform::ble_hid_task::BleRuntimeSnapshot;
 use esp32s3_platform::ble_hid_task::active_ble_connections;
 use esp32s3_platform::button_task::control_task;
+#[cfg(feature = "espnow")]
+use esp32s3_platform::espnow_link_task::espnow_host_task;
 use esp32s3_platform::storage_task::storage_command_task;
+#[cfg(not(all(feature = "hardware-e2e", feature = "espnow")))]
 use esp32s3_platform::usb_host_task::usb_input_task;
 use hidshift::DefaultRuntimeOwner;
 use hidshift::mouse_accumulator::MouseReportAccumulator;
@@ -33,9 +45,24 @@ use hidshift::runtime::{
 };
 use hidshift::storage::StorageState;
 use platform as esp32s3_platform;
-use static_cell::StaticCell;
+use static_cell::{ConstStaticCell, StaticCell};
 
 esp_bootloader_esp_idf::esp_app_desc!();
+
+// esp-radio's S3 PHY maps WIFI_BB (interrupt source 3) to the raw level-6
+// vector during coexistence calibration. esp-hal 1.1 leaves that vector as a
+// weak default. This is the complete vendor `bb_intr_handl` operation: a
+// volatile read acknowledges the calibration interrupt. Keep it in RAM
+// because a radio ISR must not depend on the flash cache.
+#[cfg(feature = "espnow")]
+#[unsafe(no_mangle)]
+#[ram]
+extern "C" fn level6_interrupt(_save_frame: *mut ()) {
+    const WIFI_BB_INTERRUPT_ACK: *const u32 = 0x6001_d04c as *const u32;
+    unsafe {
+        core::ptr::read_volatile(WIFI_BB_INTERRUPT_ACK);
+    }
+}
 
 static RUNTIME_INPUT_CHANNEL: Channel<
     CriticalSectionRawMutex,
@@ -84,6 +111,26 @@ static STATUS_COMMAND_CHANNEL: Channel<
     RUNTIME_STATUS_COMMAND_QUEUE_CAPACITY,
 > = Channel::new();
 static EXECUTOR: StaticCell<esp_rtos::embassy::Executor> = StaticCell::new();
+#[cfg(feature = "espnow")]
+static BLE_CORE_EXECUTOR: StaticCell<esp_rtos::embassy::Executor> = StaticCell::new();
+#[cfg(feature = "espnow")]
+static BLE_CORE_STACK: ConstStaticCell<Stack<{ 24 * 1024 }>> = ConstStaticCell::new(Stack::new());
+// Priority zero is shared with idle/application work and can postpone a
+// cross-core BLE command until the next scheduler slice. Priority one remains
+// below esp-radio controller work while waking the BLE host executor promptly.
+#[cfg(feature = "espnow")]
+const BLE_CORE_EXECUTOR_THREAD_PRIORITY: usize = 1;
+#[cfg(feature = "espnow")]
+struct CoexistCoreResources {
+    bt: esp_hal::peripherals::BT<'static>,
+    rng: esp_hal::peripherals::RNG<'static>,
+    adc1: esp_hal::peripherals::ADC1<'static>,
+    cpu_ctrl: esp_hal::peripherals::CPU_CTRL<'static>,
+    interrupt: SoftwareInterrupt<'static, 1>,
+}
+static CHANNEL_TASK_SINK: StaticCell<ChannelTaskSink> = StaticCell::new();
+static RUNTIME_OWNER_STORAGE: ConstStaticCell<DefaultRuntimeOwner> =
+    ConstStaticCell::new(DefaultRuntimeOwner::new(0));
 
 fn spawn_or_reset<S>(
     spawner: &Spawner,
@@ -107,7 +154,18 @@ fn spawn_or_reset<S>(
 fn main() -> ! {
     esp_println::logger::init_logger_from_env();
 
+    #[cfg(not(feature = "espnow"))]
     esp_alloc::heap_allocator!(size: 72 * 1024);
+    #[cfg(feature = "espnow")]
+    {
+        esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 64 * 1024);
+        // BLE runs on core1 with a dedicated 42-KiB stack below. Keep most
+        // allocations in reclaimed RAM and one regular-DRAM region large
+        // enough for the BLE controller's 8-KiB RTOS stack plus allocator
+        // metadata. Keeping this region contiguous also avoids Wi-Fi heap
+        // fragmentation starving the controller during coexistence startup.
+        esp_alloc::heap_allocator!(size: 24 * 1024);
+    }
 
     let reset_reason = esp_hal::system::reset_reason();
     let reset_reason_code = reset_reason.map_or(0, |reason| reason as u8);
@@ -117,130 +175,375 @@ fn main() -> ! {
     );
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
+    let boot_session_id = esp_hal::rng::Rng::new().random();
+    #[cfg(feature = "hardware-e2e")]
+    log::info!(
+        "@HIDSHIFT-BRIDGE:BOOT,{},{},{}",
+        boot_session_id,
+        reset_reason_code,
+        u8::from(was_brownout)
+    );
+    run_firmware(
+        peripherals,
+        reset_reason_code,
+        was_brownout,
+        boot_session_id,
+    )
+}
 
+#[inline(never)]
+fn run_firmware(
+    peripherals: esp_hal::peripherals::Peripherals,
+    reset_reason_code: u8,
+    was_brownout: bool,
+    boot_session_id: u32,
+) -> ! {
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let sw_ints = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
-    esp_rtos::start(timg0.timer0, sw_ints.software_interrupt0);
+    let scheduler_interrupt = sw_ints.software_interrupt0;
+    #[cfg(feature = "espnow")]
+    let ble_core_interrupt = sw_ints.software_interrupt1;
+    let gpio0 = peripherals.GPIO0;
+    let uart0 = peripherals.UART0;
+    let gpio44 = peripherals.GPIO44;
+    let usb0 = peripherals.USB0;
+    let gpio20 = peripherals.GPIO20;
+    let gpio19 = peripherals.GPIO19;
+    let wifi = peripherals.WIFI;
+    let flash = peripherals.FLASH;
+    #[cfg(feature = "espnow")]
+    let cpu_ctrl = peripherals.CPU_CTRL;
+    #[cfg(any(not(feature = "espnow"), feature = "espnow"))]
+    let (bt, rng, adc1) = (peripherals.BT, peripherals.RNG, peripherals.ADC1);
+    esp_rtos::start(timg0.timer0, scheduler_interrupt);
 
     let executor = EXECUTOR.init(esp_rtos::embassy::Executor::new());
     executor.run(|spawner| {
-        let runtime_owner_receiver = RUNTIME_INPUT_CHANNEL.receiver();
-        let storage_sender = RUNTIME_INPUT_CHANNEL.sender();
-        let usb_input_sender = RUNTIME_INPUT_CHANNEL.sender();
-        let usb_receiver = USB_COMMAND_CHANNEL.receiver();
-        let ble_control_receiver = BLE_CONTROL_COMMAND_CHANNEL.receiver();
-        let ble_notify_receiver = BLE_NOTIFY_COMMAND_CHANNEL.receiver();
-        let ble_input_sender = RUNTIME_INPUT_CHANNEL.sender();
-        let ble_restore_receiver = BLE_RESTORE_CHANNEL.receiver();
-        let sink = ChannelTaskSink {
-            ble_control: BLE_CONTROL_COMMAND_CHANNEL.sender(),
-            ble_notify: BLE_NOTIFY_COMMAND_CHANNEL.sender(),
-            usb: USB_COMMAND_CHANNEL.sender(),
-            storage: STORAGE_COMMAND_CHANNEL.sender(),
-            status: STATUS_COMMAND_CHANNEL.sender(),
-            mouse: MouseReportAccumulator::new(),
-            pending_usb: [None; RUNTIME_USB_COMMAND_QUEUE_CAPACITY],
-            pending_status: None,
-            status_updates_dropped: 0,
-        };
-
         spawn_or_reset(
             &spawner,
-            runtime_owner_task(
-                runtime_owner_receiver,
-                &RUNTIME_TICK_PENDING,
-                BLE_RUNTIME_BARRIER_REQUEST_CHANNEL.receiver(),
-                BLE_RUNTIME_BARRIER_DONE_CHANNEL.sender(),
-                BLE_RUNTIME_BARRIER_RESUME_CHANNEL.receiver(),
-                sink,
+            startup_task(
+                spawner,
+                reset_reason_code,
+                was_brownout,
+                gpio0,
+                uart0,
+                gpio44,
+                usb0,
+                gpio20,
+                gpio19,
+                wifi,
+                boot_session_id,
+                flash,
+                #[cfg(feature = "espnow")]
+                CoexistCoreResources {
+                    bt,
+                    rng,
+                    adc1,
+                    cpu_ctrl,
+                    interrupt: ble_core_interrupt,
+                },
+                #[cfg(not(feature = "espnow"))]
+                bt,
+                #[cfg(not(feature = "espnow"))]
+                rng,
+                #[cfg(not(feature = "espnow"))]
+                adc1,
             ),
-            "runtime-owner",
-        );
-        let _ = RUNTIME_INPUT_CHANNEL.try_send(RuntimeInputMessage::DiagnosticsEvent(
-            RuntimeDiagnosticsEvent::ResetReason(reset_reason_code),
-        ));
-        if was_brownout {
-            let _ = RUNTIME_INPUT_CHANNEL.try_send(RuntimeInputMessage::DiagnosticsEvent(
-                RuntimeDiagnosticsEvent::Brownout,
-            ));
-        }
-        spawn_or_reset(
-            &spawner,
-            control_task(
-                RUNTIME_INPUT_CHANNEL.sender(),
-                &RUNTIME_TICK_PENDING,
-                peripherals.GPIO0,
-            ),
-            "control",
-        );
-        spawn_or_reset(
-            &spawner,
-            esp32s3_platform::serial_management_task::serial_management_task(
-                RUNTIME_INPUT_CHANNEL.sender(),
-                peripherals.UART0,
-                peripherals.GPIO44,
-            ),
-            "serial-management",
-        );
-        spawn_or_reset(
-            &spawner,
-            usb_input_task(
-                usb_input_sender,
-                usb_receiver,
-                peripherals.USB0,
-                peripherals.GPIO20,
-                peripherals.GPIO19,
-                USB_BLE_QUIESCE_REQUEST_CHANNEL.sender(),
-                USB_BLE_QUIESCE_READY_CHANNEL.receiver(),
-                USB_BLE_QUIESCE_DONE_CHANNEL.sender(),
-            ),
-            "usb-input",
-        );
-        spawn_or_reset(
-            &spawner,
-            esp32s3_platform::ble_hid_task::ble_host_event_task(
-                ble_input_sender,
-                ble_control_receiver,
-                ble_notify_receiver,
-                ble_restore_receiver,
-                BLE_QUIESCE_REQUEST_CHANNEL.receiver(),
-                BLE_QUIESCE_READY_CHANNEL.sender(),
-                BLE_QUIESCE_DONE_CHANNEL.receiver(),
-                USB_BLE_QUIESCE_REQUEST_CHANNEL.receiver(),
-                USB_BLE_QUIESCE_READY_CHANNEL.sender(),
-                USB_BLE_QUIESCE_DONE_CHANNEL.receiver(),
-                BLE_RUNTIME_BARRIER_REQUEST_CHANNEL.sender(),
-                BLE_RUNTIME_BARRIER_DONE_CHANNEL.receiver(),
-                BLE_RUNTIME_BARRIER_RESUME_CHANNEL.sender(),
-                peripherals.BT,
-                peripherals.RNG,
-                peripherals.ADC1,
-            ),
-            "ble-host-event",
-        );
-        spawn_or_reset(
-            &spawner,
-            storage_command_task(
-                STORAGE_COMMAND_CHANNEL.receiver(),
-                storage_sender,
-                BLE_RESTORE_CHANNEL.sender(),
-                BLE_QUIESCE_REQUEST_CHANNEL.sender(),
-                BLE_QUIESCE_READY_CHANNEL.receiver(),
-                BLE_QUIESCE_DONE_CHANNEL.sender(),
-                active_ble_connections,
-                peripherals.FLASH,
-            ),
-            "storage-command",
-        );
-        spawn_or_reset(
-            &spawner,
-            status_command_task(
-                STATUS_COMMAND_CHANNEL.receiver(),
-                BLE_CONTROL_COMMAND_CHANNEL.sender(),
-            ),
-            "status-command",
+            "startup",
         );
     })
+}
+
+#[embassy_executor::task]
+async fn startup_task(
+    spawner: Spawner,
+    reset_reason_code: u8,
+    was_brownout: bool,
+    gpio0: esp_hal::peripherals::GPIO0<'static>,
+    uart0: esp_hal::peripherals::UART0<'static>,
+    gpio44: esp_hal::peripherals::GPIO44<'static>,
+    usb0: esp_hal::peripherals::USB0<'static>,
+    gpio20: esp_hal::peripherals::GPIO20<'static>,
+    gpio19: esp_hal::peripherals::GPIO19<'static>,
+    wifi: esp_hal::peripherals::WIFI<'static>,
+    boot_session_id: u32,
+    flash: esp_hal::peripherals::FLASH<'static>,
+    #[cfg(feature = "espnow")] coexist: CoexistCoreResources,
+    #[cfg(not(feature = "espnow"))] bt: esp_hal::peripherals::BT<'static>,
+    #[cfg(not(feature = "espnow"))] rng: esp_hal::peripherals::RNG<'static>,
+    #[cfg(not(feature = "espnow"))] adc1: esp_hal::peripherals::ADC1<'static>,
+) {
+    let runtime_owner_receiver = RUNTIME_INPUT_CHANNEL.receiver();
+    let storage_sender = RUNTIME_INPUT_CHANNEL.sender();
+    #[cfg(not(all(feature = "hardware-e2e", feature = "espnow")))]
+    let usb_input_sender = RUNTIME_INPUT_CHANNEL.sender();
+    #[cfg(not(all(feature = "hardware-e2e", feature = "espnow")))]
+    let usb_receiver = USB_COMMAND_CHANNEL.receiver();
+    #[cfg(not(feature = "espnow"))]
+    let ble_control_receiver = BLE_CONTROL_COMMAND_CHANNEL.receiver();
+    #[cfg(not(feature = "espnow"))]
+    let ble_notify_receiver = BLE_NOTIFY_COMMAND_CHANNEL.receiver();
+    #[cfg(not(feature = "espnow"))]
+    let ble_input_sender = RUNTIME_INPUT_CHANNEL.sender();
+    #[cfg(not(feature = "espnow"))]
+    let ble_restore_receiver = BLE_RESTORE_CHANNEL.receiver();
+    #[cfg(all(feature = "hardware-e2e", feature = "espnow"))]
+    let _ = (usb0, gpio20, gpio19);
+    #[cfg(feature = "espnow")]
+    let storage_radio_ready_receiver =
+        esp32s3_platform::espnow_link_task::storage_radio_ready_receiver();
+    let sink = CHANNEL_TASK_SINK.init_with(|| ChannelTaskSink {
+        ble_control: BLE_CONTROL_COMMAND_CHANNEL.sender(),
+        ble_notify: BLE_NOTIFY_COMMAND_CHANNEL.sender(),
+        usb: USB_COMMAND_CHANNEL.sender(),
+        storage: STORAGE_COMMAND_CHANNEL.sender(),
+        status: STATUS_COMMAND_CHANNEL.sender(),
+        mouse: MouseReportAccumulator::new(),
+        pending_usb: [None; RUNTIME_USB_COMMAND_QUEUE_CAPACITY],
+        pending_status: None,
+        status_updates_dropped: 0,
+    });
+
+    spawn_or_reset(
+        &spawner,
+        runtime_owner_task(
+            runtime_owner_receiver,
+            &RUNTIME_TICK_PENDING,
+            BLE_RUNTIME_BARRIER_REQUEST_CHANNEL.receiver(),
+            BLE_RUNTIME_BARRIER_DONE_CHANNEL.sender(),
+            BLE_RUNTIME_BARRIER_RESUME_CHANNEL.receiver(),
+            sink,
+        ),
+        "runtime-owner",
+    );
+    let _ = RUNTIME_INPUT_CHANNEL.try_send(RuntimeInputMessage::DiagnosticsEvent(
+        RuntimeDiagnosticsEvent::ResetReason(reset_reason_code),
+    ));
+    if was_brownout {
+        let _ = RUNTIME_INPUT_CHANNEL.try_send(RuntimeInputMessage::DiagnosticsEvent(
+            RuntimeDiagnosticsEvent::Brownout,
+        ));
+    }
+    spawn_or_reset(
+        &spawner,
+        control_task(RUNTIME_INPUT_CHANNEL.sender(), &RUNTIME_TICK_PENDING, gpio0),
+        "control",
+    );
+    spawn_or_reset(
+        &spawner,
+        esp32s3_platform::serial_management_task::serial_management_task(
+            RUNTIME_INPUT_CHANNEL.sender(),
+            uart0,
+            gpio44,
+            boot_session_id,
+        ),
+        "serial-management",
+    );
+    // The bridge E2E image injects reports at the normalized UART boundary.
+    // Keeping the USB Host future out of that image avoids exceeding the
+    // ESP32-S3 shared executor's startup stack; the normal firmware image
+    // still starts the USB Host task below.
+    #[cfg(not(all(feature = "hardware-e2e", feature = "espnow")))]
+    spawn_or_reset(
+        &spawner,
+        usb_input_bootstrap(
+            spawner,
+            usb_input_sender,
+            usb_receiver,
+            usb0,
+            gpio20,
+            gpio19,
+            USB_BLE_QUIESCE_REQUEST_CHANNEL.sender(),
+            USB_BLE_QUIESCE_READY_CHANNEL.receiver(),
+            USB_BLE_QUIESCE_DONE_CHANNEL.sender(),
+        ),
+        "usb-input-bootstrap",
+    );
+    #[cfg(feature = "espnow")]
+    spawn_or_reset(
+        &spawner,
+        espnow_host_task(spawner, wifi, boot_session_id),
+        "espnow-host",
+    );
+    #[cfg(feature = "espnow")]
+    spawn_or_reset(
+        &spawner,
+        ble_coexist_core_bootstrap_task(
+            coexist.bt,
+            coexist.rng,
+            coexist.adc1,
+            coexist.cpu_ctrl,
+            coexist.interrupt,
+        ),
+        "ble-coexist-core-bootstrap",
+    );
+    #[cfg(not(feature = "espnow"))]
+    spawn_or_reset(
+        &spawner,
+        esp32s3_platform::ble_hid_task::ble_host_event_task(
+            ble_input_sender,
+            ble_control_receiver,
+            ble_notify_receiver,
+            ble_restore_receiver,
+            BLE_QUIESCE_REQUEST_CHANNEL.receiver(),
+            BLE_QUIESCE_READY_CHANNEL.sender(),
+            BLE_QUIESCE_DONE_CHANNEL.receiver(),
+            USB_BLE_QUIESCE_REQUEST_CHANNEL.receiver(),
+            USB_BLE_QUIESCE_READY_CHANNEL.sender(),
+            USB_BLE_QUIESCE_DONE_CHANNEL.receiver(),
+            BLE_RUNTIME_BARRIER_REQUEST_CHANNEL.sender(),
+            BLE_RUNTIME_BARRIER_DONE_CHANNEL.receiver(),
+            BLE_RUNTIME_BARRIER_RESUME_CHANNEL.sender(),
+            bt,
+            rng,
+            adc1,
+        ),
+        "ble-host-event",
+    );
+    spawn_or_reset(
+        &spawner,
+        storage_command_task(
+            STORAGE_COMMAND_CHANNEL.receiver(),
+            storage_sender,
+            BLE_RESTORE_CHANNEL.sender(),
+            BLE_QUIESCE_REQUEST_CHANNEL.sender(),
+            BLE_QUIESCE_READY_CHANNEL.receiver(),
+            BLE_QUIESCE_DONE_CHANNEL.sender(),
+            active_ble_connections,
+            BLE_CONTROL_COMMAND_CHANNEL.sender(),
+            flash,
+            #[cfg(feature = "espnow")]
+            storage_radio_ready_receiver,
+        ),
+        "storage-command",
+    );
+    spawn_or_reset(
+        &spawner,
+        status_command_task(
+            STATUS_COMMAND_CHANNEL.receiver(),
+            BLE_CONTROL_COMMAND_CHANNEL.sender(),
+        ),
+        "status-command",
+    );
+    core::future::pending::<()>().await;
+}
+
+#[cfg(feature = "espnow")]
+#[embassy_executor::task]
+async fn ble_coexist_core_bootstrap_task(
+    bt: esp_hal::peripherals::BT<'static>,
+    rng: esp_hal::peripherals::RNG<'static>,
+    adc1: esp_hal::peripherals::ADC1<'static>,
+    cpu_ctrl: esp_hal::peripherals::CPU_CTRL<'static>,
+    ble_core_interrupt: SoftwareInterrupt<'static, 1>,
+) {
+    let radio_ready = esp32s3_platform::espnow_link_task::radio_ready_receiver();
+    let _ = radio_ready.receive().await;
+    log::info!(
+        "firmware: BLE coexist radio barrier passed heap_free={}",
+        esp_alloc::HEAP.free()
+    );
+    esp_rtos::start_second_core(
+        cpu_ctrl,
+        ble_core_interrupt,
+        BLE_CORE_STACK.take(),
+        move || {
+            esp_rtos::CurrentThreadHandle::get().set_priority(BLE_CORE_EXECUTOR_THREAD_PRIORITY);
+            // Keep the BLE host and Espressif controller task on core1. The
+            // default controller placement is core0, where Wi-Fi/ESP-NOW and
+            // the input runtime already run; that adds a second cross-core
+            // handoff to every HCI ACL submission and increases both radios'
+            // scheduling tails during coexistence.
+            log::info!(
+                "firmware: BLE controller initialization starting on core1 heap_free={}",
+                esp_alloc::HEAP.free()
+            );
+            let connector = match BleConnector::new(
+                bt,
+                esp32s3_platform::ble_hid_task::ble_controller_config(),
+            ) {
+                Ok(connector) => connector,
+                Err(error) => {
+                    log::error!(
+                        "firmware: BLE controller initialization failed on core1: {:?}; resetting",
+                        error
+                    );
+                    esp_hal::system::software_reset();
+                }
+            };
+            log::info!(
+                "firmware: BLE controller initialized on core1 heap_free={}",
+                esp_alloc::HEAP.free()
+            );
+            let executor = BLE_CORE_EXECUTOR.init(esp_rtos::embassy::Executor::new());
+            executor.run(|spawner| {
+                spawn_or_reset(
+                    &spawner,
+                    esp32s3_platform::ble_hid_task::ble_host_event_task(
+                        RUNTIME_INPUT_CHANNEL.sender(),
+                        BLE_CONTROL_COMMAND_CHANNEL.receiver(),
+                        BLE_NOTIFY_COMMAND_CHANNEL.receiver(),
+                        BLE_RESTORE_CHANNEL.receiver(),
+                        BLE_QUIESCE_REQUEST_CHANNEL.receiver(),
+                        BLE_QUIESCE_READY_CHANNEL.sender(),
+                        BLE_QUIESCE_DONE_CHANNEL.receiver(),
+                        USB_BLE_QUIESCE_REQUEST_CHANNEL.receiver(),
+                        USB_BLE_QUIESCE_READY_CHANNEL.sender(),
+                        USB_BLE_QUIESCE_DONE_CHANNEL.receiver(),
+                        BLE_RUNTIME_BARRIER_REQUEST_CHANNEL.sender(),
+                        BLE_RUNTIME_BARRIER_DONE_CHANNEL.receiver(),
+                        BLE_RUNTIME_BARRIER_RESUME_CHANNEL.sender(),
+                        connector,
+                        rng,
+                        adc1,
+                    ),
+                    "ble-host-event-core1",
+                );
+            })
+        },
+    );
+
+    core::future::pending::<()>().await;
+}
+
+#[cfg(not(all(feature = "hardware-e2e", feature = "espnow")))]
+#[embassy_executor::task]
+async fn usb_input_bootstrap(
+    spawner: Spawner,
+    sender: Sender<
+        'static,
+        CriticalSectionRawMutex,
+        RuntimeInputMessage,
+        RUNTIME_INPUT_QUEUE_CAPACITY,
+    >,
+    receiver: Receiver<
+        'static,
+        CriticalSectionRawMutex,
+        UsbTaskCommand,
+        RUNTIME_USB_COMMAND_QUEUE_CAPACITY,
+    >,
+    usb0: esp_hal::peripherals::USB0<'static>,
+    usb_dp: esp_hal::peripherals::GPIO20<'static>,
+    usb_dm: esp_hal::peripherals::GPIO19<'static>,
+    ble_quiesce_request: Sender<'static, CriticalSectionRawMutex, (), 1>,
+    ble_quiesce_ready: Receiver<'static, CriticalSectionRawMutex, (), 1>,
+    ble_quiesce_done: Sender<'static, CriticalSectionRawMutex, (), 1>,
+) {
+    spawn_or_reset(
+        &spawner,
+        usb_input_task(
+            sender,
+            receiver,
+            usb0,
+            usb_dp,
+            usb_dm,
+            ble_quiesce_request,
+            ble_quiesce_ready,
+            ble_quiesce_done,
+        ),
+        "usb-input",
+    );
+    core::future::pending::<()>().await;
 }
 
 #[embassy_executor::task]
@@ -255,9 +558,9 @@ async fn runtime_owner_task(
     barrier_request: Receiver<'static, CriticalSectionRawMutex, usize, 1>,
     barrier_done: Sender<'static, CriticalSectionRawMutex, BleRuntimeSnapshot, 1>,
     barrier_resume: Receiver<'static, CriticalSectionRawMutex, (), 1>,
-    mut sink: ChannelTaskSink,
+    mut sink: &'static mut ChannelTaskSink,
 ) {
-    let mut owner = DefaultRuntimeOwner::new(0);
+    let mut owner = RUNTIME_OWNER_STORAGE.take();
 
     log::info!("firmware: runtime owner task boot");
 
@@ -320,13 +623,16 @@ async fn process_runtime_message(
     }
     log::trace!("firmware: runtime_input {:?}", message);
 
-    let next_owner = match owner.staged_message(&message) {
-        Ok(owner) => owner,
-        Err(error) => {
-            log::error!("firmware: runtime owner error {:?}", error);
-            return;
-        }
-    };
+    // Input frames are internally transactional while their outbox is built.
+    // After that latest-state input stays committed even if its realtime
+    // delivery is dropped: the next broadcast snapshot heals the receiver.
+    // Management inputs retain a full rollback checkpoint.
+    let checkpoint = owner.checkpoint_for_message(&message);
+    if let Err(error) = owner.process_message_in_place(&message) {
+        owner.rollback_message(checkpoint);
+        log::error!("firmware: runtime owner error {:?}", error);
+        return;
+    }
 
     #[cfg(feature = "hardware-e2e")]
     if matches!(
@@ -336,14 +642,11 @@ async fn process_runtime_message(
         crate::e2e_telemetry::record_runtime_dispatch(embassy_time::Instant::now().as_micros());
     }
 
-    if let Err(error) = sink
-        .dispatch_runtime_queues(next_owner.default_queues())
-        .await
-    {
+    if let Err(error) = sink.dispatch_runtime_queues(owner.default_queues()).await {
+        owner.rollback_message(checkpoint);
         log::error!("firmware: runtime drive error {:?}", error);
         return;
     }
-    *owner = next_owner;
     for effect in owner.default_queues().effects.iter().copied() {
         apply_runtime_effect(effect);
     }
@@ -388,30 +691,7 @@ async fn status_command_task(
 }
 
 fn print_wired_management_response(response: hidshift::ManagementResponse) {
-    let bytes = response.encode();
-    esp_println::println!(
-        "@HIDSHIFT:{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        bytes[0],
-        bytes[1],
-        bytes[2],
-        bytes[3],
-        bytes[4],
-        bytes[5],
-        bytes[6],
-        bytes[7],
-        bytes[8],
-        bytes[9],
-        bytes[10],
-        bytes[11],
-        bytes[12],
-        bytes[13],
-        bytes[14],
-        bytes[15],
-        bytes[16],
-        bytes[17],
-        bytes[18],
-        bytes[19]
-    );
+    wired_management::print_response(response);
 }
 
 struct ChannelTaskSink {
@@ -465,11 +745,11 @@ impl ChannelTaskSink {
         self.flush_status_snapshot();
         self.ensure_capacity(queues)?;
         for command in queues.ble.iter().copied() {
-            self.send_ble_with_policy(command).await?;
             #[cfg(feature = "hardware-e2e")]
             if matches!(command, BleTaskCommand::Notify { .. }) {
                 crate::e2e_telemetry::record_ble_queued(embassy_time::Instant::now().as_micros());
             }
+            self.send_ble_with_policy(command).await?;
             if command.class() == hidshift::CommandClass::Realtime {
                 // Channel wakeups only mark the BLE task runnable. Yield here
                 // before lower-priority USB/storage/status dispatch so the

@@ -39,6 +39,15 @@ impl<const HOSTS: usize> Default for BleInputGate<HOSTS> {
     }
 }
 
+/// Restrict connectable advertising once at least one peer is bonded, except
+/// while the user has explicitly opened a pairing window for another peer.
+pub const fn restrict_advertising_to_bonded_peers(
+    bonded_peer_count: usize,
+    pairing_open: bool,
+) -> bool {
+    bonded_peer_count != 0 && !pairing_open
+}
+
 fn host_index<const HOSTS: usize>(host_id: HostId) -> Option<usize> {
     let index = host_id.validated().ok()?.get().checked_sub(1)? as usize;
     (index < HOSTS).then_some(index)
@@ -194,6 +203,18 @@ impl<const SLOTS: usize> BleConnectionSlots<SLOTS> {
         self.entries.iter().any(Option::is_none)
     }
 
+    /// Returns whether an already-connected peripheral should advertise an
+    /// additional slot.
+    ///
+    /// Keeping connectable advertising active during normal HID operation
+    /// consumes the same 2.4-GHz radio as BLE connection events and Wi-Fi.
+    /// Additional peers therefore connect only while the user has explicitly
+    /// opened a pairing/reconnect window. Initial connection advertising is
+    /// handled separately when no slots are connected.
+    pub fn should_advertise_additional_connection(&self, connection_window_open: bool) -> bool {
+        connection_window_open && self.should_advertise()
+    }
+
     pub fn is_connected(&self, slot: usize) -> bool {
         self.entries.get(slot).map(Option::is_some).unwrap_or(false)
     }
@@ -261,6 +282,13 @@ pub fn resolve_host_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bonded_advertising_is_filtered_except_during_explicit_pairing() {
+        assert!(!restrict_advertising_to_bonded_peers(0, false));
+        assert!(restrict_advertising_to_bonded_peers(1, false));
+        assert!(!restrict_advertising_to_bonded_peers(1, true));
+    }
     use crate::storage::{FixedName, StoredHostProfile, StoredSecurityLevel};
 
     fn peer(index: u8) -> BlePeerIdentity {
@@ -281,6 +309,7 @@ mod tests {
             name: FixedName::empty(),
             bond: Some(StoredBond {
                 peer_address: identity.peer_address,
+                peer_address_kind: crate::storage::StoredAddressKind::Public,
                 peer_irk: identity.peer_irk,
                 ltk: [host_id; 16],
                 is_bonded: true,
@@ -333,6 +362,18 @@ mod tests {
         assert_eq!(reconnected.host_id(), HostId(2));
         assert!(slots.is_connected(0));
         assert!(slots.is_connected(1));
+    }
+
+    #[test]
+    fn additional_connection_advertising_requires_an_explicit_window() {
+        let mut slots = BleConnectionSlots::<2>::new();
+        slots.connect_first_free(HostId(1), peer(1)).unwrap();
+
+        assert!(!slots.should_advertise_additional_connection(false));
+        assert!(slots.should_advertise_additional_connection(true));
+
+        slots.connect_first_free(HostId(2), peer(2)).unwrap();
+        assert!(!slots.should_advertise_additional_connection(true));
     }
 
     #[test]

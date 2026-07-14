@@ -99,6 +99,21 @@ impl<'d, A: UsbHostAllocator<'d>> UsbHidControl<'d, A> {
         }
         self.set_protocol(protocol).await
     }
+
+    pub async fn get_report(
+        &mut self,
+        report_type: u8,
+        report_id: u8,
+        buf: &mut [u8],
+    ) -> Result<usize, HidError> {
+        let value = (report_type as u16) << 8 | report_id as u16;
+        let setup =
+            SetupPacket::class_interface_in(0x01, value, self.interface as u16, buf.len() as u16);
+        self.ctrl_ch
+            .control_in(&setup.to_bytes(), buf)
+            .await
+            .map_err(Into::into)
+    }
 }
 
 fn control_endpoint_info(enum_info: &EnumerationInfo) -> EndpointInfo {

@@ -416,6 +416,7 @@ mod tests {
     fn security_event_without_bond_payload_keeps_restored_bond() {
         let stored_bond = StoredBond {
             peer_address: [1, 2, 3, 4, 5, 6],
+            peer_address_kind: crate::storage::StoredAddressKind::Public,
             peer_irk: None,
             ltk: [0x42; 16],
             is_bonded: true,

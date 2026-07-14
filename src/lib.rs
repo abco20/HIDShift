@@ -33,8 +33,12 @@ pub mod ble_notify;
 pub mod ble_runtime;
 pub mod bridge;
 pub mod e2e;
+pub mod espnow_pairing;
+pub mod espnow_pairing_management;
+pub mod espnow_security;
 pub mod ids;
 pub mod input;
+pub mod link;
 pub mod management;
 pub mod mouse_accumulator;
 pub mod reports;
@@ -43,6 +47,7 @@ pub mod runtime;
 pub mod settings;
 pub mod storage;
 pub mod target_control;
+pub mod transport;
 pub mod usb_hid;
 
 pub use ble::{
@@ -52,6 +57,7 @@ pub use ble::{
 pub use ble_connection::{
     BleConnectionEntry, BleConnectionSlot, BleConnectionSlotError, BleConnectionSlots,
     BleInputGate, BlePeerIdentity, resolve_host_id as resolve_ble_host_id,
+    restrict_advertising_to_bonded_peers,
 };
 pub use ble_notify::{
     BleNotificationDispatchError, BleNotificationSink, BleTypedNotification,
@@ -81,10 +87,10 @@ pub use input::{
 pub use management::{
     MANAGEMENT_PROTOCOL_VERSION, MANAGEMENT_REQUEST_LEN, MANAGEMENT_REQUEST_UUID,
     MANAGEMENT_RESPONSE_LEN, MANAGEMENT_RESPONSE_UUID, MANAGEMENT_SERVICE_UUID, ManagementCommand,
-    ManagementDestination, ManagementDiagnostics, ManagementHistoryEvent, ManagementHostInfo,
-    ManagementHostName, ManagementHostStatus, ManagementHostTiming, ManagementProtocolError,
-    ManagementRequest, ManagementResponse, ManagementResponsePayload, ManagementResult,
-    ManagementSchema, ManagementSetting, ManagementStatus, ManagementUsbDevice,
+    ManagementDestination, ManagementDiagnostics, ManagementEspNowInfo, ManagementHistoryEvent,
+    ManagementHostInfo, ManagementHostName, ManagementHostStatus, ManagementHostTiming,
+    ManagementProtocolError, ManagementRequest, ManagementResponse, ManagementResponsePayload,
+    ManagementResult, ManagementSchema, ManagementSetting, ManagementStatus, ManagementUsbDevice,
     ManagementUsbStatus,
 };
 pub use reports::{
@@ -132,11 +138,16 @@ pub use storage::{
     STORED_BOND_LEN, STORED_HOSTS_MAX, StorageDebouncer, StorageError, StorageFlashLayout,
     StorageHeader, StoragePersistPriority, StoragePersistence, StorageSlot, StorageSlotBackend,
     StorageSlotIndex, StorageState, StorageTaskAction, StorageTaskPolicy, StorageWriteResult,
-    StoredBond, StoredHostProfile, StoredSecurityLevel, decode_storage_image, encode_storage_image,
-    persist_storage_state, restore_latest_storage_state, select_newest_valid_storage_image,
+    StoredAddressKind, StoredBond, StoredHostProfile, StoredSecurityLevel, decode_storage_image,
+    encode_storage_image, persist_storage_state, restore_latest_storage_state,
+    select_newest_valid_storage_image,
 };
 pub use target_control::{
     ButtonIntent, DebouncedButton, DebouncedButtonEvent, TargetSwitchControl,
+};
+pub use transport::{
+    BleConnectionTiming, BlePhyPreference, InputTransport, InputTransportRouter,
+    low_latency_ble_connection_timing,
 };
 pub use usb_hid::frame::{
     UsbInputFrameError, decode_standard_input_frame, events_to_standard_input_frame,

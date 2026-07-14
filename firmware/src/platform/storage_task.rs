@@ -1,14 +1,20 @@
-use embassy_futures::select::{Either, select};
+use embassy_futures::select::{Either, Either3, select, select3};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::channel::{Receiver, Sender};
+use embassy_sync::channel::{Channel, Receiver, Sender};
 use embassy_time::{Duration, Instant, Timer};
 use esp_hal::peripherals::FLASH;
 use esp_hal::{peripherals::Interrupt, system::Cpu};
+use hidshift::espnow_pairing::{EspNowPairing, EspNowRole};
+use hidshift::espnow_pairing_management::{EspNowPairingAction, EspNowPairingService};
 use hidshift::ids::HostId;
+use hidshift::management::{
+    ManagementDestination, ManagementRequest, ManagementResponse, ManagementResult,
+};
 use hidshift::runtime::bootstrap::{initial_pairing_host, storage_with_default_target};
 use hidshift::runtime::message::RuntimeInputMessage;
 use hidshift::runtime::{
-    RUNTIME_INPUT_QUEUE_CAPACITY, RUNTIME_STORAGE_COMMAND_QUEUE_CAPACITY, StorageTaskCommand,
+    BleTaskCommand, RUNTIME_BLE_CONTROL_COMMAND_QUEUE_CAPACITY, RUNTIME_INPUT_QUEUE_CAPACITY,
+    RUNTIME_STORAGE_COMMAND_QUEUE_CAPACITY, StorageTaskCommand,
 };
 use hidshift::storage::{
     StoragePersistPriority, StoragePersistence, StorageSlotBackend, StorageState,
@@ -16,12 +22,33 @@ use hidshift::storage::{
 };
 use hidshift::target_control::ButtonIntent;
 
-use super::flash_backend::new_storage_backend;
+use super::flash_backend::{FirmwareStorageBackend, new_storage_backend};
 
 pub const STORAGE_PERSIST_DEBOUNCE_MS: u64 = 1_000;
 pub const STORAGE_PERSIST_LAZY_MS: u64 = 5_000;
 pub const STORAGE_ACTIVE_BLE_RETRY_MS: u64 = 1_000;
 pub const STORAGE_CRITICAL_FORCE_QUIESCE_MS: u64 = 5_000;
+
+#[derive(Clone, Copy, Debug)]
+pub struct EspNowManagementRequest {
+    pub destination: ManagementDestination,
+    pub request: ManagementRequest,
+}
+
+static ESPNOW_MANAGEMENT_CHANNEL: Channel<CriticalSectionRawMutex, EspNowManagementRequest, 4> =
+    Channel::new();
+static ESPNOW_RESTORE_CHANNEL: Channel<CriticalSectionRawMutex, Option<EspNowPairing>, 1> =
+    Channel::new();
+
+pub fn espnow_management_sender()
+-> Sender<'static, CriticalSectionRawMutex, EspNowManagementRequest, 4> {
+    ESPNOW_MANAGEMENT_CHANNEL.sender()
+}
+
+pub fn espnow_restore_receiver()
+-> Receiver<'static, CriticalSectionRawMutex, Option<EspNowPairing>, 1> {
+    ESPNOW_RESTORE_CHANNEL.receiver()
+}
 
 #[embassy_executor::task]
 pub async fn storage_command_task(
@@ -42,9 +69,24 @@ pub async fn storage_command_task(
     ble_quiesce_ready: Receiver<'static, CriticalSectionRawMutex, Option<StorageState>, 1>,
     ble_quiesce_done: Sender<'static, CriticalSectionRawMutex, (), 1>,
     active_ble_connections: fn() -> usize,
+    ble_control: Sender<
+        'static,
+        CriticalSectionRawMutex,
+        BleTaskCommand,
+        RUNTIME_BLE_CONTROL_COMMAND_QUEUE_CAPACITY,
+    >,
     flash: FLASH<'static>,
+    #[cfg(feature = "espnow")] radio_ready: Receiver<'static, CriticalSectionRawMutex, bool, 1>,
 ) {
+    #[cfg(feature = "espnow")]
+    if !radio_ready.receive().await {
+        log::warn!("firmware: ESP-NOW unavailable before storage init");
+    }
     let mut backend = new_storage_backend(flash);
+    let espnow_pairing = backend.restored_pairing();
+    let mut espnow_service = EspNowPairingService::new(EspNowRole::UsbHost, espnow_pairing);
+    #[cfg(feature = "espnow")]
+    ESPNOW_RESTORE_CHANNEL.send(espnow_pairing).await;
     let mut persistence =
         StoragePersistence::new(STORAGE_PERSIST_DEBOUNCE_MS, STORAGE_PERSIST_LAZY_MS);
     let storage_policy = StorageTaskPolicy {
@@ -93,8 +135,20 @@ pub async fn storage_command_task(
         let now_ms = Instant::now().as_millis();
         match storage_policy.evaluate(&persistence, now_ms, active_ble_connections()) {
             StorageTaskAction::AwaitCommand => {
-                let command = receiver.receive().await;
-                stage_storage_snapshot(&mut persistence, command.state, command.priority);
+                match select(receiver.receive(), ESPNOW_MANAGEMENT_CHANNEL.receive()).await {
+                    Either::First(command) => {
+                        stage_storage_snapshot(&mut persistence, command.state, command.priority)
+                    }
+                    Either::Second(request) => {
+                        handle_espnow_management(
+                            request,
+                            &mut espnow_service,
+                            &mut backend,
+                            ble_control,
+                        )
+                        .await;
+                    }
+                }
             }
             StorageTaskAction::WaitForDeadline { delay_ms }
             | StorageTaskAction::DeferForActiveBle { delay_ms } => {
@@ -108,16 +162,26 @@ pub async fn storage_command_task(
                         persistence.pending_priority()
                     );
                 }
-                match select(
+                match select3(
                     receiver.receive(),
+                    ESPNOW_MANAGEMENT_CHANNEL.receive(),
                     Timer::after(Duration::from_millis(delay_ms)),
                 )
                 .await
                 {
-                    Either::First(command) => {
+                    Either3::First(command) => {
                         stage_storage_snapshot(&mut persistence, command.state, command.priority)
                     }
-                    Either::Second(()) => {}
+                    Either3::Second(request) => {
+                        handle_espnow_management(
+                            request,
+                            &mut espnow_service,
+                            &mut backend,
+                            ble_control,
+                        )
+                        .await;
+                    }
+                    Either3::Third(()) => {}
                 }
             }
             StorageTaskAction::QuiesceAndPersist { forced } => {
@@ -178,6 +242,68 @@ async fn resume_ble_after_flash_write(
     ble_quiesce_done: Sender<'static, CriticalSectionRawMutex, (), 1>,
 ) {
     ble_quiesce_done.send(()).await;
+}
+
+async fn handle_espnow_management(
+    request: EspNowManagementRequest,
+    service: &mut EspNowPairingService,
+    backend: &mut FirmwareStorageBackend,
+    ble_control: Sender<
+        'static,
+        CriticalSectionRawMutex,
+        BleTaskCommand,
+        RUNTIME_BLE_CONTROL_COMMAND_QUEUE_CAPACITY,
+    >,
+) {
+    let local = esp_hal::efuse::interface_mac_address(esp_hal::efuse::InterfaceMacAddress::Station);
+    let local_address = local.as_bytes().try_into().unwrap_or([0; 6]);
+    let mut outcome = service.handle(request.request.command, local_address);
+    let restart = match outcome.action {
+        EspNowPairingAction::None => false,
+        EspNowPairingAction::Persist(pairing) => match backend.write_pairing(pairing) {
+            Ok(()) => {
+                service.persisted(pairing);
+                true
+            }
+            Err(error) => {
+                log::error!("firmware: ESP-NOW pairing persist failed: {:?}", error);
+                outcome.result = ManagementResult::InternalError;
+                false
+            }
+        },
+        EspNowPairingAction::Clear => match backend.clear_pairing() {
+            Ok(()) => {
+                service.cleared();
+                true
+            }
+            Err(error) => {
+                log::error!("firmware: ESP-NOW pairing clear failed: {:?}", error);
+                outcome.result = ManagementResult::InternalError;
+                false
+            }
+        },
+    };
+    let response = ManagementResponse {
+        request_id: request.request.request_id,
+        result: outcome.result,
+        payload: outcome.payload,
+    };
+    match request.destination {
+        ManagementDestination::Wired => print_wired_response(response),
+        ManagementDestination::Ble(host_id) => {
+            ble_control
+                .send(BleTaskCommand::ManagementResponse { host_id, response })
+                .await;
+        }
+    }
+    if restart && outcome.result == ManagementResult::Ok {
+        Timer::after_millis(100).await;
+        esp_hal::system::software_reset();
+    }
+}
+
+fn print_wired_response(response: ManagementResponse) {
+    crate::wired_management::print_response(response);
 }
 
 struct UsbInterruptQuiesceGuard {

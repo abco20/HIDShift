@@ -1,3 +1,6 @@
+use crate::espnow_pairing::{
+    ESPNOW_PAIRING_IMAGE_LEN, EspNowPairing, generation_is_newer, select_newest_pairing,
+};
 use crate::ids::HostId;
 use crate::settings::{GlobalSettings, HostSettings};
 
@@ -13,6 +16,8 @@ pub const STORED_BOND_LEN: usize = 48;
 pub const STORAGE_FLASH_SLOT_SIZE: usize = 4096;
 pub const STORAGE_FLASH_SLOT_COUNT: usize = 2;
 pub const STORAGE_FLASH_LEN: usize = STORAGE_FLASH_SLOT_SIZE * STORAGE_FLASH_SLOT_COUNT;
+pub const ESPNOW_PAIRING_FLASH_LEN: usize = STORAGE_FLASH_SLOT_SIZE * STORAGE_FLASH_SLOT_COUNT;
+pub const STORAGE_PARTITION_REQUIRED_LEN: usize = STORAGE_FLASH_LEN + ESPNOW_PAIRING_FLASH_LEN;
 pub const STORAGE_FLASH_RECORDS_PER_SLOT: usize = STORAGE_FLASH_SLOT_SIZE / STORAGE_IMAGE_LEN;
 pub const STORAGE_RETRY_BASE_MS: u64 = 1_000;
 pub const STORAGE_RETRY_MAX_MS: u64 = 60_000;
@@ -48,10 +53,22 @@ impl StoredHostProfile {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StoredBond {
     pub peer_address: [u8; 6],
+    pub peer_address_kind: StoredAddressKind,
     pub peer_irk: Option<[u8; 16]>,
     pub ltk: [u8; 16],
     pub is_bonded: bool,
     pub security_level: StoredSecurityLevel,
+}
+
+/// Address type used when programming a controller accept list.
+///
+/// This occupies a previously reserved bond byte, so schema-v1 images written
+/// before this field was added decode as `Public` and remain readable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum StoredAddressKind {
+    Public = 0,
+    Random = 1,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -702,6 +719,12 @@ pub struct NorFlashStorageBackend<F> {
     layout: StorageFlashLayout,
     slots: [[u8; STORAGE_IMAGE_LEN]; STORAGE_FLASH_SLOT_COUNT],
     next_record: [u32; STORAGE_FLASH_SLOT_COUNT],
+    pairing: Option<PairingFlashJournal>,
+}
+
+struct PairingFlashJournal {
+    slots: [[u8; ESPNOW_PAIRING_IMAGE_LEN]; STORAGE_FLASH_SLOT_COUNT],
+    next_record: [u32; STORAGE_FLASH_SLOT_COUNT],
 }
 
 impl<F> NorFlashStorageBackend<F>
@@ -733,7 +756,123 @@ where
             layout,
             slots,
             next_record,
+            pairing: None,
         })
+    }
+
+    pub fn new_with_pairing(
+        mut flash: F,
+        layout: StorageFlashLayout,
+    ) -> Result<Self, StorageError> {
+        layout.validate_for_flash(&flash)?;
+        let pairing_base = layout
+            .base_offset
+            .checked_add(layout.len())
+            .ok_or(StorageError::FlashLayout)?;
+        let required_end = pairing_base
+            .checked_add(ESPNOW_PAIRING_FLASH_LEN as u32)
+            .ok_or(StorageError::FlashLayout)?;
+        if required_end > flash.capacity() as u32
+            || !is_aligned(pairing_base as usize, F::ERASE_SIZE)
+            || !is_aligned(ESPNOW_PAIRING_IMAGE_LEN, F::WRITE_SIZE)
+            || !is_aligned(ESPNOW_PAIRING_IMAGE_LEN, F::READ_SIZE)
+        {
+            return Err(StorageError::FlashLayout);
+        }
+
+        let mut slots = [[0xffu8; STORAGE_IMAGE_LEN]; STORAGE_FLASH_SLOT_COUNT];
+        let mut next_record = [0u32; STORAGE_FLASH_SLOT_COUNT];
+        scan_flash_slot(
+            &mut flash,
+            &layout,
+            StorageSlotIndex::A,
+            &mut slots[0],
+            &mut next_record[0],
+        )?;
+        scan_flash_slot(
+            &mut flash,
+            &layout,
+            StorageSlotIndex::B,
+            &mut slots[1],
+            &mut next_record[1],
+        )?;
+        let mut pairing = PairingFlashJournal {
+            slots: [[0xff; ESPNOW_PAIRING_IMAGE_LEN]; STORAGE_FLASH_SLOT_COUNT],
+            next_record: [0; STORAGE_FLASH_SLOT_COUNT],
+        };
+        for index in [StorageSlotIndex::A, StorageSlotIndex::B] {
+            scan_pairing_flash_slot(
+                &mut flash,
+                pairing_base,
+                index,
+                &mut pairing.slots[storage_slot_number(index)],
+                &mut pairing.next_record[storage_slot_number(index)],
+            )?;
+        }
+        Ok(Self {
+            flash,
+            layout,
+            slots,
+            next_record,
+            pairing: Some(pairing),
+        })
+    }
+
+    pub fn restored_pairing(&self) -> Option<EspNowPairing> {
+        let pairing = self.pairing.as_ref()?;
+        select_newest_pairing(&pairing.slots[0], &pairing.slots[1])
+    }
+
+    pub fn write_pairing(&mut self, value: EspNowPairing) -> Result<(), StorageError> {
+        let image = value.encode().map_err(|_| StorageError::InvalidLength)?;
+        let pairing = self.pairing.as_mut().ok_or(StorageError::FlashLayout)?;
+        let a = EspNowPairing::decode(&pairing.slots[0]).ok();
+        let b = EspNowPairing::decode(&pairing.slots[1]).ok();
+        let index = match (a, b) {
+            (None, _) => StorageSlotIndex::A,
+            (Some(_), None) => StorageSlotIndex::B,
+            (Some(a), Some(b)) if generation_is_newer(b.generation, a.generation) => {
+                StorageSlotIndex::A
+            }
+            (Some(_), Some(_)) => StorageSlotIndex::B,
+        };
+        let slot = storage_slot_number(index);
+        let records_per_slot = STORAGE_FLASH_SLOT_SIZE / ESPNOW_PAIRING_IMAGE_LEN;
+        let pairing_base = self.layout.base_offset + self.layout.len();
+        let slot_offset = pairing_base + slot as u32 * STORAGE_FLASH_SLOT_SIZE as u32;
+        let mut record = pairing.next_record[slot] as usize;
+        if record >= records_per_slot {
+            self.flash
+                .erase(slot_offset, slot_offset + STORAGE_FLASH_SLOT_SIZE as u32)
+                .map_err(|_| StorageError::FlashErase)?;
+            record = 0;
+        }
+        let offset = slot_offset + (record * ESPNOW_PAIRING_IMAGE_LEN) as u32;
+        self.flash
+            .write(offset, &image)
+            .map_err(|_| StorageError::FlashWrite)?;
+        let mut verified = [0; ESPNOW_PAIRING_IMAGE_LEN];
+        self.flash
+            .read(offset, &mut verified)
+            .map_err(|_| StorageError::FlashRead)?;
+        if EspNowPairing::decode(&verified) != Ok(value) {
+            return Err(StorageError::FlashVerify);
+        }
+        pairing.slots[slot] = verified;
+        pairing.next_record[slot] = record as u32 + 1;
+        Ok(())
+    }
+
+    pub fn clear_pairing(&mut self) -> Result<(), StorageError> {
+        let pairing_base = self.layout.base_offset + self.layout.len();
+        self.flash
+            .erase(pairing_base, pairing_base + ESPNOW_PAIRING_FLASH_LEN as u32)
+            .map_err(|_| StorageError::FlashErase)?;
+        self.pairing = Some(PairingFlashJournal {
+            slots: [[0xff; ESPNOW_PAIRING_IMAGE_LEN]; STORAGE_FLASH_SLOT_COUNT],
+            next_record: [0; STORAGE_FLASH_SLOT_COUNT],
+        });
+        Ok(())
     }
 
     pub fn release(self) -> F {
@@ -822,6 +961,43 @@ where
         }
     }
 
+    Ok(())
+}
+
+fn scan_pairing_flash_slot<F>(
+    flash: &mut F,
+    pairing_base: u32,
+    index: StorageSlotIndex,
+    latest_image: &mut [u8; ESPNOW_PAIRING_IMAGE_LEN],
+    next_record: &mut u32,
+) -> Result<(), StorageError>
+where
+    F: embedded_storage::nor_flash::NorFlash,
+{
+    let slot = storage_slot_number(index) as u32;
+    let slot_offset = pairing_base + slot * STORAGE_FLASH_SLOT_SIZE as u32;
+    let records_per_slot = STORAGE_FLASH_SLOT_SIZE / ESPNOW_PAIRING_IMAGE_LEN;
+    let mut image = [0xff; ESPNOW_PAIRING_IMAGE_LEN];
+    *next_record = 0;
+    for record in 0..records_per_slot {
+        flash
+            .read(
+                slot_offset + (record * ESPNOW_PAIRING_IMAGE_LEN) as u32,
+                &mut image,
+            )
+            .map_err(|_| StorageError::FlashRead)?;
+        if image.iter().all(|byte| *byte == 0xff) {
+            *next_record = record as u32;
+            return Ok(());
+        }
+        if EspNowPairing::decode(&image).is_ok() {
+            *latest_image = image;
+            *next_record = record as u32 + 1;
+        } else {
+            *next_record = records_per_slot as u32;
+            return Ok(());
+        }
+    }
     Ok(())
 }
 
@@ -954,6 +1130,7 @@ fn encode_bond(bond: Option<StoredBond>, out: &mut [u8]) -> Result<(), StorageEr
     out[24..40].copy_from_slice(&bond.ltk);
     out[40] = bool_byte(bond.is_bonded);
     out[41] = bond.security_level as u8;
+    out[42] = bond.peer_address_kind as u8;
     Ok(())
 }
 
@@ -966,6 +1143,11 @@ fn decode_bond(record: &[u8]) -> Result<Option<StoredBond>, StorageError> {
         0 => StoredSecurityLevel::NoEncryption,
         1 => StoredSecurityLevel::Encrypted,
         2 => StoredSecurityLevel::EncryptedAuthenticated,
+        _ => return Err(StorageError::InvalidLength),
+    };
+    let peer_address_kind = match record[42] {
+        0 => StoredAddressKind::Public,
+        1 => StoredAddressKind::Random,
         _ => return Err(StorageError::InvalidLength),
     };
 
@@ -983,6 +1165,7 @@ fn decode_bond(record: &[u8]) -> Result<Option<StoredBond>, StorageError> {
 
     Ok(Some(StoredBond {
         peer_address,
+        peer_address_kind,
         peer_irk,
         ltk,
         is_bonded: record[40] != 0,
@@ -1149,6 +1332,7 @@ mod tests {
                 name: FixedName::from_ascii("desktop").unwrap(),
                 bond: Some(StoredBond {
                     peer_address: [1, 2, 3, 4, 5, 6],
+                    peer_address_kind: StoredAddressKind::Random,
                     peer_irk: Some([0x11; 16]),
                     ltk: [0x22; 16],
                     is_bonded: true,
@@ -1812,6 +1996,31 @@ mod tests {
         assert_eq!(flash.write_calls, 1);
         assert_eq!(flash.last_erased, Some((0, STORAGE_FLASH_SLOT_SIZE as u32)));
         assert_eq!(flash.last_written, Some((0, STORAGE_IMAGE_LEN)));
+    }
+
+    #[test]
+    fn espnow_pairing_uses_independent_partition_journal() {
+        let layout = StorageFlashLayout::new(0);
+        let flash = TestNorFlash::<{ STORAGE_PARTITION_REQUIRED_LEN }>::new();
+        let mut backend = NorFlashStorageBackend::new_with_pairing(flash, layout).unwrap();
+        let pairing = EspNowPairing {
+            generation: 1,
+            local_role: crate::espnow_pairing::EspNowRole::UsbHost,
+            peer_address: [1, 2, 3, 4, 5, 6],
+            channel: 6,
+            key: [0x5a; 16],
+        };
+
+        assert_eq!(backend.restored_pairing(), None);
+        backend.write_pairing(pairing).unwrap();
+        assert_eq!(backend.restored_pairing(), Some(pairing));
+        assert_eq!(restore_latest_storage_state(&backend), None);
+
+        let flash = backend.release();
+        assert_eq!(
+            flash.last_written,
+            Some((STORAGE_FLASH_LEN as u32, ESPNOW_PAIRING_IMAGE_LEN))
+        );
     }
 
     #[test]

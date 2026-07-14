@@ -99,12 +99,29 @@ impl PhysicalKeyboardState {
         frame: &KeyboardFrame,
         suppression: &mut KeyboardSuppression,
     ) -> Result<(), InputError> {
-        self.modifiers = frame.modifiers;
+        self.apply_snapshot(frame.modifiers, frame.keys_down(), suppression)
+    }
+
+    pub fn apply_state(
+        &mut self,
+        state: &PhysicalKeyboardState,
+        suppression: &mut KeyboardSuppression,
+    ) -> Result<(), InputError> {
+        self.apply_snapshot(state.modifiers, state.keys(), suppression)
+    }
+
+    fn apply_snapshot(
+        &mut self,
+        modifiers: ModifierState,
+        keys_down: &[KeyUsage],
+        suppression: &mut KeyboardSuppression,
+    ) -> Result<(), InputError> {
+        self.modifiers = modifiers;
 
         let mut index = 0;
         while index < self.keys.len() {
             let key = self.keys[index];
-            if frame.keys_down().contains(&key) {
+            if keys_down.contains(&key) {
                 index += 1;
             } else {
                 self.keys.remove(index);
@@ -112,7 +129,7 @@ impl PhysicalKeyboardState {
             }
         }
 
-        for key in frame.keys_down().iter().copied() {
+        for key in keys_down.iter().copied() {
             self.press_key(key)?;
         }
 
@@ -155,6 +172,10 @@ impl PhysicalKeyboardState {
 
     pub fn contains_key(&self, key: KeyUsage) -> bool {
         self.keys.contains(&key)
+    }
+
+    pub const fn modifiers(&self) -> ModifierState {
+        self.modifiers
     }
 
     pub fn visible_against(&self, suppression: &KeyboardSuppression) -> VisibleKeyboardState {
@@ -216,6 +237,10 @@ impl KeyboardSuppression {
 
     pub fn contains_key(&self, key: KeyUsage) -> bool {
         self.keys.contains(&key)
+    }
+
+    pub const fn modifiers(&self) -> ModifierState {
+        self.modifiers
     }
 
     /// Keep a stable 6KRO window: keys beyond `limit` remain suppressed until
@@ -347,6 +372,32 @@ mod tests {
             &[KeyUsage(0x06), KeyUsage(0x05), KeyUsage(0x07)]
         );
         assert_eq!(keyboard.modifiers, ModifierState::LEFT_SHIFT);
+    }
+
+    #[test]
+    fn physical_state_update_matches_keyboard_frame_update() {
+        let mut source = PhysicalKeyboardState::new();
+        source.modifiers = ModifierState::LEFT_SHIFT;
+        source.press_key(KeyUsage(0x05)).unwrap();
+        source.press_key(KeyUsage(0x04)).unwrap();
+
+        let mut from_state = PhysicalKeyboardState::new();
+        let mut state_suppression = KeyboardSuppression::new();
+        from_state
+            .apply_state(&source, &mut state_suppression)
+            .unwrap();
+
+        let mut frame = KeyboardFrame::new(ModifierState::LEFT_SHIFT);
+        frame.push_key(KeyUsage(0x05)).unwrap();
+        frame.push_key(KeyUsage(0x04)).unwrap();
+        let mut from_frame = PhysicalKeyboardState::new();
+        let mut frame_suppression = KeyboardSuppression::new();
+        from_frame
+            .apply_frame(&frame, &mut frame_suppression)
+            .unwrap();
+
+        assert_eq!(from_state, from_frame);
+        assert_eq!(state_suppression, frame_suppression);
     }
 
     #[test]

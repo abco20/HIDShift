@@ -1,4 +1,6 @@
-use crate::input::{KeyboardLedState, VisibleKeyboardState};
+use crate::input::{
+    KeyboardLedState, KeyboardSuppression, PhysicalKeyboardState, VisibleKeyboardState,
+};
 
 pub const KEYBOARD_REPORT_ID: u8 = 1;
 pub const KEYBOARD_REPORT_LEN: usize = 8;
@@ -49,6 +51,30 @@ impl BleKeyboard6KroReport {
         KeyboardReportBuild {
             report: Self { bytes },
             truncated,
+        }
+    }
+
+    pub fn from_physical_state(
+        state: &PhysicalKeyboardState,
+        suppression: &KeyboardSuppression,
+    ) -> KeyboardReportBuild {
+        let mut bytes = [0; KEYBOARD_REPORT_LEN];
+        bytes[0] = (state.modifiers & !suppression.modifiers()).bits();
+
+        let mut visible = 0usize;
+        for key in state.keys().iter().copied() {
+            if suppression.contains_key(key) {
+                continue;
+            }
+            if visible < KEYBOARD_6KRO_KEY_CAPACITY {
+                bytes[2 + visible] = key.0;
+            }
+            visible += 1;
+        }
+
+        KeyboardReportBuild {
+            report: Self { bytes },
+            truncated: visible > KEYBOARD_6KRO_KEY_CAPACITY,
         }
     }
 
@@ -132,6 +158,26 @@ mod tests {
         assert_eq!(
             build.report.as_bytes(),
             &[0, 0, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09]
+        );
+    }
+
+    #[test]
+    fn direct_physical_report_matches_visible_state_report() {
+        let mut keyboard = PhysicalKeyboardState::new();
+        let mut suppression = KeyboardSuppression::new();
+        let mut frame = KeyboardFrame::new(ModifierState::LEFT_SHIFT);
+        for usage in 0x04..0x0c {
+            frame.push_key(KeyUsage(usage)).unwrap();
+        }
+        keyboard.apply_frame(&frame, &mut suppression).unwrap();
+        suppression
+            .suppress_visible_after(&keyboard, KEYBOARD_6KRO_KEY_CAPACITY)
+            .unwrap();
+
+        let visible = keyboard.visible_against(&suppression);
+        assert_eq!(
+            BleKeyboard6KroReport::from_physical_state(&keyboard, &suppression),
+            BleKeyboard6KroReport::from_visible_state(&visible)
         );
     }
 

@@ -3,15 +3,13 @@ use embassy_sync::channel::Sender;
 use embassy_time::Instant;
 use esp_hal::peripherals::{GPIO44, UART0};
 use esp_hal::uart::{Config, Uart};
-use hidshift::management::{MANAGEMENT_REQUEST_LEN, ManagementDestination, ManagementRequest};
+use hidshift::InputTransport;
+use hidshift::management::ManagementDestination;
 use hidshift::runtime::RUNTIME_INPUT_QUEUE_CAPACITY;
 use hidshift::runtime::message::RuntimeInputMessage;
 
 #[cfg(feature = "hardware-e2e")]
 use hidshift::e2e::{E2eCommand, E2ePacket};
-
-const REQUEST_PREFIX: &[u8] = b"@HIDSHIFT:";
-const REQUEST_LINE_LEN: usize = REQUEST_PREFIX.len() + MANAGEMENT_REQUEST_LEN * 2;
 
 #[embassy_executor::task]
 pub async fn serial_management_task(
@@ -23,6 +21,7 @@ pub async fn serial_management_task(
     >,
     uart: UART0<'static>,
     rx: GPIO44<'static>,
+    boot_session_id: u32,
 ) {
     let Ok(uart) = Uart::new(uart, Config::default()) else {
         log::error!("firmware: management UART init failed");
@@ -39,27 +38,65 @@ pub async fn serial_management_task(
     loop {
         match uart.read_async(&mut byte).await {
             Ok(1) if byte[0] == b'\n' || byte[0] == b'\r' => {
-                if let Some(request) = decode_request_line(&line[..line_len]) {
-                    sender
-                        .send(RuntimeInputMessage::ManagementRequest {
-                            destination: ManagementDestination::Wired,
-                            request,
-                            now_ms: Instant::now().as_millis(),
-                        })
-                        .await;
+                if let Some(request) =
+                    crate::wired_management::decode_request_line(&line[..line_len])
+                {
+                    if cfg!(feature = "espnow") && request.command.is_espnow_pairing() {
+                        super::storage_task::espnow_management_sender()
+                            .send(super::storage_task::EspNowManagementRequest {
+                                destination: ManagementDestination::Wired,
+                                request,
+                            })
+                            .await;
+                    } else {
+                        sender
+                            .send(RuntimeInputMessage::ManagementRequest {
+                                destination: ManagementDestination::Wired,
+                                request,
+                                now_ms: Instant::now().as_millis(),
+                            })
+                            .await;
+                    }
                 }
                 #[cfg(feature = "hardware-e2e")]
                 if let Ok(packet) = E2ePacket::decode_line(&line[..line_len]) {
                     let sequence = packet.sequence;
                     let acknowledge = packet.requests_acknowledgement();
                     let ingress_us = Instant::now().as_micros();
+                    if matches!(packet.command, E2eCommand::Hello) {
+                        crate::e2e_telemetry::reset_espnow_timings();
+                        log::info!(
+                            "@HIDSHIFT-BRIDGE:CLOCK,{},{},{},{}",
+                            sequence,
+                            boot_session_id,
+                            device_session_id(),
+                            Instant::now().as_micros()
+                        );
+                    }
+                    if let E2eCommand::SelectTransport { transport } = packet.command {
+                        super::transport_route::select(transport);
+                        log::info!("@HIDSHIFT-BRIDGE:ROUTE,{:?}", transport);
+                    }
                     if packet.carries_input() {
                         crate::e2e_telemetry::record_ingress(sequence, ingress_us);
+                        #[cfg(feature = "espnow")]
+                        if super::transport_route::routes_to(InputTransport::EspNow) {
+                            super::espnow_link_task::forward_e2e_packet(packet, ingress_us).await;
+                            // Channel send is normally immediately ready. Yield
+                            // explicitly so the awakened radio owner can submit
+                            // the realtime frame before this UART task performs
+                            // any lower-priority decoding or acknowledgements.
+                            embassy_futures::yield_now().await;
+                        }
                     }
-                    if matches!(packet.command, E2eCommand::ReadTimestamp) {
-                        let snapshot = crate::e2e_telemetry::snapshot();
+                    if matches!(packet.command, E2eCommand::EnterDeviceDownload) {
+                        #[cfg(feature = "espnow")]
+                        super::espnow_link_task::forward_e2e_packet(packet, ingress_us).await;
+                    }
+                    if let E2eCommand::ReadTimestamp { target_sequence } = packet.command {
+                        let snapshot = crate::e2e_telemetry::snapshot(target_sequence);
                         log::info!(
-                            "@HIDSHIFT-E2E:STAMP,{},{},{},{},{},{},{},{},{},{},{},{}",
+                            "@HIDSHIFT-E2E:STAMP,{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                             sequence,
                             snapshot.sequence,
                             snapshot.ingress_us,
@@ -71,17 +108,52 @@ pub async fn serial_management_task(
                             snapshot.notify_done_us,
                             snapshot.input_count,
                             snapshot.ble_queued_count,
-                            snapshot.notify_done_count
+                            snapshot.notify_done_count,
+                            u8::from(snapshot.ble_connected),
+                            snapshot.ble_connection_interval_us,
+                            snapshot.ble_peripheral_latency,
+                            snapshot.ble_supervision_timeout_ms,
+                            snapshot.ble_tx_phy,
+                            snapshot.ble_rx_phy,
+                            snapshot.ble_parameter_updates,
+                            snapshot.ble_phy_updates,
+                            snapshot.hci_submit_us,
+                            snapshot.hci_dequeue_us,
+                            snapshot.hci_credit_us
+                        );
+                        log::info!(
+                            "@HIDSHIFT-BRIDGE:STAMP,{},{},{},{},{},{},{},{},{},{},{},{}",
+                            sequence,
+                            boot_session_id,
+                            snapshot.espnow_sequence,
+                            snapshot.espnow_ingress_us,
+                            snapshot.espnow_enqueue_us,
+                            snapshot.espnow_dequeue_us,
+                            snapshot.espnow_send_start_us,
+                            snapshot.espnow_tx_done_us,
+                            snapshot.device_sequence,
+                            snapshot.device_radio_rx_us,
+                            snapshot.device_reassembled_us,
+                            snapshot.device_hid_write_us
                         );
                     }
                     match packet.input_frames() {
                         Ok(frames) => {
                             for frame in frames.into_iter().flatten() {
-                                sender
-                                    .send(RuntimeInputMessage::BridgeEvent(
-                                        hidshift::BridgeEvent::InputFrame(frame),
-                                    ))
-                                    .await;
+                                // The standalone ESP-NOW image has no BLE
+                                // consumer. Feeding the same synthetic input
+                                // through the dormant runtime as well as the
+                                // radio path delays the realtime sender for no
+                                // observable output. A coexistence image uses
+                                // an explicit transport-routing policy instead
+                                // of restoring this unconditional duplicate.
+                                if super::transport_route::routes_to(InputTransport::Ble) {
+                                    sender
+                                        .send(RuntimeInputMessage::BridgeEvent(
+                                            hidshift::BridgeEvent::InputFrame(frame),
+                                        ))
+                                        .await;
+                                }
                             }
                             if acknowledge {
                                 log::info!(
@@ -112,34 +184,22 @@ pub async fn serial_management_task(
     }
 }
 
-fn decode_request_line(line: &[u8]) -> Option<ManagementRequest> {
-    if line.len() != REQUEST_LINE_LEN || !line.starts_with(REQUEST_PREFIX) {
-        return None;
-    }
-    let encoded = &line[REQUEST_PREFIX.len()..];
-    let mut request = [0u8; MANAGEMENT_REQUEST_LEN];
-    for (index, output) in request.iter_mut().enumerate() {
-        let high = hex_nibble(encoded[index * 2])?;
-        let low = hex_nibble(encoded[index * 2 + 1])?;
-        *output = (high << 4) | low;
-    }
-    ManagementRequest::decode(&request).ok()
+#[cfg(all(feature = "hardware-e2e", feature = "espnow"))]
+fn device_session_id() -> u32 {
+    super::espnow_link_task::device_session_id()
 }
 
-const fn hex_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
+#[cfg(all(feature = "hardware-e2e", not(feature = "espnow")))]
+const fn device_session_id() -> u32 {
+    0
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wired_management::{REQUEST_LINE_LEN, REQUEST_PREFIX, decode_request_line};
     use hidshift::HostId;
-    use hidshift::management::ManagementCommand;
+    use hidshift::management::{ManagementCommand, ManagementRequest};
 
     fn request_line(request: ManagementRequest) -> [u8; REQUEST_LINE_LEN] {
         let mut line = [0; REQUEST_LINE_LEN];

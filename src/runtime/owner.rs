@@ -36,6 +36,30 @@ pub struct RuntimeOwner<
     queues: RuntimeCommandQueues<BLE, USB, STORAGE, STATUS>,
 }
 
+/// Bridge state saved before task outboxes are dispatched.
+///
+/// The checkpoint deliberately excludes commands and per-task queues: those
+/// are outputs of the attempted input and must be discarded on rollback.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[must_use]
+pub struct RuntimeCheckpoint<const HOSTS: usize, const USB_KEYBOARDS: usize> {
+    runtime: BridgeRuntime<HOSTS, USB_KEYBOARDS>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[must_use]
+// The full checkpoint is intentionally stored inline. Runtime is no_std and
+// allocation-free; boxing this infrequent management rollback would add a
+// heap dependency to an otherwise fixed-capacity transaction boundary.
+#[allow(clippy::large_enum_variant)]
+pub enum RuntimeRollbackCheckpoint<const HOSTS: usize, const USB_KEYBOARDS: usize> {
+    /// Realtime input is internally transactional until its outbox exists.
+    /// Once accepted, its latest-state snapshot remains committed even when
+    /// downstream delivery drops it; a later snapshot heals the receiver.
+    Realtime,
+    Full(RuntimeCheckpoint<HOSTS, USB_KEYBOARDS>),
+}
+
 impl<
     const HOSTS: usize,
     const USB_KEYBOARDS: usize,
@@ -76,6 +100,45 @@ impl<
         &self.queues
     }
 
+    pub fn checkpoint_runtime(&self) -> RuntimeCheckpoint<HOSTS, USB_KEYBOARDS> {
+        RuntimeCheckpoint {
+            runtime: self.runtime.clone(),
+        }
+    }
+
+    pub fn rollback_runtime(&mut self, checkpoint: RuntimeCheckpoint<HOSTS, USB_KEYBOARDS>) {
+        self.runtime = checkpoint.runtime;
+        self.commands.clear();
+        self.queues = RuntimeCommandQueues::new();
+    }
+
+    pub fn checkpoint_for_message(
+        &self,
+        message: &RuntimeInputMessage,
+    ) -> RuntimeRollbackCheckpoint<HOSTS, USB_KEYBOARDS> {
+        if matches!(
+            message,
+            RuntimeInputMessage::BridgeEvent(crate::bridge::BridgeEvent::InputFrame(_))
+        ) {
+            RuntimeRollbackCheckpoint::Realtime
+        } else {
+            RuntimeRollbackCheckpoint::Full(self.checkpoint_runtime())
+        }
+    }
+
+    pub fn rollback_message(
+        &mut self,
+        checkpoint: RuntimeRollbackCheckpoint<HOSTS, USB_KEYBOARDS>,
+    ) {
+        match checkpoint {
+            RuntimeRollbackCheckpoint::Realtime => {
+                self.commands.clear();
+                self.queues = RuntimeCommandQueues::new();
+            }
+            RuntimeRollbackCheckpoint::Full(checkpoint) => self.rollback_runtime(checkpoint),
+        }
+    }
+
     pub fn process_input(
         &mut self,
         input: RuntimeInput<'_>,
@@ -106,31 +169,51 @@ impl<
     }
 
     pub fn staged_message(&self, message: &RuntimeInputMessage) -> Result<Self, RuntimeOwnerError> {
-        let mut next = self.clone();
+        // Only bridge state participates in the transaction. Commands and
+        // per-task queues are outputs from the previous input and are rebuilt
+        // below, so copying their full fixed capacities adds latency without
+        // adding rollback safety on the embedded hot path.
+        let mut next = Self::from_runtime(self.runtime.clone());
         next.process_message_in_place(message)?;
         Ok(next)
     }
 
-    fn process_message_in_place(
+    /// Processes one owned task-boundary message without cloning bridge state.
+    ///
+    /// Management callers that need transactional rollback must take a
+    /// [`RuntimeCheckpoint`] first. Realtime input commits latest-state
+    /// snapshots and intentionally only discards its outbox on sink failure.
+    pub fn process_message_in_place(
         &mut self,
         message: &RuntimeInputMessage,
     ) -> Result<(), RuntimeOwnerError> {
-        let mut next_commands = heapless::Vec::new();
-        let mut next_queues = RuntimeCommandQueues::new();
+        self.commands.clear();
+        if let RuntimeInputMessage::BridgeEvent(crate::bridge::BridgeEvent::InputFrame(frame)) =
+            message
+        {
+            self.queues.clear();
+            self.runtime
+                .handle_realtime_input_frame_in_place(frame.clone(), &mut self.queues.ble)?;
+            self.runtime.observe_outbox_usage(
+                self.queues.ble.len(),
+                self.queues.usb.len(),
+                self.queues.storage.len(),
+                self.queues.status.len(),
+            );
+            return Ok(());
+        }
         self.runtime
             .handle_input_in_place::<COMMANDS, ACTIONS, EVENTS>(
                 message.as_runtime_input(),
-                &mut next_commands,
+                &mut self.commands,
             )?;
-        next_queues.dispatch_from(next_commands.as_slice())?;
+        self.queues.dispatch_from(self.commands.as_slice())?;
         self.runtime.observe_outbox_usage(
-            next_queues.ble.len(),
-            next_queues.usb.len(),
-            next_queues.storage.len(),
-            next_queues.status.len(),
+            self.queues.ble.len(),
+            self.queues.usb.len(),
+            self.queues.storage.len(),
+            self.queues.status.len(),
         );
-        self.commands = next_commands;
-        self.queues = next_queues;
         Ok(())
     }
 
@@ -262,6 +345,137 @@ mod tests {
                 pairable_host: None,
             }
         );
+    }
+
+    #[test]
+    fn staged_message_rebuilds_outboxes_without_mutating_the_source_owner() {
+        let mut owner = TestOwner::new(0);
+        owner
+            .process_input(RuntimeInput::BridgeEvent(BridgeEvent::SwitchTarget {
+                target: HostId(1),
+            }))
+            .unwrap();
+        let source = owner.clone();
+
+        let staged = owner
+            .staged_message(&RuntimeInputMessage::BridgeEvent(
+                BridgeEvent::HostConnected { host_id: HostId(1) },
+            ))
+            .unwrap();
+
+        assert_eq!(owner, source);
+        assert_eq!(staged.queues.storage.len(), 0);
+        assert_eq!(staged.queues.status.len(), 1);
+    }
+
+    #[test]
+    fn runtime_checkpoint_rolls_back_state_and_discards_uncommitted_outboxes() {
+        let mut owner = ready_owner();
+        let before = owner.runtime().clone();
+        let checkpoint = owner.checkpoint_runtime();
+
+        owner
+            .process_message_in_place(&RuntimeInputMessage::BridgeEvent(
+                BridgeEvent::HostConnected { host_id: HostId(2) },
+            ))
+            .unwrap();
+        assert_ne!(owner.runtime(), &before);
+        assert!(!owner.queues().status.is_empty());
+
+        owner.rollback_runtime(checkpoint);
+
+        assert_eq!(owner.runtime(), &before);
+        assert!(owner.commands().is_empty());
+        assert!(owner.queues().ble.is_empty());
+        assert!(owner.queues().usb.is_empty());
+        assert!(owner.queues().storage.is_empty());
+        assert!(owner.queues().status.is_empty());
+        assert!(owner.queues().effects.is_empty());
+    }
+
+    #[test]
+    fn realtime_rollback_discards_outbox_but_retains_latest_state() {
+        let mut owner = ready_owner();
+        let before = owner.runtime().clone();
+        let mut keyboard = crate::input::KeyboardFrame::new(crate::input::ModifierState::empty());
+        keyboard.push_key(crate::input::KeyUsage(4)).unwrap();
+        let message = RuntimeInputMessage::BridgeEvent(BridgeEvent::InputFrame(
+            crate::input::InputFrame::Standard(crate::input::StandardInputFrame {
+                device_id: DeviceId(7),
+                interface_id: InterfaceId(1),
+                keyboard: Some(keyboard),
+                mouse: None,
+                consumer: None,
+            }),
+        ));
+        let checkpoint = owner.checkpoint_for_message(&message);
+        assert!(matches!(checkpoint, RuntimeRollbackCheckpoint::Realtime));
+
+        owner.process_message_in_place(&message).unwrap();
+        assert_ne!(owner.runtime(), &before);
+        assert_eq!(owner.queues().ble.len(), 1);
+        let committed = owner.runtime().clone();
+        owner.rollback_message(checkpoint);
+
+        assert_eq!(owner.runtime(), &committed);
+        assert!(owner.commands().is_empty());
+        assert!(owner.queues().ble.is_empty());
+
+        let management =
+            RuntimeInputMessage::BridgeEvent(BridgeEvent::HostConnected { host_id: HostId(2) });
+        assert!(matches!(
+            owner.checkpoint_for_message(&management),
+            RuntimeRollbackCheckpoint::Full(_)
+        ));
+    }
+
+    #[test]
+    fn in_place_input_frame_dispatches_directly_to_typed_ble_queue() {
+        let mut expected = ready_owner();
+        let mut actual = expected.clone();
+        let mut keyboard = crate::input::KeyboardFrame::new(crate::input::ModifierState::empty());
+        keyboard.push_key(crate::input::KeyUsage(4)).unwrap();
+        let message = RuntimeInputMessage::BridgeEvent(BridgeEvent::InputFrame(
+            crate::input::InputFrame::Standard(crate::input::StandardInputFrame {
+                device_id: DeviceId(7),
+                interface_id: InterfaceId(1),
+                keyboard: Some(keyboard),
+                mouse: None,
+                consumer: None,
+            }),
+        ));
+
+        expected.process_message(&message).unwrap();
+        actual.process_message_in_place(&message).unwrap();
+
+        assert_eq!(actual.runtime(), expected.runtime());
+        assert_eq!(actual.queues(), expected.queues());
+        assert!(actual.commands().is_empty());
+    }
+
+    #[test]
+    fn in_place_input_preflights_typed_ble_capacity_before_committing_state() {
+        let setup = ready_owner();
+        let mut owner = RuntimeOwner::<2, 1, 8, 8, 2, 0, 8, 2, 8>::from_runtime(setup.into_inner());
+        let before = owner.runtime().clone();
+        let mut keyboard = crate::input::KeyboardFrame::new(crate::input::ModifierState::empty());
+        keyboard.push_key(crate::input::KeyUsage(4)).unwrap();
+        let message = RuntimeInputMessage::BridgeEvent(BridgeEvent::InputFrame(
+            crate::input::InputFrame::Standard(crate::input::StandardInputFrame {
+                device_id: DeviceId(7),
+                interface_id: InterfaceId(1),
+                keyboard: Some(keyboard),
+                mouse: None,
+                consumer: None,
+            }),
+        ));
+
+        assert_eq!(
+            owner.process_message_in_place(&message),
+            Err(RuntimeOwnerError::Runtime(RuntimeError::CommandCapacity))
+        );
+        assert_eq!(owner.runtime(), &before);
+        assert!(owner.queues().ble.is_empty());
     }
 
     #[test]

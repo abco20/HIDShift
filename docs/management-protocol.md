@@ -27,6 +27,12 @@ setting get/set. Response payloads are explicitly tagged and never inferred
 from an opcode. Result codes distinguish invalid host, missing host, existing
 bond, invalid name, invalid setting, missing indexed item, and internal errors.
 
+ESP-NOW pairing uses opcodes `0x20..=0x24`: info, begin with peer MAC/channel,
+write a 16-byte key in validated chunks, commit, and forget. Commit succeeds
+only after every key byte has been staged. The key is write-only; info returns
+role, local MAC, peer MAC, channel, and paired state. CLI pairing stages both
+boards before committing either side.
+
 `src/settings.rs` declares the settings schema once. CLI and Web use the same
 compiled descriptors and verify the firmware schema version/count/hash before
 showing values. Wire IDs are stable numeric values; display labels and command

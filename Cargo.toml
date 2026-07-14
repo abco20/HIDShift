@@ -17,6 +17,7 @@ exclude = [
     "e2e/runner",
     "tools/hidshift-client",
     "tools/hidshiftctl",
+    "vendor/trouble-host-0.6.0",
     "web",
 ]
 resolver = "3"
@@ -26,7 +27,9 @@ name = "hidshift"
 path = "src/lib.rs"
 
 [dependencies]
+aes = { version = "0.8.4", default-features = false }
 bitflags = "2.10.0"
+cmac = { version = "0.7.2", default-features = false }
 embedded-storage = "0.3.1"
 heapless = "0.9.2"
 
@@ -36,6 +39,12 @@ hidreport = { version = "0.6.0", default-features = false }
 
 [patch.crates-io]
 embassy-usb-synopsys-otg = { path = "vendor/embassy-usb-synopsys-otg-0.4.0" }
+# trouble-host 0.6.0 starts the optional Link Layer connection-parameter
+# procedure before its L2CAP fallback. Some Linux centrals reject that LL
+# procedure asynchronously, after the API has already returned success, so the
+# fallback is never reached. The local patch exposes an explicit peripheral
+# L2CAP request used by the low-latency HID connection policy.
+trouble-host = { path = "vendor/trouble-host-0.6.0" }
 
 [profile.dev]
 debug = true

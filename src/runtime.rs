@@ -444,6 +444,49 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         }
     }
 
+    pub(crate) fn handle_realtime_input_frame_in_place<const BLE: usize>(
+        &mut self,
+        frame: crate::input::InputFrame,
+        ble: &mut heapless::Vec<BleTaskCommand, BLE>,
+    ) -> Result<(), RuntimeError> {
+        let maximum_notifications = match &frame {
+            crate::input::InputFrame::Standard(frame) => {
+                usize::from(frame.keyboard.is_some())
+                    + usize::from(frame.mouse.is_some())
+                    + usize::from(frame.consumer.is_some())
+            }
+            crate::input::InputFrame::Vendor(_) => 0,
+        };
+        if BLE.saturating_sub(ble.len()) < maximum_notifications {
+            return Err(RuntimeError::CommandCapacity);
+        }
+
+        // One input frame can emit at most keyboard, mouse and consumer
+        // notifications. Route those typed actions directly so the hot path
+        // never constructs the much larger storage-bearing RuntimeCommand.
+        let mut actions = heapless::Vec::<BridgeAction, 3>::new();
+        self.bridge
+            .handle_event_in_place(BridgeEvent::InputFrame(frame), &mut actions)?;
+        for action in actions {
+            let BridgeAction::BleNotify {
+                host_id,
+                report,
+                reason,
+            } = action
+            else {
+                return Err(RuntimeError::UnexpectedRealtimeAction);
+            };
+            let report = self.apply_host_report_settings(host_id, report);
+            ble.push(BleTaskCommand::Notify {
+                host_id,
+                report,
+                reason,
+            })
+            .map_err(|_| RuntimeError::CommandCapacity)?;
+        }
+        Ok(())
+    }
+
     pub fn register_usb_hid_interface<const COMMANDS: usize, const ACTIONS: usize>(
         &mut self,
         interface_id: InterfaceId,
@@ -729,6 +772,11 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                     ManagementResult::InvalidSetting
                 }
             }
+            ManagementCommand::GetEspNowInfo
+            | ManagementCommand::BeginEspNowPairing { .. }
+            | ManagementCommand::WriteEspNowKey { .. }
+            | ManagementCommand::CommitEspNowPairing
+            | ManagementCommand::ForgetEspNowPeer => ManagementResult::NotFound,
         };
 
         let payload = match request.command {
@@ -1692,6 +1740,18 @@ pub enum BleTaskCommand {
 }
 
 impl BleTaskCommand {
+    /// Returns whether applying this command changes who may connect.
+    ///
+    /// Realtime notifications and ordinary GATT work must not restart an
+    /// active advertiser. Restarting it disables and re-enables advertising
+    /// through HCI, which can contend with the next connection event.
+    pub const fn changes_advertising_policy(self) -> bool {
+        matches!(
+            self,
+            Self::AllowPairing { .. } | Self::RejectPairing { .. } | Self::ClearBond { .. }
+        )
+    }
+
     pub const fn lane(self) -> BleCommandLane {
         match self {
             Self::Notify {
@@ -1826,11 +1886,49 @@ impl<const BLE: usize, const USB: usize, const STORAGE: usize, const STATUS: usi
         &mut self,
         commands: &[RuntimeCommand],
     ) -> Result<(), RuntimeDispatchError> {
-        let mut next = Self::new();
+        self.validate_capacity(commands)?;
+        self.clear();
         for command in commands {
-            next.dispatch_one(command)?;
+            // Capacity was checked for every lane before mutating any queue.
+            // No push can fail unless the command classification above and
+            // dispatch below diverge.
+            self.dispatch_one(command)?;
         }
-        *self = next;
+        Ok(())
+    }
+
+    fn validate_capacity(&self, commands: &[RuntimeCommand]) -> Result<(), RuntimeDispatchError> {
+        let mut ble = 0usize;
+        let mut usb = 0usize;
+        let mut storage = 0usize;
+        let mut status = 0usize;
+        let mut effects = 0usize;
+        for command in commands {
+            match command {
+                RuntimeCommand::BleCommand(_) => ble += 1,
+                RuntimeCommand::UsbKeyboardLedWrite { .. } => usb += 1,
+                RuntimeCommand::PersistStorage { .. } => storage += 1,
+                RuntimeCommand::StatusChanged(_) | RuntimeCommand::ManagementResponse { .. } => {
+                    status += 1;
+                }
+                RuntimeCommand::ApplyEffect(_) => effects += 1,
+            }
+        }
+        if ble > BLE {
+            return Err(RuntimeDispatchError::BleQueueCapacity);
+        }
+        if usb > USB {
+            return Err(RuntimeDispatchError::UsbQueueCapacity);
+        }
+        if storage > STORAGE {
+            return Err(RuntimeDispatchError::StorageQueueCapacity);
+        }
+        if status > STATUS {
+            return Err(RuntimeDispatchError::StatusQueueCapacity);
+        }
+        if effects > STATUS {
+            return Err(RuntimeDispatchError::EffectQueueCapacity);
+        }
         Ok(())
     }
 
@@ -1926,6 +2024,7 @@ pub enum RuntimeError {
     UsbHidInterfaceCapacity,
     UsbHidInterfaceNotRegistered { interface_id: InterfaceId },
     CommandCapacity,
+    UnexpectedRealtimeAction,
 }
 
 impl From<BridgeError> for RuntimeError {
@@ -3315,6 +3414,24 @@ mod tests {
 
     #[test]
     fn command_classes_match_runtime_delivery_policy() {
+        assert!(
+            !BleTaskCommand::Notify {
+                host_id: HostId(1),
+                report: BleHidReport::Keyboard(crate::reports::BleKeyboard6KroReport::release()),
+                reason: NotifyReason::Input,
+            }
+            .changes_advertising_policy()
+        );
+        assert!(BleTaskCommand::AllowPairing { host_id: HostId(1) }.changes_advertising_policy());
+        assert!(BleTaskCommand::RejectPairing { host_id: HostId(1) }.changes_advertising_policy());
+        assert!(
+            BleTaskCommand::ClearBond {
+                host_id: HostId(1),
+                bond: None,
+            }
+            .changes_advertising_policy()
+        );
+        assert!(!BleTaskCommand::ActivateInput { host_id: HostId(1) }.changes_advertising_policy());
         assert_eq!(
             BleTaskCommand::Notify {
                 host_id: HostId(1),
@@ -3647,11 +3764,14 @@ mod tests {
             }),
         ];
         let mut queues = RuntimeCommandQueues::<1, 1, 1, 1>::new();
+        queues.dispatch_from(&commands[..1]).unwrap();
+        let before = queues.clone();
 
         assert_eq!(
             queues.dispatch_from(&commands),
             Err(RuntimeDispatchError::BleQueueCapacity)
         );
+        assert_eq!(queues, before);
     }
 
     #[test]

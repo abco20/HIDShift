@@ -1,4 +1,4 @@
-use crate::input::MouseButton;
+use crate::input::{MouseButton, MouseMovement};
 
 pub const USAGE_PAGE_GENERIC_DESKTOP: u16 = 0x01;
 pub const USAGE_PAGE_KEYBOARD: u16 = 0x07;
@@ -19,6 +19,8 @@ pub enum HidReportError {
     ReportIdMissing,
     TooManyFields,
     TooManyEvents,
+    OutputBufferTooSmall,
+    MotionFieldMissing,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -107,6 +109,41 @@ impl ReportField {
 
         Some(raw as i32)
     }
+
+    fn write_i32(self, payload: &mut [u8], index: usize, value: i32) -> bool {
+        if self.bit_size == 0 || self.bit_size > 32 || index >= self.count as usize {
+            return false;
+        }
+        let start = self.bit_offset as usize + index * self.bit_size as usize;
+        let end = match start.checked_add(self.bit_size as usize) {
+            Some(end) if end <= payload.len() * 8 => end,
+            _ => return false,
+        };
+        let value = value.clamp(self.logical_min, self.logical_max);
+        let raw = if value < 0 {
+            ((i64::from(value) + (1i64 << self.bit_size)) as u32)
+                & if self.bit_size == 32 {
+                    u32::MAX
+                } else {
+                    (1u32 << self.bit_size) - 1
+                }
+        } else {
+            value as u32
+        };
+        let mut bit = 0;
+        while start + bit < end {
+            let destination_bit = start + bit;
+            let byte = &mut payload[destination_bit / 8];
+            let mask = 1u8 << (destination_bit % 8);
+            if raw & (1 << bit) != 0 {
+                *byte |= mask;
+            } else {
+                *byte &= !mask;
+            }
+            bit += 1;
+        }
+        true
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -191,6 +228,58 @@ impl<const N: usize> HidReportDescriptor<N> {
         }
 
         domains
+    }
+
+    /// Rewrites relative mouse axes in an already encoded report. The
+    /// transport uses this with cumulative motion totals: the Device computes
+    /// the delta since the last accepted packet and writes that delta into the
+    /// composite HID report before sending it to the PC.
+    pub fn rewrite_relative_motion(
+        &self,
+        report: &[u8],
+        movement: MouseMovement,
+        out: &mut [u8],
+    ) -> Result<usize, HidReportError> {
+        if out.len() < report.len() {
+            return Err(HidReportError::OutputBufferTooSmall);
+        }
+        let (report_id, _) = self.matching_payload(report)?;
+        out[..report.len()].copy_from_slice(report);
+        let payload_offset = usize::from(self.has_report_ids);
+        let payload = &mut out[payload_offset..report.len()];
+        let mut wrote = false;
+        for (usage_page, usage, value) in [
+            (USAGE_PAGE_GENERIC_DESKTOP, USAGE_X, i32::from(movement.x)),
+            (USAGE_PAGE_GENERIC_DESKTOP, USAGE_Y, i32::from(movement.y)),
+            (
+                USAGE_PAGE_GENERIC_DESKTOP,
+                USAGE_WHEEL,
+                i32::from(movement.wheel),
+            ),
+            (USAGE_PAGE_CONSUMER, USAGE_AC_PAN, i32::from(movement.pan)),
+        ] {
+            for field in self.fields() {
+                if field.report_id != report_id
+                    || field.is_constant()
+                    || !field.is_variable()
+                    || field.usage_page != usage_page
+                {
+                    continue;
+                }
+                let Some(index) = field.index_of_usage(usage) else {
+                    continue;
+                };
+                if field.write_i32(payload, index, value) {
+                    wrote = true;
+                }
+                break;
+            }
+        }
+        if wrote {
+            Ok(report.len())
+        } else {
+            Err(HidReportError::MotionFieldMissing)
+        }
     }
 
     fn matching_payload<'a>(&self, report: &'a [u8]) -> Result<(u8, &'a [u8]), HidReportError> {
@@ -553,6 +642,76 @@ mod tests {
                 HidReportEvent::KeyboardUsageDown(0x05),
                 HidReportEvent::KeyboardUsageDown(0x0b),
             ]
+        );
+    }
+
+    #[test]
+    fn rewrites_relative_motion_in_a_numbered_report() {
+        let mut descriptor = HidReportDescriptor::<3>::new(true);
+        descriptor
+            .push(ReportField {
+                report_id: 1,
+                usage_page: USAGE_PAGE_BUTTON,
+                usage_min: 1,
+                usage_max: 3,
+                bit_offset: 0,
+                bit_size: 1,
+                count: 3,
+                flags: FIELD_FLAG_VARIABLE,
+                logical_min: 0,
+                logical_max: 1,
+            })
+            .unwrap();
+        descriptor
+            .push(ReportField {
+                report_id: 1,
+                usage_page: USAGE_PAGE_GENERIC_DESKTOP,
+                usage_min: USAGE_X,
+                usage_max: USAGE_X,
+                bit_offset: 8,
+                bit_size: 8,
+                count: 1,
+                flags: FIELD_FLAG_VARIABLE,
+                logical_min: -127,
+                logical_max: 127,
+            })
+            .unwrap();
+        descriptor
+            .push(ReportField {
+                report_id: 1,
+                usage_page: USAGE_PAGE_GENERIC_DESKTOP,
+                usage_min: USAGE_Y,
+                usage_max: USAGE_Y,
+                bit_offset: 16,
+                bit_size: 8,
+                count: 1,
+                flags: FIELD_FLAG_VARIABLE,
+                logical_min: -127,
+                logical_max: 127,
+            })
+            .unwrap();
+
+        let mut rewritten = [0; 4];
+        assert_eq!(
+            descriptor
+                .rewrite_relative_motion(
+                    &[1, 0, 0, 0],
+                    MouseMovement {
+                        x: 5,
+                        y: -6,
+                        wheel: 0,
+                        pan: 0,
+                    },
+                    &mut rewritten,
+                )
+                .unwrap(),
+            4
+        );
+        let mut events = HidReportEvents::<8>::new();
+        decode_report(&descriptor, &rewritten, &mut events).unwrap();
+        assert_eq!(
+            events.iter().collect::<Vec<_>>(),
+            vec![HidReportEvent::MouseX(5), HidReportEvent::MouseY(-6)]
         );
     }
 

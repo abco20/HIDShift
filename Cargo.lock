@@ -1013,11 +1013,13 @@ dependencies = [
  "cfg-if",
  "docsplay",
  "document-features",
+ "embassy-net-driver",
  "embassy-sync 0.8.0",
  "embedded-io 0.6.1",
  "embedded-io 0.7.1",
  "embedded-io-async 0.6.1",
  "embedded-io-async 0.7.0",
+ "enumset",
  "esp-alloc",
  "esp-config",
  "esp-hal",
@@ -1483,7 +1485,9 @@ dependencies = [
 name = "hidshift"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "bitflags 2.13.0",
+ "cmac",
  "embassy-usb-host",
  "embedded-storage",
  "heapless 0.9.3",
@@ -1495,10 +1499,12 @@ name = "hidshift-firmware"
 version = "0.1.0"
 dependencies = [
  "bt-hci",
+ "critical-section",
  "embassy-executor",
  "embassy-futures",
  "embassy-sync 0.7.2",
  "embassy-time",
+ "embassy-usb",
  "embassy-usb-driver",
  "embassy-usb-host",
  "embassy-usb-synopsys-otg 0.4.0",
@@ -2362,8 +2368,6 @@ dependencies = [
 [[package]]
 name = "trouble-host"
 version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1df7817cead4b83dfbeeaa59736ecbc97c30b21dc3bfc0cc2ce8a6687f70b37a"
 dependencies = [
  "aes",
  "bt-hci",

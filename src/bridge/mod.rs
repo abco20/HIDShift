@@ -176,47 +176,43 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
         frame: StandardInputFrame,
         out: &mut heapless::Vec<BridgeAction, ACTIONS>,
     ) -> Result<(), BridgeError> {
-        let previous_input = self.state.input.clone();
-        self.state.input_devices.apply_frame(&frame)?;
-        let aggregate = self.state.input_devices.aggregate().clone();
+        let prepared_input_devices = self.state.input_devices.prepare_frame(&frame)?;
+        let aggregate = prepared_input_devices.aggregate(&self.state.input_devices);
+        let mut next_keyboard = None;
+        let mut next_keyboard_suppression = None;
+        let mut next_mouse = None;
+        let mut next_mouse_suppression = None;
+        let mut next_consumer = None;
+        let mut next_consumer_suppression = None;
+        let mut next_stats = self.state.stats;
+        let mut next_out = out.clone();
 
-        if let Some(keyboard) = frame.keyboard {
-            let _ = keyboard;
-            let keyboard = aggregate.keyboard.to_frame()?;
-            self.state
-                .input
-                .keyboard
-                .apply_frame(&keyboard, &mut self.state.suppression.keyboard)?;
+        if frame.keyboard.is_some() {
+            let mut keyboard_state = self.state.input.keyboard.clone();
+            let mut keyboard_suppression = self.state.suppression.keyboard.clone();
+            keyboard_state.apply_state(&aggregate.keyboard, &mut keyboard_suppression)?;
 
-            let suppressed = self
-                .state
-                .suppression
-                .keyboard
-                .suppress_visible_after(&self.state.input.keyboard, KEYBOARD_6KRO_KEY_CAPACITY)?;
+            let suppressed = keyboard_suppression
+                .suppress_visible_after(&keyboard_state, KEYBOARD_6KRO_KEY_CAPACITY)?;
             if suppressed != 0 {
-                self.state.stats.keyboard_reports_truncated = self
-                    .state
-                    .stats
-                    .keyboard_reports_truncated
-                    .saturating_add(1);
+                next_stats.keyboard_reports_truncated =
+                    next_stats.keyboard_reports_truncated.saturating_add(1);
             }
 
             if let Some(host_id) = self.ready_active_host(ReportKind::Keyboard) {
-                let visible = self
-                    .state
-                    .input
-                    .keyboard
-                    .visible_against(&self.state.suppression.keyboard);
-                let build = BleKeyboard6KroReport::from_visible_state(&visible);
+                let build = BleKeyboard6KroReport::from_physical_state(
+                    &keyboard_state,
+                    &keyboard_suppression,
+                );
                 debug_assert!(!build.truncated);
                 push_action(
-                    out,
+                    &mut next_out,
                     BridgeAction::BleNotify {
                         host_id,
                         report: BleHidReport::Keyboard(build.report),
                         reason: if keyboard_contains_release(
-                            &previous_input.keyboard,
                             &self.state.input.keyboard,
+                            &keyboard_state,
                         ) {
                             NotifyReason::InputRelease
                         } else {
@@ -225,33 +221,27 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
                     },
                 )?;
             } else {
-                self.state.stats.input_reports_dropped_no_ready_target = self
-                    .state
-                    .stats
+                next_stats.input_reports_dropped_no_ready_target = next_stats
                     .input_reports_dropped_no_ready_target
                     .saturating_add(1);
             }
+            next_keyboard = Some(keyboard_state);
+            next_keyboard_suppression = Some(keyboard_suppression);
         }
 
         if let Some(mouse) = frame.mouse {
-            self.state.input.mouse = aggregate.mouse;
-            self.state.suppression.mouse_buttons = self
+            let mouse_state = aggregate.mouse;
+            let mouse_suppression = self
                 .state
                 .suppression
                 .mouse_buttons
-                .intersection(self.state.input.mouse.buttons);
-            let visible_buttons = self
-                .state
-                .input
-                .mouse
-                .buttons
-                .without(self.state.suppression.mouse_buttons);
+                .intersection(mouse_state.buttons);
+            let visible_buttons = mouse_state.buttons.without(mouse_suppression);
             if let Some(host_id) = self.ready_active_host(ReportKind::Mouse) {
-                let released_buttons = previous_input.mouse.buttons.bits()
-                    & !self.state.input.mouse.buttons.bits()
-                    != 0;
+                let released_buttons =
+                    self.state.input.mouse.buttons.bits() & !mouse_state.buttons.bits() != 0;
                 push_action(
-                    out,
+                    &mut next_out,
                     BridgeAction::BleNotify {
                         host_id,
                         report: BleHidReport::Mouse(BleMouseReport::from_frame(
@@ -259,7 +249,7 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
                             mouse.movement,
                         )),
                         reason: if released_buttons
-                            || previous_input.mouse.buttons != self.state.input.mouse.buttons
+                            || self.state.input.mouse.buttons != mouse_state.buttons
                         {
                             NotifyReason::InputEdge
                         } else {
@@ -268,35 +258,36 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
                     },
                 )?;
             } else if mouse.movement != MouseMovement::neutral() {
-                self.state.stats.mouse_movements_dropped =
-                    self.state.stats.mouse_movements_dropped.saturating_add(1);
+                next_stats.mouse_movements_dropped =
+                    next_stats.mouse_movements_dropped.saturating_add(1);
             }
+            next_mouse = Some(mouse_state);
+            next_mouse_suppression = Some(mouse_suppression);
         }
 
-        if let Some(consumer) = frame.consumer {
-            let _ = consumer;
-            self.state.input.consumer = aggregate.consumer;
-            if self.state.input.consumer.active != self.state.suppression.consumer.active {
-                self.state.suppression.consumer.active = None;
+        if frame.consumer.is_some() {
+            let consumer_state = aggregate.consumer;
+            let mut consumer_suppression = self.state.suppression.consumer;
+            if consumer_state.active != consumer_suppression.active {
+                consumer_suppression.active = None;
             }
             if let Some(host_id) = self.ready_active_host(ReportKind::Consumer) {
-                let visible_consumer =
-                    if self.state.input.consumer.active == self.state.suppression.consumer.active {
-                        None
-                    } else {
-                        self.state.input.consumer.active
-                    };
+                let visible_consumer = if consumer_state.active == consumer_suppression.active {
+                    None
+                } else {
+                    consumer_state.active
+                };
                 let report = match visible_consumer {
                     Some(usage) => BleConsumerReport::from_usage(usage),
                     None => BleConsumerReport::release(),
                 };
                 push_action(
-                    out,
+                    &mut next_out,
                     BridgeAction::BleNotify {
                         host_id,
                         report: BleHidReport::Consumer(report),
-                        reason: if previous_input.consumer.active.is_some()
-                            && self.state.input.consumer.active.is_none()
+                        reason: if self.state.input.consumer.active.is_some()
+                            && consumer_state.active.is_none()
                         {
                             NotifyReason::InputRelease
                         } else {
@@ -305,8 +296,33 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
                     },
                 )?;
             }
+            next_consumer = Some(consumer_state);
+            next_consumer_suppression = Some(consumer_suppression);
         }
 
+        self.state
+            .input_devices
+            .commit_frame(prepared_input_devices);
+        if let Some(keyboard) = next_keyboard {
+            self.state.input.keyboard = keyboard;
+        }
+        if let Some(suppression) = next_keyboard_suppression {
+            self.state.suppression.keyboard = suppression;
+        }
+        if let Some(mouse) = next_mouse {
+            self.state.input.mouse = mouse;
+        }
+        if let Some(suppression) = next_mouse_suppression {
+            self.state.suppression.mouse_buttons = suppression;
+        }
+        if let Some(consumer) = next_consumer {
+            self.state.input.consumer = consumer;
+        }
+        if let Some(suppression) = next_consumer_suppression {
+            self.state.suppression.consumer = suppression;
+        }
+        self.state.stats = next_stats;
+        *out = next_out;
         Ok(())
     }
 
@@ -977,6 +993,23 @@ mod tests {
                 reason: NotifyReason::Input,
             }]
         );
+    }
+
+    #[test]
+    fn in_place_input_action_capacity_error_does_not_commit_state_or_output() {
+        let mut bridge = ready_bridge();
+        let before = bridge.clone();
+        let mut actions = heapless::Vec::<BridgeAction, 0>::new();
+
+        assert_eq!(
+            bridge.handle_event_in_place(
+                BridgeEvent::InputFrame(InputFrame::Standard(keyboard_frame(&[0x04]))),
+                &mut actions,
+            ),
+            Err(BridgeError::ActionCapacity)
+        );
+        assert_eq!(bridge, before);
+        assert!(actions.is_empty());
     }
 
     #[test]

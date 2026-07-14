@@ -619,6 +619,8 @@ fn result_message(result: ManagementResult) -> &'static str {
         ManagementResult::InvalidName => "名前が不正です",
         ManagementResult::InvalidSetting => "設定値または対象が不正です",
         ManagementResult::NotFound => "対象が見つかりません",
+        ManagementResult::InvalidPairing => "ESP-NOWペアリング情報が不完全または不正です",
+        ManagementResult::Unavailable => "このfirmwareでは利用できません",
     }
 }
 fn client_error_message(error: BrowserClientError) -> String {

@@ -34,10 +34,24 @@ cargo +esp build \
 
 Do not enable the `diagnostic-input` feature in production builds.
 
-The `hidshift` crate contains the host-testable `no_std` bridge core. The
-`firmware` crate owns all ESP32-S3, USB Host, BLE HID, and flash integration;
-those capabilities are mandatory rather than Cargo features. The optional
-`diagnostic-input` feature only enables verbose input diagnostics.
+The default `firmware` image bridges USB Host input directly to BLE HID and
+keeps BLE/Serial management enabled. Add `--features espnow` and build both
+binaries to enable the two-board transport:
+
+```sh
+cargo +esp build -Zbuild-std=core,alloc --release \
+  --manifest-path firmware/Cargo.toml --bin firmware --features espnow \
+  --target xtensa-esp32s3-none-elf
+cargo +esp build -Zbuild-std=core,alloc --release \
+  --manifest-path firmware/Cargo.toml --no-default-features \
+  --bin bridge-device --features espnow-device \
+  --target xtensa-esp32s3-none-elf
+```
+
+`firmware` is the USB Host role. `bridge-device` is the PC-facing USB Device
+role. BLE management remains available on the Host role; both roles support
+Serial management. `hardware-e2e` and `diagnostic-input` are development-only
+features.
 
 ## Flash
 
@@ -108,6 +122,28 @@ tools/hidshiftctl/target/release/hidshiftctl --ble status
 Run `hidshiftctl --help` or `hidshiftctl <COMMAND> --help` for the complete
 command and option reference.
 
+Pair two ESP-NOW boards over their Serial management ports. The command reads
+both hardware identities, generates a random 128-bit key, writes the reciprocal
+peer configuration, and commits both journals:
+
+```sh
+hidshiftctl espnow-pair \
+  --host-serial <HOST_PORT> --device-serial <DEVICE_PORT> --channel 6
+```
+
+Inspect or remove the pairing on either board through its available management
+transport:
+
+```sh
+hidshiftctl --serial <PORT> espnow-info
+hidshiftctl --serial <PORT> espnow-forget
+```
+
+Production ESP-NOW frames are encrypted and authenticated with the pairing key.
+Pairing data uses a separate versioned A/B flash journal from BLE bonds. A
+production image does not transmit ESP-NOW input until a valid pairing has been
+committed.
+
 ### Web UI
 
 The hosted manager is available at
@@ -147,13 +183,20 @@ Linux x86_64, Windows x86_64, Intel macOS, and Apple Silicon macOS. Download the
 archive for the required target from the
 [GitHub Releases page](https://github.com/abco20/HIDShift/releases).
 
-The firmware archive contains two images:
+The firmware archive contains the default BLE image and the two images needed
+for an ESP-NOW bridge pair:
 
 - `hidshift.elf` is the recommended image for `espflash flash`; it preserves
-  symbols and lets espflash prepare the image for the connected board.
-- `hidshift-factory.bin` is a merged image starting at address `0x0`, generated
-  for boards with at least 4 MiB of flash. It includes the bootloader, partition
-  table, and factory application for factory provisioning tools.
+  symbols and lets espflash prepare the default BLE firmware image.
+- `hidshift-factory.bin` is the merged default BLE image.
+- `hidshift-espnow-host.elf` and `hidshift-espnow-host-factory.bin` are the
+  keyboard/mouse-side USB Host images for ESP-NOW.
+- `hidshift-espnow-device.elf` and `hidshift-espnow-device-factory.bin` are
+  the PC-facing USB Device images for ESP-NOW.
+
+The factory BIN files start at address `0x0` and include the bootloader,
+partition table, and factory application. They are generated for boards with
+at least 4 MiB of flash.
 
 To flash the release ELF after extracting the archive:
 
@@ -210,11 +253,23 @@ ESP_LOG=debug cargo +esp build \
 The two-ESP hardware E2E suite and its Linux setup are documented in
 [e2e/README.md](e2e/README.md).
 
+ESP-NOW uses encrypted/authenticated 54 Mbps broadcast packets. Keyboard,
+button, consumer, and vendor state is published through a bounded critical
+journal; mouse motion uses cumulative counters and coalescing. Lost packets are
+recovered by later state snapshots rather than link-layer or application-level
+retransmission. See [e2e/README.md](e2e/README.md) for fault-injection and
+hardware test details.
+
 ```sh
 source ~/export-esp.sh
 cargo run --manifest-path e2e/runner/Cargo.toml -- \
-  --latency-samples 200 --stability-seconds 120
+  --mode coexist --latency-samples 500 --stability-seconds 120
 ```
+
+The performance gates are ESP-NOW p95 below 10 ms and p99 at most 15 ms, and
+BLE p95 at most 15 ms. One reference coexistence run measured ESP-NOW keyboard
+p95/p99 at 4.61/12.76 ms, mouse at 5.94/9.29 ms, and BLE keyboard/mouse p95 at
+12.76/11.25 ms. Results vary with RF conditions and attached hardware.
 
 Run the host-side checks before submitting changes:
 

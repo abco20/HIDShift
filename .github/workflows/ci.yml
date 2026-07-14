@@ -23,15 +23,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install host system dependencies
         run: sudo apt-get update && sudo apt-get install --yes libdbus-1-dev pkg-config
-      - run: cargo test --locked
+      - run: cargo test --locked --all-targets
       - run: cargo fmt --check
       - run: cargo check --locked --lib
       - run: cargo clippy --locked --lib -- -D warnings
       - run: cargo test --locked --manifest-path tools/hidshift-client/Cargo.toml
       - run: cargo test --locked --manifest-path tools/hidshiftctl/Cargo.toml
+      - run: cargo test --locked --all-targets --manifest-path e2e/runner/Cargo.toml
       - run: cargo check --locked --manifest-path web/Cargo.toml --target wasm32-unknown-unknown
       - run: cargo fmt --check --manifest-path tools/hidshift-client/Cargo.toml
       - run: cargo fmt --check --manifest-path tools/hidshiftctl/Cargo.toml
+      - run: cargo fmt --check --manifest-path e2e/runner/Cargo.toml
       - run: cargo fmt --check --manifest-path web/Cargo.toml
       - name: Test release version validation
         run: python3 -m unittest discover -s tools/release -p 'test_*.py'
@@ -60,4 +62,27 @@ jobs:
         run: >-
           cargo +esp check --locked -Zbuild-std=core,alloc
           --manifest-path firmware/Cargo.toml --bin firmware --features diagnostic-input
+          --target xtensa-esp32s3-none-elf
+      - name: Build ESP-NOW production firmware
+        run: >-
+          cargo +esp build --locked -Zbuild-std=core,alloc --release
+          --manifest-path firmware/Cargo.toml --bin firmware --features espnow
+          --target xtensa-esp32s3-none-elf
+      - name: Build ESP-NOW Device production firmware
+        run: >-
+          cargo +esp build --locked -Zbuild-std=core,alloc --release
+          --manifest-path firmware/Cargo.toml --no-default-features
+          --bin bridge-device --features espnow-device
+          --target xtensa-esp32s3-none-elf
+      - name: Check ESP-NOW hardware E2E firmware
+        run: >-
+          cargo +esp check --locked -Zbuild-std=core,alloc
+          --manifest-path firmware/Cargo.toml --bin firmware
+          --features hardware-e2e,espnow
+          --target xtensa-esp32s3-none-elf
+      - name: Check ESP-NOW Device hardware E2E firmware
+        run: >-
+          cargo +esp check --locked -Zbuild-std=core,alloc
+          --manifest-path firmware/Cargo.toml --no-default-features --bin bridge-device
+          --features hardware-e2e,espnow-device
           --target xtensa-esp32s3-none-elf

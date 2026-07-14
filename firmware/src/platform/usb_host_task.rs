@@ -31,14 +31,16 @@ use hidshift::usb_hid::host_interface::{
 };
 use hidshift::usb_hid::host_runtime::UsbHidInterfaceRuntimeSession;
 use hidshift::usb_hid::topology::{DefaultUsbTopologyManager, UsbDeviceRoute};
+use static_cell::ConstStaticCell;
 
-use super::usb_output_transport::UsbKeyboardLedWriter;
+use super::espnow_output::{HostOutputRequest, HostOutputResponse};
+use super::usb_output_transport::{UsbKeyboardLedWriter, UsbRawReportWriter};
 use super::usb_transport::{UsbHidControl, UsbHidReader};
 
 const HOST_CHANNELS: usize = 8;
 const CONFIG_DESCRIPTOR_BUF_LEN: usize = 512;
-const REPORT_DESCRIPTOR_BUF_LEN: usize = 512;
-const REPORT_BUF_LEN: usize = 64;
+const REPORT_DESCRIPTOR_BUF_LEN: usize = hidshift::link::MAX_HID_REPORT_DESCRIPTOR_SIZE;
+const REPORT_BUF_LEN: usize = hidshift::link::MAX_HID_REPORT_SIZE;
 const MAX_REPORT_FIELDS: usize = 48;
 const MAX_REPORT_EVENTS: usize = 32;
 const MAX_ACTIVE_USB_INTERFACES: usize = 8;
@@ -66,6 +68,25 @@ struct ActiveUsbInterfaceSlot<'d> {
     last_led_bytes: Option<hidshift::usb_hid::output::KeyboardLedOutputBytes>,
 }
 
+// The USB task polls several nested futures while retaining up to eight HID
+// sessions. Keep its long-lived state out of the executor's thread stack; the
+// ESP32-S3 USB host path otherwise needs more stack than the shared executor
+// task has available during its first poll.
+type StaticActiveUsbInterfaceSlot = ActiveUsbInterfaceSlot<'static>;
+
+static CONFIG_DESCRIPTOR_STORAGE: ConstStaticCell<[u8; CONFIG_DESCRIPTOR_BUF_LEN]> =
+    ConstStaticCell::new([0; CONFIG_DESCRIPTOR_BUF_LEN]);
+static TOPOLOGY_STORAGE: ConstStaticCell<DefaultUsbTopologyManager> =
+    ConstStaticCell::new(DefaultUsbTopologyManager::new());
+static MOVEMENT_QUEUE_STORAGE: ConstStaticCell<
+    hidshift::input::UsbMovementCoalescer<MAX_ACTIVE_USB_INTERFACES>,
+> = ConstStaticCell::new(hidshift::input::UsbMovementCoalescer::<
+    MAX_ACTIVE_USB_INTERFACES,
+>::new());
+static ACTIVE_SLOTS_STORAGE: ConstStaticCell<
+    [Option<StaticActiveUsbInterfaceSlot>; MAX_ACTIVE_USB_INTERFACES],
+> = ConstStaticCell::new([const { None }; MAX_ACTIVE_USB_INTERFACES]);
+
 enum UsbSlotReadResult {
     Input {
         message: RuntimeInputMessage,
@@ -86,6 +107,34 @@ impl<'d> ActiveUsbInterfaceSlot<'d> {
                     Ok(message) => {
                         let movement_only =
                             movement_only_message(&message, &mut self.last_mouse_buttons);
+                        let motion = if movement_only {
+                            match &message {
+                                RuntimeInputMessage::BridgeEvent(
+                                    hidshift::BridgeEvent::InputFrame(
+                                        hidshift::input::InputFrame::Standard(frame),
+                                    ),
+                                ) => frame.mouse.map(|mouse| mouse.movement),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        #[cfg(feature = "espnow")]
+                        if super::transport_route::routes_to(hidshift::InputTransport::EspNow) {
+                            super::espnow_link_task::forward_input_report(
+                                self.session.device_id(),
+                                self.interface_id,
+                                embassy_time::Instant::now().as_micros(),
+                                if movement_only {
+                                    hidshift::link::InputDeliveryClass::Motion
+                                } else {
+                                    hidshift::link::InputDeliveryClass::Critical
+                                },
+                                motion,
+                                &self.report_buf[..n],
+                            )
+                            .await;
+                        }
                         return UsbSlotReadResult::Input {
                             message,
                             movement_only,
@@ -143,6 +192,10 @@ async fn forward_usb_input(
     message: RuntimeInputMessage,
     movement_only: bool,
 ) {
+    if !super::transport_route::routes_to(hidshift::InputTransport::Ble) {
+        while movement_queue.take_next().is_some() {}
+        return;
+    }
     while sender.free_capacity() > 0 {
         let Some(frame) = movement_queue.take_next() else {
             break;
@@ -429,17 +482,23 @@ pub async fn usb_input_task(
     esp_hal::interrupt::bind_handler(Interrupt::USB, usb_interrupt_handler);
 
     let (mut bus_controller, bus_handle) = embassy_usb_host::bus(host, &BUS_STATE);
-    let mut config_buf = [0u8; CONFIG_DESCRIPTOR_BUF_LEN];
-    let mut topology = DefaultUsbTopologyManager::new();
-    let mut movement_queue =
-        hidshift::input::UsbMovementCoalescer::<MAX_ACTIVE_USB_INTERFACES>::new();
+    let config_buf = CONFIG_DESCRIPTOR_STORAGE.take();
+    let mut topology = TOPOLOGY_STORAGE.take();
+    let mut movement_queue = MOVEMENT_QUEUE_STORAGE.take();
+    let mut active_slots = ACTIVE_SLOTS_STORAGE.take();
 
     loop {
         let speed = bus_controller.wait_for_connection().await;
         log::info!("firmware: usb connected speed={:?}", speed);
 
+        // All slots should have been detached on the previous disconnect, but
+        // clear them defensively before accepting a new USB session.
+        for slot in active_slots.iter_mut() {
+            *slot = None;
+        }
+
         let (enum_info, config_len) = match bus_handle
-            .enumerate(BusRoute::Direct(speed), &mut config_buf)
+            .enumerate(BusRoute::Direct(speed), &mut config_buf[..])
             .await
         {
             Ok(result) => {
@@ -473,8 +532,6 @@ pub async fn usb_input_task(
                 }
             };
         let config_desc = &config_buf[..config_len];
-        let mut active_slots: [Option<ActiveUsbInterfaceSlot<'_>>; MAX_ACTIVE_USB_INTERFACES] =
-            [const { None }; MAX_ACTIVE_USB_INTERFACES];
         if config_descriptor_has_interface_class(config_desc, 0x09) {
             let Ok(mut hub) =
                 HubHandler::<_, MAX_HUB_PORTS>::try_register(&bus_handle, &enum_info).await
@@ -487,14 +544,15 @@ pub async fn usb_input_task(
             log::info!("firmware: root hub registered ports_max={}", MAX_HUB_PORTS);
             let mut hub_port_devices = [None; MAX_HUB_PORTS];
             loop {
-                match select3(
+                match select4(
                     hub.wait_for_event(),
                     poll_active_slots(&mut active_slots),
                     receiver.receive(),
+                    super::espnow_output::output_request_receiver().receive(),
                 )
                 .await
                 {
-                    Either3::First(Ok(HandlerEvent::HandlerEvent(HubEvent::DeviceDetected {
+                    Either4::First(Ok(HandlerEvent::HandlerEvent(HubEvent::DeviceDetected {
                         port,
                         speed,
                     }))) => {
@@ -514,7 +572,7 @@ pub async fn usb_input_task(
                                 &mut active_slots,
                                 &mut hub_port_devices,
                                 &mut hub,
-                                &mut config_buf,
+                                &mut config_buf[..],
                                 device_id,
                                 port,
                                 speed,
@@ -551,7 +609,7 @@ pub async fn usb_input_task(
                                             &mut active_slots,
                                             &mut hub_port_devices,
                                             &mut hub,
-                                            &mut config_buf,
+                                            &mut config_buf[..],
                                             device_id,
                                             port,
                                             speed,
@@ -602,7 +660,7 @@ pub async fn usb_input_task(
                             break;
                         }
                     }
-                    Either3::First(Ok(HandlerEvent::HandlerEvent(HubEvent::DeviceRemoved {
+                    Either4::First(Ok(HandlerEvent::HandlerEvent(HubEvent::DeviceRemoved {
                         port,
                         ..
                     }))) => {
@@ -616,8 +674,8 @@ pub async fn usb_input_task(
                         )
                         .await;
                     }
-                    Either3::First(Ok(_)) => {}
-                    Either3::First(Err(error)) => {
+                    Either4::First(Ok(_)) => {}
+                    Either4::First(Err(error)) => {
                         log::warn!("firmware: hub event loop failed: {:?}", error);
                         let _ = remove_device_and_notify(
                             &sender,
@@ -629,14 +687,14 @@ pub async fn usb_input_task(
                         .await;
                         break;
                     }
-                    Either3::Second(UsbSlotReadResult::Input {
+                    Either4::Second(UsbSlotReadResult::Input {
                         message,
                         movement_only,
                     }) => {
                         forward_usb_input(&sender, &mut movement_queue, message, movement_only)
                             .await;
                     }
-                    Either3::Second(UsbSlotReadResult::Fatal {
+                    Either4::Second(UsbSlotReadResult::Fatal {
                         device_id: failed_device_id,
                         interface_id,
                         error,
@@ -660,7 +718,7 @@ pub async fn usb_input_task(
                         )
                         .await;
                     }
-                    Either3::Third(command) => {
+                    Either4::Third(command) => {
                         let Some(slot) = active_slots.iter_mut().find_map(|slot| {
                             slot.as_mut().filter(|slot| {
                                 command.matches_target(slot.interface_id, slot.session.device_id())
@@ -722,6 +780,9 @@ pub async fn usb_input_task(
                             );
                         }
                     }
+                    Either4::Fourth(request) => {
+                        handle_raw_output_request(&bus_handle, &mut active_slots, request).await;
+                    }
                 }
             }
             continue;
@@ -751,14 +812,20 @@ pub async fn usb_input_task(
         }
 
         loop {
-            match select(poll_active_slots(&mut active_slots), receiver.receive()).await {
-                Either::First(UsbSlotReadResult::Input {
+            match select3(
+                poll_active_slots(&mut active_slots),
+                receiver.receive(),
+                super::espnow_output::output_request_receiver().receive(),
+            )
+            .await
+            {
+                Either3::First(UsbSlotReadResult::Input {
                     message,
                     movement_only,
                 }) => {
                     forward_usb_input(&sender, &mut movement_queue, message, movement_only).await;
                 }
-                Either::First(UsbSlotReadResult::Fatal {
+                Either3::First(UsbSlotReadResult::Fatal {
                     device_id: failed_device_id,
                     interface_id,
                     error,
@@ -783,7 +850,7 @@ pub async fn usb_input_task(
                     .await;
                     break;
                 }
-                Either::Second(command) => {
+                Either3::Second(command) => {
                     let Some(slot) = active_slots.iter_mut().find_map(|slot| {
                         slot.as_mut().filter(|slot| {
                             command.matches_target(slot.interface_id, slot.session.device_id())
@@ -843,6 +910,9 @@ pub async fn usb_input_task(
                             slot.interface_id.0
                         );
                     }
+                }
+                Either3::Third(request) => {
+                    handle_raw_output_request(&bus_handle, &mut active_slots, request).await;
                 }
             }
         }
@@ -1004,6 +1074,16 @@ async fn attach_hid_interfaces_for_device<'d>(
         .await
         {
             Ok(len) => {
+                #[cfg(feature = "espnow")]
+                super::espnow_link_task::forward_interface_descriptor(
+                    device_id,
+                    interface_id,
+                    hid_info.interface_number,
+                    enum_info.device_desc.vendor_id,
+                    enum_info.device_desc.product_id,
+                    &report_descriptor_buf[..len],
+                )
+                .await;
                 let report_descriptor =
                     ReportDescriptor::<MAX_REPORT_FIELDS>::parse(&report_descriptor_buf[..len]);
                 let descriptor = match to_core_descriptor(&report_descriptor) {
@@ -1279,6 +1359,122 @@ async fn fetch_report_descriptor_with_retries<'d>(
     }
 }
 
+async fn handle_raw_output_request<'d>(
+    bus_handle: &FirmwareBusHandle<'d>,
+    active_slots: &mut [Option<ActiveUsbInterfaceSlot<'d>>; MAX_ACTIVE_USB_INTERFACES],
+    request: HostOutputRequest,
+) {
+    let interface_id = match &request {
+        HostOutputRequest::SetReport { interface_id, .. }
+        | HostOutputRequest::GetReport { interface_id, .. } => *interface_id,
+    };
+    let Some(slot) = active_slots.iter_mut().find_map(|slot| {
+        slot.as_mut()
+            .filter(|slot| slot.interface_id == interface_id)
+    }) else {
+        log::warn!(
+            "firmware: raw USB output interface missing interface={}",
+            interface_id.0
+        );
+        return;
+    };
+
+    match request {
+        HostOutputRequest::SetReport {
+            report_type,
+            report_id,
+            report,
+            ..
+        } => {
+            let prefer_interrupt = report_type == hidshift::link::HidReportType::Output;
+            match UsbRawReportWriter::new_for_interface(
+                bus_handle,
+                slot.hid_info,
+                &slot.enum_info,
+                prefer_interrupt,
+            ) {
+                Ok(mut writer) => {
+                    match with_timeout(
+                        Duration::from_millis(50),
+                        writer.write_report(report_type as u8, report_id, report.as_slice()),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => log::warn!(
+                            "firmware: raw SET_REPORT failed interface={} err={:?}",
+                            interface_id.0,
+                            error
+                        ),
+                        Err(_) => log::warn!(
+                            "firmware: raw SET_REPORT timeout interface={}",
+                            interface_id.0
+                        ),
+                    }
+                }
+                Err(error) => log::warn!(
+                    "firmware: raw SET_REPORT pipe failed interface={} err={:?}",
+                    interface_id.0,
+                    error
+                ),
+            }
+        }
+        HostOutputRequest::GetReport {
+            report_type,
+            report_id,
+            requested_len,
+            request_id,
+            ..
+        } => {
+            let mut report = [0u8; hidshift::link::MAX_HID_REPORT_SIZE];
+            let requested_len = usize::from(requested_len).min(report.len());
+            let len = match UsbHidControl::new(bus_handle, slot.hid_info, &slot.enum_info) {
+                Ok(mut control) => match with_timeout(
+                    Duration::from_millis(50),
+                    control.get_report(report_type as u8, report_id, &mut report[..requested_len]),
+                )
+                .await
+                {
+                    Ok(Ok(len)) => len,
+                    Ok(Err(error)) => {
+                        log::warn!(
+                            "firmware: raw GET_REPORT failed interface={} err={:?}",
+                            interface_id.0,
+                            error
+                        );
+                        0
+                    }
+                    Err(_) => {
+                        log::warn!(
+                            "firmware: raw GET_REPORT timeout interface={}",
+                            interface_id.0
+                        );
+                        0
+                    }
+                },
+                Err(error) => {
+                    log::warn!(
+                        "firmware: raw GET_REPORT pipe failed interface={} err={:?}",
+                        interface_id.0,
+                        error
+                    );
+                    0
+                }
+            };
+            if let Ok(report) = heapless::Vec::from_slice(&report[..len]) {
+                super::espnow_output::send_output_response(HostOutputResponse {
+                    interface_id,
+                    report_type,
+                    report_id,
+                    request_id,
+                    report,
+                })
+                .await;
+            }
+        }
+    }
+}
+
 async fn remove_device_and_notify<'d>(
     sender: &Sender<
         'static,
@@ -1319,6 +1515,8 @@ async fn remove_device_and_notify<'d>(
 
     detach_active_slots_for_device(active_slots, device_id, &mut disconnected);
     for interface_id in disconnected {
+        #[cfg(feature = "espnow")]
+        super::espnow_link_task::forward_interface_removed(device_id, interface_id).await;
         sender
             .send(RuntimeInputMessage::UsbHidInterfaceDisconnected { interface_id })
             .await;
