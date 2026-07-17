@@ -3,7 +3,6 @@ use embassy_sync::channel::Sender;
 use embassy_time::Instant;
 use esp_hal::peripherals::{GPIO44, UART0};
 use esp_hal::uart::{Config, Uart};
-use hidshift::InputTransport;
 use hidshift::management::ManagementDestination;
 use hidshift::runtime::RUNTIME_INPUT_QUEUE_CAPACITY;
 use hidshift::runtime::message::RuntimeInputMessage;
@@ -21,7 +20,7 @@ pub async fn serial_management_task(
     >,
     uart: UART0<'static>,
     rx: GPIO44<'static>,
-    boot_session_id: u32,
+    _boot_session_id: u32,
 ) {
     let Ok(uart) = Uart::new(uart, Config::default()) else {
         log::error!("firmware: management UART init failed");
@@ -41,22 +40,13 @@ pub async fn serial_management_task(
                 if let Some(request) =
                     crate::wired_management::decode_request_line(&line[..line_len])
                 {
-                    if cfg!(feature = "espnow") && request.command.is_espnow_pairing() {
-                        super::storage_task::espnow_management_sender()
-                            .send(super::storage_task::EspNowManagementRequest {
-                                destination: ManagementDestination::Wired,
-                                request,
-                            })
-                            .await;
-                    } else {
-                        sender
-                            .send(RuntimeInputMessage::ManagementRequest {
-                                destination: ManagementDestination::Wired,
-                                request,
-                                now_ms: Instant::now().as_millis(),
-                            })
-                            .await;
-                    }
+                    sender
+                        .send(RuntimeInputMessage::ManagementRequest {
+                            destination: ManagementDestination::Wired,
+                            request,
+                            now_ms: Instant::now().as_millis(),
+                        })
+                        .await;
                 }
                 #[cfg(feature = "hardware-e2e")]
                 if let Ok(packet) = E2ePacket::decode_line(&line[..line_len]) {
@@ -64,34 +54,19 @@ pub async fn serial_management_task(
                     let acknowledge = packet.requests_acknowledgement();
                     let ingress_us = Instant::now().as_micros();
                     if matches!(packet.command, E2eCommand::Hello) {
-                        crate::e2e_telemetry::reset_espnow_timings();
                         log::info!(
                             "@HIDSHIFT-BRIDGE:CLOCK,{},{},{},{}",
                             sequence,
-                            boot_session_id,
+                            _boot_session_id,
                             device_session_id(),
                             Instant::now().as_micros()
                         );
                     }
                     if let E2eCommand::SelectTransport { transport } = packet.command {
-                        super::transport_route::select(transport);
                         log::info!("@HIDSHIFT-BRIDGE:ROUTE,{:?}", transport);
                     }
                     if packet.carries_input() {
                         crate::e2e_telemetry::record_ingress(sequence, ingress_us);
-                        #[cfg(feature = "espnow")]
-                        if super::transport_route::routes_to(InputTransport::EspNow) {
-                            super::espnow_link_task::forward_e2e_packet(packet, ingress_us).await;
-                            // Channel send is normally immediately ready. Yield
-                            // explicitly so the awakened radio owner can submit
-                            // the realtime frame before this UART task performs
-                            // any lower-priority decoding or acknowledgements.
-                            embassy_futures::yield_now().await;
-                        }
-                    }
-                    if matches!(packet.command, E2eCommand::EnterDeviceDownload) {
-                        #[cfg(feature = "espnow")]
-                        super::espnow_link_task::forward_e2e_packet(packet, ingress_us).await;
                     }
                     if let E2eCommand::ReadTimestamp { target_sequence } = packet.command {
                         let snapshot = crate::e2e_telemetry::snapshot(target_sequence);
@@ -124,7 +99,7 @@ pub async fn serial_management_task(
                         log::info!(
                             "@HIDSHIFT-BRIDGE:STAMP,{},{},{},{},{},{},{},{},{},{},{},{}",
                             sequence,
-                            boot_session_id,
+                            _boot_session_id,
                             snapshot.espnow_sequence,
                             snapshot.espnow_ingress_us,
                             snapshot.espnow_enqueue_us,
@@ -140,20 +115,11 @@ pub async fn serial_management_task(
                     match packet.input_frames() {
                         Ok(frames) => {
                             for frame in frames.into_iter().flatten() {
-                                // The standalone ESP-NOW image has no BLE
-                                // consumer. Feeding the same synthetic input
-                                // through the dormant runtime as well as the
-                                // radio path delays the realtime sender for no
-                                // observable output. A coexistence image uses
-                                // an explicit transport-routing policy instead
-                                // of restoring this unconditional duplicate.
-                                if super::transport_route::routes_to(InputTransport::Ble) {
-                                    sender
-                                        .send(RuntimeInputMessage::BridgeEvent(
-                                            hidshift::BridgeEvent::InputFrame(frame),
-                                        ))
-                                        .await;
-                                }
+                                sender
+                                    .send(RuntimeInputMessage::BridgeEvent(
+                                        hidshift::BridgeEvent::InputFrame(frame),
+                                    ))
+                                    .await;
                             }
                             if acknowledge {
                                 log::info!(
@@ -184,12 +150,7 @@ pub async fn serial_management_task(
     }
 }
 
-#[cfg(all(feature = "hardware-e2e", feature = "espnow"))]
-fn device_session_id() -> u32 {
-    super::espnow_link_task::device_session_id()
-}
-
-#[cfg(all(feature = "hardware-e2e", not(feature = "espnow")))]
+#[cfg(feature = "hardware-e2e")]
 const fn device_session_id() -> u32 {
     0
 }

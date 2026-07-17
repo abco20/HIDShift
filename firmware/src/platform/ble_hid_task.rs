@@ -30,7 +30,9 @@ use hidshift::runtime::{
     RUNTIME_BLE_NOTIFY_COMMAND_QUEUE_CAPACITY, RUNTIME_HOSTS_MAX, RUNTIME_INPUT_QUEUE_CAPACITY,
     RuntimeDiagnosticsEvent,
 };
-use hidshift::storage::{FixedName, StorageState, StoredAddressKind};
+#[cfg(not(feature = "hardware-e2e"))]
+use hidshift::storage::StoredAddressKind;
+use hidshift::storage::{FixedName, StorageState};
 use hidshift::{BleConnectionSlots, BleInputGate, BlePeerIdentity, resolve_ble_host_id};
 use static_cell::StaticCell;
 use trouble_host::prelude::*;
@@ -45,27 +47,17 @@ const BLE_L2CAP_CHANNELS_MAX: usize = BLE_CONNECTIONS_MAX * 2;
 const BLE_ATTRIBUTE_TABLE_SIZE: usize = 72;
 const BLE_NOTIFY_TIMEOUT_MS: u64 = 30;
 const MANAGEMENT_NOTIFY_TIMEOUT_MS: u64 = 1_000;
-// A legacy advertising event occupies the shared 2.4-GHz radio on all three
-// advertising channels. In coexistence mode a 160-ms interval makes enough
-// ESP-NOW reports wait behind those events to move p99 above the game-latency
-// gate. One second remains responsive for target discovery while keeping idle
-// advertising out of the realtime tail.
-#[cfg(feature = "espnow")]
-const COEX_ADVERTISING_INTERVAL_MS: u64 = 1_000;
 const MANAGEMENT_SERVICE_UUID_LE: [u8; 16] = [
     0x01, 0x00, 0x3a, 0x4f, 0x6d, 0x5b, 0x4b, 0x9f, 0x0d, 0x4f, 0x15, 0x1b, 0x00, 0x00, 0x51, 0x7f,
 ];
 
 pub fn ble_controller_config() -> BleControllerConfig {
-    let config = BleControllerConfig::default()
+    BleControllerConfig::default()
         .with_max_connections(BLE_CONTROLLER_ACTIVITIES_MAX)
         // HIDShift is a BLE peripheral only. Central scanning and Direct Test
         // Mode reserve sizeable controller heaps but are never exercised.
         .with_scan(false)
-        .with_dtm(false);
-    #[cfg(feature = "espnow")]
-    let config = config.with_task_cpu(esp_hal::system::Cpu::AppCpu);
-    config
+        .with_dtm(false)
 }
 
 static BLE_ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
@@ -198,8 +190,7 @@ pub async fn ble_host_event_task(
     runtime_barrier_request: Sender<'static, CriticalSectionRawMutex, usize, 1>,
     runtime_barrier_done: Receiver<'static, CriticalSectionRawMutex, BleRuntimeSnapshot, 1>,
     runtime_barrier_resume: Sender<'static, CriticalSectionRawMutex, (), 1>,
-    #[cfg(feature = "espnow")] connector: BleConnector<'static>,
-    #[cfg(not(feature = "espnow"))] bt: esp_hal::peripherals::BT<'static>,
+    bt: esp_hal::peripherals::BT<'static>,
     rng: esp_hal::peripherals::RNG<'static>,
     adc1: esp_hal::peripherals::ADC1<'static>,
 ) {
@@ -218,23 +209,9 @@ pub async fn ble_host_event_task(
         }
     };
     let restored_state = restore_receiver.receive().await;
-    #[cfg(feature = "espnow")]
-    log::info!(
-        "firmware: BLE storage restored heap_free={}",
-        esp_alloc::HEAP.free()
-    );
-    #[cfg(feature = "espnow")]
-    let current_storage = restored_state;
-    #[cfg(not(feature = "espnow"))]
     let mut current_storage = restored_state;
-    #[cfg(feature = "espnow")]
-    let pairable_host = None;
-    #[cfg(not(feature = "espnow"))]
     let mut pairable_host = None;
-    #[cfg(not(feature = "espnow"))]
     let mut bt = Some(bt);
-    #[cfg(feature = "espnow")]
-    let mut connector = Some(connector);
     let server = match Server::new_with_config(GapConfig::Peripheral(PeripheralConfig {
         name: BLE_DEVICE_NAME,
         appearance: &appearance::human_interface_device::KEYBOARD,
@@ -252,16 +229,6 @@ pub async fn ble_host_event_task(
     retain_gatt_service_fields(server);
 
     loop {
-        #[cfg(feature = "espnow")]
-        let connector = match connector.take() {
-            Some(connector) => connector,
-            None => {
-                log::error!("firmware: BLE coexist controller restart requested; resetting");
-                Timer::after_millis(20).await;
-                esp_hal::system::software_reset();
-            }
-        };
-        #[cfg(not(feature = "espnow"))]
         let connector = match BleConnector::new(
             match bt.take() {
                 Some(bt) => bt,
@@ -305,15 +272,10 @@ pub async fn ble_host_event_task(
                     runtime_barrier_done,
                 )
                 .await;
-                #[cfg(feature = "espnow")]
-                let _ = &snapshot;
-                #[cfg(not(feature = "espnow"))]
-                {
-                    if let Some(storage) = snapshot.storage.clone() {
-                        current_storage = Some(storage);
-                    }
-                    pairable_host = snapshot.pairable_host;
+                if let Some(storage) = snapshot.storage.clone() {
+                    current_storage = Some(storage);
                 }
+                pairable_host = snapshot.pairable_host;
                 log::info!("firmware: ble quiesced for flash write");
                 quiesce_ready.send(snapshot.storage).await;
                 quiesce_done.receive().await;
@@ -326,27 +288,15 @@ pub async fn ble_host_event_task(
                     runtime_barrier_done,
                 )
                 .await;
-                #[cfg(feature = "espnow")]
-                let _ = &snapshot;
-                #[cfg(not(feature = "espnow"))]
-                {
-                    if let Some(storage) = snapshot.storage {
-                        current_storage = Some(storage);
-                    }
-                    pairable_host = snapshot.pairable_host;
+                if let Some(storage) = snapshot.storage {
+                    current_storage = Some(storage);
                 }
+                pairable_host = snapshot.pairable_host;
                 log::info!("firmware: ble quiesced for usb enumeration");
                 usb_quiesce_ready.send(()).await;
                 usb_quiesce_done.receive().await;
                 runtime_barrier_resume.send(()).await;
             }
-        }
-
-        #[cfg(feature = "espnow")]
-        {
-            log::info!("firmware: BLE coexist host stopped; resetting for core0 reinitialization");
-            Timer::after_millis(20).await;
-            esp_hal::system::software_reset();
         }
     }
 }
@@ -357,7 +307,6 @@ async fn disconnect_runtime_hosts_before_quiesce(
 ) -> BleRuntimeSnapshot {
     let host_mask = BLE_ACTIVE_HOST_MASK.swap(0, Ordering::AcqRel);
     BLE_ACTIVE_CONNECTIONS.store(0, Ordering::Release);
-    super::transport_route::set_available(hidshift::InputTransport::Ble, false);
     barrier_request.send(host_mask).await;
     barrier_done.receive().await
 }
@@ -515,7 +464,7 @@ impl BleControlState {
     }
 
     fn restrict_advertising_to_bonds(&self) -> bool {
-        if cfg!(all(feature = "hardware-e2e", not(feature = "espnow"))) {
+        if cfg!(feature = "hardware-e2e") {
             true
         } else {
             hidshift::restrict_advertising_to_bonded_peers(
@@ -565,7 +514,7 @@ fn resolve_connection_host_id<P>(
 where
     P: PacketPool,
 {
-    #[cfg(all(feature = "hardware-e2e", not(feature = "espnow")))]
+    #[cfg(feature = "hardware-e2e")]
     if control.pairing_host() == Some(HostId(1))
         && conn.raw().peer_address().into_inner() != hidshift::e2e::E2E_PROBE_BLE_ADDRESS_RAW
     {
@@ -580,7 +529,7 @@ where
     (is_pairing || reconnect_enabled).then_some(resolved)
 }
 
-#[cfg(all(feature = "hardware-e2e", not(feature = "espnow")))]
+#[cfg(feature = "hardware-e2e")]
 fn e2e_linux_address() -> Option<BdAddr> {
     let value = option_env!("HIDSHIFT_E2E_LINUX_ADDRESS")?;
     let mut visible = [0u8; 6];
@@ -609,7 +558,7 @@ async fn configure_ble_accept_list<C, P>(
         return;
     }
 
-    #[cfg(not(all(feature = "hardware-e2e", not(feature = "espnow"))))]
+    #[cfg(not(feature = "hardware-e2e"))]
     if let Some(storage) = restored_state {
         let mut added = 0usize;
         for host in storage.hosts() {
@@ -638,7 +587,7 @@ async fn configure_ble_accept_list<C, P>(
         log::info!("firmware: programmed {} bonded accept-list peer(s)", added);
     }
 
-    #[cfg(all(feature = "hardware-e2e", not(feature = "espnow")))]
+    #[cfg(feature = "hardware-e2e")]
     let _ = restored_state;
 }
 
@@ -674,7 +623,7 @@ async fn accept_ble_connections<'values, 'server, C>(
 {
     let mut control = BleControlState::new(restored_state, pairable_host);
     configure_ble_accept_list(stack, restored_state).await;
-    #[cfg(all(feature = "hardware-e2e", not(feature = "espnow")))]
+    #[cfg(feature = "hardware-e2e")]
     {
         let address = BdAddr::new(hidshift::e2e::E2E_PROBE_BLE_ADDRESS_RAW);
         if let Err(error) = stack
@@ -1168,8 +1117,7 @@ async fn dispatch_ble_command_to_connected_slot<C>(
             conn.raw().disconnect();
             sender.send(disconnected_message(host_id)).await;
             mark_host_disconnected(host_id);
-            let active = decrement_active_ble_connections();
-            super::transport_route::set_available(hidshift::InputTransport::Ble, active != 0);
+            decrement_active_ble_connections();
             let _ = slots.set_disconnected(slot_index);
             clear_connection_slot(connection_slots, slot_index);
         }
@@ -1354,7 +1302,6 @@ async fn configure_ble_connection<C, P>(
     }
     mark_host_connected(host_id);
     let active = BLE_ACTIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
-    super::transport_route::set_available(hidshift::InputTransport::Ble, true);
     log::info!(
         "firmware: ble slot {} connected host={} active_ble={} pairing_allowed={} restored_bond={}",
         slot,
@@ -1469,7 +1416,7 @@ where
         &mut scan_data,
     )?;
 
-    let mut parameters = AdvertisementParameters {
+    let parameters = AdvertisementParameters {
         filter_policy: if restrict_to_accept_list {
             AdvFilterPolicy::FilterConn
         } else {
@@ -1477,12 +1424,6 @@ where
         },
         ..Default::default()
     };
-    #[cfg(feature = "espnow")]
-    {
-        let interval = Duration::from_millis(COEX_ADVERTISING_INTERVAL_MS);
-        parameters.interval_min = interval;
-        parameters.interval_max = interval;
-    }
     let advertiser = peripheral
         .advertise(
             &parameters,
@@ -1525,7 +1466,6 @@ where
             #[cfg(feature = "hardware-e2e")]
             crate::e2e_telemetry::record_ble_disconnected();
             let active = decrement_active_ble_connections();
-            super::transport_route::set_available(hidshift::InputTransport::Ble, active != 0);
             log::info!(
                 "firmware: ble slot {} disconnected: {:?} active_ble={}",
                 slot,
@@ -1558,18 +1498,6 @@ where
                 GattEvent::Write(event) => {
                     let message = if event.handle() == server.management.request.handle {
                         match ManagementRequest::decode(event.data()) {
-                            Ok(request)
-                                if cfg!(feature = "espnow")
-                                    && request.command.is_espnow_pairing() =>
-                            {
-                                super::storage_task::espnow_management_sender()
-                                    .send(super::storage_task::EspNowManagementRequest {
-                                        destination: ManagementDestination::Ble(host_id),
-                                        request,
-                                    })
-                                    .await;
-                                None
-                            }
                             Ok(request) => Some(RuntimeInputMessage::ManagementRequest {
                                 destination: ManagementDestination::Ble(host_id),
                                 request,
