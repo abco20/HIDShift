@@ -58,8 +58,8 @@ mod tests {
 
     #[test]
     fn mac_parser_identifies_two_serial_paths_for_the_same_board() {
-        let info = "Chip type: esp32s3\nMAC address:       68:EE:8F:63:94:A0\n";
-        assert_eq!(parse_mac_address(info), Some("68:ee:8f:63:94:a0".into()));
+        let info = "Chip type: esp32s3\nMAC address:       12:34:56:78:9A:BC\n";
+        assert_eq!(parse_mac_address(info), Some("12:34:56:78:9a:bc".into()));
         assert_eq!(parse_mac_address("Connecting..."), None);
     }
 

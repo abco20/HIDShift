@@ -2,19 +2,19 @@
   "schema_version": 2,
   "metric": "dut_ingress_to_probe_clock_synchronized",
   "keyboard": {
-    "samples": 200,
-    "mean_ms": 5.623864,
-    "p50_ms": 5.686284,
-    "p95_ms": 9.089284,
-    "p99_ms": 9.291284,
-    "max_ms": 9.344284
+    "samples": 400,
+    "mean_ms": 5.762946,
+    "p50_ms": 5.749391,
+    "p95_ms": 9.180391,
+    "p99_ms": 9.429391,
+    "max_ms": 9.527391
   },
   "mouse": {
-    "samples": 100,
-    "mean_ms": 5.426204,
-    "p50_ms": 5.467284,
-    "p95_ms": 8.858284,
-    "p99_ms": 9.127284,
-    "max_ms": 9.127284
+    "samples": 200,
+    "mean_ms": 5.572846,
+    "p50_ms": 5.589391,
+    "p95_ms": 8.945391,
+    "p99_ms": 9.293391,
+    "max_ms": 9.309391
   }
 }
