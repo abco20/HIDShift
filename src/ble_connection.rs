@@ -235,13 +235,17 @@ impl<const SLOTS: usize> BleConnectionSlots<SLOTS> {
     /// Returns whether an already-connected peripheral should advertise an
     /// additional slot.
     ///
-    /// Keeping connectable advertising active during normal HID operation
-    /// consumes the same 2.4-GHz radio as BLE connection events and Wi-Fi.
-    /// Additional peers therefore connect only while the user has explicitly
-    /// opened a pairing/reconnect window. Initial connection advertising is
-    /// handled separately when no slots are connected.
-    pub fn should_advertise_additional_connection(&self, connection_window_open: bool) -> bool {
-        connection_window_open && self.should_advertise()
+    /// Advertising remains enabled while a registered session has not yet
+    /// reconnected. It stops once every retained peer is connected, avoiding
+    /// permanent advertising load without making a second host wait for the
+    /// active host to disconnect.
+    pub fn should_advertise_additional_connection(
+        &self,
+        pairing_window_open: bool,
+        retained_session_count: usize,
+    ) -> bool {
+        self.should_advertise()
+            && (pairing_window_open || self.connected_count() < retained_session_count)
     }
 
     pub fn is_connected(&self, slot: usize) -> bool {
@@ -408,15 +412,17 @@ mod tests {
     }
 
     #[test]
-    fn additional_connection_advertising_requires_an_explicit_window() {
+    fn additional_connection_advertising_restores_retained_sessions() {
         let mut slots = BleConnectionSlots::<2>::new();
         slots.connect_first_free(HostId(1), peer(1)).unwrap();
 
-        assert!(!slots.should_advertise_additional_connection(false));
-        assert!(slots.should_advertise_additional_connection(true));
+        assert!(!slots.should_advertise_additional_connection(false, 1));
+        assert!(slots.should_advertise_additional_connection(false, 2));
+        assert!(slots.should_advertise_additional_connection(true, 1));
 
         slots.connect_first_free(HostId(2), peer(2)).unwrap();
-        assert!(!slots.should_advertise_additional_connection(true));
+        assert!(!slots.should_advertise_additional_connection(false, 2));
+        assert!(!slots.should_advertise_additional_connection(true, 2));
     }
 
     #[test]

@@ -753,7 +753,10 @@ async fn manage_ble_connections<'values, 'server, C>(
         let advertising = advertise_if_slot_available(
             peripheral,
             server,
-            slots.should_advertise_additional_connection(control.pairing_host().is_some()),
+            slots.should_advertise_additional_connection(
+                control.pairing_host().is_some(),
+                control.bonded_peer_count(),
+            ),
             control.restrict_advertising_to_bonds(),
         );
         let mut advertising = core::pin::pin!(advertising);

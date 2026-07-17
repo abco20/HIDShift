@@ -10,7 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use hidshift::HostId;
 use hidshift::e2e::{E2eCommand, E2ePacket};
 use hidshift::management::{
@@ -32,9 +32,10 @@ const DUT_BAUD_RATE: u32 = 115_200;
 const PROBE_BAUD_RATE: u32 = 115_200;
 const DUT_CHIP: &str = "esp32s3";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum ProbeChip {
     Esp32,
+    #[value(name = "esp32s3")]
     Esp32S3,
 }
 
@@ -75,6 +76,9 @@ struct Args {
     dut_port: Option<PathBuf>,
     #[arg(long)]
     probe_port: Option<PathBuf>,
+    /// Required with --skip-flash so discovery does not reset the loaded probe.
+    #[arg(long, value_enum)]
+    probe_chip: Option<ProbeChip>,
     #[arg(long)]
     skip_flash: bool,
     #[arg(long)]
@@ -277,6 +281,19 @@ fn main() -> Result<()> {
     harness.wait_transport_ready(Duration::from_secs(45))?;
 
     let mut tests = run_functional_raw_tests(&mut harness)?;
+    if args.skip_linux {
+        tests.push(TestResult {
+            name: "linux_evdev".into(),
+            passed: true,
+            detail: "skipped by --skip-linux".into(),
+        });
+    } else {
+        tests.extend(run_linux_evdev_test(&mut harness)?);
+    }
+
+    // When Linux integration is enabled, host 2 remains connected while host
+    // 1 (the Probe) is active. The primary latency and stability results thus
+    // exercise the retained multi-host session rather than a single link.
     let clock_sync = synchronize_probe_clock(&mut harness, 20)?;
     let dut_clock_sync = synchronize_dut_clock(&mut harness, 20)?;
     let measurement = run_latency_test(
@@ -294,16 +311,6 @@ fn main() -> Result<()> {
     let latency = measurement.end_to_end;
     let host_observed_latency = measurement.host_observed;
     let stability = run_stability_test(&mut harness, Duration::from_secs(args.stability_seconds))?;
-
-    if args.skip_linux {
-        tests.push(TestResult {
-            name: "linux_evdev".into(),
-            passed: true,
-            detail: "skipped by --skip-linux".into(),
-        });
-    } else {
-        tests.extend(run_linux_evdev_test(&mut harness)?);
-    }
 
     let baseline = read_baseline(&repo.join(&args.baseline))?;
     let baseline_comparison =
@@ -415,6 +422,12 @@ fn resolve_ports(args: &Args, repo: &Path) -> Result<(PathBuf, PathBuf, ProbeChi
             fs::canonicalize(dut)? != fs::canonicalize(probe)?,
             "DUT and probe resolve to the same device"
         );
+        if args.skip_flash {
+            let probe_chip = args
+                .probe_chip
+                .context("--skip-flash requires --probe-chip with explicit ports")?;
+            return Ok((dut.clone(), probe.clone(), probe_chip));
+        }
         verify_chip(repo, dut, DUT_CHIP)?;
         let probe_info = board_info(repo, probe)?;
         let probe_chip = parse_chip_type(&probe_info)
@@ -426,6 +439,10 @@ fn resolve_ports(args: &Args, repo: &Path) -> Result<(PathBuf, PathBuf, ProbeChi
     ensure!(
         args.dut_port.is_none() && args.probe_port.is_none(),
         "provide both --dut-port and --probe-port, or neither"
+    );
+    ensure!(
+        !args.skip_flash,
+        "--skip-flash requires --dut-port, --probe-port, and --probe-chip to avoid resetting boards during discovery"
     );
 
     let candidates = serial_by_path_candidates(Path::new("/dev/serial/by-path"))?;
@@ -824,6 +841,7 @@ impl Harness {
     fn wait_transport_ready(&mut self, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
         let mut attempt = 0u8;
+        let mut last_error = None;
         while Instant::now() < deadline {
             // Change the key on every retry so a buffered notification from a
             // pre-persist connection cannot be mistaken for current transport.
@@ -833,28 +851,33 @@ impl Harness {
                 modifiers: 0,
                 keys: [key, 0, 0, 0, 0, 0],
             })?;
-            if self
-                .await_notification(
-                    "keyboard",
-                    &[0, 0, key, 0, 0, 0, 0, 0],
-                    Duration::from_secs(3),
-                )
-                .is_ok()
-            {
-                self.send(E2eCommand::Keyboard {
-                    modifiers: 0,
-                    keys: [0; 6],
-                })?;
-                if self
-                    .await_notification("keyboard", &[0; 8], Duration::from_secs(3))
-                    .is_ok()
-                {
-                    return Ok(());
+            match self.await_notification_matching(
+                "keyboard",
+                &[0, 0, key, 0, 0, 0, 0, 0],
+                Duration::from_secs(3),
+            ) {
+                Ok(_) => {
+                    self.send(E2eCommand::Keyboard {
+                        modifiers: 0,
+                        keys: [0; 6],
+                    })?;
+                    match self.await_notification_matching(
+                        "keyboard",
+                        &[0; 8],
+                        Duration::from_secs(3),
+                    ) {
+                        Ok(_) => return Ok(()),
+                        Err(error) => last_error = Some(error.to_string()),
+                    }
                 }
+                Err(error) => last_error = Some(error.to_string()),
             }
             thread::sleep(Duration::from_millis(250));
         }
-        bail!("BLE transport did not become ready")
+        bail!(
+            "BLE transport did not become ready: {}",
+            last_error.as_deref().unwrap_or("no notification attempt")
+        )
     }
 
     fn await_notification(
@@ -862,6 +885,25 @@ impl Harness {
         kind: &str,
         expected: &[u8],
         timeout: Duration,
+    ) -> Result<SerialLine> {
+        self.await_notification_impl(kind, expected, timeout, true)
+    }
+
+    fn await_notification_matching(
+        &self,
+        kind: &str,
+        expected: &[u8],
+        timeout: Duration,
+    ) -> Result<SerialLine> {
+        self.await_notification_impl(kind, expected, timeout, false)
+    }
+
+    fn await_notification_impl(
+        &self,
+        kind: &str,
+        expected: &[u8],
+        timeout: Duration,
+        fail_on_mismatch: bool,
     ) -> Result<SerialLine> {
         let deadline = Instant::now() + timeout;
         let mut last_probe_line = None;
@@ -892,11 +934,13 @@ impl Harness {
                     if notification.bytes == expected {
                         return Ok(line);
                     }
-                    bail!(
-                        "received unexpected {kind} report {:02x?}, expected {:02x?}",
-                        notification.bytes,
-                        expected
-                    );
+                    if fail_on_mismatch {
+                        bail!(
+                            "received unexpected {kind} report {:02x?}, expected {:02x?}",
+                            notification.bytes,
+                            expected
+                        );
+                    }
                 }
             }
         }
@@ -1346,6 +1390,7 @@ fn record_latency_sample(
     let dut_hci_submit = dut_clock_sync
         .host_time(dut.hci_submit_us)
         .context("DUT HCI submit timestamp is out of range")?;
+    let cross_device_uncertainty = probe_clock_sync.round_trip / 2 + dut_clock_sync.round_trip / 2;
     let synchronized = probe_received
         .checked_duration_since(dut_ingress)
         .context("cross-device clock synchronization produced a negative latency")?;
@@ -1364,17 +1409,23 @@ fn record_latency_sample(
     notify_done_to_hci_submit_values
         .push((dut.hci_submit_us - dut.notify_done_us) as f64 / 1_000.0);
     hci_submit_to_probe_values.push(
-        probe_received
-            .checked_duration_since(dut_hci_submit)
-            .context("BLE HCI-submit-to-probe latency was negative")?
-            .as_secs_f64()
+        duration_between_synchronized_devices(
+            probe_received,
+            dut_hci_submit,
+            cross_device_uncertainty,
+        )
+        .context("BLE HCI-submit-to-probe latency exceeded clock uncertainty")?
+        .as_secs_f64()
             * 1_000.0,
     );
     notify_to_probe_values.push(
-        probe_received
-            .checked_duration_since(dut_notify_done)
-            .context("BLE notify-done-to-probe latency was negative")?
-            .as_secs_f64()
+        duration_between_synchronized_devices(
+            probe_received,
+            dut_notify_done,
+            cross_device_uncertainty,
+        )
+        .context("BLE notify-done-to-probe latency exceeded clock uncertainty")?
+        .as_secs_f64()
             * 1_000.0,
     );
     Ok(())
@@ -1527,6 +1578,18 @@ impl DeviceClockSync {
         let apparent_lead = synchronized.checked_duration_since(observed)?;
         (apparent_lead <= self.round_trip / 2).then_some(Duration::ZERO)
     }
+}
+
+fn duration_between_synchronized_devices(
+    later: Instant,
+    earlier: Instant,
+    uncertainty: Duration,
+) -> Option<Duration> {
+    if let Some(duration) = later.checked_duration_since(earlier) {
+        return Some(duration);
+    }
+    let apparent_lead = earlier.checked_duration_since(later)?;
+    (apparent_lead <= uncertainty).then_some(Duration::ZERO)
 }
 
 fn run_stability_test(harness: &mut Harness, duration: Duration) -> Result<StabilityStats> {
@@ -1721,11 +1784,19 @@ fn run_linux_evdev_test(harness: &mut Harness) -> Result<Vec<TestResult>> {
     // second host.
     thread::sleep(Duration::from_secs(10));
     harness.wait_transport_ready(Duration::from_secs(30))?;
-    start_linux_pairing(harness, HostId(2))?;
+    let status = read_management_status(harness)?;
+    let linux_bonded = status.hosts[1].bonded;
+    if !linux_bonded {
+        start_linux_pairing(harness, HostId(2))?;
+    }
     println!("provisioning: LinuxAdvertising");
     let address = discover_hidshift_address()?;
-    println!("provisioning: LinuxPair");
-    pair_linux_host(&address, || start_linux_pairing(harness, HostId(2)))?;
+    if !linux_bonded {
+        println!("provisioning: LinuxPair");
+        pair_linux_host(&address, || start_linux_pairing(harness, HostId(2)))?;
+    } else {
+        println!("provisioning: LinuxPair reused bonded host 2 ({address})");
+    }
     bluetoothctl(&["trust", &address], 10)?;
     // A fresh DUT bond is persisted by a planned BLE stack restart. Let that
     // finish before asking BlueZ to restore the encrypted connection.
@@ -1754,17 +1825,63 @@ fn run_linux_evdev_test(harness: &mut Harness) -> Result<Vec<TestResult>> {
     })?;
     let event = wait_input_event_any(&mut inputs, 1, 30, 1, Duration::from_secs(3))?;
     harness.send(E2eCommand::ReleaseAll)?;
-    Ok(vec![TestResult {
-        name: "linux_evdev_keyboard".into(),
-        passed: true,
-        detail: format!(
-            "{} HIDShift event devices; type={} code={} value={}",
-            devices.len(),
-            event.0,
-            event.1,
-            event.2
-        ),
-    }])
+    let request_id = harness.send_management(ManagementCommand::SelectHost(HostId(1)))?;
+    let response = harness.wait_management_response(request_id, Duration::from_secs(3))?;
+    ensure!(
+        response.result == ManagementResult::Ok,
+        "DUT rejected Probe host selection after Linux evdev test: {:?}",
+        response.result
+    );
+    harness.wait_transport_ready(Duration::from_secs(10))?;
+    let request_id = harness.send_management(ManagementCommand::GetStatus)?;
+    let response = harness.wait_management_response(request_id, Duration::from_secs(3))?;
+    let both_connected = matches!(
+        response.payload,
+        ManagementResponsePayload::Status(status)
+            if status.hosts[0].connected
+                && status.hosts[0].encrypted
+                && status.hosts[1].connected
+                && status.hosts[1].encrypted
+                && status.active_host == Some(HostId(1))
+    );
+    ensure!(
+        both_connected,
+        "DUT did not retain encrypted Probe and Linux sessions"
+    );
+    Ok(vec![
+        TestResult {
+            name: "linux_evdev_keyboard".into(),
+            passed: true,
+            detail: format!(
+                "{} HIDShift event devices; type={} code={} value={}",
+                devices.len(),
+                event.0,
+                event.1,
+                event.2
+            ),
+        },
+        TestResult {
+            name: "two_encrypted_sessions".into(),
+            passed: true,
+            detail: "Probe active while Linux remains connected".into(),
+        },
+    ])
+}
+
+fn read_management_status<H: ManagementHarness>(
+    harness: &mut H,
+) -> Result<hidshift::ManagementStatus> {
+    let request_id = harness.send_management(ManagementCommand::GetStatus)?;
+    let response = harness.wait_management_response(request_id, Duration::from_secs(3))?;
+    ensure!(
+        response.result == ManagementResult::Ok,
+        "DUT rejected status request: {:?}",
+        response.result
+    );
+    match response.payload {
+        ManagementResponsePayload::Status(status) => Ok(status),
+        payload => bail!("DUT returned unexpected status payload: {payload:?}"),
+    }
 }
 
 fn discover_hidshift_address() -> Result<String> {
@@ -2067,6 +2184,35 @@ mod tests {
             sync.duration_since_synced(
                 host_anchor - Duration::from_micros(1_001),
                 host_anchor + Duration::from_micros(1),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn cross_device_duration_clamps_only_bounded_clock_error() {
+        let anchor = Instant::now();
+        assert_eq!(
+            duration_between_synchronized_devices(
+                anchor + Duration::from_millis(2),
+                anchor,
+                Duration::from_millis(1),
+            ),
+            Some(Duration::from_millis(2))
+        );
+        assert_eq!(
+            duration_between_synchronized_devices(
+                anchor,
+                anchor + Duration::from_micros(100),
+                Duration::from_millis(1),
+            ),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            duration_between_synchronized_devices(
+                anchor,
+                anchor + Duration::from_millis(2),
+                Duration::from_millis(1),
             ),
             None
         );

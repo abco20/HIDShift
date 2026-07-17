@@ -27,7 +27,8 @@ cargo run --manifest-path e2e/runner/Cargo.toml -- \
 Useful options are:
 
 - `--dut-port` and `--probe-port` to override port discovery
-- `--skip-flash` to reuse loaded images
+- `--skip-flash` with explicit `--dut-port`, `--probe-port`, and `--probe-chip`
+  to reuse loaded images without resetting boards during chip discovery
 - `--skip-linux` to omit Linux-side integration checks
 - `--write-baseline` to replace the checked-in baseline after a representative run
 
@@ -45,6 +46,11 @@ The primary metric maps DUT and Probe timestamps to the host using independent
 minimum-round-trip clock synchronization. Host-observed latency, which includes
 USB-serial delivery, is diagnostic only. The low-latency gate requires both
 keyboard and mouse p95 below 10 ms and p99 at most 15 ms.
+
+In the default full run, Linux is paired as host 2 before latency collection.
+The runner switches back to the Probe and verifies that both links remain
+connected and encrypted, so the reported latency and stability cover a
+retained two-host session. `--skip-linux` intentionally measures one link.
 
 Timestamped JSON results are written to ignored files in `e2e/results/`.
 `e2e/baseline.json` is the only tracked performance reference. Do not update it
