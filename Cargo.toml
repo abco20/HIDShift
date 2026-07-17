@@ -27,9 +27,7 @@ name = "hidshift"
 path = "src/lib.rs"
 
 [dependencies]
-aes = { version = "0.8.4", default-features = false }
 bitflags = "2.10.0"
-cmac = { version = "0.7.2", default-features = false }
 embedded-storage = "0.3.1"
 heapless = "0.9.2"
 

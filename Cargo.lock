@@ -1483,9 +1483,7 @@ dependencies = [
 name = "hidshift"
 version = "0.1.0"
 dependencies = [
- "aes",
  "bitflags 2.13.0",
- "cmac",
  "embassy-usb-host",
  "embedded-storage",
  "heapless 0.9.3",

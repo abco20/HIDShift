@@ -33,12 +33,8 @@ pub mod ble_notify;
 pub mod ble_runtime;
 pub mod bridge;
 pub mod e2e;
-pub mod espnow_pairing;
-pub mod espnow_pairing_management;
-pub mod espnow_security;
 pub mod ids;
 pub mod input;
-pub mod link;
 pub mod management;
 pub mod mouse_accumulator;
 pub mod reports;
@@ -87,10 +83,10 @@ pub use input::{
 pub use management::{
     MANAGEMENT_PROTOCOL_VERSION, MANAGEMENT_REQUEST_LEN, MANAGEMENT_REQUEST_UUID,
     MANAGEMENT_RESPONSE_LEN, MANAGEMENT_RESPONSE_UUID, MANAGEMENT_SERVICE_UUID, ManagementCommand,
-    ManagementDestination, ManagementDiagnostics, ManagementEspNowInfo, ManagementHistoryEvent,
-    ManagementHostInfo, ManagementHostName, ManagementHostStatus, ManagementHostTiming,
-    ManagementProtocolError, ManagementRequest, ManagementResponse, ManagementResponsePayload,
-    ManagementResult, ManagementSchema, ManagementSetting, ManagementStatus, ManagementUsbDevice,
+    ManagementDestination, ManagementDiagnostics, ManagementHistoryEvent, ManagementHostInfo,
+    ManagementHostName, ManagementHostStatus, ManagementHostTiming, ManagementProtocolError,
+    ManagementRequest, ManagementResponse, ManagementResponsePayload, ManagementResult,
+    ManagementSchema, ManagementSetting, ManagementStatus, ManagementUsbDevice,
     ManagementUsbStatus,
 };
 pub use reports::{
