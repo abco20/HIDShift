@@ -8,8 +8,7 @@ pub use ble_hid::{
     BLE_HID_INPUT_REPORT_MAX_LEN, BLE_HID_NOTIFICATIONS_PER_REPORT_MAX, BLE_HID_NOTIFY_MAX_LEN,
     BleHidCharacteristic, BleHidInputReport, BleHidNotification, BleHidNotificationError,
     FEATURE_REPORT_TYPE, HID_INFORMATION, INPUT_REPORT_TYPE, OUTPUT_REPORT_TYPE,
-    V1_CONSUMER_REPORT_MAP, V1_KEYBOARD_REPORT_MAP, V1_MOUSE_REPORT_MAP,
-    notifications_for_input_report, report_id, report_type,
+    V1_COMBINED_REPORT_MAP, notifications_for_input_report, report_id, report_type,
 };
 pub use ble_keyboard::{
     BleKeyboard6KroReport, BleKeyboardLedOutputReport, BleKeyboardOutputError, BleKeyboardReport,

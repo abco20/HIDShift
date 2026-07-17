@@ -31,6 +31,16 @@ pub fn parse_chip_type(output: &str) -> Option<String> {
     })
 }
 
+pub fn parse_mac_address(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("MAC address:")
+            .map(str::trim)
+            .filter(|address| address.len() == 17)
+            .map(str::to_ascii_lowercase)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -44,6 +54,13 @@ mod tests {
             Some("esp32s3".into())
         );
         assert_eq!(parse_chip_type("Connecting..."), None);
+    }
+
+    #[test]
+    fn mac_parser_identifies_two_serial_paths_for_the_same_board() {
+        let info = "Chip type: esp32s3\nMAC address:       68:EE:8F:63:94:A0\n";
+        assert_eq!(parse_mac_address(info), Some("68:ee:8f:63:94:a0".into()));
+        assert_eq!(parse_mac_address("Connecting..."), None);
     }
 
     #[test]

@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serialport::{FlowControl, SerialPort};
 
 mod board;
-use board::{parse_chip_type, serial_by_path_candidates};
+use board::{parse_chip_type, parse_mac_address, serial_by_path_candidates};
 mod metrics;
 use metrics::{
     BaselineComparison, LatencyStats, PerformanceBaseline, ble_game_latency_passes,
@@ -31,7 +31,43 @@ use metrics::{
 const DUT_BAUD_RATE: u32 = 115_200;
 const PROBE_BAUD_RATE: u32 = 115_200;
 const DUT_CHIP: &str = "esp32s3";
-const PROBE_CHIP: &str = "esp32";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProbeChip {
+    Esp32,
+    Esp32S3,
+}
+
+impl ProbeChip {
+    fn from_espflash(value: &str) -> Option<Self> {
+        match value {
+            "esp32" => Some(Self::Esp32),
+            "esp32s3" => Some(Self::Esp32S3),
+            _ => None,
+        }
+    }
+
+    const fn espflash_name(self) -> &'static str {
+        match self {
+            Self::Esp32 => "esp32",
+            Self::Esp32S3 => "esp32s3",
+        }
+    }
+
+    const fn cargo_target(self) -> &'static str {
+        match self {
+            Self::Esp32 => "xtensa-esp32-none-elf",
+            Self::Esp32S3 => "xtensa-esp32s3-none-elf",
+        }
+    }
+
+    const fn cargo_feature(self) -> &'static str {
+        match self {
+            Self::Esp32 => "esp32",
+            Self::Esp32S3 => "esp32s3",
+        }
+    }
+}
 #[derive(Parser, Debug)]
 #[command(about = "HIDShift BLE hardware E2E runner")]
 struct Args {
@@ -210,12 +246,12 @@ fn main() -> Result<()> {
         .and_then(Path::parent)
         .context("runner must live below the repository root")?
         .to_path_buf();
-    let (dut, probe) = resolve_ports(&args, &repo)?;
+    let (dut, probe, probe_chip) = resolve_ports(&args, &repo)?;
 
     println!("DUT   {} ({DUT_CHIP})", dut.display());
-    println!("Probe {} ({PROBE_CHIP})", probe.display());
+    println!("Probe {} ({})", probe.display(), probe_chip.espflash_name());
     if !args.skip_flash {
-        build_and_flash(&repo, &dut, &probe)?;
+        build_and_flash(&repo, &dut, &probe, probe_chip)?;
     } else {
         let _ = bluetoothctl(&["power", "off"], 10);
     }
@@ -373,17 +409,19 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn resolve_ports(args: &Args, repo: &Path) -> Result<(PathBuf, PathBuf)> {
+fn resolve_ports(args: &Args, repo: &Path) -> Result<(PathBuf, PathBuf, ProbeChip)> {
     if let (Some(dut), Some(probe)) = (&args.dut_port, &args.probe_port) {
         ensure!(
             fs::canonicalize(dut)? != fs::canonicalize(probe)?,
             "DUT and probe resolve to the same device"
         );
-        if !args.skip_flash {
-            verify_chip(repo, dut, DUT_CHIP)?;
-            verify_chip(repo, probe, PROBE_CHIP)?;
-        }
-        return Ok((dut.clone(), probe.clone()));
+        verify_chip(repo, dut, DUT_CHIP)?;
+        let probe_info = board_info(repo, probe)?;
+        let probe_chip = parse_chip_type(&probe_info)
+            .as_deref()
+            .and_then(ProbeChip::from_espflash)
+            .context("probe must be an ESP32 or ESP32-S3")?;
+        return Ok((dut.clone(), probe.clone(), probe_chip));
     }
     ensure!(
         args.dut_port.is_none() && args.probe_port.is_none(),
@@ -391,21 +429,40 @@ fn resolve_ports(args: &Args, repo: &Path) -> Result<(PathBuf, PathBuf)> {
     );
 
     let candidates = serial_by_path_candidates(Path::new("/dev/serial/by-path"))?;
-    let mut chips = BTreeMap::<String, PathBuf>::new();
+    let mut boards = BTreeMap::<(String, String), PathBuf>::new();
     for path in candidates {
         if let Ok(info) = board_info(repo, &path)
             && let Some(chip) = parse_chip_type(&info)
+            && let Some(mac) = parse_mac_address(&info)
         {
-            if chip == DUT_CHIP || chip == PROBE_CHIP {
-                chips.entry(chip.to_owned()).or_insert(path);
+            if ProbeChip::from_espflash(&chip).is_some() {
+                // One ESP32-S3 may be visible through both an external UART
+                // bridge and native USB-JTAG. Keep the first stable by-path
+                // candidate for each hardware MAC instead of flashing it as
+                // two different boards.
+                boards.entry((chip, mac)).or_insert(path);
             }
         }
     }
-    let dut = chips.remove(DUT_CHIP).context("no ESP32-S3 DUT found")?;
-    let probe = chips
-        .remove(PROBE_CHIP)
-        .context("no classic ESP32 probe found")?;
-    Ok((dut, probe))
+    let mut esp32 = Vec::new();
+    let mut esp32s3 = Vec::new();
+    for ((chip, _), path) in boards {
+        match ProbeChip::from_espflash(&chip) {
+            Some(ProbeChip::Esp32) => esp32.push(path),
+            Some(ProbeChip::Esp32S3) => esp32s3.push(path),
+            None => {}
+        }
+    }
+    let dut = esp32s3.first().cloned().context("no ESP32-S3 DUT found")?;
+    if let Some(probe) = esp32.into_iter().next() {
+        return Ok((dut, probe, ProbeChip::Esp32));
+    }
+    ensure!(
+        esp32s3.len() == 2,
+        "S3-only E2E discovery requires exactly two unique boards; found {} (use --dut-port and --probe-port)",
+        esp32s3.len()
+    );
+    Ok((dut, esp32s3[1].clone(), ProbeChip::Esp32S3))
 }
 
 fn verify_chip(repo: &Path, port: &Path, expected: &str) -> Result<()> {
@@ -434,7 +491,7 @@ fn board_info(repo: &Path, port: &Path) -> Result<String> {
     ))
 }
 
-fn build_and_flash(repo: &Path, dut: &Path, probe: &Path) -> Result<()> {
+fn build_and_flash(repo: &Path, dut: &Path, probe: &Path, probe_chip: ProbeChip) -> Result<()> {
     let export = esp_export_path()?;
     remove_cached_hidshift_devices();
     let linux_address = linux_controller_address()?;
@@ -450,7 +507,12 @@ fn build_and_flash(repo: &Path, dut: &Path, probe: &Path) -> Result<()> {
     // and persist a bond while the replacement probe image is still building.
     run(
         Command::new("espflash")
-            .args(["erase-flash", "--chip", PROBE_CHIP, "--port"])
+            .args([
+                "erase-flash",
+                "--chip",
+                probe_chip.espflash_name(),
+                "--port",
+            ])
             .arg(probe),
         repo,
     )?;
@@ -483,16 +545,22 @@ fn build_and_flash(repo: &Path, dut: &Path, probe: &Path) -> Result<()> {
 
     let address = read_dut_ble_address(dut, Duration::from_secs(15))?;
     let build_probe = format!(
-        ". '{}' && HIDSHIFT_DUT_ADDRESS='{}' cargo +esp build -Zbuild-std=core,alloc --release --manifest-path e2e/probe-firmware/Cargo.toml --target xtensa-esp32-none-elf",
+        ". '{}' && HIDSHIFT_DUT_ADDRESS='{}' cargo +esp build -Zbuild-std=core,alloc --release --manifest-path e2e/probe-firmware/Cargo.toml --no-default-features --features {} --target {}",
         export.display(),
-        address
+        address,
+        probe_chip.cargo_feature(),
+        probe_chip.cargo_target()
     );
     run(Command::new("sh").arg("-c").arg(build_probe), repo)?;
     run(
         Command::new("espflash")
-            .args(["flash", "--chip", PROBE_CHIP, "--port"])
+            .args(["flash", "--chip", probe_chip.espflash_name(), "--port"])
             .arg(probe)
-            .arg("e2e/probe-firmware/target/xtensa-esp32-none-elf/release/hidshift-e2e-probe"),
+            .arg(
+                repo.join("e2e/probe-firmware/target")
+                    .join(probe_chip.cargo_target())
+                    .join("release/hidshift-e2e-probe"),
+            ),
         repo,
     )?;
     Ok(())

@@ -95,8 +95,7 @@ pub use reports::{
     BleHidNotificationError, BleHidReport, BleKeyboard6KroReport, BleKeyboardLedOutputReport,
     BleKeyboardOutputError, BleKeyboardReport, BleMouseReport, FEATURE_REPORT_TYPE,
     HID_INFORMATION, INPUT_REPORT_TYPE, KeyboardReportBuild, OUTPUT_REPORT_TYPE, ReportKind,
-    V1_CONSUMER_REPORT_MAP, V1_KEYBOARD_REPORT_MAP, V1_MOUSE_REPORT_MAP,
-    notifications_for_input_report, report_id, report_type,
+    V1_COMBINED_REPORT_MAP, notifications_for_input_report, report_id, report_type,
 };
 pub use routing::{ActiveTargetError, HostRouter};
 pub use runtime::{

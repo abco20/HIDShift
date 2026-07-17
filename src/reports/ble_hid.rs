@@ -1,6 +1,7 @@
 use super::{BleHidReport, ReportKind};
 use crate::reports::{
-    CONSUMER_REPORT_LEN, KEYBOARD_REPORT_ID, KEYBOARD_REPORT_LEN, MOUSE_REPORT_LEN, ble_keyboard,
+    CONSUMER_REPORT_ID, CONSUMER_REPORT_LEN, KEYBOARD_REPORT_ID, KEYBOARD_REPORT_LEN,
+    MOUSE_REPORT_ID, MOUSE_REPORT_LEN, ble_keyboard,
 };
 
 pub const INPUT_REPORT_TYPE: u8 = 1;
@@ -105,7 +106,8 @@ pub const fn input_report_characteristic(kind: ReportKind) -> BleHidCharacterist
 pub const fn report_id(kind: ReportKind) -> u8 {
     match kind {
         ReportKind::Keyboard | ReportKind::KeyboardOutput => KEYBOARD_REPORT_ID,
-        ReportKind::Mouse | ReportKind::Consumer => 0,
+        ReportKind::Mouse => MOUSE_REPORT_ID,
+        ReportKind::Consumer => CONSUMER_REPORT_ID,
     }
 }
 
@@ -130,8 +132,8 @@ pub const fn report_type(kind: ReportKind) -> u8 {
     }
 }
 
-pub const V1_KEYBOARD_REPORT_MAP: &[u8] = &[
-    // A shared ID lets BlueZ route UHID output back to this Report characteristic.
+const V1_KEYBOARD_REPORT_MAP: &[u8] = &[
+    // Report IDs route each collection to its GATT Report characteristic.
     0x05,
     0x01, // Usage Page (Generic Desktop)
     0x09,
@@ -199,55 +201,129 @@ pub const V1_KEYBOARD_REPORT_MAP: &[u8] = &[
     0xc0, // End Collection
 ];
 
-pub const V1_MOUSE_REPORT_MAP: &[u8] = &[
-    // One unnumbered mouse input report.
-    0x05, 0x01, // Usage Page (Generic Desktop)
-    0x09, 0x02, // Usage (Mouse)
-    0xa1, 0x01, // Collection (Application)
-    0x09, 0x01, // Usage (Pointer)
-    0xa1, 0x00, // Collection (Physical)
-    0x05, 0x09, // Usage Page (Buttons)
-    0x19, 0x01, // Usage Minimum (Button 1)
-    0x29, 0x05, // Usage Maximum (Button 5)
-    0x15, 0x00, // Logical Minimum (0)
-    0x25, 0x01, // Logical Maximum (1)
-    0x75, 0x01, // Report Size (1)
-    0x95, 0x05, // Report Count (5)
-    0x81, 0x02, // Input (Data,Var,Abs)
-    0x75, 0x03, // Report Size (3)
-    0x95, 0x01, // Report Count (1)
-    0x81, 0x01, // Input (Const,Array,Abs)
-    0x05, 0x01, // Usage Page (Generic Desktop)
-    0x09, 0x30, // Usage (X)
-    0x09, 0x31, // Usage (Y)
-    0x09, 0x38, // Usage (Wheel)
-    0x15, 0x81, // Logical Minimum (-127)
-    0x25, 0x7f, // Logical Maximum (127)
-    0x75, 0x08, // Report Size (8)
-    0x95, 0x03, // Report Count (3)
-    0x81, 0x06, // Input (Data,Var,Rel)
-    0x05, 0x0c, // Usage Page (Consumer)
-    0x0a, 0x38, 0x02, // Usage (AC Pan)
-    0x95, 0x01, // Report Count (1)
-    0x81, 0x06, // Input (Data,Var,Rel)
+const V1_MOUSE_REPORT_MAP: &[u8] = &[
+    0x05,
+    0x01, // Usage Page (Generic Desktop)
+    0x09,
+    0x02, // Usage (Mouse)
+    0xa1,
+    0x01, // Collection (Application)
+    0x85,
+    MOUSE_REPORT_ID, // Report ID (2)
+    0x09,
+    0x01, // Usage (Pointer)
+    0xa1,
+    0x00, // Collection (Physical)
+    0x05,
+    0x09, // Usage Page (Buttons)
+    0x19,
+    0x01, // Usage Minimum (Button 1)
+    0x29,
+    0x05, // Usage Maximum (Button 5)
+    0x15,
+    0x00, // Logical Minimum (0)
+    0x25,
+    0x01, // Logical Maximum (1)
+    0x75,
+    0x01, // Report Size (1)
+    0x95,
+    0x05, // Report Count (5)
+    0x81,
+    0x02, // Input (Data,Var,Abs)
+    0x75,
+    0x03, // Report Size (3)
+    0x95,
+    0x01, // Report Count (1)
+    0x81,
+    0x01, // Input (Const,Array,Abs)
+    0x05,
+    0x01, // Usage Page (Generic Desktop)
+    0x09,
+    0x30, // Usage (X)
+    0x09,
+    0x31, // Usage (Y)
+    0x09,
+    0x38, // Usage (Wheel)
+    0x15,
+    0x81, // Logical Minimum (-127)
+    0x25,
+    0x7f, // Logical Maximum (127)
+    0x75,
+    0x08, // Report Size (8)
+    0x95,
+    0x03, // Report Count (3)
+    0x81,
+    0x06, // Input (Data,Var,Rel)
+    0x05,
+    0x0c, // Usage Page (Consumer)
+    0x0a,
+    0x38,
+    0x02, // Usage (AC Pan)
+    0x95,
+    0x01, // Report Count (1)
+    0x81,
+    0x06, // Input (Data,Var,Rel)
     0xc0, // End Collection
     0xc0, // End Collection
 ];
 
-pub const V1_CONSUMER_REPORT_MAP: &[u8] = &[
-    // One unnumbered consumer-control input report.
-    0x05, 0x0c, // Usage Page (Consumer)
-    0x09, 0x01, // Usage (Consumer Control)
-    0xa1, 0x01, // Collection (Application)
-    0x15, 0x00, // Logical Minimum (0)
-    0x26, 0xff, 0x03, // Logical Maximum (0x03ff)
-    0x19, 0x00, // Usage Minimum (Unassigned)
-    0x2a, 0xff, 0x03, // Usage Maximum (0x03ff)
-    0x75, 0x10, // Report Size (16)
-    0x95, 0x01, // Report Count (1)
-    0x81, 0x00, // Input (Data,Array,Abs)
+const V1_CONSUMER_REPORT_MAP: &[u8] = &[
+    0x05,
+    0x0c, // Usage Page (Consumer)
+    0x09,
+    0x01, // Usage (Consumer Control)
+    0xa1,
+    0x01, // Collection (Application)
+    0x85,
+    CONSUMER_REPORT_ID, // Report ID (3)
+    0x15,
+    0x00, // Logical Minimum (0)
+    0x26,
+    0xff,
+    0x03, // Logical Maximum (0x03ff)
+    0x19,
+    0x00, // Usage Minimum (Unassigned)
+    0x2a,
+    0xff,
+    0x03, // Usage Maximum (0x03ff)
+    0x75,
+    0x10, // Report Size (16)
+    0x95,
+    0x01, // Report Count (1)
+    0x81,
+    0x00, // Input (Data,Array,Abs)
     0xc0, // End Collection
 ];
+
+const V1_COMBINED_REPORT_MAP_LEN: usize =
+    V1_KEYBOARD_REPORT_MAP.len() + V1_MOUSE_REPORT_MAP.len() + V1_CONSUMER_REPORT_MAP.len();
+
+const fn combined_report_map() -> [u8; V1_COMBINED_REPORT_MAP_LEN] {
+    let mut output = [0; V1_COMBINED_REPORT_MAP_LEN];
+    let maps = [
+        V1_KEYBOARD_REPORT_MAP,
+        V1_MOUSE_REPORT_MAP,
+        V1_CONSUMER_REPORT_MAP,
+    ];
+    let mut output_index = 0;
+    let mut map_index = 0;
+    while map_index < maps.len() {
+        let map = maps[map_index];
+        let mut input_index = 0;
+        while input_index < map.len() {
+            output[output_index] = map[input_index];
+            output_index += 1;
+            input_index += 1;
+        }
+        map_index += 1;
+    }
+    output
+}
+
+const V1_COMBINED_REPORT_MAP_BYTES: [u8; V1_COMBINED_REPORT_MAP_LEN] = combined_report_map();
+
+/// One HOGP Report Map containing all reports exposed by the single HID service.
+pub const V1_COMBINED_REPORT_MAP: &[u8] = &V1_COMBINED_REPORT_MAP_BYTES;
 
 #[cfg(test)]
 mod tests {
@@ -256,10 +332,10 @@ mod tests {
     use hidreport::{Field, Report, ReportDescriptor, ReportId, UsageId, UsagePage};
 
     #[test]
-    fn keyboard_uses_numbered_report_references_for_bluez_output_routing() {
+    fn every_report_uses_a_unique_report_reference() {
         assert_eq!(report_id(ReportKind::Keyboard), KEYBOARD_REPORT_ID);
-        assert_eq!(report_id(ReportKind::Mouse), 0);
-        assert_eq!(report_id(ReportKind::Consumer), 0);
+        assert_eq!(report_id(ReportKind::Mouse), MOUSE_REPORT_ID);
+        assert_eq!(report_id(ReportKind::Consumer), CONSUMER_REPORT_ID);
         assert_eq!(report_id(ReportKind::KeyboardOutput), KEYBOARD_REPORT_ID);
         assert_eq!(report_type(ReportKind::KeyboardOutput), OUTPUT_REPORT_TYPE);
     }
@@ -348,27 +424,22 @@ mod tests {
     }
 
     #[test]
-    fn only_keyboard_report_map_declares_a_report_id() {
-        assert!(has_report_id(V1_KEYBOARD_REPORT_MAP));
-        assert!(!has_report_id(V1_MOUSE_REPORT_MAP));
-        assert!(!has_report_id(V1_CONSUMER_REPORT_MAP));
-    }
+    fn combined_report_map_matches_every_gatt_report_characteristic() {
+        let descriptor = ReportDescriptor::try_from(V1_COMBINED_REPORT_MAP).unwrap();
+        let input = |id| {
+            descriptor
+                .input_reports()
+                .iter()
+                .find(|report| report.report_id() == &Some(ReportId::from(id)))
+                .unwrap()
+        };
+        let keyboard = input(KEYBOARD_REPORT_ID);
+        let mouse = input(MOUSE_REPORT_ID);
+        let consumer = input(CONSUMER_REPORT_ID);
+        let keyboard_output = &descriptor.output_reports()[0];
 
-    #[test]
-    fn split_report_maps_match_rust_report_structs_with_hidreport() {
-        let keyboard_descriptor = ReportDescriptor::try_from(V1_KEYBOARD_REPORT_MAP).unwrap();
-        let mouse_descriptor = ReportDescriptor::try_from(V1_MOUSE_REPORT_MAP).unwrap();
-        let consumer_descriptor = ReportDescriptor::try_from(V1_CONSUMER_REPORT_MAP).unwrap();
-
-        let keyboard = &keyboard_descriptor.input_reports()[0];
-        let keyboard_output = &keyboard_descriptor.output_reports()[0];
-        let mouse = &mouse_descriptor.input_reports()[0];
-        let consumer = &consumer_descriptor.input_reports()[0];
-
-        assert_eq!(keyboard_descriptor.input_reports().len(), 1);
-        assert_eq!(keyboard_descriptor.output_reports().len(), 1);
-        assert_eq!(mouse_descriptor.input_reports().len(), 1);
-        assert_eq!(consumer_descriptor.input_reports().len(), 1);
+        assert_eq!(descriptor.input_reports().len(), 3);
+        assert_eq!(descriptor.output_reports().len(), 1);
         assert_eq!(
             keyboard.report_id(),
             &Some(ReportId::from(KEYBOARD_REPORT_ID))
@@ -377,11 +448,14 @@ mod tests {
             keyboard_output.report_id(),
             &Some(ReportId::from(KEYBOARD_REPORT_ID))
         );
-        assert_eq!(mouse.report_id(), &None);
-        assert_eq!(consumer.report_id(), &None);
+        assert_eq!(mouse.report_id(), &Some(ReportId::from(MOUSE_REPORT_ID)));
+        assert_eq!(
+            consumer.report_id(),
+            &Some(ReportId::from(CONSUMER_REPORT_ID))
+        );
         assert_eq!(keyboard.size_in_bytes(), KEYBOARD_REPORT_LEN + 1);
-        assert_eq!(mouse.size_in_bytes(), MOUSE_REPORT_LEN);
-        assert_eq!(consumer.size_in_bytes(), CONSUMER_REPORT_LEN);
+        assert_eq!(mouse.size_in_bytes(), MOUSE_REPORT_LEN + 1);
+        assert_eq!(consumer.size_in_bytes(), CONSUMER_REPORT_LEN + 1);
         assert_eq!(keyboard_output.size_in_bytes(), 2);
 
         let led_usages = keyboard_output
@@ -411,11 +485,14 @@ mod tests {
     }
 
     #[test]
-    fn split_report_maps_expose_keyboard_leds_and_mouse_pan() {
-        let keyboard_descriptor = ReportDescriptor::try_from(V1_KEYBOARD_REPORT_MAP).unwrap();
-        let mouse_descriptor = ReportDescriptor::try_from(V1_MOUSE_REPORT_MAP).unwrap();
-        let output = &keyboard_descriptor.output_reports()[0];
-        let mouse = &mouse_descriptor.input_reports()[0];
+    fn combined_report_map_exposes_keyboard_leds_and_mouse_pan() {
+        let descriptor = ReportDescriptor::try_from(V1_COMBINED_REPORT_MAP).unwrap();
+        let output = &descriptor.output_reports()[0];
+        let mouse = descriptor
+            .input_reports()
+            .iter()
+            .find(|report| report.report_id() == &Some(ReportId::from(MOUSE_REPORT_ID)))
+            .unwrap();
 
         let led_fields = output
             .fields()
@@ -432,9 +509,5 @@ mod tests {
             _ => false,
         });
         assert!(mouse_has_pan);
-    }
-
-    fn has_report_id(map: &[u8]) -> bool {
-        map.contains(&0x85)
     }
 }

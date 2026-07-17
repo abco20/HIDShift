@@ -21,8 +21,8 @@ use hidshift::management::{
     MANAGEMENT_REQUEST_LEN, MANAGEMENT_RESPONSE_LEN, ManagementDestination, ManagementRequest,
 };
 use hidshift::reports::{
-    HID_INFORMATION, INPUT_REPORT_TYPE, KEYBOARD_REPORT_ID, OUTPUT_REPORT_TYPE,
-    V1_CONSUMER_REPORT_MAP, V1_KEYBOARD_REPORT_MAP, V1_MOUSE_REPORT_MAP,
+    CONSUMER_REPORT_ID, HID_INFORMATION, INPUT_REPORT_TYPE, KEYBOARD_REPORT_ID, MOUSE_REPORT_ID,
+    OUTPUT_REPORT_TYPE, V1_COMBINED_REPORT_MAP,
 };
 use hidshift::runtime::message::RuntimeInputMessage;
 use hidshift::runtime::{
@@ -77,9 +77,7 @@ pub struct BleRuntimeSnapshot {
     attribute_table_size = BLE_ATTRIBUTE_TABLE_SIZE
 )]
 struct Server {
-    keyboard_hid: KeyboardHidService,
-    mouse_hid: MouseHidService,
-    consumer_hid: ConsumerHidService,
+    hid: HidService,
     device_information: DeviceInformationService,
     management: ManagementService,
 }
@@ -107,45 +105,25 @@ struct ManagementService {
 }
 
 #[gatt_service(uuid = "1812")]
-struct KeyboardHidService {
+struct HidService {
     #[characteristic(uuid = "2a4a", read, value = HID_INFORMATION)]
     hid_information: [u8; 4],
-    #[characteristic(uuid = "2a4b", read, value = V1_KEYBOARD_REPORT_MAP)]
+    #[characteristic(uuid = "2a4b", read, value = V1_COMBINED_REPORT_MAP)]
     report_map: &'static [u8],
     #[characteristic(uuid = "2a4c", write_without_response, value = 0)]
     control_point: u8,
     #[descriptor(uuid = "2908", read, value = [KEYBOARD_REPORT_ID, INPUT_REPORT_TYPE])]
     #[characteristic(uuid = "2a4d", read, notify, value = [0; 8])]
-    input_report: [u8; 8],
+    keyboard_input_report: [u8; 8],
     #[descriptor(uuid = "2908", read, value = [KEYBOARD_REPORT_ID, OUTPUT_REPORT_TYPE])]
     #[characteristic(uuid = "2a4d", read, write, write_without_response, value = [0])]
-    output_report: [u8; 1],
-}
-
-#[gatt_service(uuid = "1812")]
-struct MouseHidService {
-    #[characteristic(uuid = "2a4a", read, value = HID_INFORMATION)]
-    hid_information: [u8; 4],
-    #[characteristic(uuid = "2a4b", read, value = V1_MOUSE_REPORT_MAP)]
-    report_map: &'static [u8],
-    #[characteristic(uuid = "2a4c", write_without_response, value = 0)]
-    control_point: u8,
-    #[descriptor(uuid = "2908", read, value = [0, INPUT_REPORT_TYPE])]
+    keyboard_output_report: [u8; 1],
+    #[descriptor(uuid = "2908", read, value = [MOUSE_REPORT_ID, INPUT_REPORT_TYPE])]
     #[characteristic(uuid = "2a4d", read, notify, value = [0; 5])]
-    input_report: [u8; 5],
-}
-
-#[gatt_service(uuid = "1812")]
-struct ConsumerHidService {
-    #[characteristic(uuid = "2a4a", read, value = HID_INFORMATION)]
-    hid_information: [u8; 4],
-    #[characteristic(uuid = "2a4b", read, value = V1_CONSUMER_REPORT_MAP)]
-    report_map: &'static [u8],
-    #[characteristic(uuid = "2a4c", write_without_response, value = 0)]
-    control_point: u8,
-    #[descriptor(uuid = "2908", read, value = [0, INPUT_REPORT_TYPE])]
+    mouse_input_report: [u8; 5],
+    #[descriptor(uuid = "2908", read, value = [CONSUMER_REPORT_ID, INPUT_REPORT_TYPE])]
     #[characteristic(uuid = "2a4d", read, notify, value = [0; 2])]
-    input_report: [u8; 2],
+    consumer_input_report: [u8; 2],
 }
 
 #[gatt_service(uuid = "180a")]
@@ -376,6 +354,7 @@ async fn run_ble_host_events<'server, C>(
 }
 
 fn retain_gatt_service_fields(server: &Server) {
+    let _ = &server.hid;
     let _ = &server.device_information;
     let _ = &server.management;
 }
@@ -1676,11 +1655,11 @@ async fn report_encryption_if_ready<P>(
 
 fn ble_hid_attribute_handles(server: &Server<'_>) -> BleHidAttributeHandles {
     BleHidAttributeHandles {
-        keyboard_input_cccd: server.keyboard_hid.input_report.cccd_handle,
-        mouse_input_cccd: server.mouse_hid.input_report.cccd_handle,
-        consumer_input_cccd: server.consumer_hid.input_report.cccd_handle,
-        keyboard_output_cccd: server.keyboard_hid.output_report.cccd_handle,
-        keyboard_output_report: server.keyboard_hid.output_report.handle,
+        keyboard_input_cccd: server.hid.keyboard_input_report.cccd_handle,
+        mouse_input_cccd: server.hid.mouse_input_report.cccd_handle,
+        consumer_input_cccd: server.hid.consumer_input_report.cccd_handle,
+        keyboard_output_cccd: server.hid.keyboard_output_report.cccd_handle,
+        keyboard_output_report: server.hid.keyboard_output_report.handle,
         boot_keyboard_output_report: None,
     }
 }
@@ -1763,22 +1742,22 @@ where
     let result = match report {
         hidshift::reports::BleHidReport::Keyboard(report) => {
             server
-                .keyboard_hid
-                .input_report
+                .hid
+                .keyboard_input_report
                 .notify_immediate(stack, conn, report.as_bytes(), observe_ble_hci_tx)
                 .await
         }
         hidshift::reports::BleHidReport::Mouse(report) => {
             server
-                .mouse_hid
-                .input_report
+                .hid
+                .mouse_input_report
                 .notify_immediate(stack, conn, report.as_bytes(), observe_ble_hci_tx)
                 .await
         }
         hidshift::reports::BleHidReport::Consumer(report) => {
             server
-                .consumer_hid
-                .input_report
+                .hid
+                .consumer_input_report
                 .notify_immediate(stack, conn, report.as_bytes(), observe_ble_hci_tx)
                 .await
         }

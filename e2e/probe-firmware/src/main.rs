@@ -1,6 +1,12 @@
 #![no_std]
 #![no_main]
 
+#[cfg(any(
+    all(feature = "esp32", feature = "esp32s3"),
+    not(any(feature = "esp32", feature = "esp32s3"))
+))]
+compile_error!("select exactly one probe chip feature: esp32 or esp32s3");
+
 extern crate alloc;
 
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -9,12 +15,12 @@ use embassy_futures::join::join3;
 use embassy_futures::select::{Either, Either3, select, select3};
 use embassy_time::{Duration, Instant, Timer, with_timeout};
 use esp_backtrace as _;
+use esp_hal::Async;
 use esp_hal::clock::CpuClock;
 use esp_hal::interrupt::software::SoftwareInterruptControl;
 use esp_hal::rng::{Trng, TrngSource};
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal::uart::{Config as UartConfig, UartRx};
-use esp_hal::Async;
 use esp_radio::ble::controller::BleConnector;
 use static_cell::StaticCell;
 use trouble_host::prelude::*;
@@ -36,8 +42,12 @@ fn main() -> ! {
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
+    #[cfg(feature = "esp32")]
+    let telemetry_pin = peripherals.GPIO3;
+    #[cfg(feature = "esp32s3")]
+    let telemetry_pin = peripherals.GPIO44;
     let telemetry_rx = match UartRx::new(peripherals.UART0, UartConfig::default()) {
-        Ok(rx) => rx.with_rx(peripherals.GPIO3).into_async(),
+        Ok(rx) => rx.with_rx(telemetry_pin).into_async(),
         Err(_) => esp_hal::system::software_reset(),
     };
     let timer = TimerGroup::new(peripherals.TIMG0);
@@ -134,9 +144,7 @@ async fn probe_task(
     let mut resources: HostResources<DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX> =
         HostResources::new();
     let stack = trouble_host::new(controller, &mut resources)
-        .set_random_address(Address::random(
-            hidshift::e2e::E2E_PROBE_BLE_ADDRESS_RAW,
-        ))
+        .set_random_address(Address::random(hidshift::e2e::E2E_PROBE_BLE_ADDRESS_RAW))
         .set_random_generator_seed(&mut trng);
     stack.set_io_capabilities(IoCapabilities::NoInputNoOutput);
     let Host {
@@ -190,25 +198,26 @@ async fn probe_task(
             let _ = connection.set_bondable(true);
             let _ = connection.request_security();
 
-            let secured = match with_timeout(Duration::from_secs(10), wait_for_security(&connection)).await {
-                Ok(Some(bond)) => {
-                    if let Some(bond) = bond
-                        && let Err(error) = stack.add_bond_information(bond)
-                    {
-                        log::warn!("@HIDSHIFT-PROBE:BOND-ERROR,{:?}", error);
+            let secured =
+                match with_timeout(Duration::from_secs(10), wait_for_security(&connection)).await {
+                    Ok(Some(bond)) => {
+                        if let Some(bond) = bond
+                            && let Err(error) = stack.add_bond_information(bond)
+                        {
+                            log::warn!("@HIDSHIFT-PROBE:BOND-ERROR,{:?}", error);
+                        }
+                        log::info!("@HIDSHIFT-PROBE:ENCRYPTED");
+                        true
                     }
-                    log::info!("@HIDSHIFT-PROBE:ENCRYPTED");
-                    true
-                }
-                Ok(None) => {
-                    log::warn!("@HIDSHIFT-PROBE:PAIRING-FAILED");
-                    false
-                }
-                Err(_) => {
-                    log::warn!("@HIDSHIFT-PROBE:PAIRING-TIMEOUT");
-                    false
-                }
-            };
+                    Ok(None) => {
+                        log::warn!("@HIDSHIFT-PROBE:PAIRING-FAILED");
+                        false
+                    }
+                    Err(_) => {
+                        log::warn!("@HIDSHIFT-PROBE:PAIRING-TIMEOUT");
+                        false
+                    }
+                };
             if !secured {
                 connection.disconnect();
                 Timer::after_millis(250).await;
@@ -314,25 +323,45 @@ where
     P: PacketPool,
 {
     let services = client.services_by_uuid(&HID_SERVICE_UUID).await?;
-    if services.len() != 3 {
-        log::warn!("@HIDSHIFT-PROBE:SERVICE-COUNT,{}", services.len());
-    }
-    if services.len() < 3 {
-        return Err(trouble_host::Error::NotFound.into());
-    }
-
-    let keyboard = client
-        .characteristic_by_uuid::<[u8; 8]>(&services[0], &REPORT_UUID)
-        .await?;
-    let mouse = client
-        .characteristic_by_uuid::<[u8; 5]>(&services[1], &REPORT_UUID)
-        .await?;
-    let consumer = client
-        .characteristic_by_uuid::<[u8; 2]>(&services[2], &REPORT_UUID)
-        .await?;
-    let keyboard_listener = client.subscribe(&keyboard, false).await?;
-    let mouse_listener = client.subscribe(&mouse, false).await?;
-    let consumer_listener = client.subscribe(&consumer, false).await?;
+    let (keyboard_listener, mouse_listener, consumer_listener) = match services.as_slice() {
+        [combined] => {
+            let characteristics = client.characteristics::<8>(combined).await?;
+            let mut inputs = characteristics
+                .iter()
+                .filter(|characteristic| characteristic.props.has_cccd());
+            let keyboard = inputs.next().ok_or(trouble_host::Error::NotFound)?;
+            let mouse = inputs.next().ok_or(trouble_host::Error::NotFound)?;
+            let consumer = inputs.next().ok_or(trouble_host::Error::NotFound)?;
+            if inputs.next().is_some() {
+                return Err(trouble_host::Error::InsufficientSpace.into());
+            }
+            (
+                client.subscribe(keyboard, false).await?,
+                client.subscribe(mouse, false).await?,
+                client.subscribe(consumer, false).await?,
+            )
+        }
+        [keyboard_service, mouse_service, consumer_service] => {
+            let keyboard = client
+                .characteristic_by_uuid::<[u8; 8]>(keyboard_service, &REPORT_UUID)
+                .await?;
+            let mouse = client
+                .characteristic_by_uuid::<[u8; 5]>(mouse_service, &REPORT_UUID)
+                .await?;
+            let consumer = client
+                .characteristic_by_uuid::<[u8; 2]>(consumer_service, &REPORT_UUID)
+                .await?;
+            (
+                client.subscribe(&keyboard, false).await?,
+                client.subscribe(&mouse, false).await?,
+                client.subscribe(&consumer, false).await?,
+            )
+        }
+        _ => {
+            log::warn!("@HIDSHIFT-PROBE:SERVICE-COUNT,{}", services.len());
+            return Err(trouble_host::Error::NotFound.into());
+        }
+    };
     log::info!("@HIDSHIFT-PROBE:SUBSCRIBED,keyboard,mouse,consumer");
 
     let _ = join3(
@@ -344,16 +373,13 @@ where
     Ok(())
 }
 
-async fn relay_notifications(
-    kind: &'static str,
-    mut listener: NotificationListener<'_, 512>,
-) {
+async fn relay_notifications(kind: &'static str, mut listener: NotificationListener<'_, 512>) {
     loop {
         let notification = listener.next().await;
-    let bytes = notification.as_ref();
-    let now_us = Instant::now().as_micros();
-    let sequence = NOTIFICATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    match (kind, bytes) {
+        let bytes = notification.as_ref();
+        let now_us = Instant::now().as_micros();
+        let sequence = NOTIFICATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        match (kind, bytes) {
             ("keyboard", [a, b, c, d, e, f, g, h]) => esp_println::println!(
                 "@N:{:08x}:k:{:016x}:{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
                 sequence,
@@ -377,13 +403,9 @@ async fn relay_notifications(
                 d,
                 e
             ),
-            ("consumer", [a, b]) => esp_println::println!(
-                "@N:{:08x}:c:{:016x}:{:02x}{:02x}",
-                sequence,
-                now_us,
-                a,
-                b
-            ),
+            ("consumer", [a, b]) => {
+                esp_println::println!("@N:{:08x}:c:{:016x}:{:02x}{:02x}", sequence, now_us, a, b)
+            }
             _ => log::warn!("@HIDSHIFT-PROBE:BAD-NOTIFY,{},{}", kind, bytes.len()),
         }
     }
