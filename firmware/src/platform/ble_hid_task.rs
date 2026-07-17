@@ -38,7 +38,7 @@ use static_cell::StaticCell;
 use trouble_host::prelude::*;
 
 const BLE_DEVICE_NAME: &str = "HIDShift";
-const BLE_CONNECTIONS_MAX: usize = 4;
+const BLE_CONNECTIONS_MAX: usize = RUNTIME_HOSTS_MAX;
 // ESP32-S3 counts advertising in the controller activity limit. Four
 // simultaneous peripheral links therefore require one additional activity.
 const BLE_CONTROLLER_ACTIVITIES_MAX: u8 = BLE_CONNECTIONS_MAX as u8 + 1;

@@ -71,8 +71,8 @@ pub use bridge::{
     keyboard_led_event_from_ble_output,
 };
 pub use ids::{
-    DeviceId, HOST_SLOT_MAX, HOST_SLOT_MIN, HostId, HostSlot, InterfaceId, InvalidHostSlot,
-    ReportId, SlotId,
+    DeviceId, HOST_SLOT_COUNT, HOST_SLOT_MAX, HOST_SLOT_MIN, HostId, HostSlot, InterfaceId,
+    InvalidHostSlot, ReportId, SlotId,
 };
 pub use input::{
     ConsumerUsage, InputEvent, KeyCode, KeyUsage, KeyboardEvent, KeyboardFrame, KeyboardLedState,

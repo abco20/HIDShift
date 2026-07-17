@@ -1,8 +1,8 @@
-use crate::ids::HostId;
+use crate::ids::{HOST_SLOT_COUNT, HostId};
 use crate::settings::{GlobalSettings, HostSettings};
 
 pub const MAX_HOST_NAME_LEN: usize = 32;
-pub const STORED_HOSTS_MAX: usize = 4;
+pub const STORED_HOSTS_MAX: usize = HOST_SLOT_COUNT;
 pub const STORAGE_MAGIC: [u8; 4] = *b"E32B";
 pub const STORAGE_SCHEMA_VERSION: u16 = 1;
 pub const STORAGE_IMAGE_LEN: usize = 512;
