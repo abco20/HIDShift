@@ -151,9 +151,10 @@ pub use usb_hid::output::{
 pub use usb_hid::runtime_adapter::runtime_input_from_usb_report;
 pub use usb_hid::source::{
     OwnedUsbHidInputReport, USB_DEVICE_STRING_MAX_LEN, USB_HID_REPORT_DESCRIPTOR_MAX_LEN,
-    USB_HID_REPORT_MAX_LEN, UsbDeviceString, UsbHidDeviceIdentity, UsbHidInputReport,
-    UsbHidInterfaceSnapshot, UsbHidReportBytes, UsbHidReportDescriptorBytes, UsbHidSourceError,
-    UsbHidSourceEvent,
+    USB_HID_REPORT_MAX_LEN, UsbDeviceString, UsbHidControlRequest, UsbHidControlRequestKind,
+    UsbHidControlResponse, UsbHidControlResponseKind, UsbHidDeviceIdentity, UsbHidInputReport,
+    UsbHidInterfaceSnapshot, UsbHidReportBytes, UsbHidReportDescriptorBytes, UsbHidReportTarget,
+    UsbHidReportType, UsbHidSourceError, UsbHidSourceEvent,
 };
 pub use usb_hid::topology::{
     DefaultUsbTopologyManager, USB_TOPOLOGY_DEVICES_MAX, USB_TOPOLOGY_INTERFACES_MAX,

@@ -156,6 +156,108 @@ impl OwnedUsbHidInputReport {
     }
 }
 
+/// HID class report types as encoded in the high byte of USB `wValue`.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UsbHidReportType {
+    Input = 1,
+    Output = 2,
+    Feature = 3,
+}
+
+/// Identifies a report on one physical USB interface without remapping IDs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UsbHidReportTarget {
+    pub device_id: DeviceId,
+    pub interface_id: InterfaceId,
+    pub report_type: UsbHidReportType,
+    pub report_id: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UsbHidControlRequestKind {
+    GetReport { maximum_length: usize },
+    SetReport,
+}
+
+/// Owned reverse-direction request suitable for crossing an async task boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UsbHidControlRequest {
+    pub target: UsbHidReportTarget,
+    pub kind: UsbHidControlRequestKind,
+    data: UsbHidReportBytes,
+}
+
+impl UsbHidControlRequest {
+    pub fn get_report(
+        target: UsbHidReportTarget,
+        maximum_length: usize,
+    ) -> Result<Self, UsbHidSourceError> {
+        if maximum_length > USB_HID_REPORT_MAX_LEN {
+            return Err(UsbHidSourceError::ReportTooLong);
+        }
+        Ok(Self {
+            target,
+            kind: UsbHidControlRequestKind::GetReport { maximum_length },
+            data: UsbHidReportBytes::new(),
+        })
+    }
+
+    pub fn set_report(target: UsbHidReportTarget, data: &[u8]) -> Result<Self, UsbHidSourceError> {
+        Ok(Self {
+            target,
+            kind: UsbHidControlRequestKind::SetReport,
+            data: report_bytes(data)?,
+        })
+    }
+
+    pub const fn target(&self) -> UsbHidReportTarget {
+        self.target
+    }
+
+    pub fn data(&self) -> Option<&[u8]> {
+        match self.kind {
+            UsbHidControlRequestKind::GetReport { .. } => None,
+            UsbHidControlRequestKind::SetReport => Some(self.data.as_slice()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UsbHidControlResponseKind {
+    GetReport,
+    SetReportComplete,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UsbHidControlResponse {
+    pub target: UsbHidReportTarget,
+    pub kind: UsbHidControlResponseKind,
+    data: UsbHidReportBytes,
+}
+
+impl UsbHidControlResponse {
+    pub fn get_report(target: UsbHidReportTarget, data: &[u8]) -> Result<Self, UsbHidSourceError> {
+        Ok(Self {
+            target,
+            kind: UsbHidControlResponseKind::GetReport,
+            data: report_bytes(data)?,
+        })
+    }
+
+    pub fn set_report_complete(target: UsbHidReportTarget) -> Self {
+        Self {
+            target,
+            kind: UsbHidControlResponseKind::SetReportComplete,
+            data: UsbHidReportBytes::new(),
+        }
+    }
+
+    pub fn data(&self) -> &[u8] {
+        self.data.as_slice()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UsbHidSourceEvent<'a> {
     DeviceAttached(&'a UsbHidDeviceIdentity),
@@ -250,6 +352,53 @@ mod tests {
         let report = [0; USB_HID_REPORT_MAX_LEN + 1];
         assert_eq!(
             UsbHidInputReport::new(DeviceId(1), InterfaceId(1), &report),
+            Err(UsbHidSourceError::ReportTooLong)
+        );
+    }
+
+    #[test]
+    fn reverse_control_request_preserves_the_physical_report_target() {
+        let target = UsbHidReportTarget {
+            device_id: DeviceId(3),
+            interface_id: InterfaceId(7),
+            report_type: UsbHidReportType::Feature,
+            report_id: 0x21,
+        };
+        let request = UsbHidControlRequest::get_report(target, 63).unwrap();
+        assert_eq!(
+            request,
+            UsbHidControlRequest {
+                target,
+                kind: UsbHidControlRequestKind::GetReport { maximum_length: 63 },
+                data: UsbHidReportBytes::new(),
+            }
+        );
+
+        let bytes = [0x21, 0xaa, 0x55];
+        let request = UsbHidControlRequest::set_report(target, &bytes).unwrap();
+        assert_eq!(request.target(), target);
+        assert_eq!(request.data(), Some(bytes.as_slice()));
+
+        let response = UsbHidControlResponse::get_report(target, &bytes).unwrap();
+        assert_eq!(response.target, target);
+        assert_eq!(response.kind, UsbHidControlResponseKind::GetReport);
+        assert_eq!(response.data(), bytes);
+    }
+
+    #[test]
+    fn reverse_control_request_rejects_unrepresentable_report_lengths() {
+        let target = UsbHidReportTarget {
+            device_id: DeviceId(1),
+            interface_id: InterfaceId(1),
+            report_type: UsbHidReportType::Output,
+            report_id: 0,
+        };
+        assert_eq!(
+            UsbHidControlRequest::get_report(target, USB_HID_REPORT_MAX_LEN + 1),
+            Err(UsbHidSourceError::ReportTooLong)
+        );
+        assert_eq!(
+            UsbHidControlRequest::set_report(target, &[0; USB_HID_REPORT_MAX_LEN + 1]),
             Err(UsbHidSourceError::ReportTooLong)
         );
     }
