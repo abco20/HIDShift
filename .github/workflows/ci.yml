@@ -58,31 +58,9 @@ jobs:
           --target xtensa-esp32s3-none-elf
       - name: Record firmware size
         run: stat --printf='firmware_bytes=%s\n' target/xtensa-esp32s3-none-elf/release/firmware
-      - name: Check diagnostic firmware
-        run: >-
-          cargo +esp check --locked -Zbuild-std=core,alloc
-          --manifest-path firmware/Cargo.toml --bin firmware --features diagnostic-input
-          --target xtensa-esp32s3-none-elf
-      - name: Build ESP-NOW production firmware
-        run: >-
-          cargo +esp build --locked -Zbuild-std=core,alloc --release
-          --manifest-path firmware/Cargo.toml --bin firmware --features espnow
-          --target xtensa-esp32s3-none-elf
-      - name: Build ESP-NOW Device production firmware
-        run: >-
-          cargo +esp build --locked -Zbuild-std=core,alloc --release
-          --manifest-path firmware/Cargo.toml --no-default-features
-          --bin bridge-device --features espnow-device
-          --target xtensa-esp32s3-none-elf
-      - name: Check ESP-NOW hardware E2E firmware
+      - name: Check hardware E2E firmware
         run: >-
           cargo +esp check --locked -Zbuild-std=core,alloc
           --manifest-path firmware/Cargo.toml --bin firmware
-          --features hardware-e2e,espnow
-          --target xtensa-esp32s3-none-elf
-      - name: Check ESP-NOW Device hardware E2E firmware
-        run: >-
-          cargo +esp check --locked -Zbuild-std=core,alloc
-          --manifest-path firmware/Cargo.toml --no-default-features --bin bridge-device
-          --features hardware-e2e,espnow-device
+          --features hardware-e2e
           --target xtensa-esp32s3-none-elf

@@ -1451,6 +1451,7 @@ impl DeviceClockSync {
     /// to a directly observed host instant. The midpoint estimate can place a
     /// mapped timestamp at most half the synchronization round trip after the
     /// real event; clamp only that bounded diagnostic artifact to zero.
+    #[cfg(test)]
     fn duration_since_synced(self, observed: Instant, synchronized: Instant) -> Option<Duration> {
         if let Some(duration) = observed.checked_duration_since(synchronized) {
             return Some(duration);
