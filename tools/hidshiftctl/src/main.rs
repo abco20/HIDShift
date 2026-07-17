@@ -54,11 +54,6 @@ enum CliCommand {
         value: i32,
     },
     Overview,
-    EspNowPair {
-        host_serial: String,
-        device_serial: String,
-        channel: u8,
-    },
 }
 
 #[derive(Debug, Parser)]
@@ -128,21 +123,6 @@ enum CommandArgs {
         #[command(subcommand)]
         command: SettingsArgs,
     },
-    /// 2台のbridge boardをESP-NOWで相互にペアリング
-    EspnowPair {
-        /// keyboard/mouse側（USB Host role）のSerialポート
-        #[arg(long)]
-        host_serial: String,
-        /// PC側（USB Device role）のSerialポート
-        #[arg(long)]
-        device_serial: String,
-        #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u8).range(1..=14))]
-        channel: u8,
-    },
-    /// このboardのESP-NOW role・MAC・pairing状態を表示
-    EspnowInfo,
-    /// このboardのESP-NOW pairingを削除
-    EspnowForget,
 }
 
 #[derive(Debug, Subcommand)]
@@ -221,11 +201,6 @@ async fn run() -> Result<(), Box<dyn Error>> {
             print_devices(&arguments.transport).await?;
             print_history(&arguments.transport).await
         }
-        CliCommand::EspNowPair {
-            host_serial,
-            device_serial,
-            channel,
-        } => pair_espnow(&host_serial, &device_serial, channel).await,
     }
 }
 
@@ -252,147 +227,6 @@ async fn request(
         .accept(&bytes)
         .map_err(|error| format!("invalid firmware response: {error:?}"))?;
     Ok(response)
-}
-
-async fn pair_espnow(
-    host_serial: &str,
-    device_serial: &str,
-    channel: u8,
-) -> Result<(), Box<dyn Error>> {
-    let mut host_session = SerialManagementSession::open(host_serial)?;
-    let mut device_session = SerialManagementSession::open(device_serial)?;
-    // Opening the USB serial ports toggles auto-reset on the supported boards.
-    // Keep both ports open for the whole transaction and wait for one boot only.
-    std::thread::sleep(Duration::from_secs(2));
-    let host = espnow_info_session(&mut host_session)
-        .map_err(|error| format!("Host identity request failed: {error}"))?;
-    let device = espnow_info_session(&mut device_session)
-        .map_err(|error| format!("Device identity request failed: {error}"))?;
-    if host.role != hidshift::espnow_pairing::EspNowRole::UsbHost {
-        return Err(format!("{host_serial} is not the USB Host role").into());
-    }
-    if device.role != hidshift::espnow_pairing::EspNowRole::UsbDevice {
-        return Err(format!("{device_serial} is not the USB Device role").into());
-    }
-
-    let mut key = [0u8; hidshift::espnow_pairing::ESPNOW_KEY_LEN];
-    getrandom::fill(&mut key)?;
-    for (role, session, peer_address) in [
-        ("Host", &mut host_session, device.local_address),
-        ("Device", &mut device_session, host.local_address),
-    ] {
-        ensure_ok(
-            session
-                .request(ManagementCommand::BeginEspNowPairing {
-                    peer_address,
-                    channel,
-                })
-                .map_err(|error| format!("{role} begin failed: {error}"))?,
-        )?;
-        for offset in (0..key.len()).step_by(hidshift::espnow_pairing::ESPNOW_PAIRING_KEY_CHUNK_LEN)
-        {
-            let end =
-                (offset + hidshift::espnow_pairing::ESPNOW_PAIRING_KEY_CHUNK_LEN).min(key.len());
-            let mut bytes = [0; hidshift::espnow_pairing::ESPNOW_PAIRING_KEY_CHUNK_LEN];
-            bytes[..end - offset].copy_from_slice(&key[offset..end]);
-            ensure_ok(
-                session
-                    .request(ManagementCommand::WriteEspNowKey {
-                        offset: offset as u8,
-                        length: (end - offset) as u8,
-                        bytes,
-                    })
-                    .map_err(|error| format!("{role} key chunk {offset} failed: {error}"))?,
-            )?;
-        }
-    }
-
-    // Commit the Device first. It can reboot while the Host remains reachable
-    // to report a failure; the next invocation safely replaces either side.
-    commit_espnow_pairing(
-        &mut device_session,
-        device_serial,
-        hidshift::espnow_pairing::EspNowRole::UsbDevice,
-        host.local_address,
-        channel,
-        "Device",
-    )?;
-    commit_espnow_pairing(
-        &mut host_session,
-        host_serial,
-        hidshift::espnow_pairing::EspNowRole::UsbHost,
-        device.local_address,
-        channel,
-        "Host",
-    )?;
-    println!(
-        "ESP-NOW pairing complete: host={} device={} channel={}",
-        format_mac(host.local_address),
-        format_mac(device.local_address),
-        channel
-    );
-    Ok(())
-}
-
-fn commit_espnow_pairing(
-    session: &mut SerialManagementSession,
-    serial: &str,
-    role: hidshift::espnow_pairing::EspNowRole,
-    expected_peer: [u8; 6],
-    channel: u8,
-    label: &str,
-) -> Result<(), Box<dyn Error>> {
-    match session.request(ManagementCommand::CommitEspNowPairing) {
-        Ok(response) => ensure_ok(response),
-        Err(commit_error) => {
-            // Commit persists the journal before restarting the controller.
-            // The restart can close the serial session before the response is
-            // delivered, so verify the durable state through a fresh session
-            // instead of reporting a false pairing failure.
-            eprintln!(
-                "{label} commit response was lost ({commit_error}); verifying persisted pairing"
-            );
-            std::thread::sleep(Duration::from_secs(2));
-            let mut verification = SerialManagementSession::open(serial)?;
-            std::thread::sleep(Duration::from_secs(2));
-            let info = espnow_info_session(&mut verification)?;
-            if !espnow_pairing_matches(&info, role, expected_peer, channel) {
-                return Err(format!(
-                    "{label} commit failed ({commit_error}); persisted state was role={:?} paired={} channel={} peer={}",
-                    info.role,
-                    info.paired,
-                    info.channel,
-                    format_mac(info.peer_address)
-                )
-                .into());
-            }
-            eprintln!("{label} pairing was persisted; continuing after lost commit response");
-            Ok(())
-        }
-    }
-}
-
-fn espnow_pairing_matches(
-    info: &hidshift::ManagementEspNowInfo,
-    role: hidshift::espnow_pairing::EspNowRole,
-    expected_peer: [u8; 6],
-    channel: u8,
-) -> bool {
-    info.paired
-        && info.role == role
-        && info.channel == channel
-        && info.peer_address == expected_peer
-}
-
-fn espnow_info_session(
-    session: &mut SerialManagementSession,
-) -> Result<hidshift::ManagementEspNowInfo, Box<dyn Error>> {
-    let response = session.request(ManagementCommand::GetEspNowInfo)?;
-    ensure_ok(response)?;
-    match response.payload {
-        ManagementResponsePayload::EspNowInfo(info) => Ok(info),
-        _ => Err("firmware returned no ESP-NOW identity".into()),
-    }
 }
 
 fn ensure_ok(response: ManagementResponse) -> Result<(), Box<dyn Error>> {
@@ -438,64 +272,6 @@ fn serial_request(
     Err(boot_diagnostic
         .unwrap_or("timed out waiting for HIDShift on the serial port")
         .into())
-}
-
-struct SerialManagementSession {
-    port: Box<dyn SerialPort>,
-    decoder: SerialResponseDecoder,
-    next_request_id: u8,
-}
-
-impl SerialManagementSession {
-    fn open(port_name: &str) -> Result<Self, Box<dyn Error>> {
-        Ok(Self {
-            port: open_management_serial(port_name)?,
-            decoder: SerialResponseDecoder::default(),
-            next_request_id: 1,
-        })
-    }
-
-    fn request(
-        &mut self,
-        command: ManagementCommand,
-    ) -> Result<ManagementResponse, Box<dyn Error>> {
-        let request_id = self.next_request_id;
-        self.next_request_id = self.next_request_id.wrapping_add(1);
-        let mut client = ManagementClient::new(request_id);
-        let request = client
-            .begin(command)
-            .map_err(|error| format!("could not start request: {error:?}"))?;
-        self.port.write_all(&encode_serial_request(request))?;
-        self.port.flush()?;
-
-        let deadline = Instant::now() + DEFAULT_TIMEOUT;
-        let mut chunk = [0u8; 128];
-        let mut diagnostic_tail = Vec::with_capacity(512);
-        let mut boot_diagnostic = None;
-        while Instant::now() < deadline {
-            let length = match self.port.read(&mut chunk) {
-                Ok(0) => continue,
-                Ok(length) => length,
-                Err(error) if error.kind() == std::io::ErrorKind::TimedOut => continue,
-                Err(error) => return Err(error.into()),
-            };
-            diagnostic_tail.extend_from_slice(&chunk[..length]);
-            boot_diagnostic = boot_diagnostic.or_else(|| serial_boot_diagnostic(&diagnostic_tail));
-            if diagnostic_tail.len() > 512 {
-                diagnostic_tail.drain(..diagnostic_tail.len() - 512);
-            }
-            for response in self.decoder.push(&chunk[..length]) {
-                if response[1] == request_id {
-                    return client
-                        .accept(&response)
-                        .map_err(|error| format!("invalid firmware response: {error:?}").into());
-                }
-            }
-        }
-        Err(boot_diagnostic
-            .unwrap_or("timed out waiting for HIDShift on the serial port")
-            .into())
-    }
 }
 
 fn open_management_serial(port_name: &str) -> Result<Box<dyn SerialPort>, Box<dyn Error>> {
@@ -709,14 +485,6 @@ fn print_response(response: ManagementResponse) {
             timing.last_disconnected_seconds,
             timing.last_disconnect_reason
         ),
-        ManagementResponsePayload::EspNowInfo(info) => println!(
-            "esp-now: paired={} role={:?} channel={} local={} peer={}",
-            info.paired,
-            info.role,
-            info.channel,
-            format_mac(info.local_address),
-            format_mac(info.peer_address)
-        ),
         ManagementResponsePayload::UsbDevice(device) => println!(
             "usb[{}] device={} {:04x}:{:04x} flags=0x{:02x} name-part={}",
             device.index,
@@ -728,13 +496,6 @@ fn print_response(response: ManagementResponse) {
         ),
         ManagementResponsePayload::None => {}
     }
-}
-
-fn format_mac(address: [u8; 6]) -> String {
-    format!(
-        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        address[0], address[1], address[2], address[3], address[4], address[5]
-    )
 }
 
 async fn print_devices(transport: &Transport) -> Result<(), Box<dyn Error>> {
@@ -1122,7 +883,6 @@ const fn result_message(result: ManagementResult) -> &'static str {
         ManagementResult::InvalidName => "invalid host name",
         ManagementResult::InvalidSetting => "invalid setting, target, or value",
         ManagementResult::NotFound => "requested item was not found",
-        ManagementResult::InvalidPairing => "invalid or incomplete ESP-NOW pairing transaction",
         ManagementResult::Unavailable => "requested feature is unavailable in this firmware",
     }
 }
@@ -1181,17 +941,6 @@ where
                 }
             }
         },
-        CommandArgs::EspnowPair {
-            host_serial,
-            device_serial,
-            channel,
-        } => CliCommand::EspNowPair {
-            host_serial,
-            device_serial,
-            channel,
-        },
-        CommandArgs::EspnowInfo => CliCommand::Request(ManagementCommand::GetEspNowInfo),
-        CommandArgs::EspnowForget => CliCommand::Request(ManagementCommand::ForgetEspNowPeer),
     };
     Ok(Arguments { transport, command })
 }
@@ -1227,68 +976,6 @@ mod tests {
                 }),
             }
         );
-        assert_eq!(
-            parse_arguments(["--serial", "/dev/ttyUSB0", "espnow-info"].map(str::to_owned))
-                .unwrap()
-                .command,
-            CliCommand::Request(ManagementCommand::GetEspNowInfo)
-        );
-        assert_eq!(
-            parse_arguments(["--ble", "espnow-forget"].map(str::to_owned))
-                .unwrap()
-                .command,
-            CliCommand::Request(ManagementCommand::ForgetEspNowPeer)
-        );
-    }
-
-    #[test]
-    fn parses_two_board_espnow_pairing_without_global_transport() {
-        assert_eq!(
-            parse_arguments(
-                [
-                    "espnow-pair",
-                    "--host-serial",
-                    "/dev/ttyACM0",
-                    "--device-serial",
-                    "/dev/ttyACM1",
-                    "--channel",
-                    "11",
-                ]
-                .map(str::to_owned)
-            )
-            .unwrap(),
-            Arguments {
-                transport: Transport::None,
-                command: CliCommand::EspNowPair {
-                    host_serial: "/dev/ttyACM0".into(),
-                    device_serial: "/dev/ttyACM1".into(),
-                    channel: 11,
-                },
-            }
-        );
-    }
-
-    #[test]
-    fn persisted_espnow_pairing_can_confirm_a_lost_commit_response() {
-        let info = hidshift::ManagementEspNowInfo {
-            paired: true,
-            role: hidshift::espnow_pairing::EspNowRole::UsbHost,
-            channel: 6,
-            local_address: [1, 2, 3, 4, 5, 6],
-            peer_address: [6, 5, 4, 3, 2, 1],
-        };
-        assert!(espnow_pairing_matches(
-            &info,
-            hidshift::espnow_pairing::EspNowRole::UsbHost,
-            [6, 5, 4, 3, 2, 1],
-            6
-        ));
-        assert!(!espnow_pairing_matches(
-            &info,
-            hidshift::espnow_pairing::EspNowRole::UsbDevice,
-            [6, 5, 4, 3, 2, 1],
-            6
-        ));
     }
 
     #[test]

@@ -11,8 +11,7 @@ name = "firmware"
 path = "src/main.rs"
 
 [features]
-default = ["ble"]
-ble = ["esp-radio/ble"]
+default = []
 hardware-e2e = []
 
 [dependencies]
@@ -32,7 +31,7 @@ esp-hal = { version = "1.1.1", default-features = false, features = ["__bluetoot
 # Keep logger output and the wired E2E management protocol from interleaving
 # byte-by-byte across interrupt contexts.
 esp-println = { version = "0.17.0", default-features = false, features = ["critical-section", "esp32s3", "log-04", "uart"] }
-esp-radio = { version = "1.0.0-beta.0", default-features = false, features = ["esp-alloc", "esp32s3", "log-04", "unstable"] }
+esp-radio = { version = "1.0.0-beta.0", default-features = false, features = ["ble", "esp-alloc", "esp32s3", "log-04", "unstable"] }
 esp-rtos = { version = "0.3.0", features = ["embassy", "esp-alloc", "esp-radio", "esp32s3"] }
 esp-storage = { version = "0.9.0", default-features = false, features = ["esp32s3"] }
 esp-synopsys-usb-otg = "0.4.2"

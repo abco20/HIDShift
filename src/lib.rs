@@ -43,7 +43,6 @@ pub mod runtime;
 pub mod settings;
 pub mod storage;
 pub mod target_control;
-pub mod transport;
 pub mod usb_hid;
 
 pub use ble::{
@@ -52,7 +51,8 @@ pub use ble::{
 };
 pub use ble_connection::{
     BleConnectionEntry, BleConnectionSlot, BleConnectionSlotError, BleConnectionSlots,
-    BleInputGate, BlePeerIdentity, resolve_host_id as resolve_ble_host_id,
+    BleConnectionTiming, BleInputGate, BlePeerIdentity, BlePhyPreference,
+    low_latency_ble_connection_timing, resolve_host_id as resolve_ble_host_id,
     restrict_advertising_to_bonded_peers,
 };
 pub use ble_notify::{
@@ -140,10 +140,6 @@ pub use storage::{
 };
 pub use target_control::{
     ButtonIntent, DebouncedButton, DebouncedButtonEvent, TargetSwitchControl,
-};
-pub use transport::{
-    BleConnectionTiming, BlePhyPreference, InputTransport, InputTransportRouter,
-    low_latency_ble_connection_timing,
 };
 pub use usb_hid::frame::{
     UsbInputFrameError, decode_standard_input_frame, events_to_standard_input_frame,

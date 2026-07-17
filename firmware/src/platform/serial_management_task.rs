@@ -62,14 +62,11 @@ pub async fn serial_management_task(
                             Instant::now().as_micros()
                         );
                     }
-                    if let E2eCommand::SelectTransport { transport } = packet.command {
-                        log::info!("@HIDSHIFT-BRIDGE:ROUTE,{:?}", transport);
-                    }
                     if packet.carries_input() {
                         crate::e2e_telemetry::record_ingress(sequence, ingress_us);
                     }
-                    if let E2eCommand::ReadTimestamp { target_sequence } = packet.command {
-                        let snapshot = crate::e2e_telemetry::snapshot(target_sequence);
+                    if let E2eCommand::ReadTimestamp { .. } = packet.command {
+                        let snapshot = crate::e2e_telemetry::snapshot();
                         log::info!(
                             "@HIDSHIFT-E2E:STAMP,{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                             sequence,
@@ -95,21 +92,6 @@ pub async fn serial_management_task(
                             snapshot.hci_submit_us,
                             snapshot.hci_dequeue_us,
                             snapshot.hci_credit_us
-                        );
-                        log::info!(
-                            "@HIDSHIFT-BRIDGE:STAMP,{},{},{},{},{},{},{},{},{},{},{},{}",
-                            sequence,
-                            _boot_session_id,
-                            snapshot.espnow_sequence,
-                            snapshot.espnow_ingress_us,
-                            snapshot.espnow_enqueue_us,
-                            snapshot.espnow_dequeue_us,
-                            snapshot.espnow_send_start_us,
-                            snapshot.espnow_tx_done_us,
-                            snapshot.device_sequence,
-                            snapshot.device_radio_rx_us,
-                            snapshot.device_reassembled_us,
-                            snapshot.device_hid_write_us
                         );
                     }
                     match packet.input_frames() {

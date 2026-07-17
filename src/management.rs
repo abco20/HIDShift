@@ -479,8 +479,7 @@ pub enum ManagementResult {
     InvalidName = 5,
     InvalidSetting = 6,
     NotFound = 7,
-    InvalidPairing = 8,
-    Unavailable = 9,
+    Unavailable = 8,
 }
 
 impl ManagementResult {
@@ -494,8 +493,7 @@ impl ManagementResult {
             5 => Ok(Self::InvalidName),
             6 => Ok(Self::InvalidSetting),
             7 => Ok(Self::NotFound),
-            8 => Ok(Self::InvalidPairing),
-            9 => Ok(Self::Unavailable),
+            8 => Ok(Self::Unavailable),
             _ => Err(ManagementProtocolError::InvalidArgument),
         }
     }
