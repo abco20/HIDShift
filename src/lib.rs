@@ -157,6 +157,12 @@ pub use usb_hid::output::{
     BitPos, KeyboardLedOutputBytes, KeyboardLedOutputError, KeyboardLedOutputReport,
 };
 pub use usb_hid::runtime_adapter::runtime_input_from_usb_report;
+pub use usb_hid::source::{
+    OwnedUsbHidInputReport, USB_DEVICE_STRING_MAX_LEN, USB_HID_REPORT_DESCRIPTOR_MAX_LEN,
+    USB_HID_REPORT_MAX_LEN, UsbDeviceString, UsbHidDeviceIdentity, UsbHidInputReport,
+    UsbHidInterfaceSnapshot, UsbHidReportBytes, UsbHidReportDescriptorBytes, UsbHidSourceError,
+    UsbHidSourceEvent,
+};
 pub use usb_hid::topology::{
     DefaultUsbTopologyManager, USB_TOPOLOGY_DEVICES_MAX, USB_TOPOLOGY_INTERFACES_MAX,
     UsbDeviceRoute, UsbDeviceTopologyEntry, UsbInterfaceTopologyEntry, UsbTopologyError,

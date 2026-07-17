@@ -103,7 +103,14 @@ impl<'d> ActiveUsbInterfaceSlot<'d> {
     async fn next_result(&mut self) -> UsbSlotReadResult {
         loop {
             match self.reader.read(&mut self.report_buf).await {
-                Ok(n) => match self.session.input_message(&self.report_buf[..n]) {
+                Ok(n) => match self
+                    .session
+                    .capture_input_report(&self.report_buf[..n])
+                    .map_err(
+                        hidshift::usb_hid::host_runtime::UsbHidInterfaceRuntimeInputError::from,
+                    )
+                    .and_then(|report| self.session.input_message(report))
+                {
                     Ok(message) => {
                         let movement_only =
                             movement_only_message(&message, &mut self.last_mouse_buttons);
@@ -1097,11 +1104,28 @@ async fn attach_hid_interfaces_for_device<'d>(
                         return Err(());
                     }
                 };
-                match UsbHidInterfaceRuntimeSession::<MAX_REPORT_FIELDS, MAX_REPORT_EVENTS>::from_core_descriptor(
-                    interface_id,
+                let source = match hidshift::UsbHidInterfaceSnapshot::new(
                     device_id,
-                    descriptor,
+                    interface_id,
+                    hid_info.interface_number,
+                    0,
+                    hid_info.interface_subclass,
+                    hid_info.interface_protocol,
                     &report_descriptor_buf[..len],
+                ) {
+                    Ok(source) => source,
+                    Err(error) => {
+                        log::warn!(
+                            "firmware: usb source snapshot rejected interface={} err={:?}",
+                            interface_id.0,
+                            error
+                        );
+                        return Err(());
+                    }
+                };
+                match UsbHidInterfaceRuntimeSession::<MAX_REPORT_FIELDS, MAX_REPORT_EVENTS>::from_source_snapshot(
+                    source,
+                    descriptor,
                     hid_info.boot_keyboard_led_fallback_allowed(),
                 ) {
                     Ok(session) => session,
