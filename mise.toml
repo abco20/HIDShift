@@ -1,0 +1,132 @@
+[tools]
+rust = {
+  version = "1.95.0",
+  profile = "minimal",
+  components = ["rustfmt", "clippy"],
+  targets = ["wasm32-unknown-unknown"],
+}
+
+"cargo:trunk" = "0.21.14"
+"cargo:espflash" = "4.4.0"
+"cargo:espup" = "0.17.1"
+
+[tasks."host:ci"]
+description = "Run the host checks used by CI in order"
+run = [
+  "cargo test --locked --all-targets",
+  "cargo fmt --check",
+  "cargo check --locked --lib",
+  "cargo clippy --locked --lib -- -D warnings",
+  "cargo test --locked --manifest-path tools/hidshift-client/Cargo.toml",
+  "cargo test --locked --manifest-path tools/hidshiftctl/Cargo.toml",
+  "cargo test --locked --all-targets --manifest-path e2e/runner/Cargo.toml",
+  "cargo check --locked --manifest-path web/Cargo.toml --target wasm32-unknown-unknown",
+  "cargo fmt --check --manifest-path tools/hidshift-client/Cargo.toml",
+  "cargo fmt --check --manifest-path tools/hidshiftctl/Cargo.toml",
+  "cargo fmt --check --manifest-path e2e/runner/Cargo.toml",
+  "cargo fmt --check --manifest-path web/Cargo.toml",
+  "python3 -m unittest discover -s tools/release -p 'test_*.py'",
+]
+
+[tasks."web:serve"]
+description = "Serve the Web UI with Trunk"
+dir = "web"
+env = { NO_COLOR = "false" }
+run = "trunk serve --open"
+
+[tasks."web:build"]
+description = "Build the Web UI for local use"
+dir = "web"
+env = { NO_COLOR = "false" }
+run = "trunk build --release --locked"
+
+[tasks."esp:install"]
+description = "Install the ESP32-S3 Xtensa Rust toolchain"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+mkdir -p "$MISE_PROJECT_ROOT/.mise/esp"
+espup install \
+  --targets esp32s3 \
+  --export-file "$MISE_PROJECT_ROOT/.mise/esp/export-esp.sh"
+"""
+
+[tasks."firmware:build"]
+description = "Build the production ESP32-S3 firmware"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+export_file="$MISE_PROJECT_ROOT/.mise/esp/export-esp.sh"
+
+if [[ ! -f "$export_file" ]]; then
+  echo "ESP toolchain is not installed. Run: mise run esp:install" >&2
+  exit 1
+fi
+
+source "$export_file"
+
+cargo +esp build \
+  --locked \
+  -Zbuild-std=core,alloc \
+  --release \
+  --manifest-path firmware/Cargo.toml \
+  --bin firmware \
+  --target xtensa-esp32s3-none-elf
+"""
+
+[tasks."firmware:check"]
+description = "Run the ESP32-S3 firmware checks"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+export_file="$MISE_PROJECT_ROOT/.mise/esp/export-esp.sh"
+
+if [[ ! -f "$export_file" ]]; then
+  echo "ESP toolchain is not installed. Run: mise run esp:install" >&2
+  exit 1
+fi
+
+source "$export_file"
+
+cargo +esp check \
+  --locked \
+  -Zbuild-std=core,alloc \
+  --manifest-path firmware/Cargo.toml \
+  --bin firmware \
+  --features hardware-e2e \
+  --target xtensa-esp32s3-none-elf
+
+cargo +esp check \
+  --locked \
+  -Zbuild-std=core,alloc \
+  --manifest-path e2e/probe-firmware/Cargo.toml \
+  --no-default-features \
+  --features esp32s3 \
+  --target xtensa-esp32s3-none-elf
+"""
+
+[tasks."firmware:flash"]
+description = "Build and flash the production ESP32-S3 firmware"
+depends = ["firmware:build"]
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+export_file="$MISE_PROJECT_ROOT/.mise/esp/export-esp.sh"
+
+if [[ ! -f "$export_file" ]]; then
+  echo "ESP toolchain is not installed. Run: mise run esp:install" >&2
+  exit 1
+fi
+
+source "$export_file"
+
+espflash flash \
+  --chip esp32s3 \
+  --partition-table partitions/bridge.csv \
+  --target-app-partition factory \
+  target/xtensa-esp32s3-none-elf/release/firmware
+"""
