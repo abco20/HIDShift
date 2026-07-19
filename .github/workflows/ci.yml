@@ -22,7 +22,9 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - name: Install host system dependencies
-        run: sudo apt-get update && sudo apt-get install --yes libdbus-1-dev pkg-config
+        run: >-
+          sudo apt-get update && sudo apt-get install --yes
+          libdbus-1-dev libudev-dev pkg-config
       - run: cargo test --locked --all-targets
       - run: cargo fmt --check
       - run: cargo check --locked --lib
