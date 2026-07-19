@@ -32,6 +32,10 @@ impl<const HOSTS: usize> BleHostStateMachine<HOSTS> {
         Ok(changed)
     }
 
+    pub fn clear_active_target(&mut self) {
+        self.active_target = None;
+    }
+
     pub fn on_connected(&mut self, host_id: HostId) -> Result<(), HostStateError> {
         let host = self.upsert_host(host_id)?;
         host.connected = true;

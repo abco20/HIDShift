@@ -192,8 +192,15 @@ impl<
             message
         {
             self.queues.clear();
+            #[cfg(not(feature = "dual-s3-wired"))]
             self.runtime
                 .handle_realtime_input_frame_in_place(frame.clone(), &mut self.queues.ble)?;
+            #[cfg(feature = "dual-s3-wired")]
+            self.runtime.handle_realtime_input_frame_in_place(
+                frame.clone(),
+                &mut self.queues.ble,
+                &mut self.queues.device,
+            )?;
             self.runtime.observe_outbox_usage(
                 self.queues.ble.len(),
                 self.queues.usb.len(),

@@ -6,9 +6,14 @@ use crate::input::{
     ConsumerState, InputAggregator, InputFrame, KeyboardLedState, KeyboardSuppression,
     MouseButtons, MouseMovement, PhysicalInputState, StandardInputFrame,
 };
+use crate::output_target::OutputTarget;
+#[cfg(feature = "dual-s3-wired")]
+use crate::output_target::{
+    OutputTargetAvailability, OutputTargetState, StoredOutputTarget, StoredPresentationConfig,
+};
 use crate::reports::{
-    BleConsumerReport, BleHidReport, BleKeyboard6KroReport, BleKeyboardLedOutputReport,
-    BleKeyboardOutputError, BleMouseReport, KEYBOARD_6KRO_KEY_CAPACITY, ReportKind,
+    BleKeyboardLedOutputReport, BleKeyboardOutputError, ConsumerReport, KEYBOARD_6KRO_KEY_CAPACITY,
+    Keyboard6KroReport, MouseReport, ReportKind, StandardHidReport,
 };
 use crate::storage::{StorageError, StorageState, StoredBond};
 
@@ -88,10 +93,14 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
             BridgeEvent::InputFrame(frame) => self.handle_input_frame(frame, out),
             BridgeEvent::HostConnected { host_id } => {
                 self.state.hosts.on_connected(host_id)?;
+                #[cfg(feature = "dual-s3-wired")]
+                self.refresh_selected_target_availability();
                 self.push_status(out)
             }
             BridgeEvent::HostDisconnected { host_id } => {
                 self.state.hosts.on_disconnected(host_id);
+                #[cfg(feature = "dual-s3-wired")]
+                self.refresh_selected_target_availability();
                 self.push_status(out)
             }
             BridgeEvent::HostSecurityChanged {
@@ -111,6 +120,8 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
                     self.state.pairable_host = None;
                     push_action(out, BridgeAction::RejectPairing { host_id })?;
                 }
+                #[cfg(feature = "dual-s3-wired")]
+                self.refresh_selected_target_availability();
                 self.push_status(out)
             }
             BridgeEvent::CccdChanged {
@@ -122,6 +133,8 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
                 if persist {
                     push_action(out, BridgeAction::PersistProfiles)?;
                 }
+                #[cfg(feature = "dual-s3-wired")]
+                self.refresh_selected_target_availability();
                 self.push_status(out)
             }
             BridgeEvent::UsbHidInterfaceConnected {
@@ -151,6 +164,12 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
             BridgeEvent::PairingModeExpired { host_id } => self.expire_pairing_mode(host_id, out),
             BridgeEvent::ClearHost { host_id } => self.clear_host(host_id, out),
             BridgeEvent::SwitchTarget { target } => self.switch_target(target, out),
+            #[cfg(feature = "dual-s3-wired")]
+            BridgeEvent::SelectOutputTarget { target } => self.select_output_target(target, out),
+            #[cfg(feature = "dual-s3-wired")]
+            BridgeEvent::WiredAvailabilityChanged { availability } => {
+                self.wired_availability_changed(availability, out)
+            }
             BridgeEvent::UsbDeviceRemoved { interface_id } => {
                 self.usb_device_removed(interface_id, out)
             }
@@ -199,17 +218,15 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
                     next_stats.keyboard_reports_truncated.saturating_add(1);
             }
 
-            if let Some(host_id) = self.ready_active_host(ReportKind::Keyboard) {
-                let build = BleKeyboard6KroReport::from_physical_state(
-                    &keyboard_state,
-                    &keyboard_suppression,
-                );
+            if let Some(target) = self.ready_active_target(ReportKind::Keyboard) {
+                let build =
+                    Keyboard6KroReport::from_physical_state(&keyboard_state, &keyboard_suppression);
                 debug_assert!(!build.truncated);
                 push_action(
                     &mut next_out,
-                    BridgeAction::BleNotify {
-                        host_id,
-                        report: BleHidReport::Keyboard(build.report),
+                    BridgeAction::Notify {
+                        target,
+                        report: StandardHidReport::Keyboard(build.report),
                         reason: if keyboard_contains_release(
                             &self.state.input.keyboard,
                             &keyboard_state,
@@ -237,14 +254,14 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
                 .mouse_buttons
                 .intersection(mouse_state.buttons);
             let visible_buttons = mouse_state.buttons.without(mouse_suppression);
-            if let Some(host_id) = self.ready_active_host(ReportKind::Mouse) {
+            if let Some(target) = self.ready_active_target(ReportKind::Mouse) {
                 let released_buttons =
                     self.state.input.mouse.buttons.bits() & !mouse_state.buttons.bits() != 0;
                 push_action(
                     &mut next_out,
-                    BridgeAction::BleNotify {
-                        host_id,
-                        report: BleHidReport::Mouse(BleMouseReport::from_frame(
+                    BridgeAction::Notify {
+                        target,
+                        report: StandardHidReport::Mouse(MouseReport::from_frame(
                             visible_buttons,
                             mouse.movement,
                         )),
@@ -271,21 +288,21 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
             if consumer_state.active != consumer_suppression.active {
                 consumer_suppression.active = None;
             }
-            if let Some(host_id) = self.ready_active_host(ReportKind::Consumer) {
+            if let Some(target) = self.ready_active_target(ReportKind::Consumer) {
                 let visible_consumer = if consumer_state.active == consumer_suppression.active {
                     None
                 } else {
                     consumer_state.active
                 };
                 let report = match visible_consumer {
-                    Some(usage) => BleConsumerReport::from_usage(usage),
-                    None => BleConsumerReport::release(),
+                    Some(usage) => ConsumerReport::from_usage(usage),
+                    None => ConsumerReport::release(),
                 };
                 push_action(
                     &mut next_out,
-                    BridgeAction::BleNotify {
-                        host_id,
-                        report: BleHidReport::Consumer(report),
+                    BridgeAction::Notify {
+                        target,
+                        report: StandardHidReport::Consumer(report),
                         reason: if self.state.input.consumer.active.is_some()
                             && consumer_state.active.is_none()
                         {
@@ -331,7 +348,73 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
         target: HostId,
         out: &mut heapless::Vec<BridgeAction, ACTIONS>,
     ) -> Result<(), BridgeError> {
+        #[cfg(feature = "dual-s3-wired")]
+        self.select_output_target(OutputTarget::Ble(target), out)?;
+        #[cfg(not(feature = "dual-s3-wired"))]
         self.activate_target(target, NotifyReason::TargetSwitchRelease, out)?;
+        #[cfg(feature = "dual-s3-wired")]
+        return Ok(());
+        #[cfg(not(feature = "dual-s3-wired"))]
+        self.push_status(out)
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    fn select_output_target<const ACTIONS: usize>(
+        &mut self,
+        target: OutputTarget,
+        out: &mut heapless::Vec<BridgeAction, ACTIONS>,
+    ) -> Result<(), BridgeError> {
+        target
+            .validate()
+            .map_err(|_| BridgeError::InvalidOutputTarget)?;
+        if self.state.output_target.selected == target {
+            return self.push_status(out);
+        }
+
+        if let Some(active) = self.state.output_target.active {
+            self.push_release_target(active, NotifyReason::TargetSwitchRelease, out)?;
+        }
+        self.state
+            .suppression
+            .keyboard
+            .capture_from(&self.state.input.keyboard)?;
+        self.state.suppression.mouse_buttons = self.state.input.mouse.buttons;
+        self.state.suppression.consumer = self.state.input.consumer;
+
+        let operation_id = self
+            .state
+            .output_target
+            .select(target)
+            .map_err(|_| BridgeError::InvalidOutputTarget)?;
+        match target {
+            OutputTarget::Wired => {
+                self.state.hosts.clear_active_target();
+                push_action(out, BridgeAction::ActivateWired { operation_id })?;
+            }
+            OutputTarget::Ble(host_id) => {
+                self.state.hosts.set_active_target(host_id)?;
+                push_action(out, BridgeAction::ActivateInput { host_id })?;
+                self.apply_active_host_leds(out)?;
+                self.refresh_selected_target_availability();
+            }
+        }
+        push_action(out, BridgeAction::PersistProfiles)?;
+        self.push_status(out)
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    fn wired_availability_changed<const ACTIONS: usize>(
+        &mut self,
+        availability: OutputTargetAvailability,
+        out: &mut heapless::Vec<BridgeAction, ACTIONS>,
+    ) -> Result<(), BridgeError> {
+        self.state.wired_availability = availability;
+        if self.state.output_target.selected == OutputTarget::Wired {
+            self.state.output_target.set_availability(availability);
+            if availability == OutputTargetAvailability::Ready {
+                self.push_neutral_reports(OutputTarget::Wired, NotifyReason::SafetyRelease, out)?;
+            }
+        }
         self.push_status(out)
     }
 
@@ -498,10 +581,10 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
                 .visible_against(&self.state.suppression.keyboard);
             push_action(
                 out,
-                BridgeAction::BleNotify {
-                    host_id,
-                    report: BleHidReport::Keyboard(
-                        BleKeyboard6KroReport::from_visible_state(&visible).report,
+                BridgeAction::Notify {
+                    target: OutputTarget::Ble(host_id),
+                    report: StandardHidReport::Keyboard(
+                        Keyboard6KroReport::from_visible_state(&visible).report,
                     ),
                     reason,
                 },
@@ -524,9 +607,9 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
                 .without(self.state.suppression.mouse_buttons);
             push_action(
                 out,
-                BridgeAction::BleNotify {
-                    host_id,
-                    report: BleHidReport::Mouse(BleMouseReport::from_frame(
+                BridgeAction::Notify {
+                    target: OutputTarget::Ble(host_id),
+                    report: StandardHidReport::Mouse(MouseReport::from_frame(
                         visible_buttons,
                         MouseMovement::neutral(),
                     )),
@@ -542,14 +625,14 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
             && previous_input.consumer.active != self.state.input.consumer.active
         {
             let report = match self.state.input.consumer.active {
-                Some(usage) => BleConsumerReport::from_usage(usage),
-                None => BleConsumerReport::release(),
+                Some(usage) => ConsumerReport::from_usage(usage),
+                None => ConsumerReport::release(),
             };
             push_action(
                 out,
-                BridgeAction::BleNotify {
-                    host_id,
-                    report: BleHidReport::Consumer(report),
+                BridgeAction::Notify {
+                    target: OutputTarget::Ble(host_id),
+                    report: StandardHidReport::Consumer(report),
                     reason,
                 },
             )?;
@@ -567,9 +650,9 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
         if self.can_send(host_id, ReportKind::Keyboard) {
             push_action(
                 out,
-                BridgeAction::BleNotify {
-                    host_id,
-                    report: BleHidReport::Keyboard(BleKeyboard6KroReport::release()),
+                BridgeAction::Notify {
+                    target: OutputTarget::Ble(host_id),
+                    report: StandardHidReport::Keyboard(Keyboard6KroReport::release()),
                     reason,
                 },
             )?;
@@ -577,9 +660,9 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
         if self.can_send(host_id, ReportKind::Mouse) {
             push_action(
                 out,
-                BridgeAction::BleNotify {
-                    host_id,
-                    report: BleHidReport::Mouse(BleMouseReport::release_buttons()),
+                BridgeAction::Notify {
+                    target: OutputTarget::Ble(host_id),
+                    report: StandardHidReport::Mouse(MouseReport::release_buttons()),
                     reason,
                 },
             )?;
@@ -587,9 +670,46 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
         if self.can_send(host_id, ReportKind::Consumer) {
             push_action(
                 out,
-                BridgeAction::BleNotify {
-                    host_id,
-                    report: BleHidReport::Consumer(BleConsumerReport::release()),
+                BridgeAction::Notify {
+                    target: OutputTarget::Ble(host_id),
+                    report: StandardHidReport::Consumer(ConsumerReport::release()),
+                    reason,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    fn push_release_target<const ACTIONS: usize>(
+        &self,
+        target: OutputTarget,
+        reason: NotifyReason,
+        out: &mut heapless::Vec<BridgeAction, ACTIONS>,
+    ) -> Result<(), BridgeError> {
+        match target {
+            OutputTarget::Ble(host_id) => self.push_release_reports(host_id, reason, out),
+            OutputTarget::Wired => self.push_neutral_reports(target, reason, out),
+        }
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    fn push_neutral_reports<const ACTIONS: usize>(
+        &self,
+        target: OutputTarget,
+        reason: NotifyReason,
+        out: &mut heapless::Vec<BridgeAction, ACTIONS>,
+    ) -> Result<(), BridgeError> {
+        for report in [
+            StandardHidReport::Keyboard(Keyboard6KroReport::release()),
+            StandardHidReport::Mouse(MouseReport::release_buttons()),
+            StandardHidReport::Consumer(ConsumerReport::release()),
+        ] {
+            push_action(
+                out,
+                BridgeAction::Notify {
+                    target,
+                    report,
                     reason,
                 },
             )?;
@@ -611,9 +731,50 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
         }
     }
 
-    fn ready_active_host(&self, kind: ReportKind) -> Option<HostId> {
-        let host_id = self.state.hosts.active_target()?;
-        self.can_send(host_id, kind).then_some(host_id)
+    fn ready_active_target(&self, kind: ReportKind) -> Option<OutputTarget> {
+        #[cfg(feature = "dual-s3-wired")]
+        {
+            let target = self.state.output_target.active?;
+            match target {
+                OutputTarget::Wired => Some(target),
+                OutputTarget::Ble(host_id) => self.can_send(host_id, kind).then_some(target),
+            }
+        }
+        #[cfg(not(feature = "dual-s3-wired"))]
+        {
+            let host_id = self.state.hosts.active_target()?;
+            self.can_send(host_id, kind)
+                .then_some(OutputTarget::Ble(host_id))
+        }
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    fn refresh_selected_target_availability(&mut self) {
+        let availability = match self.state.output_target.selected {
+            OutputTarget::Wired => self.state.wired_availability,
+            OutputTarget::Ble(host_id) => {
+                let any_ready = [
+                    ReportKind::Keyboard,
+                    ReportKind::Mouse,
+                    ReportKind::Consumer,
+                ]
+                .into_iter()
+                .any(|kind| self.can_send(host_id, kind));
+                if any_ready {
+                    OutputTargetAvailability::Ready
+                } else if self
+                    .state
+                    .hosts
+                    .host(host_id)
+                    .is_some_and(|host| host.connected)
+                {
+                    OutputTargetAvailability::ConnectedNotReady
+                } else {
+                    OutputTargetAvailability::Unavailable
+                }
+            }
+        };
+        self.state.output_target.set_availability(availability);
     }
 
     pub fn can_send(&self, host_id: HostId, kind: ReportKind) -> bool {
@@ -621,7 +782,24 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
     }
 
     pub fn storage_state(&self, generation: u32) -> Result<StorageState, StorageError> {
-        self.state.hosts.storage_state(generation)
+        let storage = self.state.hosts.storage_state(generation)?;
+        #[cfg(feature = "dual-s3-wired")]
+        let mut storage = storage;
+        #[cfg(feature = "dual-s3-wired")]
+        {
+            storage.presentation = StoredPresentationConfig {
+                output_target: match self.state.output_target.selected {
+                    OutputTarget::Wired => StoredOutputTarget::Wired,
+                    OutputTarget::Ble(host_id) => StoredOutputTarget::Ble(
+                        host_id
+                            .validated()
+                            .map_err(|_| StorageError::InvalidHostId)?,
+                    ),
+                },
+                mirror_target: self.state.mirror_target,
+            };
+        }
+        Ok(storage)
     }
 
     pub fn restore_storage_state<const ACTIONS: usize>(
@@ -631,6 +809,19 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
     ) -> Result<(), BridgeError> {
         out.clear();
         self.state.hosts.restore(storage)?;
+        #[cfg(feature = "dual-s3-wired")]
+        {
+            self.state.output_target = OutputTargetState::new();
+            self.state.output_target.selected =
+                match (storage.presentation.output_target, storage.last_active_host) {
+                    (StoredOutputTarget::Wired, Some(host_id)) => OutputTarget::Ble(host_id),
+                    (stored, _) => stored.as_output_target(),
+                };
+            self.state.mirror_target = storage.presentation.mirror_target;
+            if self.state.output_target.selected == OutputTarget::Wired {
+                self.state.hosts.clear_active_target();
+            }
+        }
         self.state.pairable_host = None;
         Ok(())
     }
@@ -652,6 +843,12 @@ pub struct BridgeState<const HOSTS: usize> {
     pub hosts: BleHostStateMachine<HOSTS>,
     pub pairable_host: Option<HostId>,
     pub stats: BridgeStats,
+    #[cfg(feature = "dual-s3-wired")]
+    pub output_target: OutputTargetState,
+    #[cfg(feature = "dual-s3-wired")]
+    pub wired_availability: OutputTargetAvailability,
+    #[cfg(feature = "dual-s3-wired")]
+    pub mirror_target: Option<crate::output_target::StoredMirrorTarget>,
 }
 
 impl<const HOSTS: usize> BridgeState<HOSTS> {
@@ -664,6 +861,12 @@ impl<const HOSTS: usize> BridgeState<HOSTS> {
             hosts: BleHostStateMachine::new(),
             pairable_host: None,
             stats: BridgeStats::new(),
+            #[cfg(feature = "dual-s3-wired")]
+            output_target: OutputTargetState::new(),
+            #[cfg(feature = "dual-s3-wired")]
+            wired_availability: OutputTargetAvailability::Unavailable,
+            #[cfg(feature = "dual-s3-wired")]
+            mirror_target: None,
         }
     }
 
@@ -807,13 +1010,21 @@ pub enum BridgeEvent {
     SwitchTarget {
         target: HostId,
     },
+    #[cfg(feature = "dual-s3-wired")]
+    SelectOutputTarget {
+        target: OutputTarget,
+    },
+    #[cfg(feature = "dual-s3-wired")]
+    WiredAvailabilityChanged {
+        availability: OutputTargetAvailability,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BridgeAction {
-    BleNotify {
-        host_id: HostId,
-        report: BleHidReport,
+    Notify {
+        target: OutputTarget,
+        report: StandardHidReport,
         reason: NotifyReason,
     },
     UsbSetKeyboardLeds {
@@ -833,6 +1044,10 @@ pub enum BridgeAction {
     },
     ActivateInput {
         host_id: HostId,
+    },
+    #[cfg(feature = "dual-s3-wired")]
+    ActivateWired {
+        operation_id: u32,
     },
     PersistProfiles,
     StatusChanged(BridgeStatus),
@@ -874,6 +1089,8 @@ pub enum BridgeError {
     HostState(HostStateError),
     Input(crate::input::InputError),
     Storage(StorageError),
+    #[cfg(feature = "dual-s3-wired")]
+    InvalidOutputTarget,
 }
 
 impl From<crate::input::InputError> for BridgeError {
@@ -978,10 +1195,10 @@ mod tests {
 
         assert_eq!(
             actions.as_slice(),
-            &[BridgeAction::BleNotify {
-                host_id: HOST_A,
-                report: BleHidReport::Keyboard(
-                    BleKeyboard6KroReport::from_visible_state(
+            &[BridgeAction::Notify {
+                target: OutputTarget::Ble(HOST_A),
+                report: StandardHidReport::Keyboard(
+                    Keyboard6KroReport::from_visible_state(
                         &bridge
                             .state()
                             .input
@@ -993,6 +1210,114 @@ mod tests {
                 reason: NotifyReason::Input,
             }]
         );
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    #[test]
+    fn wired_target_routes_exclusively_after_release_and_suppression() {
+        let mut bridge = ready_bridge();
+        let mut actions = heapless::Vec::<BridgeAction, 12>::new();
+
+        bridge
+            .handle_event(
+                BridgeEvent::InputFrame(InputFrame::Standard(keyboard_frame(&[0x04]))),
+                &mut actions,
+            )
+            .unwrap();
+        actions.clear();
+
+        bridge
+            .handle_event(
+                BridgeEvent::SelectOutputTarget {
+                    target: OutputTarget::Wired,
+                },
+                &mut actions,
+            )
+            .unwrap();
+        assert!(matches!(
+            actions.first(),
+            Some(BridgeAction::Notify {
+                target: OutputTarget::Ble(HOST_A),
+                report: StandardHidReport::Keyboard(report),
+                reason: NotifyReason::TargetSwitchRelease,
+            }) if report == &Keyboard6KroReport::release()
+        ));
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, BridgeAction::ActivateWired { operation_id: 2 }))
+        );
+        assert_eq!(bridge.state().output_target.active, None);
+
+        bridge
+            .handle_event(
+                BridgeEvent::WiredAvailabilityChanged {
+                    availability: OutputTargetAvailability::Ready,
+                },
+                &mut actions,
+            )
+            .unwrap();
+        assert_eq!(
+            bridge.state().output_target.active,
+            Some(OutputTarget::Wired)
+        );
+
+        bridge
+            .handle_event(
+                BridgeEvent::InputFrame(InputFrame::Standard(keyboard_frame(&[]))),
+                &mut actions,
+            )
+            .unwrap();
+        bridge
+            .handle_event(
+                BridgeEvent::InputFrame(InputFrame::Standard(keyboard_frame(&[0x05]))),
+                &mut actions,
+            )
+            .unwrap();
+        assert!(matches!(
+            actions.as_slice(),
+            [BridgeAction::Notify {
+                target: OutputTarget::Wired,
+                report: StandardHidReport::Keyboard(report),
+                reason: NotifyReason::Input,
+            }] if report.as_bytes()[2] == 0x05
+        ));
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    #[test]
+    fn unavailable_selected_target_never_fails_over() {
+        let mut bridge = ready_bridge();
+        let mut actions = heapless::Vec::<BridgeAction, 12>::new();
+        bridge
+            .handle_event(
+                BridgeEvent::SelectOutputTarget {
+                    target: OutputTarget::Wired,
+                },
+                &mut actions,
+            )
+            .unwrap();
+        actions.clear();
+
+        bridge
+            .handle_event(
+                BridgeEvent::WiredAvailabilityChanged {
+                    availability: OutputTargetAvailability::Unavailable,
+                },
+                &mut actions,
+            )
+            .unwrap();
+        actions.clear();
+        bridge
+            .handle_event(
+                BridgeEvent::InputFrame(InputFrame::Standard(keyboard_frame(&[0x04]))),
+                &mut actions,
+            )
+            .unwrap();
+
+        assert!(actions.is_empty());
+        assert_eq!(bridge.state().output_target.selected, OutputTarget::Wired);
+        assert_eq!(bridge.state().output_target.active, None);
     }
 
     #[test]
@@ -1033,7 +1358,7 @@ mod tests {
 
         assert!(matches!(
             actions.as_slice(),
-            [BridgeAction::BleNotify {
+            [BridgeAction::Notify {
                 reason: NotifyReason::InputRelease,
                 ..
             }]
@@ -1055,7 +1380,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             actions.as_slice(),
-            [BridgeAction::BleNotify {
+            [BridgeAction::Notify {
                 reason: NotifyReason::Input,
                 ..
             }]
@@ -1070,7 +1395,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             actions.as_slice(),
-            [BridgeAction::BleNotify {
+            [BridgeAction::Notify {
                 reason: NotifyReason::InputRelease,
                 ..
             }]
@@ -1100,7 +1425,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             actions.as_slice(),
-            [BridgeAction::BleNotify {
+            [BridgeAction::Notify {
                 reason: NotifyReason::InputRelease,
                 ..
             }]
@@ -1127,9 +1452,9 @@ mod tests {
 
         assert_eq!(
             actions.as_slice()[0],
-            BridgeAction::BleNotify {
-                host_id: HOST_A,
-                report: BleHidReport::Keyboard(BleKeyboard6KroReport::release()),
+            BridgeAction::Notify {
+                target: OutputTarget::Ble(HOST_A),
+                report: StandardHidReport::Keyboard(Keyboard6KroReport::release()),
                 reason: NotifyReason::TargetSwitchRelease,
             }
         );
@@ -1144,9 +1469,9 @@ mod tests {
 
         assert_eq!(
             actions.as_slice(),
-            &[BridgeAction::BleNotify {
-                host_id: HOST_B,
-                report: BleHidReport::Keyboard(BleKeyboard6KroReport::release()),
+            &[BridgeAction::Notify {
+                target: OutputTarget::Ble(HOST_B),
+                report: StandardHidReport::Keyboard(Keyboard6KroReport::release()),
                 reason: NotifyReason::Input,
             }]
         );
@@ -1168,9 +1493,9 @@ mod tests {
 
         assert_eq!(actions.len(), 1);
         match actions[0] {
-            BridgeAction::BleNotify {
-                host_id,
-                report: BleHidReport::Keyboard(report),
+            BridgeAction::Notify {
+                target: OutputTarget::Ble(host_id),
+                report: StandardHidReport::Keyboard(report),
                 reason,
             } => {
                 assert_eq!(host_id, HOST_B);
@@ -1204,9 +1529,9 @@ mod tests {
 
         assert_eq!(
             actions.as_slice()[0],
-            BridgeAction::BleNotify {
-                host_id: HOST_A,
-                report: BleHidReport::Mouse(BleMouseReport::release_buttons()),
+            BridgeAction::Notify {
+                target: OutputTarget::Ble(HOST_A),
+                report: StandardHidReport::Mouse(MouseReport::release_buttons()),
                 reason: NotifyReason::TargetSwitchRelease,
             }
         );
@@ -1229,9 +1554,9 @@ mod tests {
 
         assert_eq!(
             actions.as_slice(),
-            &[BridgeAction::BleNotify {
-                host_id: HOST_B,
-                report: BleHidReport::Mouse(BleMouseReport::from_frame(
+            &[BridgeAction::Notify {
+                target: OutputTarget::Ble(HOST_B),
+                report: StandardHidReport::Mouse(MouseReport::from_frame(
                     MouseButtons::empty(),
                     MouseMovement {
                         x: 4,
@@ -1267,9 +1592,9 @@ mod tests {
 
         assert_eq!(
             actions.as_slice(),
-            &[BridgeAction::BleNotify {
-                host_id: HOST_B,
-                report: BleHidReport::Mouse(BleMouseReport::from_frame(
+            &[BridgeAction::Notify {
+                target: OutputTarget::Ble(HOST_B),
+                report: StandardHidReport::Mouse(MouseReport::from_frame(
                     mouse_buttons(&[MouseButton::Left]),
                     MouseMovement::neutral()
                 )),
@@ -1298,9 +1623,9 @@ mod tests {
 
         assert_eq!(
             actions.as_slice()[0],
-            BridgeAction::BleNotify {
-                host_id: HOST_A,
-                report: BleHidReport::Consumer(BleConsumerReport::release()),
+            BridgeAction::Notify {
+                target: OutputTarget::Ble(HOST_A),
+                report: StandardHidReport::Consumer(ConsumerReport::release()),
                 reason: NotifyReason::TargetSwitchRelease,
             }
         );
@@ -1315,9 +1640,9 @@ mod tests {
 
         assert_eq!(
             actions.as_slice(),
-            &[BridgeAction::BleNotify {
-                host_id: HOST_B,
-                report: BleHidReport::Consumer(BleConsumerReport::release()),
+            &[BridgeAction::Notify {
+                target: OutputTarget::Ble(HOST_B),
+                report: StandardHidReport::Consumer(ConsumerReport::release()),
                 reason: NotifyReason::Input,
             }]
         );
@@ -1339,9 +1664,9 @@ mod tests {
 
         assert_eq!(
             actions.as_slice(),
-            &[BridgeAction::BleNotify {
-                host_id: HOST_B,
-                report: BleHidReport::Consumer(BleConsumerReport::from_usage(ConsumerUsage(
+            &[BridgeAction::Notify {
+                target: OutputTarget::Ble(HOST_B),
+                report: StandardHidReport::Consumer(ConsumerReport::from_usage(ConsumerUsage(
                     0x00e9
                 ))),
                 reason: NotifyReason::Input,
@@ -1404,19 +1729,19 @@ mod tests {
         assert_eq!(
             &actions.as_slice()[..3],
             &[
-                BridgeAction::BleNotify {
-                    host_id: HOST_A,
-                    report: BleHidReport::Keyboard(BleKeyboard6KroReport::release()),
+                BridgeAction::Notify {
+                    target: OutputTarget::Ble(HOST_A),
+                    report: StandardHidReport::Keyboard(Keyboard6KroReport::release()),
                     reason: NotifyReason::UsbDeviceRemovedRelease,
                 },
-                BridgeAction::BleNotify {
-                    host_id: HOST_A,
-                    report: BleHidReport::Mouse(BleMouseReport::release_buttons()),
+                BridgeAction::Notify {
+                    target: OutputTarget::Ble(HOST_A),
+                    report: StandardHidReport::Mouse(MouseReport::release_buttons()),
                     reason: NotifyReason::UsbDeviceRemovedRelease,
                 },
-                BridgeAction::BleNotify {
-                    host_id: HOST_A,
-                    report: BleHidReport::Consumer(BleConsumerReport::release()),
+                BridgeAction::Notify {
+                    target: OutputTarget::Ble(HOST_A),
+                    report: StandardHidReport::Consumer(ConsumerReport::release()),
                     reason: NotifyReason::UsbDeviceRemovedRelease,
                 },
             ]
@@ -1497,9 +1822,9 @@ mod tests {
 
         assert!(actions.iter().any(|action| matches!(
             action,
-            BridgeAction::BleNotify {
-                host_id: HOST_A,
-                report: BleHidReport::Keyboard(report),
+            BridgeAction::Notify {
+                target: OutputTarget::Ble(HOST_A),
+                report: StandardHidReport::Keyboard(report),
                 reason: NotifyReason::UsbDeviceRemovedRelease,
             } if report.as_bytes() == &[0x02, 0, 0x05, 0, 0, 0, 0, 0]
         )));
@@ -2085,8 +2410,8 @@ mod tests {
             )
             .unwrap();
         let first = match actions[0] {
-            BridgeAction::BleNotify {
-                report: BleHidReport::Keyboard(report),
+            BridgeAction::Notify {
+                report: StandardHidReport::Keyboard(report),
                 ..
             } => report,
             _ => panic!("expected keyboard notification"),
@@ -2102,8 +2427,8 @@ mod tests {
             )
             .unwrap();
         let after_release = match actions[0] {
-            BridgeAction::BleNotify {
-                report: BleHidReport::Keyboard(report),
+            BridgeAction::Notify {
+                report: StandardHidReport::Keyboard(report),
                 ..
             } => report,
             _ => panic!("expected keyboard notification"),

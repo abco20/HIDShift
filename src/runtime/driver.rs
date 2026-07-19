@@ -1,3 +1,5 @@
+#[cfg(feature = "dual-s3-wired")]
+use super::DeviceTaskCommand;
 use super::message::RuntimeInputMessage;
 use super::owner::{RuntimeOwner, RuntimeOwnerError};
 use super::{
@@ -18,6 +20,8 @@ pub trait RuntimeTaskSink {
     ) -> Result<(), (RuntimeTaskKind, Self::Error)>;
 
     fn send_ble(&mut self, command: BleTaskCommand) -> Result<(), Self::Error>;
+    #[cfg(feature = "dual-s3-wired")]
+    fn send_device(&mut self, command: DeviceTaskCommand) -> Result<(), Self::Error>;
     fn send_usb(&mut self, command: UsbTaskCommand) -> Result<(), Self::Error>;
     fn send_storage(&mut self, command: StorageTaskCommand) -> Result<(), Self::Error>;
     fn send_status(&mut self, command: StatusTaskCommand) -> Result<(), Self::Error>;
@@ -27,6 +31,8 @@ pub trait RuntimeTaskSink {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeTaskKind {
     Ble,
+    #[cfg(feature = "dual-s3-wired")]
+    Device,
     Usb,
     Storage,
     Status,
@@ -105,6 +111,14 @@ where
                 error,
             })?;
     }
+    #[cfg(feature = "dual-s3-wired")]
+    for command in queues.device.iter().copied() {
+        sink.send_device(command)
+            .map_err(|error| RuntimeDriverError::Sink {
+                task: RuntimeTaskKind::Device,
+                error,
+            })?;
+    }
     for command in queues.usb.iter().copied() {
         sink.send_usb(command)
             .map_err(|error| RuntimeDriverError::Sink {
@@ -168,6 +182,43 @@ mod tests {
                 report: BleHidReport::Keyboard(_),
                 reason: NotifyReason::Input,
             }
+        ));
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    #[test]
+    fn drive_runtime_message_routes_wired_input_only_to_device_sink() {
+        let mut owner = ready_owner();
+        let mut sink = RecordingSink::default();
+        for message in [
+            RuntimeInputMessage::BridgeEvent(BridgeEvent::SelectOutputTarget {
+                target: crate::output_target::OutputTarget::Wired,
+            }),
+            RuntimeInputMessage::BridgeEvent(BridgeEvent::WiredAvailabilityChanged {
+                availability: crate::output_target::OutputTargetAvailability::Ready,
+            }),
+        ] {
+            drive_runtime_message(&mut owner, &message, &mut sink).unwrap();
+        }
+        sink.ble.clear();
+        sink.device.clear();
+
+        drive_runtime_message(
+            &mut owner,
+            &RuntimeInputMessage::BridgeEvent(BridgeEvent::InputFrame(InputFrame::Standard(
+                keyboard_input(DeviceId(7), KeyUsage(0x04)),
+            ))),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert!(sink.ble.is_empty());
+        assert!(matches!(
+            sink.device.as_slice(),
+            [DeviceTaskCommand::StandardReport {
+                report: crate::reports::StandardHidReport::Keyboard(report),
+                reason: NotifyReason::Input,
+            }] if report.as_bytes()[2] == 0x04
         ));
     }
 
@@ -310,6 +361,8 @@ mod tests {
     #[derive(Default)]
     struct RecordingSink {
         ble: heapless::Vec<BleTaskCommand, 8>,
+        #[cfg(feature = "dual-s3-wired")]
+        device: heapless::Vec<DeviceTaskCommand, 8>,
         usb: heapless::Vec<UsbTaskCommand, 8>,
         storage: heapless::Vec<StorageTaskCommand, 8>,
         status: heapless::Vec<StatusTaskCommand, 8>,
@@ -331,6 +384,8 @@ mod tests {
         ) -> Result<(), (RuntimeTaskKind, Self::Error)> {
             let rejected = match self.fail_task {
                 Some(RuntimeTaskKind::Ble) => !queues.ble.is_empty(),
+                #[cfg(feature = "dual-s3-wired")]
+                Some(RuntimeTaskKind::Device) => !queues.device.is_empty(),
                 Some(RuntimeTaskKind::Usb) => !queues.usb.is_empty(),
                 Some(RuntimeTaskKind::Storage) => !queues.storage.is_empty(),
                 Some(RuntimeTaskKind::Status) => !queues.status.is_empty(),
@@ -348,6 +403,15 @@ mod tests {
                 return Err(SinkError::Rejected);
             }
             self.ble.push(command).unwrap();
+            Ok(())
+        }
+
+        #[cfg(feature = "dual-s3-wired")]
+        fn send_device(&mut self, command: DeviceTaskCommand) -> Result<(), Self::Error> {
+            if self.fail_task == Some(RuntimeTaskKind::Device) {
+                return Err(SinkError::Rejected);
+            }
+            self.device.push(command).unwrap();
             Ok(())
         }
 

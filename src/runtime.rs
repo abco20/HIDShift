@@ -8,6 +8,9 @@ use crate::management::{
     ManagementSchema, ManagementSetting, ManagementStatus, ManagementUsbDevice,
     ManagementUsbStatus,
 };
+use crate::output_target::OutputTarget;
+#[cfg(feature = "dual-s3-wired")]
+use crate::reports::StandardHidReport;
 use crate::reports::{BleConsumerReport, BleHidReport, BleKeyboard6KroReport, BleMouseReport};
 use crate::settings::{
     GlobalSettings, HostSettings, SETTING_COUNT, SETTINGS_SCHEMA_HASH, SETTINGS_SCHEMA_VERSION,
@@ -47,6 +50,8 @@ pub const RUNTIME_BLE_COMMAND_QUEUE_CAPACITY: usize = RUNTIME_COMMAND_CAPACITY;
 pub const RUNTIME_BLE_CONTROL_COMMAND_QUEUE_CAPACITY: usize = RUNTIME_COMMAND_CAPACITY;
 pub const RUNTIME_BLE_NOTIFY_COMMAND_QUEUE_CAPACITY: usize = RUNTIME_COMMAND_CAPACITY;
 pub const RUNTIME_USB_COMMAND_QUEUE_CAPACITY: usize = RUNTIME_COMMAND_CAPACITY;
+#[cfg(feature = "dual-s3-wired")]
+pub const RUNTIME_DEVICE_COMMAND_QUEUE_CAPACITY: usize = RUNTIME_COMMAND_CAPACITY;
 pub const RUNTIME_STORAGE_COMMAND_QUEUE_CAPACITY: usize = RUNTIME_COMMAND_CAPACITY;
 pub const RUNTIME_STATUS_COMMAND_QUEUE_CAPACITY: usize = RUNTIME_COMMAND_CAPACITY;
 
@@ -444,6 +449,7 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         }
     }
 
+    #[cfg(not(feature = "dual-s3-wired"))]
     pub(crate) fn handle_realtime_input_frame_in_place<const BLE: usize>(
         &mut self,
         frame: crate::input::InputFrame,
@@ -468,21 +474,107 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         self.bridge
             .handle_event_in_place(BridgeEvent::InputFrame(frame), &mut actions)?;
         for action in actions {
-            let BridgeAction::BleNotify {
-                host_id,
+            let BridgeAction::Notify {
+                target: OutputTarget::Ble(host_id),
                 report,
                 reason,
             } = action
             else {
                 return Err(RuntimeError::UnexpectedRealtimeAction);
             };
-            let report = self.apply_host_report_settings(host_id, report);
+            let report = self.apply_host_report_settings(host_id, report.into());
             ble.push(BleTaskCommand::Notify {
                 host_id,
                 report,
                 reason,
             })
             .map_err(|_| RuntimeError::CommandCapacity)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    pub(crate) fn handle_realtime_input_frame_in_place<const BLE: usize, const DEVICE: usize>(
+        &mut self,
+        frame: crate::input::InputFrame,
+        ble: &mut heapless::Vec<BleTaskCommand, BLE>,
+        device: &mut heapless::Vec<DeviceTaskCommand, DEVICE>,
+    ) -> Result<(), RuntimeError> {
+        let maximum_reports = match &frame {
+            crate::input::InputFrame::Standard(frame) => {
+                usize::from(frame.keyboard.is_some())
+                    + usize::from(frame.mouse.is_some())
+                    + usize::from(frame.consumer.is_some())
+            }
+            crate::input::InputFrame::Vendor(_) => 0,
+        };
+        match self.bridge.state().output_target.active {
+            Some(OutputTarget::Ble(_)) if BLE.saturating_sub(ble.len()) < maximum_reports => {
+                return Err(RuntimeError::CommandCapacity);
+            }
+            Some(OutputTarget::Wired) if DEVICE.saturating_sub(device.len()) < maximum_reports => {
+                return Err(RuntimeError::CommandCapacity);
+            }
+            _ => {}
+        }
+
+        let mut actions = heapless::Vec::<BridgeAction, 3>::new();
+        self.bridge
+            .handle_event_in_place(BridgeEvent::InputFrame(frame), &mut actions)?;
+
+        let ble_required = actions
+            .iter()
+            .filter(|action| {
+                matches!(
+                    action,
+                    BridgeAction::Notify {
+                        target: OutputTarget::Ble(_),
+                        ..
+                    }
+                )
+            })
+            .count();
+        let device_required = actions
+            .iter()
+            .filter(|action| {
+                matches!(
+                    action,
+                    BridgeAction::Notify {
+                        target: OutputTarget::Wired,
+                        ..
+                    }
+                )
+            })
+            .count();
+        if BLE.saturating_sub(ble.len()) < ble_required
+            || DEVICE.saturating_sub(device.len()) < device_required
+        {
+            return Err(RuntimeError::CommandCapacity);
+        }
+
+        for action in actions {
+            let BridgeAction::Notify {
+                target,
+                report,
+                reason,
+            } = action
+            else {
+                return Err(RuntimeError::UnexpectedRealtimeAction);
+            };
+            match target {
+                OutputTarget::Ble(host_id) => {
+                    let report = self.apply_host_report_settings(host_id, report.into());
+                    ble.push(BleTaskCommand::Notify {
+                        host_id,
+                        report,
+                        reason,
+                    })
+                    .map_err(|_| RuntimeError::CommandCapacity)?;
+                }
+                OutputTarget::Wired => device
+                    .push(DeviceTaskCommand::StandardReport { report, reason })
+                    .map_err(|_| RuntimeError::CommandCapacity)?,
+            }
         }
         Ok(())
     }
@@ -1320,21 +1412,40 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         commands: &mut heapless::Vec<RuntimeCommand, COMMANDS>,
     ) -> Result<(), RuntimeError> {
         match action {
-            BridgeAction::BleNotify {
-                host_id,
+            BridgeAction::Notify {
+                target,
                 report,
                 reason,
-            } => {
-                let report = self.apply_host_report_settings(host_id, report);
-                push_command(
-                    commands,
-                    RuntimeCommand::BleCommand(BleTaskCommand::Notify {
-                        host_id,
-                        report,
-                        reason,
-                    }),
-                )
-            }
+            } => match target {
+                OutputTarget::Ble(host_id) => {
+                    let report = self.apply_host_report_settings(host_id, report.into());
+                    push_command(
+                        commands,
+                        RuntimeCommand::BleCommand(BleTaskCommand::Notify {
+                            host_id,
+                            report,
+                            reason,
+                        }),
+                    )
+                }
+                OutputTarget::Wired => {
+                    #[cfg(feature = "dual-s3-wired")]
+                    {
+                        push_command(
+                            commands,
+                            RuntimeCommand::DeviceCommand(DeviceTaskCommand::StandardReport {
+                                report,
+                                reason,
+                            }),
+                        )
+                    }
+                    #[cfg(not(feature = "dual-s3-wired"))]
+                    {
+                        let _ = (report, reason);
+                        Err(RuntimeError::WiredFeatureDisabled)
+                    }
+                }
+            },
             BridgeAction::AllowPairing { host_id } => push_command(
                 commands,
                 RuntimeCommand::BleCommand(BleTaskCommand::AllowPairing { host_id }),
@@ -1350,6 +1461,11 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             BridgeAction::ActivateInput { host_id } => push_command(
                 commands,
                 RuntimeCommand::BleCommand(BleTaskCommand::ActivateInput { host_id }),
+            ),
+            #[cfg(feature = "dual-s3-wired")]
+            BridgeAction::ActivateWired { operation_id } => push_command(
+                commands,
+                RuntimeCommand::DeviceCommand(DeviceTaskCommand::ActivateFallback { operation_id }),
             ),
             BridgeAction::UsbSetKeyboardLeds {
                 interface_id,
@@ -1673,6 +1789,8 @@ struct PendingTargetSwitch {
 #[allow(clippy::large_enum_variant)]
 pub enum RuntimeCommand {
     BleCommand(BleTaskCommand),
+    #[cfg(feature = "dual-s3-wired")]
+    DeviceCommand(DeviceTaskCommand),
     UsbKeyboardLedWrite {
         interface_id: InterfaceId,
         device_id: DeviceId,
@@ -1732,6 +1850,36 @@ pub enum BleTaskCommand {
         host_id: HostId,
         response: ManagementResponse,
     },
+}
+
+#[cfg(feature = "dual-s3-wired")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeviceTaskCommand {
+    StandardReport {
+        report: StandardHidReport,
+        reason: NotifyReason,
+    },
+    ReleaseAll,
+    ActivateFallback {
+        operation_id: u32,
+    },
+}
+
+#[cfg(feature = "dual-s3-wired")]
+impl DeviceTaskCommand {
+    pub const fn class(self) -> CommandClass {
+        match self {
+            Self::StandardReport { reason, .. } => match reason {
+                NotifyReason::Input => CommandClass::Realtime,
+                NotifyReason::InputEdge
+                | NotifyReason::InputRelease
+                | NotifyReason::TargetSwitchRelease
+                | NotifyReason::UsbDeviceRemovedRelease
+                | NotifyReason::SafetyRelease => CommandClass::Critical,
+            },
+            Self::ReleaseAll | Self::ActivateFallback { .. } => CommandClass::Critical,
+        }
+    }
 }
 
 impl BleTaskCommand {
@@ -1836,6 +1984,8 @@ pub struct ManagementTaskResponse {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeDispatchError {
     BleQueueCapacity,
+    #[cfg(feature = "dual-s3-wired")]
+    DeviceQueueCapacity,
     UsbQueueCapacity,
     StorageQueueCapacity,
     StatusQueueCapacity,
@@ -1850,6 +2000,8 @@ pub struct RuntimeCommandQueues<
     const STATUS: usize,
 > {
     pub ble: heapless::Vec<BleTaskCommand, BLE>,
+    #[cfg(feature = "dual-s3-wired")]
+    pub device: heapless::Vec<DeviceTaskCommand, RUNTIME_DEVICE_COMMAND_QUEUE_CAPACITY>,
     pub usb: heapless::Vec<UsbTaskCommand, USB>,
     pub storage: heapless::Vec<StorageTaskCommand, STORAGE>,
     pub status: heapless::Vec<StatusTaskCommand, STATUS>,
@@ -1862,6 +2014,8 @@ impl<const BLE: usize, const USB: usize, const STORAGE: usize, const STATUS: usi
     pub const fn new() -> Self {
         Self {
             ble: heapless::Vec::new(),
+            #[cfg(feature = "dual-s3-wired")]
+            device: heapless::Vec::new(),
             usb: heapless::Vec::new(),
             storage: heapless::Vec::new(),
             status: heapless::Vec::new(),
@@ -1871,6 +2025,8 @@ impl<const BLE: usize, const USB: usize, const STORAGE: usize, const STATUS: usi
 
     pub fn clear(&mut self) {
         self.ble.clear();
+        #[cfg(feature = "dual-s3-wired")]
+        self.device.clear();
         self.usb.clear();
         self.storage.clear();
         self.status.clear();
@@ -1894,6 +2050,8 @@ impl<const BLE: usize, const USB: usize, const STORAGE: usize, const STATUS: usi
 
     fn validate_capacity(&self, commands: &[RuntimeCommand]) -> Result<(), RuntimeDispatchError> {
         let mut ble = 0usize;
+        #[cfg(feature = "dual-s3-wired")]
+        let mut device = 0usize;
         let mut usb = 0usize;
         let mut storage = 0usize;
         let mut status = 0usize;
@@ -1901,6 +2059,8 @@ impl<const BLE: usize, const USB: usize, const STORAGE: usize, const STATUS: usi
         for command in commands {
             match command {
                 RuntimeCommand::BleCommand(_) => ble += 1,
+                #[cfg(feature = "dual-s3-wired")]
+                RuntimeCommand::DeviceCommand(_) => device += 1,
                 RuntimeCommand::UsbKeyboardLedWrite { .. } => usb += 1,
                 RuntimeCommand::PersistStorage { .. } => storage += 1,
                 RuntimeCommand::StatusChanged(_) | RuntimeCommand::ManagementResponse { .. } => {
@@ -1911,6 +2071,10 @@ impl<const BLE: usize, const USB: usize, const STORAGE: usize, const STATUS: usi
         }
         if ble > BLE {
             return Err(RuntimeDispatchError::BleQueueCapacity);
+        }
+        #[cfg(feature = "dual-s3-wired")]
+        if device > RUNTIME_DEVICE_COMMAND_QUEUE_CAPACITY {
+            return Err(RuntimeDispatchError::DeviceQueueCapacity);
         }
         if usb > USB {
             return Err(RuntimeDispatchError::UsbQueueCapacity);
@@ -1933,6 +2097,11 @@ impl<const BLE: usize, const USB: usize, const STORAGE: usize, const STATUS: usi
                 .ble
                 .push(*command)
                 .map_err(|_| RuntimeDispatchError::BleQueueCapacity),
+            #[cfg(feature = "dual-s3-wired")]
+            RuntimeCommand::DeviceCommand(command) => self
+                .device
+                .push(*command)
+                .map_err(|_| RuntimeDispatchError::DeviceQueueCapacity),
             RuntimeCommand::UsbKeyboardLedWrite {
                 interface_id,
                 device_id,
@@ -2020,6 +2189,7 @@ pub enum RuntimeError {
     UsbHidInterfaceNotRegistered { interface_id: InterfaceId },
     CommandCapacity,
     UnexpectedRealtimeAction,
+    WiredFeatureDisabled,
 }
 
 impl From<BridgeError> for RuntimeError {

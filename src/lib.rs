@@ -37,7 +37,6 @@ pub mod ids;
 pub mod input;
 pub mod management;
 pub mod mouse_accumulator;
-#[cfg(feature = "dual-s3-wired")]
 pub mod output_target;
 pub mod reports;
 pub mod routing;
@@ -91,7 +90,6 @@ pub use management::{
     ManagementSchema, ManagementSetting, ManagementStatus, ManagementUsbDevice,
     ManagementUsbStatus,
 };
-#[cfg(feature = "dual-s3-wired")]
 pub use output_target::{
     MirrorCandidateId, MirrorConfiguration, OutputTarget, OutputTargetAvailability,
     OutputTargetState, StoredMirrorTarget, StoredOutputTarget, StoredPresentationConfig,
@@ -131,6 +129,8 @@ pub use runtime::{
     },
     owner::{DefaultRuntimeOwner, RuntimeOwner, RuntimeOwnerError},
 };
+#[cfg(feature = "dual-s3-wired")]
+pub use runtime::{DeviceTaskCommand, RUNTIME_DEVICE_COMMAND_QUEUE_CAPACITY};
 pub use settings::{
     GlobalSettings, HostSettings, SETTING_COUNT, SETTING_DESCRIPTORS, SETTINGS_SCHEMA_HASH,
     SETTINGS_SCHEMA_VERSION, SettingChoice, SettingDescriptor, SettingId, SettingScope,

@@ -32,6 +32,8 @@ use hidshift::runtime::{
     RUNTIME_USB_COMMAND_QUEUE_CAPACITY, RuntimeDiagnosticsEvent, StatusTaskCommand,
     StorageTaskCommand, UsbTaskCommand,
 };
+#[cfg(feature = "dual-s3-wired")]
+use hidshift::runtime::{DeviceTaskCommand, RUNTIME_DEVICE_COMMAND_QUEUE_CAPACITY};
 use hidshift::storage::StorageState;
 use platform as esp32s3_platform;
 use static_cell::{ConstStaticCell, StaticCell};
@@ -59,6 +61,12 @@ static USB_COMMAND_CHANNEL: Channel<
     CriticalSectionRawMutex,
     UsbTaskCommand,
     RUNTIME_USB_COMMAND_QUEUE_CAPACITY,
+> = Channel::new();
+#[cfg(feature = "dual-s3-wired")]
+static DEVICE_COMMAND_CHANNEL: Channel<
+    CriticalSectionRawMutex,
+    DeviceTaskCommand,
+    RUNTIME_DEVICE_COMMAND_QUEUE_CAPACITY,
 > = Channel::new();
 static STORAGE_COMMAND_CHANNEL: Channel<
     CriticalSectionRawMutex,
@@ -203,6 +211,8 @@ async fn startup_task(
     let storage_sender = RUNTIME_INPUT_CHANNEL.sender();
     let usb_input_sender = RUNTIME_INPUT_CHANNEL.sender();
     let usb_receiver = USB_COMMAND_CHANNEL.receiver();
+    #[cfg(feature = "dual-s3-wired")]
+    let device_receiver = DEVICE_COMMAND_CHANNEL.receiver();
     let ble_control_receiver = BLE_CONTROL_COMMAND_CHANNEL.receiver();
     let ble_notify_receiver = BLE_NOTIFY_COMMAND_CHANNEL.receiver();
     let ble_input_sender = RUNTIME_INPUT_CHANNEL.sender();
@@ -211,6 +221,8 @@ async fn startup_task(
         ble_control: BLE_CONTROL_COMMAND_CHANNEL.sender(),
         ble_notify: BLE_NOTIFY_COMMAND_CHANNEL.sender(),
         usb: USB_COMMAND_CHANNEL.sender(),
+        #[cfg(feature = "dual-s3-wired")]
+        device: DEVICE_COMMAND_CHANNEL.sender(),
         storage: STORAGE_COMMAND_CHANNEL.sender(),
         status: STATUS_COMMAND_CHANNEL.sender(),
         mouse: MouseReportAccumulator::new(),
@@ -313,7 +325,35 @@ async fn startup_task(
         ),
         "status-command",
     );
+    #[cfg(feature = "dual-s3-wired")]
+    spawn_or_reset(
+        &spawner,
+        device_command_task(device_receiver),
+        "device-command",
+    );
     core::future::pending::<()>().await;
+}
+
+#[cfg(feature = "dual-s3-wired")]
+#[embassy_executor::task]
+async fn device_command_task(
+    receiver: Receiver<
+        'static,
+        CriticalSectionRawMutex,
+        DeviceTaskCommand,
+        RUNTIME_DEVICE_COMMAND_QUEUE_CAPACITY,
+    >,
+) {
+    loop {
+        let command = receiver.receive().await;
+        // The queue is deliberately live before the SPI transport lands so
+        // the feature build preserves bounded backpressure and never routes a
+        // wired command into a BLE or USB-host queue.
+        log::debug!(
+            "firmware: device command pending SPI transport {:?}",
+            command
+        );
+    }
 }
 
 #[embassy_executor::task]
@@ -522,6 +562,13 @@ struct ChannelTaskSink {
         UsbTaskCommand,
         RUNTIME_USB_COMMAND_QUEUE_CAPACITY,
     >,
+    #[cfg(feature = "dual-s3-wired")]
+    device: Sender<
+        'static,
+        CriticalSectionRawMutex,
+        DeviceTaskCommand,
+        RUNTIME_DEVICE_COMMAND_QUEUE_CAPACITY,
+    >,
     storage: Sender<
         'static,
         CriticalSectionRawMutex,
@@ -565,6 +612,10 @@ impl ChannelTaskSink {
                 // executor can begin the GATT notification immediately.
                 embassy_futures::yield_now().await;
             }
+        }
+        #[cfg(feature = "dual-s3-wired")]
+        for command in queues.device.iter().copied() {
+            self.device.send(command).await;
         }
         for command in queues.usb.iter().copied() {
             self.send_usb_with_policy(command).await?;
@@ -616,6 +667,10 @@ impl ChannelTaskSink {
         }
         if self.storage.free_capacity() < queues.storage.len() {
             return Err(ChannelTaskSendError::StorageQueueFull);
+        }
+        #[cfg(feature = "dual-s3-wired")]
+        if self.device.free_capacity() < queues.device.len() {
+            return Err(ChannelTaskSendError::DeviceQueueFull);
         }
         let required_status = queues
             .status
@@ -867,6 +922,10 @@ impl RuntimeTaskSink for ChannelTaskSink {
                 ChannelTaskSendError::BleQueueFull => {
                     hidshift::runtime::driver::RuntimeTaskKind::Ble
                 }
+                #[cfg(feature = "dual-s3-wired")]
+                ChannelTaskSendError::DeviceQueueFull => {
+                    hidshift::runtime::driver::RuntimeTaskKind::Device
+                }
                 ChannelTaskSendError::UsbQueueFull => {
                     hidshift::runtime::driver::RuntimeTaskKind::Usb
                 }
@@ -892,6 +951,13 @@ impl RuntimeTaskSink for ChannelTaskSink {
                 .try_send(command)
                 .map_err(ChannelTaskSendError::from),
         }
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    fn send_device(&mut self, command: DeviceTaskCommand) -> Result<(), Self::Error> {
+        self.device
+            .try_send(command)
+            .map_err(ChannelTaskSendError::from)
     }
 
     fn send_usb(&mut self, command: UsbTaskCommand) -> Result<(), Self::Error> {
@@ -934,9 +1000,18 @@ fn apply_runtime_effect(effect: hidshift::runtime::RuntimeEffect) {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ChannelTaskSendError {
     BleQueueFull,
+    #[cfg(feature = "dual-s3-wired")]
+    DeviceQueueFull,
     UsbQueueFull,
     StorageQueueFull,
     StatusQueueFull,
+}
+
+#[cfg(feature = "dual-s3-wired")]
+impl From<TrySendError<DeviceTaskCommand>> for ChannelTaskSendError {
+    fn from(_: TrySendError<DeviceTaskCommand>) -> Self {
+        Self::DeviceQueueFull
+    }
 }
 
 impl From<TrySendError<BleTaskCommand>> for ChannelTaskSendError {
