@@ -47,9 +47,10 @@ impl BrowserClient {
     }
 
     pub fn receive(&self, bytes: &[u8]) {
-        let accepted = self.protocol.borrow_mut().accept(bytes);
+        let accepted = self.protocol.borrow_mut().accept_notification(bytes);
         let response = match accepted {
-            Ok(response) => Ok(response),
+            Ok(Some(response)) => Ok(response),
+            Ok(None) => return,
             Err(error) => {
                 if !self.protocol.borrow().is_pending() {
                     return;
@@ -108,9 +109,46 @@ impl BrowserClient {
 #[cfg(test)]
 mod tests {
     use futures_util::FutureExt;
-    use hidshift::ManagementCommand;
+    use hidshift::{
+        MANAGEMENT_RESPONSE_LEN, ManagementCommand, ManagementResponsePayload, ManagementResult,
+        ManagementStatus,
+    };
 
     use super::*;
+
+    fn response(request_id: u8) -> [u8; MANAGEMENT_RESPONSE_LEN] {
+        ManagementResponse {
+            request_id,
+            result: ManagementResult::Ok,
+            payload: ManagementResponsePayload::Status(ManagementStatus::empty(4)),
+        }
+        .encode()
+    }
+
+    #[test]
+    fn stale_notification_does_not_fail_the_pending_request() {
+        let client = BrowserClient::new();
+        client
+            .protocol
+            .borrow_mut()
+            .begin(ManagementCommand::GetStatus)
+            .unwrap();
+        let (sender, receiver) = oneshot::channel();
+        *client.response_sender.borrow_mut() = Some(sender);
+
+        client.receive(&response(255));
+
+        assert!(client.protocol.borrow().is_pending());
+        assert!(client.response_sender.borrow().is_some());
+
+        client.receive(&response(0));
+
+        assert!(matches!(
+            receiver.now_or_never(),
+            Some(Ok(Ok(ManagementResponse { request_id: 0, .. })))
+        ));
+        assert!(!client.protocol.borrow().is_pending());
+    }
 
     #[test]
     fn malformed_response_fails_pending_request_instead_of_timing_out() {
@@ -123,7 +161,9 @@ mod tests {
         let (sender, receiver) = oneshot::channel();
         *client.response_sender.borrow_mut() = Some(sender);
 
-        client.receive(&[0xff; 20]);
+        let mut malformed_current = [0xff; 20];
+        malformed_current[1] = 0;
+        client.receive(&malformed_current);
 
         assert!(matches!(
             receiver.now_or_never(),

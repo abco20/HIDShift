@@ -82,6 +82,26 @@ impl ManagementClient {
         Ok(response)
     }
 
+    /// Accepts an asynchronous transport notification when it belongs to the
+    /// in-flight request. Notifications for another request ID are stale or
+    /// unsolicited and leave the current request pending.
+    pub fn accept_notification(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<Option<ManagementResponse>, ClientError> {
+        let pending = self.pending.ok_or(ClientError::NoPendingRequest)?;
+        if bytes
+            .get(1)
+            .copied()
+            .is_some_and(|request_id| request_id != pending.request().request_id)
+        {
+            return Ok(None);
+        }
+        let response = pending.accept(bytes)?;
+        self.pending = None;
+        Ok(Some(response))
+    }
+
     pub fn cancel(&mut self) -> Option<PendingRequest> {
         self.pending.take()
     }
@@ -232,6 +252,22 @@ mod tests {
         );
         assert!(client.is_pending());
         assert!(client.accept(&response(7)).is_ok());
+    }
+
+    #[test]
+    fn stale_notification_is_ignored_until_the_expected_response_arrives() {
+        let mut client = ManagementClient::new(7);
+        client.begin(ManagementCommand::GetStatus).unwrap();
+
+        let mut malformed_stale = [0xff; MANAGEMENT_RESPONSE_LEN];
+        malformed_stale[1] = 6;
+        assert_eq!(client.accept_notification(&malformed_stale), Ok(None));
+        assert!(client.is_pending());
+        assert_eq!(
+            client.accept_notification(&response(7)),
+            Ok(Some(ManagementResponse::decode(&response(7)).unwrap()))
+        );
+        assert!(!client.is_pending());
     }
 
     #[test]
