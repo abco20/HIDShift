@@ -75,19 +75,25 @@ pub async fn storage_command_task(
                 .await;
         }
     } else {
+        let state = StorageState::new(0);
+        let initial_pairing_host = initial_pairing_host(&state, HostId(1));
+        let state = storage_with_default_target(&state, HostId(1));
+        #[cfg(not(feature = "dual-s3-wired"))]
         log::info!("firmware: storage empty; restoring default active target host=1");
-        let mut state = StorageState::new(0);
-        state.last_active_host = Some(HostId(1));
+        #[cfg(feature = "dual-s3-wired")]
+        log::info!("firmware: storage empty; restoring default wired target");
         runtime_input
             .send(RuntimeInputMessage::RestoreStorage(state))
             .await;
-        log::info!("firmware: storage empty; opening initial pairing host=1");
-        runtime_input
-            .send(RuntimeInputMessage::ButtonIntent {
-                intent: ButtonIntent::EnterPairingMode,
-                now_ms: Instant::now().as_millis(),
-            })
-            .await;
+        if initial_pairing_host.is_some() {
+            log::info!("firmware: storage empty; opening initial pairing host=1");
+            runtime_input
+                .send(RuntimeInputMessage::ButtonIntent {
+                    intent: ButtonIntent::EnterPairingMode,
+                    now_ms: Instant::now().as_millis(),
+                })
+                .await;
+        }
     }
     loop {
         let now_ms = Instant::now().as_millis();

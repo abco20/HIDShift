@@ -9,9 +9,9 @@ use clap::{ArgGroup, Parser, Subcommand};
 use futures_util::StreamExt;
 use hidshift::{
     MANAGEMENT_REQUEST_UUID, MANAGEMENT_RESPONSE_LEN, MANAGEMENT_RESPONSE_UUID,
-    MANAGEMENT_SERVICE_UUID, ManagementCommand, ManagementHostStatus, ManagementResponse,
-    ManagementResponsePayload, ManagementResult, SETTING_DESCRIPTORS, SettingScope, SettingTarget,
-    setting_by_key,
+    MANAGEMENT_SERVICE_UUID, ManagementCommand, ManagementHostStatus, ManagementOutputTarget,
+    ManagementResponse, ManagementResponsePayload, ManagementResult, SETTING_DESCRIPTORS,
+    SettingScope, SettingTarget, setting_by_key,
 };
 use hidshift_client::{
     ManagementClient, PendingRequest, SerialResponseDecoder, encode_serial_request,
@@ -90,6 +90,11 @@ enum CommandArgs {
         #[arg(value_parser = clap::value_parser!(u8).range(1..=4))]
         slot: u8,
     },
+    /// USBまたはBLEの出力先を選択・確認
+    Target {
+        #[command(subcommand)]
+        command: TargetArgs,
+    },
     /// 新しいPCやスマートフォンのペアリングを開始
     Pair {
         #[arg(value_parser = clap::value_parser!(u8).range(1..=4))]
@@ -123,6 +128,19 @@ enum CommandArgs {
         #[command(subcommand)]
         command: SettingsArgs,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum TargetArgs {
+    /// Device S3経由のWired USBを選択
+    Usb,
+    /// BLE Host slotを選択
+    Ble {
+        #[arg(value_parser = clap::value_parser!(u8).range(1..=4))]
+        slot: u8,
+    },
+    /// 選択中・稼働中の出力先とReady状態を表示
+    Status,
 }
 
 #[derive(Debug, Subcommand)]
@@ -494,7 +512,30 @@ fn print_response(response: ManagementResponse) {
             device.flags,
             String::from_utf8_lossy(device.name_chunk())
         ),
+        ManagementResponsePayload::OutputTargetStatus(status) => {
+            println!("selected: {}", display_output_target(status.selected));
+            println!(
+                "active:   {}",
+                status
+                    .active
+                    .map(display_output_target)
+                    .unwrap_or_else(|| "none".to_owned())
+            );
+            println!("state:    {:?}", status.availability);
+            println!("wired:   {}", if status.wired_ready { "ready" } else { "not ready" });
+            println!("ble ready mask: 0x{:02x}", status.ready_ble_mask);
+            println!("presentation: {:?}", status.effective_presentation);
+            println!("mirror configured: {}", status.mirror_configured);
+            println!("operation: {}", status.operation_id);
+        }
         ManagementResponsePayload::None => {}
+    }
+}
+
+fn display_output_target(target: ManagementOutputTarget) -> String {
+    match target {
+        ManagementOutputTarget::Wired => "usb".to_owned(),
+        ManagementOutputTarget::Ble(host_id) => format!("ble {}", host_id.0),
     }
 }
 
@@ -909,6 +950,19 @@ where
         CommandArgs::Select { slot } => {
             CliCommand::Request(ManagementCommand::SelectHost(hidshift::HostId(slot)))
         }
+        CommandArgs::Target { command } => match command {
+            TargetArgs::Usb => CliCommand::Request(ManagementCommand::SelectOutputTarget(
+                ManagementOutputTarget::Wired,
+            )),
+            TargetArgs::Ble { slot } => CliCommand::Request(
+                ManagementCommand::SelectOutputTarget(ManagementOutputTarget::Ble(
+                    hidshift::HostId(slot),
+                )),
+            ),
+            TargetArgs::Status => {
+                CliCommand::Request(ManagementCommand::GetOutputTargetStatus)
+            }
+        },
         CommandArgs::Pair { slot } => {
             CliCommand::Request(ManagementCommand::StartPairing(hidshift::HostId(slot)))
         }
@@ -975,6 +1029,32 @@ mod tests {
                     name: hidshift::ManagementHostName::from_ascii("Work PC").unwrap(),
                 }),
             }
+        );
+    }
+
+    #[test]
+    fn parses_wired_and_ble_output_target_commands() {
+        assert_eq!(
+            parse_arguments(["--serial", "/dev/ttyACM0", "target", "usb"].map(str::to_owned))
+                .unwrap()
+                .command,
+            CliCommand::Request(ManagementCommand::SelectOutputTarget(
+                ManagementOutputTarget::Wired
+            ))
+        );
+        assert_eq!(
+            parse_arguments(["--ble", "target", "ble", "4"].map(str::to_owned))
+                .unwrap()
+                .command,
+            CliCommand::Request(ManagementCommand::SelectOutputTarget(
+                ManagementOutputTarget::Ble(hidshift::HostId(4))
+            ))
+        );
+        assert_eq!(
+            parse_arguments(["--ble", "target", "status"].map(str::to_owned))
+                .unwrap()
+                .command,
+            CliCommand::Request(ManagementCommand::GetOutputTargetStatus)
         );
     }
 

@@ -95,6 +95,10 @@ pub use management::{
     ManagementSchema, ManagementSetting, ManagementStatus, ManagementUsbDevice,
     ManagementUsbStatus,
 };
+#[cfg(feature = "dual-s3-wired")]
+pub use management::{
+    ManagementOutputTarget, ManagementOutputTargetStatus, ManagementUsbPresentationKind,
+};
 pub use output_target::{
     MirrorCandidateId, MirrorConfiguration, OutputTarget, OutputTargetAvailability,
     OutputTargetState, StoredMirrorTarget, StoredOutputTarget, StoredPresentationConfig,

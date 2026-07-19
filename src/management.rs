@@ -1,4 +1,6 @@
 use crate::ids::HostId;
+#[cfg(feature = "dual-s3-wired")]
+use crate::output_target::{OutputTarget, OutputTargetAvailability, UsbPresentation};
 use crate::settings::{SettingId, SettingTarget};
 
 pub const MANAGEMENT_PROTOCOL_VERSION: u8 = 1;
@@ -24,6 +26,10 @@ const OP_GET_SCHEMA: u8 = 0x0b;
 const OP_GET_SETTING: u8 = 0x0c;
 const OP_SET_SETTING: u8 = 0x0d;
 const OP_GET_HOST_TIMING: u8 = 0x0e;
+#[cfg(feature = "dual-s3-wired")]
+const OP_SELECT_OUTPUT_TARGET: u8 = 0x0f;
+#[cfg(feature = "dual-s3-wired")]
+const OP_GET_OUTPUT_TARGET_STATUS: u8 = 0x10;
 
 const PAYLOAD_NONE: u8 = 0;
 const PAYLOAD_STATUS: u8 = 1;
@@ -34,6 +40,8 @@ const PAYLOAD_HISTORY: u8 = 5;
 const PAYLOAD_SCHEMA: u8 = 6;
 const PAYLOAD_SETTING: u8 = 7;
 const PAYLOAD_HOST_TIMING: u8 = 8;
+#[cfg(feature = "dual-s3-wired")]
+const PAYLOAD_OUTPUT_TARGET_STATUS: u8 = 9;
 const STATUS_PAYLOAD_LEN: u8 = 10;
 const HOST_INFO_PAYLOAD_LEN: u8 = 15;
 const USB_DEVICE_PAYLOAD_LEN: u8 = 15;
@@ -42,6 +50,8 @@ const HISTORY_PAYLOAD_LEN: u8 = 15;
 const SCHEMA_PAYLOAD_LEN: u8 = 8;
 const SETTING_PAYLOAD_LEN: u8 = 8;
 const HOST_TIMING_PAYLOAD_LEN: u8 = 10;
+#[cfg(feature = "dual-s3-wired")]
+const OUTPUT_TARGET_STATUS_PAYLOAD_LEN: u8 = 14;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ManagementRequest {
@@ -75,6 +85,12 @@ impl ManagementRequest {
             },
             (OP_GET_DIAGNOSTICS, []) => ManagementCommand::GetDiagnostics,
             (OP_GET_HOST_TIMING, [host]) => ManagementCommand::GetHostTiming(HostId(*host)),
+            #[cfg(feature = "dual-s3-wired")]
+            (OP_SELECT_OUTPUT_TARGET, [kind, id]) => {
+                ManagementCommand::SelectOutputTarget(ManagementOutputTarget::decode(*kind, *id)?)
+            }
+            #[cfg(feature = "dual-s3-wired")]
+            (OP_GET_OUTPUT_TARGET_STATUS, []) => ManagementCommand::GetOutputTargetStatus,
             (OP_GET_HISTORY, [index]) => ManagementCommand::GetHistory { index: *index },
             (OP_GET_SCHEMA, []) => ManagementCommand::GetSchema,
             (OP_GET_SETTING, [id_low, id_high, scope, target]) => ManagementCommand::GetSetting {
@@ -110,6 +126,10 @@ impl ManagementRequest {
                 | OP_SET_SETTING | OP_GET_HOST_TIMING,
                 _,
             ) => {
+                return Err(ManagementProtocolError::InvalidArgument);
+            }
+            #[cfg(feature = "dual-s3-wired")]
+            (OP_SELECT_OUTPUT_TARGET | OP_GET_OUTPUT_TARGET_STATUS, _) => {
                 return Err(ManagementProtocolError::InvalidArgument);
             }
             _ => return Err(ManagementProtocolError::UnknownCommand),
@@ -149,6 +169,16 @@ impl ManagementRequest {
             ManagementCommand::GetHostTiming(host_id) => {
                 encode_host_command(&mut bytes, OP_GET_HOST_TIMING, host_id)
             }
+            #[cfg(feature = "dual-s3-wired")]
+            ManagementCommand::SelectOutputTarget(target) => {
+                bytes[2] = OP_SELECT_OUTPUT_TARGET;
+                bytes[3] = 2;
+                let (kind, id) = target.encode();
+                bytes[4] = kind;
+                bytes[5] = id;
+            }
+            #[cfg(feature = "dual-s3-wired")]
+            ManagementCommand::GetOutputTargetStatus => bytes[2] = OP_GET_OUTPUT_TARGET_STATUS,
             ManagementCommand::GetHistory { index } => {
                 bytes[2] = OP_GET_HISTORY;
                 bytes[3] = 1;
@@ -217,6 +247,52 @@ pub enum ManagementCommand {
         target: SettingTarget,
         value: i32,
     },
+    #[cfg(feature = "dual-s3-wired")]
+    SelectOutputTarget(ManagementOutputTarget),
+    #[cfg(feature = "dual-s3-wired")]
+    GetOutputTargetStatus,
+}
+
+#[cfg(feature = "dual-s3-wired")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagementOutputTarget {
+    Wired,
+    Ble(HostId),
+}
+
+#[cfg(feature = "dual-s3-wired")]
+impl ManagementOutputTarget {
+    const fn encode(self) -> (u8, u8) {
+        match self {
+            Self::Wired => (0, 0),
+            Self::Ble(host_id) => (1, host_id.0),
+        }
+    }
+
+    fn decode(kind: u8, id: u8) -> Result<Self, ManagementProtocolError> {
+        match (kind, id) {
+            (0, 0) => Ok(Self::Wired),
+            (1, 1..=4) => Ok(Self::Ble(HostId(id))),
+            _ => Err(ManagementProtocolError::InvalidArgument),
+        }
+    }
+
+    pub const fn to_output_target(self) -> OutputTarget {
+        match self {
+            Self::Wired => OutputTarget::Wired,
+            Self::Ble(host_id) => OutputTarget::Ble(host_id),
+        }
+    }
+}
+
+#[cfg(feature = "dual-s3-wired")]
+impl From<OutputTarget> for ManagementOutputTarget {
+    fn from(value: OutputTarget) -> Self {
+        match value {
+            OutputTarget::Wired => Self::Wired,
+            OutputTarget::Ble(host_id) => Self::Ble(host_id),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -323,6 +399,27 @@ impl ManagementResponse {
                 bytes[6..10].copy_from_slice(&timing.last_connected_seconds.to_le_bytes());
                 bytes[10..14].copy_from_slice(&timing.last_disconnected_seconds.to_le_bytes());
                 bytes[14] = timing.last_disconnect_reason;
+            }
+            #[cfg(feature = "dual-s3-wired")]
+            ManagementResponsePayload::OutputTargetStatus(status) => {
+                bytes[3] = PAYLOAD_OUTPUT_TARGET_STATUS;
+                bytes[4] = OUTPUT_TARGET_STATUS_PAYLOAD_LEN;
+                let (selected_kind, selected_id) = status.selected.encode();
+                bytes[5] = selected_kind;
+                bytes[6] = selected_id;
+                if let Some(active) = status.active {
+                    let (active_kind, active_id) = active.encode();
+                    bytes[7] = active_kind;
+                    bytes[8] = active_id;
+                } else {
+                    bytes[7] = 0xff;
+                }
+                bytes[9] = availability_byte(status.availability);
+                bytes[10] = u8::from(status.wired_ready);
+                bytes[11] = status.ready_ble_mask;
+                bytes[12] = status.effective_presentation as u8;
+                bytes[13] = u8::from(status.mirror_configured);
+                bytes[14..18].copy_from_slice(&status.operation_id.to_le_bytes());
             }
         }
         bytes
@@ -445,6 +542,28 @@ impl ManagementResponse {
                     last_disconnect_reason: bytes[14],
                 })
             }
+            #[cfg(feature = "dual-s3-wired")]
+            (PAYLOAD_OUTPUT_TARGET_STATUS, OUTPUT_TARGET_STATUS_PAYLOAD_LEN) => {
+                let selected = ManagementOutputTarget::decode(bytes[5], bytes[6])?;
+                let active = if bytes[7] == 0xff {
+                    if bytes[8] != 0 {
+                        return Err(ManagementProtocolError::InvalidArgument);
+                    }
+                    None
+                } else {
+                    Some(ManagementOutputTarget::decode(bytes[7], bytes[8])?)
+                };
+                ManagementResponsePayload::OutputTargetStatus(ManagementOutputTargetStatus {
+                    selected,
+                    active,
+                    availability: availability_from_byte(bytes[9])?,
+                    wired_ready: decode_bool(bytes[10])?,
+                    ready_ble_mask: bytes[11] & 0x0f,
+                    effective_presentation: ManagementUsbPresentationKind::from_byte(bytes[12])?,
+                    mirror_configured: decode_bool(bytes[13])?,
+                    operation_id: u32::from_le_bytes([bytes[14], bytes[15], bytes[16], bytes[17]]),
+                })
+            }
             _ => return Err(ManagementProtocolError::InvalidArgument),
         };
         Ok(Self {
@@ -466,6 +585,8 @@ pub enum ManagementResponsePayload {
     Schema(ManagementSchema),
     Setting(ManagementSetting),
     HostTiming(ManagementHostTiming),
+    #[cfg(feature = "dual-s3-wired")]
+    OutputTargetStatus(ManagementOutputTargetStatus),
 }
 
 #[repr(u8)]
@@ -516,6 +637,48 @@ impl ManagementStatus {
             host_count,
             usb: ManagementUsbStatus::empty(),
             hosts: [ManagementHostStatus::empty(); 4],
+        }
+    }
+}
+
+#[cfg(feature = "dual-s3-wired")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ManagementOutputTargetStatus {
+    pub selected: ManagementOutputTarget,
+    pub active: Option<ManagementOutputTarget>,
+    pub availability: OutputTargetAvailability,
+    pub wired_ready: bool,
+    pub ready_ble_mask: u8,
+    pub effective_presentation: ManagementUsbPresentationKind,
+    pub mirror_configured: bool,
+    pub operation_id: u32,
+}
+
+#[cfg(feature = "dual-s3-wired")]
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagementUsbPresentationKind {
+    Fallback = 0,
+    Mirror = 1,
+}
+
+#[cfg(feature = "dual-s3-wired")]
+impl ManagementUsbPresentationKind {
+    fn from_byte(value: u8) -> Result<Self, ManagementProtocolError> {
+        match value {
+            0 => Ok(Self::Fallback),
+            1 => Ok(Self::Mirror),
+            _ => Err(ManagementProtocolError::InvalidArgument),
+        }
+    }
+}
+
+#[cfg(feature = "dual-s3-wired")]
+impl From<UsbPresentation> for ManagementUsbPresentationKind {
+    fn from(value: UsbPresentation) -> Self {
+        match value {
+            UsbPresentation::Fallback => Self::Fallback,
+            UsbPresentation::Mirror(_) => Self::Mirror,
         }
     }
 }
@@ -746,6 +909,34 @@ fn decode_setting_target(scope: u8, target: u8) -> Result<SettingTarget, Managem
     }
 }
 
+#[cfg(feature = "dual-s3-wired")]
+const fn availability_byte(value: OutputTargetAvailability) -> u8 {
+    match value {
+        OutputTargetAvailability::Ready => 0,
+        OutputTargetAvailability::ConnectedNotReady => 1,
+        OutputTargetAvailability::Unavailable => 2,
+    }
+}
+
+#[cfg(feature = "dual-s3-wired")]
+fn availability_from_byte(value: u8) -> Result<OutputTargetAvailability, ManagementProtocolError> {
+    match value {
+        0 => Ok(OutputTargetAvailability::Ready),
+        1 => Ok(OutputTargetAvailability::ConnectedNotReady),
+        2 => Ok(OutputTargetAvailability::Unavailable),
+        _ => Err(ManagementProtocolError::InvalidArgument),
+    }
+}
+
+#[cfg(feature = "dual-s3-wired")]
+fn decode_bool(value: u8) -> Result<bool, ManagementProtocolError> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(ManagementProtocolError::InvalidArgument),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -813,6 +1004,50 @@ mod tests {
             payload: ManagementResponsePayload::Status(status),
         };
         assert_eq!(ManagementResponse::decode(&response.encode()), Ok(response));
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    #[test]
+    fn output_target_commands_and_status_round_trip() {
+        for command in [
+            ManagementCommand::SelectOutputTarget(ManagementOutputTarget::Wired),
+            ManagementCommand::SelectOutputTarget(ManagementOutputTarget::Ble(HostId(4))),
+            ManagementCommand::GetOutputTargetStatus,
+        ] {
+            let request = ManagementRequest {
+                request_id: 19,
+                command,
+            };
+            assert_eq!(ManagementRequest::decode(&request.encode()), Ok(request));
+        }
+
+        let status = ManagementOutputTargetStatus {
+            selected: ManagementOutputTarget::Wired,
+            active: Some(ManagementOutputTarget::Wired),
+            availability: OutputTargetAvailability::Ready,
+            wired_ready: true,
+            ready_ble_mask: 0b0101,
+            effective_presentation: ManagementUsbPresentationKind::Fallback,
+            mirror_configured: false,
+            operation_id: 0x1234_5678,
+        };
+        let response = ManagementResponse {
+            request_id: 19,
+            result: ManagementResult::Ok,
+            payload: ManagementResponsePayload::OutputTargetStatus(status),
+        };
+        assert_eq!(ManagementResponse::decode(&response.encode()), Ok(response));
+
+        let mut invalid = ManagementRequest {
+            request_id: 1,
+            command: ManagementCommand::SelectOutputTarget(ManagementOutputTarget::Wired),
+        }
+        .encode();
+        invalid[5] = 1;
+        assert_eq!(
+            ManagementRequest::decode(&invalid),
+            Err(ManagementProtocolError::InvalidArgument)
+        );
     }
 
     #[test]

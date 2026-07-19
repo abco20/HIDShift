@@ -8,6 +8,10 @@ use crate::management::{
     ManagementSchema, ManagementSetting, ManagementStatus, ManagementUsbDevice,
     ManagementUsbStatus,
 };
+#[cfg(feature = "dual-s3-wired")]
+use crate::management::{
+    ManagementOutputTarget, ManagementOutputTargetStatus, ManagementUsbPresentationKind,
+};
 use crate::output_target::OutputTarget;
 #[cfg(feature = "dual-s3-wired")]
 use crate::reports::StandardHidReport;
@@ -689,10 +693,24 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         };
         match intent {
             ButtonIntent::NextConnectedTarget => {
+                #[cfg(feature = "dual-s3-wired")]
+                {
+                    let Some(target) = self.next_ready_output_target() else {
+                        commands.clear();
+                        return Ok(());
+                    };
+                    self.pending_target_switch = None;
+                    self.handle_bridge_event::<COMMANDS, ACTIONS>(
+                        BridgeEvent::SelectOutputTarget { target },
+                        commands,
+                    )
+                }
+                #[cfg(not(feature = "dual-s3-wired"))]
                 let Some(target) = self.bridge.state().hosts.next_connected_target() else {
                     commands.clear();
                     return Ok(());
                 };
+                #[cfg(not(feature = "dual-s3-wired"))]
                 self.request_target_switch::<COMMANDS, ACTIONS>(target, now_ms, commands)
             }
             ButtonIntent::EnterPairingMode => {
@@ -723,6 +741,40 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                 )
             }
         }
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    fn next_ready_output_target(&self) -> Option<OutputTarget> {
+        let selected = self.bridge.state().output_target.selected;
+        let selected_index = match selected {
+            OutputTarget::Wired => 0,
+            OutputTarget::Ble(host_id) => usize::from(host_id.0.min(4)),
+        };
+        for offset in 1..=5 {
+            let index = (selected_index + offset) % 5;
+            let target = if index == 0 {
+                OutputTarget::Wired
+            } else {
+                OutputTarget::Ble(HostId(index as u8))
+            };
+            let ready = match target {
+                OutputTarget::Wired => {
+                    self.bridge.state().wired_availability
+                        == crate::output_target::OutputTargetAvailability::Ready
+                }
+                OutputTarget::Ble(host_id) => [
+                    crate::reports::ReportKind::Keyboard,
+                    crate::reports::ReportKind::Mouse,
+                    crate::reports::ReportKind::Consumer,
+                ]
+                .into_iter()
+                .any(|kind| self.bridge.can_send(host_id, kind)),
+            };
+            if ready {
+                return Some(target);
+            }
+        }
+        None
     }
 
     fn handle_management_request<const COMMANDS: usize, const ACTIONS: usize>(
@@ -864,6 +916,26 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                     ManagementResult::InvalidSetting
                 }
             }
+            #[cfg(feature = "dual-s3-wired")]
+            ManagementCommand::SelectOutputTarget(target) => {
+                let output_target = target.to_output_target();
+                if output_target.validate().is_err()
+                    || matches!(output_target, OutputTarget::Ble(host) if !valid_management_host::<HOSTS>(host))
+                {
+                    ManagementResult::InvalidHost
+                } else {
+                    self.pending_target_switch = None;
+                    self.handle_bridge_event_append::<COMMANDS, ACTIONS>(
+                        BridgeEvent::SelectOutputTarget {
+                            target: output_target,
+                        },
+                        commands,
+                    )?;
+                    ManagementResult::Ok
+                }
+            }
+            #[cfg(feature = "dual-s3-wired")]
+            ManagementCommand::GetOutputTargetStatus => ManagementResult::Ok,
         };
 
         let payload = match request.command {
@@ -922,6 +994,12 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                     value: self.setting_value(id, target).unwrap_or_default(),
                 })
             }
+            #[cfg(feature = "dual-s3-wired")]
+            ManagementCommand::SelectOutputTarget(_) | ManagementCommand::GetOutputTargetStatus => {
+                ManagementResponsePayload::OutputTargetStatus(
+                    self.management_output_target_status(),
+                )
+            }
             _ => ManagementResponsePayload::Status(self.management_status()),
         };
 
@@ -955,6 +1033,38 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             }
         }
         status
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    pub fn management_output_target_status(&self) -> ManagementOutputTargetStatus {
+        let target = self.bridge.state().output_target;
+        let mut ready_ble_mask = 0u8;
+        for index in 0..HOSTS.min(4) {
+            let host_id = HostId((index + 1) as u8);
+            if [
+                crate::reports::ReportKind::Keyboard,
+                crate::reports::ReportKind::Mouse,
+                crate::reports::ReportKind::Consumer,
+            ]
+            .into_iter()
+            .any(|kind| self.bridge.can_send(host_id, kind))
+            {
+                ready_ble_mask |= 1 << index;
+            }
+        }
+        ManagementOutputTargetStatus {
+            selected: ManagementOutputTarget::from(target.selected),
+            active: target.active.map(ManagementOutputTarget::from),
+            availability: target.availability,
+            wired_ready: self.bridge.state().wired_availability
+                == crate::output_target::OutputTargetAvailability::Ready,
+            ready_ble_mask,
+            // Mirror availability is added by the mirror supervisor. Merely
+            // storing a target never makes it effective.
+            effective_presentation: ManagementUsbPresentationKind::Fallback,
+            mirror_configured: self.bridge.state().mirror_target.is_some(),
+            operation_id: target.transition_operation_id,
+        }
     }
 
     fn management_host_info(&self, host_id: HostId) -> Option<ManagementHostInfo> {
@@ -1203,6 +1313,7 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         Ok(())
     }
 
+    #[cfg(not(feature = "dual-s3-wired"))]
     fn request_target_switch<const COMMANDS: usize, const ACTIONS: usize>(
         &mut self,
         target: HostId,
@@ -2599,6 +2710,70 @@ mod tests {
         assert!(!status.hosts[2].known);
     }
 
+    #[cfg(feature = "dual-s3-wired")]
+    #[test]
+    fn management_selects_unavailable_wired_without_failing_over() {
+        let mut runtime = BridgeRuntime::<4, 1>::new(0);
+        let mut commands = heapless::Vec::<RuntimeCommand, 16>::new();
+        runtime
+            .handle_input::<16, 16, 2>(
+                RuntimeInput::BridgeEvent(BridgeEvent::HostConnected { host_id: HostId(1) }),
+                &mut commands,
+            )
+            .unwrap();
+        runtime
+            .handle_input::<16, 16, 2>(
+                management_request(
+                    ManagementCommand::SelectOutputTarget(ManagementOutputTarget::Ble(HostId(1))),
+                    20,
+                ),
+                &mut commands,
+            )
+            .unwrap();
+        runtime
+            .handle_input::<16, 16, 2>(
+                management_request(
+                    ManagementCommand::SelectOutputTarget(ManagementOutputTarget::Wired),
+                    21,
+                ),
+                &mut commands,
+            )
+            .unwrap();
+        let ManagementResponsePayload::OutputTargetStatus(status) =
+            management_response(&commands).payload
+        else {
+            panic!()
+        };
+        assert_eq!(status.selected, ManagementOutputTarget::Wired);
+        assert_eq!(status.active, None);
+        assert_eq!(
+            status.availability,
+            crate::output_target::OutputTargetAvailability::Unavailable
+        );
+
+        runtime
+            .handle_input::<16, 16, 2>(
+                RuntimeInput::BridgeEvent(BridgeEvent::WiredAvailabilityChanged {
+                    availability: crate::output_target::OutputTargetAvailability::Ready,
+                }),
+                &mut commands,
+            )
+            .unwrap();
+        runtime
+            .handle_input::<16, 16, 2>(
+                management_request(ManagementCommand::GetOutputTargetStatus, 22),
+                &mut commands,
+            )
+            .unwrap();
+        let ManagementResponsePayload::OutputTargetStatus(status) =
+            management_response(&commands).payload
+        else {
+            panic!()
+        };
+        assert_eq!(status.active, Some(ManagementOutputTarget::Wired));
+        assert!(status.wired_ready);
+    }
+
     #[test]
     fn management_rejects_invalid_or_destructive_slot_requests() {
         let mut runtime = BridgeRuntime::<4, 1>::new(0);
@@ -3097,6 +3272,7 @@ mod tests {
         )));
     }
 
+    #[cfg(not(feature = "dual-s3-wired"))]
     #[test]
     fn button_intent_cycles_to_next_connected_target_in_runtime() {
         let mut runtime = BridgeRuntime::<3, 1>::new(0);
@@ -3149,6 +3325,58 @@ mod tests {
                 })
             )
         }));
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    #[test]
+    fn button_intent_cycles_wired_and_only_ready_ble_targets() {
+        let mut runtime = BridgeRuntime::<4, 1>::new(0);
+        let mut commands = heapless::Vec::<RuntimeCommand, 16>::new();
+        runtime
+            .handle_event::<16, 16>(
+                BridgeEvent::WiredAvailabilityChanged {
+                    availability: crate::output_target::OutputTargetAvailability::Ready,
+                },
+                &mut commands,
+            )
+            .unwrap();
+        for host_id in [HostId(1), HostId(3)] {
+            for event in [
+                BridgeEvent::HostConnected { host_id },
+                BridgeEvent::HostSecurityChanged {
+                    host_id,
+                    encrypted: true,
+                    bonded: true,
+                    bond: None,
+                },
+                BridgeEvent::CccdChanged {
+                    host_id,
+                    report: ReportKind::Keyboard,
+                    enabled: true,
+                },
+            ] {
+                runtime
+                    .handle_event::<16, 16>(event, &mut commands)
+                    .unwrap();
+            }
+        }
+
+        for expected in [
+            OutputTarget::Ble(HostId(1)),
+            OutputTarget::Ble(HostId(3)),
+            OutputTarget::Wired,
+        ] {
+            runtime
+                .handle_input::<16, 16, 2>(
+                    RuntimeInput::ButtonIntent {
+                        intent: ButtonIntent::NextConnectedTarget,
+                        now_ms: 100,
+                    },
+                    &mut commands,
+                )
+                .unwrap();
+            assert_eq!(runtime.bridge().state().output_target.selected, expected);
+        }
     }
 
     #[test]

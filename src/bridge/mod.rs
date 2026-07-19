@@ -399,6 +399,17 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
             OutputTarget::Wired => {
                 self.state.hosts.clear_active_target();
                 push_action(out, BridgeAction::ActivateWired { operation_id })?;
+                self.state
+                    .output_target
+                    .set_availability(self.state.wired_availability);
+                if self.state.wired_availability == OutputTargetAvailability::Ready {
+                    self.push_neutral_reports(
+                        OutputTarget::Wired,
+                        NotifyReason::SafetyRelease,
+                        out,
+                    )?;
+                    self.push_usb_keyboard_leds(self.state.wired_keyboard_leds, out)?;
+                }
             }
             OutputTarget::Ble(host_id) => {
                 self.state.hosts.set_active_target(host_id)?;
@@ -1304,6 +1315,43 @@ mod tests {
                 reason: NotifyReason::Input,
             }] if report.as_bytes()[2] == 0x05
         ));
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    #[test]
+    fn selecting_wired_reuses_cached_ready_state() {
+        let mut bridge = ready_bridge();
+        let mut actions = heapless::Vec::<BridgeAction, 12>::new();
+        bridge
+            .handle_event(
+                BridgeEvent::WiredAvailabilityChanged {
+                    availability: OutputTargetAvailability::Ready,
+                },
+                &mut actions,
+            )
+            .unwrap();
+
+        bridge
+            .handle_event(
+                BridgeEvent::SelectOutputTarget {
+                    target: OutputTarget::Wired,
+                },
+                &mut actions,
+            )
+            .unwrap();
+
+        assert_eq!(
+            bridge.state().output_target.active,
+            Some(OutputTarget::Wired)
+        );
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            BridgeAction::Notify {
+                target: OutputTarget::Wired,
+                reason: NotifyReason::SafetyRelease,
+                ..
+            }
+        )));
     }
 
     #[cfg(feature = "dual-s3-wired")]
