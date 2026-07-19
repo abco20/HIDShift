@@ -27,6 +27,7 @@ pub const RECORD_DIAGNOSTICS: u8 = 0x31;
 pub const RECORD_TEST_FAULT: u8 = 0x32;
 
 pub const HELLO_WIRE_LEN: usize = 12;
+pub const USB_STATE_WIRE_LEN: usize = 8;
 pub const STANDARD_INPUT_HEADER_LEN: usize = 5;
 pub const STANDARD_INPUT_MAX_LEN: usize = STANDARD_INPUT_HEADER_LEN + KEYBOARD_REPORT_LEN;
 
@@ -36,6 +37,15 @@ pub enum InterchipRole {
     Host = 1,
     Device = 2,
 }
+
+pub const CAPABILITY_DYNAMIC_PROFILE: u32 = 1 << 0;
+pub const CAPABILITY_FALLBACK_PROFILE: u32 = 1 << 1;
+pub const CAPABILITY_CONTROL_FORWARDING: u32 = 1 << 2;
+pub const CAPABILITY_ENDPOINT_IN: u32 = 1 << 3;
+pub const CAPABILITY_ENDPOINT_OUT: u32 = 1 << 4;
+pub const CAPABILITY_PROFILE_FLASH_CACHE: u32 = 1 << 5;
+pub const CAPABILITY_STANDARD_WIRED_HID: u32 = 1 << 6;
+pub const CAPABILITY_USB_STATE_REPORTING: u32 = 1 << 7;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Hello {
@@ -97,6 +107,56 @@ impl Hello {
             firmware_minor: *firmware_minor,
             capabilities: u32::from_le_bytes([*c0, *c1, *c2, *c3]),
             active_profile_hash: u32::from_le_bytes([*h0, *h1, *h2, *h3]),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UsbState {
+    pub attached: bool,
+    pub configured: bool,
+    pub fallback_active: bool,
+    pub healthy: bool,
+    pub active_profile_hash: u32,
+    pub error_code: u16,
+}
+
+impl UsbState {
+    pub const fn encode(self) -> [u8; USB_STATE_WIRE_LEN] {
+        let mut flags = 0u8;
+        if self.attached {
+            flags |= 1 << 0;
+        }
+        if self.configured {
+            flags |= 1 << 1;
+        }
+        if self.fallback_active {
+            flags |= 1 << 2;
+        }
+        if self.healthy {
+            flags |= 1 << 3;
+        }
+        let hash = self.active_profile_hash.to_le_bytes();
+        let error = self.error_code.to_le_bytes();
+        [
+            flags, 0, hash[0], hash[1], hash[2], hash[3], error[0], error[1],
+        ]
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, MessageError> {
+        let [flags, reserved, h0, h1, h2, h3, e0, e1] = bytes else {
+            return Err(MessageError::InvalidLength);
+        };
+        if *reserved != 0 || *flags & !0x0f != 0 {
+            return Err(MessageError::InvalidFlags);
+        }
+        Ok(Self {
+            attached: *flags & (1 << 0) != 0,
+            configured: *flags & (1 << 1) != 0,
+            fallback_active: *flags & (1 << 2) != 0,
+            healthy: *flags & (1 << 3) != 0,
+            active_profile_hash: u32::from_le_bytes([*h0, *h1, *h2, *h3]),
+            error_code: u16::from_le_bytes([*e0, *e1]),
         })
     }
 }
@@ -173,6 +233,7 @@ impl StandardInputReport {
 pub enum MessageError {
     InvalidLength,
     InvalidRole,
+    InvalidFlags,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -197,6 +258,23 @@ mod tests {
             active_profile_hash: 0xaabb_ccdd,
         };
         assert_eq!(Hello::decode(&hello.encode()), Ok(hello));
+    }
+
+    #[test]
+    fn usb_state_round_trips_and_rejects_reserved_bits() {
+        let state = UsbState {
+            attached: true,
+            configured: true,
+            fallback_active: true,
+            healthy: true,
+            active_profile_hash: 0x1234_5678,
+            error_code: 9,
+        };
+        assert_eq!(UsbState::decode(&state.encode()), Ok(state));
+
+        let mut invalid = state.encode();
+        invalid[0] |= 0x80;
+        assert_eq!(UsbState::decode(&invalid), Err(MessageError::InvalidFlags));
     }
 
     #[test]

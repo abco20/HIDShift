@@ -13,6 +13,7 @@ publish = false
 members = ["firmware"]
 default-members = ["."]
 exclude = [
+    "device-firmware",
     "e2e/probe-firmware",
     "e2e/runner",
     "tools/hidshift-client",

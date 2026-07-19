@@ -161,6 +161,15 @@ fn run_firmware(
     let usb0 = peripherals.USB0;
     let gpio20 = peripherals.GPIO20;
     let gpio19 = peripherals.GPIO19;
+    #[cfg(feature = "dual-s3-wired")]
+    let mirror_spi = (
+        peripherals.SPI2,
+        peripherals.DMA_CH0,
+        peripherals.GPIO10,
+        peripherals.GPIO11,
+        peripherals.GPIO12,
+        peripherals.GPIO13,
+    );
     let flash = peripherals.FLASH;
     let (bt, rng, adc1) = (peripherals.BT, peripherals.RNG, peripherals.ADC1);
     esp_rtos::start(timg0.timer0, scheduler_interrupt);
@@ -184,6 +193,8 @@ fn run_firmware(
                 bt,
                 rng,
                 adc1,
+                #[cfg(feature = "dual-s3-wired")]
+                mirror_spi,
             ),
             "startup",
         );
@@ -206,6 +217,14 @@ async fn startup_task(
     bt: esp_hal::peripherals::BT<'static>,
     rng: esp_hal::peripherals::RNG<'static>,
     adc1: esp_hal::peripherals::ADC1<'static>,
+    #[cfg(feature = "dual-s3-wired")] mirror_spi: (
+        esp_hal::peripherals::SPI2<'static>,
+        esp_hal::peripherals::DMA_CH0<'static>,
+        esp_hal::peripherals::GPIO10<'static>,
+        esp_hal::peripherals::GPIO11<'static>,
+        esp_hal::peripherals::GPIO12<'static>,
+        esp_hal::peripherals::GPIO13<'static>,
+    ),
 ) {
     let runtime_owner_receiver = RUNTIME_INPUT_CHANNEL.receiver();
     let storage_sender = RUNTIME_INPUT_CHANNEL.sender();
@@ -328,32 +347,20 @@ async fn startup_task(
     #[cfg(feature = "dual-s3-wired")]
     spawn_or_reset(
         &spawner,
-        device_command_task(device_receiver),
-        "device-command",
+        esp32s3_platform::mirror_spi_task::mirror_spi_master_task(
+            device_receiver,
+            RUNTIME_INPUT_CHANNEL.sender(),
+            boot_session_id,
+            mirror_spi.0,
+            mirror_spi.1,
+            mirror_spi.2,
+            mirror_spi.3,
+            mirror_spi.4,
+            mirror_spi.5,
+        ),
+        "mirror-spi-master",
     );
     core::future::pending::<()>().await;
-}
-
-#[cfg(feature = "dual-s3-wired")]
-#[embassy_executor::task]
-async fn device_command_task(
-    receiver: Receiver<
-        'static,
-        CriticalSectionRawMutex,
-        DeviceTaskCommand,
-        RUNTIME_DEVICE_COMMAND_QUEUE_CAPACITY,
-    >,
-) {
-    loop {
-        let command = receiver.receive().await;
-        // The queue is deliberately live before the SPI transport lands so
-        // the feature build preserves bounded backpressure and never routes a
-        // wired command into a BLE or USB-host queue.
-        log::debug!(
-            "firmware: device command pending SPI transport {:?}",
-            command
-        );
-    }
 }
 
 #[embassy_executor::task]

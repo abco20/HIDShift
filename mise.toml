@@ -76,6 +76,72 @@ cargo +esp build \
   --target xtensa-esp32s3-none-elf
 """
 
+[tasks."firmware:build-dual"]
+description = "Build the optional dual-S3 Host firmware"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+export_file="$MISE_PROJECT_ROOT/.mise/esp/export-esp.sh"
+if [[ ! -f "$export_file" ]]; then
+  echo "ESP toolchain is not installed. Run: mise run esp:install" >&2
+  exit 1
+fi
+source "$export_file"
+
+cargo +esp build \
+  --locked \
+  -Zbuild-std=core,alloc \
+  --release \
+  --manifest-path firmware/Cargo.toml \
+  --bin firmware \
+  --features dual-s3-wired \
+  --target xtensa-esp32s3-none-elf
+"""
+
+[tasks."device-firmware:build"]
+description = "Build the dual-S3 native USB Device firmware"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+export_file="$MISE_PROJECT_ROOT/.mise/esp/export-esp.sh"
+if [[ ! -f "$export_file" ]]; then
+  echo "ESP toolchain is not installed. Run: mise run esp:install" >&2
+  exit 1
+fi
+source "$export_file"
+
+cargo +esp build \
+  --locked \
+  -Zbuild-std=core \
+  --release \
+  --manifest-path device-firmware/Cargo.toml \
+  --bin hidshift-device \
+  --target xtensa-esp32s3-none-elf
+"""
+
+[tasks."device-firmware:check"]
+description = "Check the dual-S3 native USB Device firmware"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+export_file="$MISE_PROJECT_ROOT/.mise/esp/export-esp.sh"
+if [[ ! -f "$export_file" ]]; then
+  echo "ESP toolchain is not installed. Run: mise run esp:install" >&2
+  exit 1
+fi
+source "$export_file"
+
+cargo +esp check \
+  --locked \
+  -Zbuild-std=core \
+  --manifest-path device-firmware/Cargo.toml \
+  --bin hidshift-device \
+  --target xtensa-esp32s3-none-elf
+"""
+
 [tasks."firmware:check"]
 description = "Run the ESP32-S3 firmware checks"
 run = """
