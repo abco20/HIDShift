@@ -33,7 +33,9 @@ use hidshift::runtime::{
 #[cfg(not(feature = "hardware-e2e"))]
 use hidshift::storage::StoredAddressKind;
 use hidshift::storage::{FixedName, StorageState};
-use hidshift::{BleConnectionSlots, BleInputGate, BlePeerIdentity, resolve_ble_host_id};
+use hidshift::{
+    BleConnectionSlots, BleInputGate, BlePairingBackoff, BlePeerIdentity, resolve_ble_host_id,
+};
 use static_cell::StaticCell;
 use trouble_host::prelude::*;
 
@@ -189,6 +191,7 @@ pub async fn ble_host_event_task(
     let restored_state = restore_receiver.receive().await;
     let mut current_storage = restored_state;
     let mut pairable_host = None;
+    let mut pairing_backoff = BlePairingBackoff::<RUNTIME_HOSTS_MAX>::new();
     let mut bt = Some(bt);
     let server = match Server::new_with_config(GapConfig::Peripheral(PeripheralConfig {
         name: BLE_DEVICE_NAME,
@@ -236,6 +239,7 @@ pub async fn ble_host_event_task(
                 server,
                 current_storage.as_ref(),
                 pairable_host,
+                &mut pairing_backoff,
             ),
             quiesce_request.receive(),
             usb_quiesce_request.receive(),
@@ -313,6 +317,7 @@ async fn run_ble_host_events<'server, C>(
     server: &'server Server<'server>,
     restored_state: Option<&StorageState>,
     pairable_host: Option<HostId>,
+    pairing_backoff: &mut BlePairingBackoff<RUNTIME_HOSTS_MAX>,
 ) where
     C: Controller
         + ControllerCmdSync<LeClearFilterAcceptList>
@@ -345,6 +350,7 @@ async fn run_ble_host_events<'server, C>(
         notify_receiver,
         restored_state,
         pairable_host,
+        pairing_backoff,
     );
     // Poll application/GATT work before the controller runner. A notification
     // queued by `accept` can then be drained by the runner in the same executor
@@ -359,19 +365,24 @@ fn retain_gatt_service_fields(server: &Server) {
     let _ = &server.management;
 }
 
-#[derive(Clone, Copy, Debug)]
-struct BleControlState {
+struct BleControlState<'backoff> {
     pairing_allowed: [bool; RUNTIME_HOSTS_MAX],
     restored_bond: [bool; RUNTIME_HOSTS_MAX],
     input_gate: BleInputGate<RUNTIME_HOSTS_MAX>,
+    pairing_backoff: &'backoff mut BlePairingBackoff<RUNTIME_HOSTS_MAX>,
 }
 
-impl BleControlState {
-    fn new(restored_state: Option<&StorageState>, pairable_host: Option<HostId>) -> Self {
+impl<'backoff> BleControlState<'backoff> {
+    fn new(
+        restored_state: Option<&StorageState>,
+        pairable_host: Option<HostId>,
+        pairing_backoff: &'backoff mut BlePairingBackoff<RUNTIME_HOSTS_MAX>,
+    ) -> Self {
         let mut state = Self {
             pairing_allowed: [false; RUNTIME_HOSTS_MAX],
             restored_bond: [false; RUNTIME_HOSTS_MAX],
             input_gate: BleInputGate::new(),
+            pairing_backoff,
         };
         if let Some(storage) = restored_state {
             for host in storage.hosts() {
@@ -396,8 +407,16 @@ impl BleControlState {
             } => self.input_gate.block(host_id),
             BleTaskCommand::Notify { .. } | BleTaskCommand::ManagementResponse { .. } => {}
             BleTaskCommand::ActivateInput { host_id } => self.input_gate.activate(host_id),
-            BleTaskCommand::AllowPairing { host_id } => self.set_pairing_allowed(host_id, true),
-            BleTaskCommand::RejectPairing { host_id } => self.set_pairing_allowed(host_id, false),
+            BleTaskCommand::AllowPairing { host_id } => {
+                self.pairing_backoff.clear();
+                self.set_pairing_allowed(host_id, true);
+            }
+            BleTaskCommand::RejectPairing { host_id } => {
+                self.set_pairing_allowed(host_id, false);
+                if self.pairing_host().is_none() {
+                    self.pairing_backoff.clear();
+                }
+            }
             BleTaskCommand::ClearBond { host_id, .. } => {
                 self.set_pairing_allowed(host_id, false);
                 self.set_restored_bond(host_id, false);
@@ -410,6 +429,18 @@ impl BleControlState {
             .and_then(|index| self.pairing_allowed.get(index))
             .copied()
             .unwrap_or(false)
+    }
+
+    fn pairing_backoff_remaining_ms(&self, peer: BlePeerIdentity, now_ms: u64) -> Option<u64> {
+        self.pairing_backoff.blocked_remaining_ms(peer, now_ms)
+    }
+
+    fn record_pairing_failure(&mut self, peer: BlePeerIdentity, now_ms: u64) -> u64 {
+        self.pairing_backoff.record_failure(peer, now_ms)
+    }
+
+    fn clear_pairing_failure(&mut self, peer: BlePeerIdentity) {
+        self.pairing_backoff.clear_peer(peer);
     }
 
     fn should_drop(&self, command: BleTaskCommand) -> bool {
@@ -485,27 +516,72 @@ where
     }
 }
 
-fn resolve_connection_host_id<P>(
+enum BleConnectionAdmission {
+    Accept {
+        host_id: HostId,
+        peer: BlePeerIdentity,
+    },
+    RejectUnknown,
+    RejectBackoff {
+        remaining_ms: u64,
+    },
+}
+
+fn admit_ble_connection<P>(
     conn: &GattConnection<'_, '_, P>,
     restored_state: Option<&StorageState>,
-    control: &BleControlState,
-) -> Option<HostId>
+    control: &BleControlState<'_>,
+    now_ms: u64,
+) -> BleConnectionAdmission
 where
     P: PacketPool,
 {
+    let peer = connection_peer_identity(conn);
     #[cfg(feature = "hardware-e2e")]
     if control.pairing_host() == Some(HostId(1))
         && conn.raw().peer_address().into_inner() != hidshift::e2e::E2E_PROBE_BLE_ADDRESS_RAW
     {
-        return None;
+        return BleConnectionAdmission::RejectUnknown;
     }
-    let peer_identity = connection_peer_identity(conn);
-    let resolved = resolve_ble_host_id(restored_state, peer_identity, control.pairing_host())?;
-    let is_pairing = control.pairing_allowed(resolved);
+
+    let peer_matches_stored_bond = resolve_ble_host_id(restored_state, peer, None).is_some();
+    if control.pairing_host().is_some()
+        && !peer_matches_stored_bond
+        && let Some(remaining_ms) = control.pairing_backoff_remaining_ms(peer, now_ms)
+    {
+        return BleConnectionAdmission::RejectBackoff { remaining_ms };
+    }
+
+    let Some(host_id) = resolve_ble_host_id(restored_state, peer, control.pairing_host()) else {
+        return BleConnectionAdmission::RejectUnknown;
+    };
+    // An existing bond remains admissible while a pairing window is open,
+    // but it must not be made bondable or treated as a new pairing candidate.
+    let is_pairing = control.pairing_allowed(host_id);
     let reconnect_enabled = restored_state
         .map(|state| state.global_settings.auto_reconnect)
         .unwrap_or(true);
-    (is_pairing || reconnect_enabled).then_some(resolved)
+    if is_pairing || reconnect_enabled {
+        BleConnectionAdmission::Accept { host_id, peer }
+    } else {
+        BleConnectionAdmission::RejectUnknown
+    }
+}
+
+fn is_pairing_candidate(
+    restored_state: Option<&StorageState>,
+    control: &BleControlState<'_>,
+    peer: BlePeerIdentity,
+) -> bool {
+    control.pairing_host().is_some() && resolve_ble_host_id(restored_state, peer, None).is_none()
+}
+
+fn reject_ble_connection<P>(conn: &GattConnection<'_, '_, P>)
+where
+    P: PacketPool,
+{
+    let _ = conn.raw().set_bondable(false);
+    conn.raw().disconnect();
 }
 
 #[cfg(feature = "hardware-e2e")]
@@ -594,13 +670,14 @@ async fn accept_ble_connections<'values, 'server, C>(
     >,
     restored_state: Option<&StorageState>,
     pairable_host: Option<HostId>,
+    pairing_backoff: &mut BlePairingBackoff<RUNTIME_HOSTS_MAX>,
 ) where
     C: Controller
         + ControllerCmdSync<LeClearFilterAcceptList>
         + ControllerCmdSync<LeAddDeviceToFilterAcceptList>
         + ControllerCmdAsync<LeSetPhy>,
 {
-    let mut control = BleControlState::new(restored_state, pairable_host);
+    let mut control = BleControlState::new(restored_state, pairable_host, pairing_backoff);
     configure_ble_accept_list(stack, restored_state).await;
     #[cfg(feature = "hardware-e2e")]
     {
@@ -637,28 +714,40 @@ async fn accept_ble_connections<'values, 'server, C>(
         .await
         {
             Either::First(Ok(conn)) => {
-                let Some(host_id) = resolve_connection_host_id(&conn, restored_state, &control)
-                else {
-                    log::warn!(
-                        "firmware: rejecting unknown peer outside pairing identity={:?}",
-                        conn.raw().peer_identity()
-                    );
-                    if let Err(err) = conn.raw().set_bondable(false) {
+                let admission = admit_ble_connection(
+                    &conn,
+                    restored_state,
+                    &control,
+                    Instant::now().as_millis(),
+                );
+                let (host_id, peer) = match admission {
+                    BleConnectionAdmission::Accept { host_id, peer } => (host_id, peer),
+                    BleConnectionAdmission::RejectUnknown => {
                         log::warn!(
-                            "firmware: ble set_bondable failed while rejecting unknown peer: {:?}",
-                            err
+                            "firmware: rejecting unknown BLE peer peer_address={:02X?}",
+                            conn.raw().peer_address().into_inner()
                         );
+                        reject_ble_connection(&conn);
+                        continue;
                     }
-                    conn.raw().disconnect();
-                    continue;
+                    BleConnectionAdmission::RejectBackoff { remaining_ms } => {
+                        log::warn!(
+                            "firmware: rejecting temporarily blocked pairing peer remaining_ms={} peer_address={:02X?}",
+                            remaining_ms,
+                            conn.raw().peer_address().into_inner()
+                        );
+                        reject_ble_connection(&conn);
+                        continue;
+                    }
                 };
+                let pairing_candidate = is_pairing_candidate(restored_state, &control, peer);
                 configure_ble_connection(
                     0,
                     host_id,
                     stack,
                     &conn,
                     sender,
-                    control.pairing_allowed(host_id),
+                    control.pairing_allowed(host_id) && pairing_candidate,
                     control.restored_bond(host_id),
                 )
                 .await;
@@ -717,7 +806,7 @@ async fn manage_ble_connections<'values, 'server, C>(
     slot2: Option<GattConnection<'values, 'server, DefaultPacketPool>>,
     slot3: Option<GattConnection<'values, 'server, DefaultPacketPool>>,
     restored_state: Option<&StorageState>,
-    control: &mut BleControlState,
+    control: &mut BleControlState<'_>,
 ) where
     C: Controller + ControllerCmdAsync<LeSetPhy>,
 {
@@ -728,14 +817,15 @@ async fn manage_ble_connections<'values, 'server, C>(
         BleConnectionTaskSlot::new(slot2),
         BleConnectionTaskSlot::new(slot3),
     ];
-    for (slot, state) in connection_slots.iter().enumerate() {
-        initialize_ble_slot(
+    for slot in 0..connection_slots.len() {
+        let pairing_candidate = initialize_ble_slot(
             &mut slots,
             slot,
-            state.conn.as_ref(),
+            connection_slots[slot].conn.as_ref(),
             restored_state,
             control,
         );
+        connection_slots[slot].pairing_candidate = pairing_candidate;
     }
 
     'connections: loop {
@@ -773,22 +863,34 @@ async fn manage_ble_connections<'values, 'server, C>(
                 // deliberately biased by argument order, so command reception
                 // must be first rather than behind GATT and advertising work.
                 Either3::Third(Ok(conn)) => {
-                    let Some(host_id) = resolve_connection_host_id(&conn, restored_state, control)
-                    else {
-                        log::warn!(
-                            "firmware: rejecting unknown peer outside pairing identity={:?}",
-                            conn.raw().peer_identity()
-                        );
-                        if let Err(err) = conn.raw().set_bondable(false) {
+                    let admission = admit_ble_connection(
+                        &conn,
+                        restored_state,
+                        control,
+                        Instant::now().as_millis(),
+                    );
+                    let (host_id, peer_identity) = match admission {
+                        BleConnectionAdmission::Accept { host_id, peer } => (host_id, peer),
+                        BleConnectionAdmission::RejectUnknown => {
                             log::warn!(
-                                "firmware: ble set_bondable failed while rejecting unknown peer: {:?}",
-                                err
+                                "firmware: rejecting unknown BLE peer peer_address={:02X?}",
+                                conn.raw().peer_address().into_inner()
                             );
+                            reject_ble_connection(&conn);
+                            continue 'connections;
                         }
-                        conn.raw().disconnect();
-                        continue 'connections;
+                        BleConnectionAdmission::RejectBackoff { remaining_ms } => {
+                            log::warn!(
+                                "firmware: rejecting temporarily blocked pairing peer remaining_ms={} peer_address={:02X?}",
+                                remaining_ms,
+                                conn.raw().peer_address().into_inner()
+                            );
+                            reject_ble_connection(&conn);
+                            continue 'connections;
+                        }
                     };
-                    let peer_identity = connection_peer_identity(&conn);
+                    let pairing_candidate =
+                        is_pairing_candidate(restored_state, control, peer_identity);
                     match slots.connect_first_free(host_id, peer_identity) {
                         Ok(assigned_slot) => {
                             configure_ble_connection(
@@ -797,7 +899,7 @@ async fn manage_ble_connections<'values, 'server, C>(
                                 stack,
                                 &conn,
                                 sender,
-                                control.pairing_allowed(host_id),
+                                control.pairing_allowed(host_id) && pairing_candidate,
                                 control.restored_bond(host_id),
                             )
                             .await;
@@ -805,6 +907,7 @@ async fn manage_ble_connections<'values, 'server, C>(
                                 &mut connection_slots,
                                 assigned_slot.index(),
                                 conn,
+                                pairing_candidate,
                             );
                         }
                         Err(err) => {
@@ -820,12 +923,51 @@ async fn manage_ble_connections<'values, 'server, C>(
                 }
                 Either3::Second(slot_event) => {
                     let (slot, progress) = slot_event;
-                    if let ConnectionProgress::Disconnected = progress {
-                        if let Err(err) = slots.set_disconnected(slot) {
-                            log::error!("firmware: ble slot state error {:?}", err);
+                    match progress {
+                        ConnectionProgress::Stay => {}
+                        ConnectionProgress::SecurityEstablished => {
+                            if let Some(entry) = slots.entry_for_slot(slot) {
+                                control.clear_pairing_failure(entry.peer_identity);
+                            }
+                            if let Some(connection_slot) = connection_slots.get_mut(slot) {
+                                connection_slot.pairing_failure_recorded = false;
+                            }
                         }
-                        clear_connection_slot(&mut connection_slots, slot);
-                        continue 'connections;
+                        ConnectionProgress::SecurityFailed => {
+                            record_pairing_failure_for_slot(
+                                slot,
+                                &slots,
+                                &mut connection_slots,
+                                control,
+                            );
+                            if let Some(conn) = connection_slots
+                                .get(slot)
+                                .and_then(|connection_slot| connection_slot.conn.as_ref())
+                            {
+                                let _ = conn.raw().set_bondable(false);
+                                conn.raw().disconnect();
+                            }
+                        }
+                        ConnectionProgress::Disconnected { reason } => {
+                            if is_stale_bond_disconnect_reason(reason)
+                                && !connection_slots
+                                    .get(slot)
+                                    .map(|connection_slot| connection_slot.pairing_failure_recorded)
+                                    .unwrap_or(false)
+                            {
+                                record_pairing_failure_for_slot(
+                                    slot,
+                                    &slots,
+                                    &mut connection_slots,
+                                    control,
+                                );
+                            }
+                            if let Err(err) = slots.set_disconnected(slot) {
+                                log::error!("firmware: ble slot state error {:?}", err);
+                            }
+                            clear_connection_slot(&mut connection_slots, slot);
+                            continue 'connections;
+                        }
                     }
                 }
                 Either3::First(command) => {
@@ -861,6 +1003,8 @@ async fn manage_ble_connections<'values, 'server, C>(
 struct BleConnectionTaskSlot<'values, 'server> {
     conn: Option<GattConnection<'values, 'server, DefaultPacketPool>>,
     encryption_reported: bool,
+    pairing_candidate: bool,
+    pairing_failure_recorded: bool,
 }
 
 impl<'values, 'server> BleConnectionTaskSlot<'values, 'server> {
@@ -868,6 +1012,8 @@ impl<'values, 'server> BleConnectionTaskSlot<'values, 'server> {
         Self {
             conn,
             encryption_reported: false,
+            pairing_candidate: false,
+            pairing_failure_recorded: false,
         }
     }
 }
@@ -877,24 +1023,27 @@ fn initialize_ble_slot<P>(
     slot: usize,
     conn: Option<&GattConnection<'_, '_, P>>,
     restored_state: Option<&StorageState>,
-    control: &BleControlState,
-) where
+    control: &BleControlState<'_>,
+) -> bool
+where
     P: PacketPool,
 {
     let Some(conn) = conn else {
-        return;
-    };
-    let Some(host_id) = resolve_connection_host_id(conn, restored_state, control) else {
-        log::info!(
-            "firmware: skipping slot init for unknown peer identity={:?}",
-            conn.raw().peer_identity()
-        );
-        return;
+        return false;
     };
     let peer_identity = connection_peer_identity(conn);
+    let Some(host_id) = resolve_ble_host_id(restored_state, peer_identity, control.pairing_host())
+    else {
+        log::info!(
+            "firmware: skipping slot init for unknown peer address={:02X?}",
+            peer_identity.peer_address
+        );
+        return false;
+    };
     if let Err(err) = slots.set_connected(slot, host_id, peer_identity) {
         log::error!("firmware: ble slot state error {:?}", err);
     }
+    is_pairing_candidate(restored_state, control, peer_identity)
 }
 
 async fn advertise_if_slot_available<'values, 'server, C>(
@@ -1023,10 +1172,13 @@ fn assign_connection_to_slot<'values, 'server>(
     connection_slots: &mut [BleConnectionTaskSlot<'values, 'server>; BLE_CONNECTIONS_MAX],
     slot: usize,
     conn: GattConnection<'values, 'server, DefaultPacketPool>,
+    pairing_candidate: bool,
 ) {
     if let Some(entry) = connection_slots.get_mut(slot) {
         entry.conn = Some(conn);
         entry.encryption_reported = false;
+        entry.pairing_candidate = pairing_candidate;
+        entry.pairing_failure_recorded = false;
     }
 }
 
@@ -1037,6 +1189,8 @@ fn clear_connection_slot<'values, 'server>(
     if let Some(entry) = connection_slots.get_mut(slot) {
         entry.conn = None;
         entry.encryption_reported = false;
+        entry.pairing_candidate = false;
+        entry.pairing_failure_recorded = false;
     }
 }
 
@@ -1293,10 +1447,9 @@ async fn configure_ble_connection<C, P>(
         restored_bond
     );
     log::debug!(
-        "firmware: ble slot {} peer={:?} identity={:?}",
+        "firmware: ble slot {} peer_address={:02X?}",
         slot,
-        conn.raw().peer_address(),
-        conn.raw().peer_identity()
+        conn.raw().peer_address().into_inner()
     );
     if let Err(err) = conn.raw().set_bondable(pairing_allowed) {
         log::warn!("firmware: ble set_bondable failed: {:?}", err);
@@ -1420,10 +1573,52 @@ where
     Ok(advertiser.accept().await?.with_attribute_server(server)?)
 }
 
+const HCI_AUTHENTICATION_FAILURE: u8 = 0x05;
+const HCI_PIN_OR_KEY_MISSING: u8 = 0x06;
+
+const fn is_stale_bond_disconnect_reason(reason: u8) -> bool {
+    matches!(reason, HCI_AUTHENTICATION_FAILURE | HCI_PIN_OR_KEY_MISSING)
+}
+
+fn record_pairing_failure_for_slot(
+    slot: usize,
+    slots: &BleConnectionSlots<BLE_CONNECTIONS_MAX>,
+    connection_slots: &mut [BleConnectionTaskSlot<'_, '_>; BLE_CONNECTIONS_MAX],
+    control: &mut BleControlState<'_>,
+) {
+    let Some(entry) = slots.entry_for_slot(slot) else {
+        return;
+    };
+    let Some(connection_slot) = connection_slots.get_mut(slot) else {
+        return;
+    };
+
+    // Only a peer admitted as an unknown pairing candidate may enter this
+    // quarantine. A restored bond failing to reconnect is not a pairing
+    // failure for the currently open pairing window.
+    if !connection_slot.pairing_candidate
+        || !control.pairing_allowed(entry.host_id)
+        || connection_slot.pairing_failure_recorded
+    {
+        return;
+    }
+
+    let backoff_ms =
+        control.record_pairing_failure(entry.peer_identity, Instant::now().as_millis());
+    connection_slot.pairing_failure_recorded = true;
+    log::warn!(
+        "firmware: pairing peer temporarily blocked host={} backoff_ms={}",
+        entry.host_id.0,
+        backoff_ms,
+    );
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConnectionProgress {
     Stay,
-    Disconnected,
+    SecurityEstablished,
+    SecurityFailed,
+    Disconnected { reason: u8 },
 }
 
 async fn process_gatt_event<P>(
@@ -1464,7 +1659,9 @@ where
                 ))
                 .await;
             mark_host_disconnected(host_id);
-            ConnectionProgress::Disconnected
+            ConnectionProgress::Disconnected {
+                reason: u8::from(reason),
+            }
         }
         GattConnectionEvent::Gatt { event } => {
             // ATT has a short response deadline. Never wait for the shared runtime
@@ -1539,9 +1736,8 @@ where
             }
             if let Some(bond) = bond.as_ref() {
                 log::debug!(
-                    "firmware: ble slot {} pairing bond identity={:?} bonded={} level={:?}",
+                    "firmware: ble slot {} pairing bond bonded={} level={:?}",
                     slot,
-                    bond.identity,
                     bond.is_bonded,
                     bond.security_level
                 );
@@ -1562,11 +1758,15 @@ where
                 security_level,
                 bonded
             );
-            ConnectionProgress::Stay
+            if security_level.encrypted() {
+                ConnectionProgress::SecurityEstablished
+            } else {
+                ConnectionProgress::Stay
+            }
         }
         GattConnectionEvent::PairingFailed(err) => {
             log::warn!("firmware: ble slot {} pairing failed: {:?}", slot, err);
-            ConnectionProgress::Stay
+            ConnectionProgress::SecurityFailed
         }
         GattConnectionEvent::ConnectionParamsUpdated {
             conn_interval,
