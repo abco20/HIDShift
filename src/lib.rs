@@ -41,6 +41,8 @@ pub mod input;
 #[cfg(feature = "dual-s3-wired")]
 pub mod interchip;
 pub mod management;
+#[cfg(feature = "dual-s3-wired")]
+pub mod mirror;
 pub mod mouse_accumulator;
 pub mod output_target;
 pub mod reports;

@@ -4,6 +4,50 @@ pub const FALLBACK_USB_DEVICE_RELEASE: u16 = 0x0002;
 pub const FALLBACK_USB_MANUFACTURER: &str = "HIDShift";
 pub const FALLBACK_USB_PRODUCT: &str = "HIDShift Wired";
 
+pub const FALLBACK_DEVICE_DESCRIPTOR: [u8; 18] = [
+    18,
+    0x01,
+    0x00,
+    0x02, // USB 2.0
+    0,
+    0,
+    0,
+    64,
+    FALLBACK_USB_VENDOR_ID as u8,
+    (FALLBACK_USB_VENDOR_ID >> 8) as u8,
+    FALLBACK_USB_PRODUCT_ID as u8,
+    (FALLBACK_USB_PRODUCT_ID >> 8) as u8,
+    FALLBACK_USB_DEVICE_RELEASE as u8,
+    (FALLBACK_USB_DEVICE_RELEASE >> 8) as u8,
+    1,
+    2,
+    0,
+    1,
+];
+
+pub const FALLBACK_CONFIGURATION_DESCRIPTOR: [u8; 91] = [
+    9, 0x02, 91, 0, 3, 1, 0, 0x80, 50, // configuration
+    9, 0x04, 0, 0, 2, 0x03, 0x01, 0x01, 0, // boot keyboard
+    9, 0x21, 0x11, 0x01, 0, 1, 0x22, 65, 0, // keyboard HID
+    7, 0x05, 0x81, 0x03, 8, 0, 1, // keyboard IN
+    7, 0x05, 0x01, 0x03, 1, 0, 1, // keyboard OUT
+    9, 0x04, 1, 0, 1, 0x03, 0x01, 0x02, 0, // boot mouse
+    9, 0x21, 0x11, 0x01, 0, 1, 0x22, 55, 0, // mouse HID
+    7, 0x05, 0x82, 0x03, 5, 0, 1, // mouse IN
+    9, 0x04, 2, 0, 1, 0x03, 0, 0, 0, // consumer control
+    9, 0x21, 0x11, 0x01, 0, 1, 0x22, 23, 0, // consumer HID
+    7, 0x05, 0x83, 0x03, 2, 0, 1, // consumer IN
+];
+
+const LANGUAGES_STRING_DESCRIPTOR: [u8; 4] = [4, 0x03, 0x09, 0x04];
+const MANUFACTURER_STRING_DESCRIPTOR: [u8; 18] = [
+    18, 0x03, b'H', 0, b'I', 0, b'D', 0, b'S', 0, b'h', 0, b'i', 0, b'f', 0, b't', 0,
+];
+const PRODUCT_STRING_DESCRIPTOR: [u8; 30] = [
+    30, 0x03, b'H', 0, b'I', 0, b'D', 0, b'S', 0, b'h', 0, b'i', 0, b'f', 0, b't', 0, b' ', 0,
+    b'W', 0, b'i', 0, b'r', 0, b'e', 0, b'd', 0,
+];
+
 pub const KEYBOARD_REPORT_DESCRIPTOR: &[u8] = &[
     0x05, 0x01, // Usage Page (Generic Desktop)
     0x09, 0x06, // Usage (Keyboard)
@@ -84,6 +128,53 @@ pub const CONSUMER_REPORT_DESCRIPTOR: &[u8] = &[
     0xc0, // End Collection
 ];
 
+pub fn build_fallback_mirror_image(
+    out: &mut [u8],
+) -> Result<usize, crate::mirror::MirrorImageEncodeError> {
+    let strings = [
+        crate::mirror::StringRecord {
+            index: 0,
+            lang_id: 0,
+            descriptor: &LANGUAGES_STRING_DESCRIPTOR,
+        },
+        crate::mirror::StringRecord {
+            index: 1,
+            lang_id: 0x0409,
+            descriptor: &MANUFACTURER_STRING_DESCRIPTOR,
+        },
+        crate::mirror::StringRecord {
+            index: 2,
+            lang_id: 0x0409,
+            descriptor: &PRODUCT_STRING_DESCRIPTOR,
+        },
+    ];
+    let reports = [
+        crate::mirror::HidReportRecord {
+            interface_number: 0,
+            descriptor: KEYBOARD_REPORT_DESCRIPTOR,
+        },
+        crate::mirror::HidReportRecord {
+            interface_number: 1,
+            descriptor: MOUSE_REPORT_DESCRIPTOR,
+        },
+        crate::mirror::HidReportRecord {
+            interface_number: 2,
+            descriptor: CONSUMER_REPORT_DESCRIPTOR,
+        },
+    ];
+    crate::mirror::serialize_mirror_image(
+        crate::mirror::MirrorImageSource {
+            flags: 0,
+            device_descriptor: &FALLBACK_DEVICE_DESCRIPTOR,
+            configuration_descriptor: &FALLBACK_CONFIGURATION_DESCRIPTOR,
+            bos_descriptor: &[],
+            strings: &strings,
+            hid_reports: &reports,
+        },
+        out,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,5 +196,23 @@ mod tests {
         assert_eq!(FALLBACK_USB_PRODUCT, "HIDShift Wired");
         assert_ne!(FALLBACK_USB_VENDOR_ID, 0);
         assert_ne!(FALLBACK_USB_PRODUCT_ID, 0);
+    }
+
+    #[test]
+    fn fallback_uses_the_same_mirror_image_validator_and_endpoint_planner() {
+        let mut bytes = [0; 1024];
+        let length = build_fallback_mirror_image(&mut bytes).unwrap();
+        let plan = crate::mirror::validate_mirror_image(&bytes[..length]).unwrap();
+
+        assert_eq!(plan.interfaces.len(), 3);
+        assert_eq!(plan.endpoints.len(), 4);
+        assert_eq!(
+            plan.endpoints
+                .iter()
+                .map(|endpoint| endpoint.address)
+                .collect::<heapless::Vec<_, 4>>()
+                .as_slice(),
+            &[0x81, 0x01, 0x82, 0x83]
+        );
     }
 }

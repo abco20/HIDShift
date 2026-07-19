@@ -1,0 +1,13 @@
+pub mod image;
+pub mod parser;
+pub mod plan;
+pub mod validator;
+
+pub use image::{
+    HSMI_HEADER_LEN, HSMI_MAGIC, HSMI_MAX_SIZE, HSMI_VERSION, HidReportDescriptorTable,
+    HidReportRecord, MirrorImage, MirrorImageEncodeError, MirrorImageHeader, MirrorImageSource,
+    StringDescriptorTable, StringRecord, serialize_mirror_image,
+};
+pub use parser::{MirrorImageParseError, parse_mirror_image};
+pub use plan::{EndpointPlan, HidInterfacePlan, UsbDevicePlan};
+pub use validator::{MirrorRejectReason, validate_mirror_image};
