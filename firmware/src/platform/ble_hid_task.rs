@@ -191,6 +191,7 @@ pub async fn ble_host_event_task(
     let restored_state = restore_receiver.receive().await;
     let mut current_storage = restored_state;
     let mut pairable_host = None;
+    let mut pairing_backoff = BlePairingBackoff::<RUNTIME_HOSTS_MAX>::new();
     let mut bt = Some(bt);
     let server = match Server::new_with_config(GapConfig::Peripheral(PeripheralConfig {
         name: BLE_DEVICE_NAME,
@@ -238,6 +239,7 @@ pub async fn ble_host_event_task(
                 server,
                 current_storage.as_ref(),
                 pairable_host,
+                &mut pairing_backoff,
             ),
             quiesce_request.receive(),
             usb_quiesce_request.receive(),
@@ -315,6 +317,7 @@ async fn run_ble_host_events<'server, C>(
     server: &'server Server<'server>,
     restored_state: Option<&StorageState>,
     pairable_host: Option<HostId>,
+    pairing_backoff: &mut BlePairingBackoff<RUNTIME_HOSTS_MAX>,
 ) where
     C: Controller
         + ControllerCmdSync<LeClearFilterAcceptList>
@@ -347,6 +350,7 @@ async fn run_ble_host_events<'server, C>(
         notify_receiver,
         restored_state,
         pairable_host,
+        pairing_backoff,
     );
     // Poll application/GATT work before the controller runner. A notification
     // queued by `accept` can then be drained by the runner in the same executor
@@ -361,21 +365,24 @@ fn retain_gatt_service_fields(server: &Server) {
     let _ = &server.management;
 }
 
-#[derive(Clone, Debug)]
-struct BleControlState {
+struct BleControlState<'backoff> {
     pairing_allowed: [bool; RUNTIME_HOSTS_MAX],
     restored_bond: [bool; RUNTIME_HOSTS_MAX],
     input_gate: BleInputGate<RUNTIME_HOSTS_MAX>,
-    pairing_backoff: BlePairingBackoff<RUNTIME_HOSTS_MAX>,
+    pairing_backoff: &'backoff mut BlePairingBackoff<RUNTIME_HOSTS_MAX>,
 }
 
-impl BleControlState {
-    fn new(restored_state: Option<&StorageState>, pairable_host: Option<HostId>) -> Self {
+impl<'backoff> BleControlState<'backoff> {
+    fn new(
+        restored_state: Option<&StorageState>,
+        pairable_host: Option<HostId>,
+        pairing_backoff: &'backoff mut BlePairingBackoff<RUNTIME_HOSTS_MAX>,
+    ) -> Self {
         let mut state = Self {
             pairing_allowed: [false; RUNTIME_HOSTS_MAX],
             restored_bond: [false; RUNTIME_HOSTS_MAX],
             input_gate: BleInputGate::new(),
-            pairing_backoff: BlePairingBackoff::new(),
+            pairing_backoff,
         };
         if let Some(storage) = restored_state {
             for host in storage.hosts() {
@@ -523,7 +530,7 @@ enum BleConnectionAdmission {
 fn admit_ble_connection<P>(
     conn: &GattConnection<'_, '_, P>,
     restored_state: Option<&StorageState>,
-    control: &BleControlState,
+    control: &BleControlState<'_>,
     now_ms: u64,
 ) -> BleConnectionAdmission
 where
@@ -563,21 +570,16 @@ where
 
 fn is_pairing_candidate(
     restored_state: Option<&StorageState>,
-    control: &BleControlState,
+    control: &BleControlState<'_>,
     peer: BlePeerIdentity,
 ) -> bool {
     control.pairing_host().is_some() && resolve_ble_host_id(restored_state, peer, None).is_none()
 }
 
-fn reject_ble_connection<P>(conn: &GattConnection<'_, '_, P>, reason: &str)
+fn reject_ble_connection<P>(conn: &GattConnection<'_, '_, P>)
 where
     P: PacketPool,
 {
-    log::warn!(
-        "firmware: rejecting BLE connection reason={} peer_address={:02X?}",
-        reason,
-        conn.raw().peer_address().into_inner()
-    );
     let _ = conn.raw().set_bondable(false);
     conn.raw().disconnect();
 }
@@ -668,13 +670,14 @@ async fn accept_ble_connections<'values, 'server, C>(
     >,
     restored_state: Option<&StorageState>,
     pairable_host: Option<HostId>,
+    pairing_backoff: &mut BlePairingBackoff<RUNTIME_HOSTS_MAX>,
 ) where
     C: Controller
         + ControllerCmdSync<LeClearFilterAcceptList>
         + ControllerCmdSync<LeAddDeviceToFilterAcceptList>
         + ControllerCmdAsync<LeSetPhy>,
 {
-    let mut control = BleControlState::new(restored_state, pairable_host);
+    let mut control = BleControlState::new(restored_state, pairable_host, pairing_backoff);
     configure_ble_accept_list(stack, restored_state).await;
     #[cfg(feature = "hardware-e2e")]
     {
@@ -720,7 +723,11 @@ async fn accept_ble_connections<'values, 'server, C>(
                 let (host_id, peer) = match admission {
                     BleConnectionAdmission::Accept { host_id, peer } => (host_id, peer),
                     BleConnectionAdmission::RejectUnknown => {
-                        reject_ble_connection(&conn, "unknown peer");
+                        log::warn!(
+                            "firmware: rejecting unknown BLE peer peer_address={:02X?}",
+                            conn.raw().peer_address().into_inner()
+                        );
+                        reject_ble_connection(&conn);
                         continue;
                     }
                     BleConnectionAdmission::RejectBackoff { remaining_ms } => {
@@ -729,7 +736,7 @@ async fn accept_ble_connections<'values, 'server, C>(
                             remaining_ms,
                             conn.raw().peer_address().into_inner()
                         );
-                        reject_ble_connection(&conn, "pairing backoff");
+                        reject_ble_connection(&conn);
                         continue;
                     }
                 };
@@ -799,7 +806,7 @@ async fn manage_ble_connections<'values, 'server, C>(
     slot2: Option<GattConnection<'values, 'server, DefaultPacketPool>>,
     slot3: Option<GattConnection<'values, 'server, DefaultPacketPool>>,
     restored_state: Option<&StorageState>,
-    control: &mut BleControlState,
+    control: &mut BleControlState<'_>,
 ) where
     C: Controller + ControllerCmdAsync<LeSetPhy>,
 {
@@ -865,7 +872,11 @@ async fn manage_ble_connections<'values, 'server, C>(
                     let (host_id, peer_identity) = match admission {
                         BleConnectionAdmission::Accept { host_id, peer } => (host_id, peer),
                         BleConnectionAdmission::RejectUnknown => {
-                            reject_ble_connection(&conn, "unknown peer");
+                            log::warn!(
+                                "firmware: rejecting unknown BLE peer peer_address={:02X?}",
+                                conn.raw().peer_address().into_inner()
+                            );
+                            reject_ble_connection(&conn);
                             continue 'connections;
                         }
                         BleConnectionAdmission::RejectBackoff { remaining_ms } => {
@@ -874,7 +885,7 @@ async fn manage_ble_connections<'values, 'server, C>(
                                 remaining_ms,
                                 conn.raw().peer_address().into_inner()
                             );
-                            reject_ble_connection(&conn, "pairing backoff");
+                            reject_ble_connection(&conn);
                             continue 'connections;
                         }
                     };
@@ -1012,7 +1023,7 @@ fn initialize_ble_slot<P>(
     slot: usize,
     conn: Option<&GattConnection<'_, '_, P>>,
     restored_state: Option<&StorageState>,
-    control: &BleControlState,
+    control: &BleControlState<'_>,
 ) -> bool
 where
     P: PacketPool,
@@ -1573,7 +1584,7 @@ fn record_pairing_failure_for_slot(
     slot: usize,
     slots: &BleConnectionSlots<BLE_CONNECTIONS_MAX>,
     connection_slots: &mut [BleConnectionTaskSlot<'_, '_>; BLE_CONNECTIONS_MAX],
-    control: &mut BleControlState,
+    control: &mut BleControlState<'_>,
 ) {
     let Some(entry) = slots.entry_for_slot(slot) else {
         return;
