@@ -5,14 +5,6 @@ mice, and consumer controls to the currently selected Bluetooth Low Energy
 host. Up to four BLE host sessions can remain registered so the active target
 can change without first disconnecting the previous host.
 
-The current PC-facing path is standard BLE HID. The USB Host boundary also
-preserves each physical device's identity, report descriptor, interface, and
-raw reports. That boundary is intended for a future PC companion driver that
-can expose vendor-specific devices without emulating them in ESP32 USB Device
-firmware; the driver and its wire protocol are not part of the current release.
-The intended boundary is documented in
-[docs/driver-architecture.md](docs/driver-architecture.md).
-
 ## Hardware
 
 - ESP32-S3
