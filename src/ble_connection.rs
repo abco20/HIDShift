@@ -113,6 +113,107 @@ impl BlePeerIdentity {
     }
 }
 
+pub const BLE_PAIRING_BACKOFF_STEPS_MS: [u64; 4] = [2_000, 5_000, 15_000, 30_000];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlePairingBackoffEntry {
+    peer: BlePeerIdentity,
+    failure_count: u8,
+    blocked_until_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlePairingBackoff<const CAPACITY: usize> {
+    entries: [Option<BlePairingBackoffEntry>; CAPACITY],
+}
+
+impl<const CAPACITY: usize> BlePairingBackoff<CAPACITY> {
+    pub const fn new() -> Self {
+        Self {
+            entries: [None; CAPACITY],
+        }
+    }
+
+    pub fn blocked_remaining_ms(&self, peer: BlePeerIdentity, now_ms: u64) -> Option<u64> {
+        self.entries.iter().flatten().find_map(|entry| {
+            (entry.peer.matches_peer(peer) && entry.blocked_until_ms > now_ms)
+                .then_some(entry.blocked_until_ms - now_ms)
+        })
+    }
+
+    pub fn record_failure(&mut self, peer: BlePeerIdentity, now_ms: u64) -> u64 {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.peer.matches_peer(peer))
+        {
+            entry.failure_count = entry.failure_count.saturating_add(1);
+            let backoff_ms = backoff_for_failure_count(entry.failure_count);
+            entry.blocked_until_ms = now_ms.saturating_add(backoff_ms);
+            return backoff_ms;
+        }
+
+        let replacement = self
+            .entries
+            .iter()
+            .position(|entry| entry.is_none())
+            .or_else(|| {
+                self.entries
+                    .iter()
+                    .position(|entry| entry.is_some_and(|entry| entry.blocked_until_ms <= now_ms))
+            })
+            .or_else(|| {
+                self.entries
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, entry)| {
+                        entry
+                            .map(|entry| entry.blocked_until_ms)
+                            .unwrap_or(u64::MAX)
+                    })
+                    .map(|(index, _)| index)
+            });
+
+        let Some(index) = replacement else {
+            return 0;
+        };
+        let backoff_ms = BLE_PAIRING_BACKOFF_STEPS_MS[0];
+        self.entries[index] = Some(BlePairingBackoffEntry {
+            peer,
+            failure_count: 1,
+            blocked_until_ms: now_ms.saturating_add(backoff_ms),
+        });
+        backoff_ms
+    }
+
+    pub fn clear_peer(&mut self, peer: BlePeerIdentity) {
+        for entry in &mut self.entries {
+            if entry.is_some_and(|entry| entry.peer.matches_peer(peer)) {
+                *entry = None;
+            }
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.fill(None);
+    }
+}
+
+impl<const CAPACITY: usize> Default for BlePairingBackoff<CAPACITY> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+const fn backoff_for_failure_count(failure_count: u8) -> u64 {
+    let mut index = failure_count.saturating_sub(1) as usize;
+    if index >= BLE_PAIRING_BACKOFF_STEPS_MS.len() {
+        index = BLE_PAIRING_BACKOFF_STEPS_MS.len() - 1;
+    }
+    BLE_PAIRING_BACKOFF_STEPS_MS[index]
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BleConnectionEntry {
     pub host_id: HostId,
@@ -342,6 +443,13 @@ mod tests {
         BlePeerIdentity {
             peer_address: [index, 2, 3, 4, 5, 6],
             peer_irk: Some([index; 16]),
+        }
+    }
+
+    fn address_peer(index: u8) -> BlePeerIdentity {
+        BlePeerIdentity {
+            peer_address: [index, 2, 3, 4, 5, 6],
+            peer_irk: None,
         }
     }
 
@@ -596,5 +704,86 @@ mod tests {
         gate.activate(HostId(1));
         assert!(!gate.should_drop_input(HostId(1)));
         assert!(gate.should_drop_input(HostId(0)));
+    }
+
+    #[test]
+    fn pairing_backoff_blocks_same_address_but_not_another_peer() {
+        let mut backoff = BlePairingBackoff::<4>::new();
+        let first = address_peer(1);
+        let second = address_peer(2);
+
+        assert_eq!(backoff.record_failure(first, 100), 2_000);
+        assert_eq!(backoff.blocked_remaining_ms(first, 100), Some(2_000));
+        assert_eq!(backoff.blocked_remaining_ms(second, 100), None);
+    }
+
+    #[test]
+    fn pairing_backoff_escalates_and_caps_at_thirty_seconds() {
+        let mut backoff = BlePairingBackoff::<4>::new();
+        let peer = address_peer(1);
+
+        assert_eq!(backoff.record_failure(peer, 0), 2_000);
+        assert_eq!(backoff.record_failure(peer, 2_000), 5_000);
+        assert_eq!(backoff.record_failure(peer, 7_000), 15_000);
+        assert_eq!(backoff.record_failure(peer, 22_000), 30_000);
+        assert_eq!(backoff.record_failure(peer, 52_000), 30_000);
+        assert_eq!(backoff.blocked_remaining_ms(peer, 52_000), Some(30_000));
+    }
+
+    #[test]
+    fn pairing_backoff_expires_and_can_be_cleared() {
+        let mut backoff = BlePairingBackoff::<4>::new();
+        let peer = address_peer(1);
+
+        backoff.record_failure(peer, 100);
+        assert_eq!(backoff.blocked_remaining_ms(peer, 2_099), Some(1));
+        assert_eq!(backoff.blocked_remaining_ms(peer, 2_100), None);
+
+        backoff.clear_peer(peer);
+        assert_eq!(backoff.blocked_remaining_ms(peer, 2_100), None);
+        backoff.record_failure(peer, 2_100);
+        backoff.clear();
+        assert_eq!(backoff.blocked_remaining_ms(peer, 2_100), None);
+    }
+
+    #[test]
+    fn pairing_backoff_matches_rotating_address_by_irk() {
+        let mut backoff = BlePairingBackoff::<4>::new();
+        let first = peer(1);
+        let mut rotated = first;
+        rotated.peer_address = [9, 8, 7, 6, 5, 4];
+
+        backoff.record_failure(first, 0);
+
+        assert_eq!(backoff.blocked_remaining_ms(rotated, 0), Some(2_000));
+    }
+
+    #[test]
+    fn pairing_backoff_uses_address_when_irk_is_missing() {
+        let mut backoff = BlePairingBackoff::<4>::new();
+        let first = address_peer(1);
+        let same_address = address_peer(1);
+        let other_address = address_peer(2);
+
+        backoff.record_failure(first, 0);
+
+        assert_eq!(backoff.blocked_remaining_ms(same_address, 0), Some(2_000));
+        assert_eq!(backoff.blocked_remaining_ms(other_address, 0), None);
+    }
+
+    #[test]
+    fn pairing_backoff_replaces_earliest_entry_when_capacity_is_full() {
+        let mut backoff = BlePairingBackoff::<2>::new();
+        let first = address_peer(1);
+        let second = address_peer(2);
+        let third = address_peer(3);
+
+        backoff.record_failure(first, 0);
+        backoff.record_failure(second, 1_000);
+        backoff.record_failure(third, 1_500);
+
+        assert_eq!(backoff.blocked_remaining_ms(first, 1_500), None);
+        assert_eq!(backoff.blocked_remaining_ms(second, 1_500), Some(1_500));
+        assert_eq!(backoff.blocked_remaining_ms(third, 1_500), Some(2_000));
     }
 }

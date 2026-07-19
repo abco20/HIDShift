@@ -50,10 +50,10 @@ pub use ble::{
     cccd_notify_enabled,
 };
 pub use ble_connection::{
-    BleConnectionEntry, BleConnectionSlot, BleConnectionSlotError, BleConnectionSlots,
-    BleConnectionTiming, BleInputGate, BlePeerIdentity, BlePhyPreference,
-    low_latency_ble_connection_timing, resolve_host_id as resolve_ble_host_id,
-    restrict_advertising_to_bonded_peers,
+    BLE_PAIRING_BACKOFF_STEPS_MS, BleConnectionEntry, BleConnectionSlot, BleConnectionSlotError,
+    BleConnectionSlots, BleConnectionTiming, BleInputGate, BlePairingBackoff,
+    BlePairingBackoffEntry, BlePeerIdentity, BlePhyPreference, low_latency_ble_connection_timing,
+    resolve_host_id as resolve_ble_host_id, restrict_advertising_to_bonded_peers,
 };
 pub use ble_notify::{
     BleNotificationDispatchError, BleNotificationSink, BleTypedNotification,
