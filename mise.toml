@@ -142,6 +142,42 @@ cargo +esp check \
   --target xtensa-esp32s3-none-elf
 """
 
+[tasks."firmware:flash-dual"]
+description = "Flash the optional dual-S3 Host firmware using HIDSHIFT_HOST_PORT"
+depends = ["firmware:build-dual"]
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+: "${HIDSHIFT_HOST_PORT:?Set HIDSHIFT_HOST_PORT to the Host S3 UART path}"
+
+export_file="$MISE_PROJECT_ROOT/.mise/esp/export-esp.sh"
+source "$export_file"
+
+espflash flash \
+  --chip esp32s3 \
+  --port "$HIDSHIFT_HOST_PORT" \
+  --partition-table partitions/bridge.csv \
+  --target-app-partition factory \
+  target/xtensa-esp32s3-none-elf/release/firmware
+"""
+
+[tasks."device-firmware:flash"]
+description = "Flash the native USB Device firmware using HIDSHIFT_DEVICE_PORT"
+depends = ["device-firmware:build"]
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+: "${HIDSHIFT_DEVICE_PORT:?Set HIDSHIFT_DEVICE_PORT to the Device S3 UART path}"
+
+export_file="$MISE_PROJECT_ROOT/.mise/esp/export-esp.sh"
+source "$export_file"
+
+espflash flash \
+  --chip esp32s3 \
+  --port "$HIDSHIFT_DEVICE_PORT" \
+  device-firmware/target/xtensa-esp32s3-none-elf/release/hidshift-device
+"""
+
 [tasks."firmware:check"]
 description = "Run the ESP32-S3 firmware checks"
 run = """

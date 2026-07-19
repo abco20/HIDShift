@@ -13,7 +13,8 @@ pub use message::{
     CAPABILITY_CONTROL_FORWARDING, CAPABILITY_DYNAMIC_PROFILE, CAPABILITY_ENDPOINT_IN,
     CAPABILITY_ENDPOINT_OUT, CAPABILITY_FALLBACK_PROFILE, CAPABILITY_PROFILE_FLASH_CACHE,
     CAPABILITY_STANDARD_WIRED_HID, CAPABILITY_USB_STATE_REPORTING, Hello, InterchipRole,
-    StandardInputReport, StandardInputReportError, UsbState,
+    StandardInputReport, StandardInputReportError, StandardOutputReport, StandardOutputReportError,
+    UsbState,
 };
 pub use record::{Record, RecordCodecError, RecordIter, RecordRef, encode_records};
 pub use reliable::{

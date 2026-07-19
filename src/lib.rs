@@ -34,6 +34,8 @@ pub mod ble_runtime;
 pub mod bridge;
 pub mod checksum;
 pub mod e2e;
+#[cfg(feature = "dual-s3-wired")]
+pub mod fallback;
 pub mod ids;
 pub mod input;
 #[cfg(feature = "dual-s3-wired")]

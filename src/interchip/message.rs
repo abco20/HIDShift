@@ -30,6 +30,8 @@ pub const HELLO_WIRE_LEN: usize = 12;
 pub const USB_STATE_WIRE_LEN: usize = 8;
 pub const STANDARD_INPUT_HEADER_LEN: usize = 5;
 pub const STANDARD_INPUT_MAX_LEN: usize = STANDARD_INPUT_HEADER_LEN + KEYBOARD_REPORT_LEN;
+pub const STANDARD_OUTPUT_MAX_DATA_LEN: usize = 8;
+pub const STANDARD_OUTPUT_WIRE_LEN: usize = 2 + STANDARD_OUTPUT_MAX_DATA_LEN;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -168,6 +170,63 @@ pub struct StandardInputReport {
     pub report: StandardHidReport,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StandardOutputReport {
+    pub kind: u8,
+    pub length: u8,
+    pub data: [u8; STANDARD_OUTPUT_MAX_DATA_LEN],
+}
+
+impl StandardOutputReport {
+    pub fn new(kind: u8, data: &[u8]) -> Result<Self, StandardOutputReportError> {
+        if data.len() > STANDARD_OUTPUT_MAX_DATA_LEN {
+            return Err(StandardOutputReportError::DataTooLong);
+        }
+        let mut report = Self {
+            kind,
+            length: data.len() as u8,
+            data: [0; STANDARD_OUTPUT_MAX_DATA_LEN],
+        };
+        report.data[..data.len()].copy_from_slice(data);
+        Ok(report)
+    }
+
+    pub const fn data(&self) -> &[u8] {
+        self.data.split_at(self.length as usize).0
+    }
+
+    pub const fn encode(self) -> [u8; STANDARD_OUTPUT_WIRE_LEN] {
+        let mut bytes = [0; STANDARD_OUTPUT_WIRE_LEN];
+        bytes[0] = self.kind;
+        bytes[1] = self.length;
+        let mut index = 0;
+        while index < STANDARD_OUTPUT_MAX_DATA_LEN {
+            bytes[index + 2] = self.data[index];
+            index += 1;
+        }
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, StandardOutputReportError> {
+        if bytes.len() != STANDARD_OUTPUT_WIRE_LEN {
+            return Err(StandardOutputReportError::InvalidLength);
+        }
+        let length = bytes[1] as usize;
+        if length > STANDARD_OUTPUT_MAX_DATA_LEN
+            || bytes[2 + length..].iter().any(|byte| *byte != 0)
+        {
+            return Err(StandardOutputReportError::InvalidLength);
+        }
+        let mut data = [0; STANDARD_OUTPUT_MAX_DATA_LEN];
+        data.copy_from_slice(&bytes[2..]);
+        Ok(Self {
+            kind: bytes[0],
+            length: length as u8,
+            data,
+        })
+    }
+}
+
 impl StandardInputReport {
     pub fn encode(self) -> ([u8; STANDARD_INPUT_MAX_LEN], u8) {
         let mut bytes = [0; STANDARD_INPUT_MAX_LEN];
@@ -243,6 +302,12 @@ pub enum StandardInputReportError {
     InvalidReportLength,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StandardOutputReportError {
+    DataTooLong,
+    InvalidLength,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,6 +361,20 @@ mod tests {
                 Ok(message)
             );
         }
+    }
+
+    #[test]
+    fn standard_output_report_round_trips_with_zeroed_tail() {
+        let report = StandardOutputReport::new(1, &[0x05]).unwrap();
+        assert_eq!(report.data(), &[0x05]);
+        assert_eq!(StandardOutputReport::decode(&report.encode()), Ok(report));
+
+        let mut noncanonical = report.encode();
+        noncanonical[9] = 1;
+        assert_eq!(
+            StandardOutputReport::decode(&noncanonical),
+            Err(StandardOutputReportError::InvalidLength)
+        );
     }
 
     #[test]

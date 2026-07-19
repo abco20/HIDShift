@@ -154,6 +154,15 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
                     Ok(())
                 }
             }
+            #[cfg(feature = "dual-s3-wired")]
+            BridgeEvent::WiredKeyboardLedChanged { leds } => {
+                self.state.wired_keyboard_leds = leds;
+                if self.state.output_target.selected == OutputTarget::Wired {
+                    self.push_usb_keyboard_leds(leds, out)
+                } else {
+                    Ok(())
+                }
+            }
             BridgeEvent::SetHostName { host_id, name } => {
                 if self.state.hosts.set_name(host_id, name)? {
                     push_action(out, BridgeAction::PersistProfiles)?;
@@ -413,6 +422,7 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
             self.state.output_target.set_availability(availability);
             if availability == OutputTargetAvailability::Ready {
                 self.push_neutral_reports(OutputTarget::Wired, NotifyReason::SafetyRelease, out)?;
+                self.push_usb_keyboard_leds(self.state.wired_keyboard_leds, out)?;
             }
         }
         self.push_status(out)
@@ -522,6 +532,10 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
         &self,
         out: &mut heapless::Vec<BridgeAction, ACTIONS>,
     ) -> Result<(), BridgeError> {
+        #[cfg(feature = "dual-s3-wired")]
+        if self.state.output_target.selected == OutputTarget::Wired {
+            return self.push_usb_keyboard_leds(self.state.wired_keyboard_leds, out);
+        }
         let Some(active_target) = self.state.hosts.active_target() else {
             return Ok(());
         };
@@ -848,6 +862,8 @@ pub struct BridgeState<const HOSTS: usize> {
     #[cfg(feature = "dual-s3-wired")]
     pub wired_availability: OutputTargetAvailability,
     #[cfg(feature = "dual-s3-wired")]
+    pub wired_keyboard_leds: KeyboardLedState,
+    #[cfg(feature = "dual-s3-wired")]
     pub mirror_target: Option<crate::output_target::StoredMirrorTarget>,
 }
 
@@ -865,6 +881,8 @@ impl<const HOSTS: usize> BridgeState<HOSTS> {
             output_target: OutputTargetState::new(),
             #[cfg(feature = "dual-s3-wired")]
             wired_availability: OutputTargetAvailability::Unavailable,
+            #[cfg(feature = "dual-s3-wired")]
+            wired_keyboard_leds: KeyboardLedState::empty(),
             #[cfg(feature = "dual-s3-wired")]
             mirror_target: None,
         }
@@ -1017,6 +1035,10 @@ pub enum BridgeEvent {
     #[cfg(feature = "dual-s3-wired")]
     WiredAvailabilityChanged {
         availability: OutputTargetAvailability,
+    },
+    #[cfg(feature = "dual-s3-wired")]
+    WiredKeyboardLedChanged {
+        leds: KeyboardLedState,
     },
 }
 
@@ -1318,6 +1340,57 @@ mod tests {
         assert!(actions.is_empty());
         assert_eq!(bridge.state().output_target.selected, OutputTarget::Wired);
         assert_eq!(bridge.state().output_target.active, None);
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    #[test]
+    fn wired_keyboard_led_is_cached_and_applied_only_for_wired_selection() {
+        let mut bridge = ready_bridge();
+        let mut actions = heapless::Vec::<BridgeAction, 12>::new();
+        bridge
+            .handle_event(
+                BridgeEvent::UsbHidInterfaceConnected {
+                    interface_id: InterfaceId(9),
+                    device_id: DeviceId(4),
+                    keyboard_led_sink: true,
+                },
+                &mut actions,
+            )
+            .unwrap();
+        actions.clear();
+
+        bridge
+            .handle_event(
+                BridgeEvent::WiredKeyboardLedChanged {
+                    leds: KeyboardLedState::CAPS_LOCK,
+                },
+                &mut actions,
+            )
+            .unwrap();
+        assert!(actions.is_empty());
+
+        bridge
+            .handle_event(
+                BridgeEvent::SelectOutputTarget {
+                    target: OutputTarget::Wired,
+                },
+                &mut actions,
+            )
+            .unwrap();
+        actions.clear();
+        bridge
+            .handle_event(
+                BridgeEvent::WiredAvailabilityChanged {
+                    availability: OutputTargetAvailability::Ready,
+                },
+                &mut actions,
+            )
+            .unwrap();
+        assert!(actions.contains(&BridgeAction::UsbSetKeyboardLeds {
+            interface_id: InterfaceId(9),
+            device_id: DeviceId(4),
+            leds: KeyboardLedState::CAPS_LOCK,
+        }));
     }
 
     #[test]

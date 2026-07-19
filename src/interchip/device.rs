@@ -3,12 +3,13 @@ use heapless::Vec;
 use super::message::{
     CAPABILITY_FALLBACK_PROFILE, CAPABILITY_STANDARD_WIRED_HID, CAPABILITY_USB_STATE_REPORTING,
     RECORD_FORCE_FALLBACK, RECORD_HEARTBEAT, RECORD_HELLO, RECORD_HELLO_ACK, RECORD_LINK_RESET,
-    RECORD_STANDARD_INPUT_REPORT, RECORD_STANDARD_RELEASE_ALL, RECORD_USB_STATE,
+    RECORD_STANDARD_INPUT_REPORT, RECORD_STANDARD_OUTPUT_REPORT, RECORD_STANDARD_RELEASE_ALL,
+    RECORD_USB_STATE,
 };
 use super::{
     Hello, InterchipRole, ReceiveDisposition, Record, RecordIter, ReliableReceiver, ReliableSender,
     RetransmitAction, SPI_CELL_LEN, SPI_CELL_PAYLOAD_LEN, SPI_PROTOCOL_VERSION, SpiCell,
-    StandardInputReport, UsbState, encode_records,
+    StandardInputReport, StandardOutputReport, UsbState, encode_records,
 };
 
 const DEVICE_CAPABILITIES: u32 =
@@ -25,6 +26,7 @@ pub enum DeviceLinkEvent {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DeviceLinkDiagnostics {
+    pub valid_cells: u32,
     pub standard_reports_received: u32,
     pub releases_received: u32,
     pub malformed_cells: u32,
@@ -71,6 +73,15 @@ impl DeviceLink {
         }
     }
 
+    pub fn queue_standard_output(&mut self, report: StandardOutputReport, now_ms: u64) -> bool {
+        if !self.host_compatible || self.next_cell.is_some() {
+            return false;
+        }
+        let data = report.encode();
+        self.next_cell = self.queue_record(RECORD_STANDARD_OUTPUT_REPORT, &data, now_ms);
+        self.next_cell.is_some()
+    }
+
     pub fn next_transaction(&mut self, now_ms: u64) -> [u8; SPI_CELL_LEN] {
         self.sender
             .set_cumulative_ack(self.receiver.cumulative_ack());
@@ -109,6 +120,7 @@ impl DeviceLink {
                 return;
             }
         };
+        self.diagnostics.valid_cells = self.diagnostics.valid_cells.saturating_add(1);
         self.sender.acknowledge(cell.header.cumulative_ack);
         match self.receiver.receive(&cell) {
             ReceiveDisposition::Accepted { .. } => {}
@@ -361,5 +373,35 @@ mod tests {
         assert_eq!(events.as_slice(), &[DeviceLinkEvent::StandardInput(report)]);
         assert_eq!(device.diagnostics().standard_reports_received, 1);
         assert_eq!(device.diagnostics().duplicate_cells, 1);
+    }
+
+    #[test]
+    fn standard_output_is_sent_only_after_compatible_hello() {
+        let mut device = DeviceLink::new(2, fallback_state());
+        let output = StandardOutputReport::new(1, &[0x02]).unwrap();
+        assert!(!device.queue_standard_output(output, 0));
+
+        let mut host = ReliableSender::new(1);
+        let hello = Hello {
+            role: InterchipRole::Host,
+            protocol_version: SPI_PROTOCOL_VERSION,
+            firmware_major: 0,
+            firmware_minor: 2,
+            capabilities: DEVICE_CAPABILITIES,
+            active_profile_hash: 0,
+        }
+        .encode();
+        let mut events = Vec::<_, 1>::new();
+        device.handle_transaction(&host_cell(&mut host, RECORD_HELLO, &hello), 0, &mut events);
+        // Send the mandatory HELLO_ACK/USB_STATE response first.
+        let _ = device.next_transaction(1);
+        assert!(device.queue_standard_output(output, 2));
+        let cell = SpiCell::decode(&device.next_transaction(2)).unwrap();
+        let record = RecordIter::new(cell.payload(), cell.header.record_count)
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.record_type, RECORD_STANDARD_OUTPUT_REPORT);
+        assert_eq!(StandardOutputReport::decode(record.data), Ok(output));
     }
 }

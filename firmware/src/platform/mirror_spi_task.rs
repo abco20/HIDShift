@@ -6,15 +6,17 @@ use esp_hal::spi::Mode;
 use esp_hal::spi::master::{Config, Spi};
 use esp_hal::time::Rate;
 use hidshift::bridge::{BridgeEvent, NotifyReason};
+use hidshift::input::KeyboardLedState;
 use hidshift::interchip::message::{
     CAPABILITY_FALLBACK_PROFILE, CAPABILITY_STANDARD_WIRED_HID, CAPABILITY_USB_STATE_REPORTING,
     RECORD_FORCE_FALLBACK, RECORD_HEARTBEAT, RECORD_HELLO, RECORD_HELLO_ACK, RECORD_LINK_RESET,
-    RECORD_STANDARD_INPUT_REPORT, RECORD_STANDARD_RELEASE_ALL, RECORD_USB_STATE,
+    RECORD_STANDARD_INPUT_REPORT, RECORD_STANDARD_OUTPUT_REPORT, RECORD_STANDARD_RELEASE_ALL,
+    RECORD_USB_STATE,
 };
 use hidshift::interchip::{
     Hello, InterchipRole, ReceiveDisposition, Record, RecordIter, ReliableReceiver, ReliableSender,
     RetransmitAction, SPI_CELL_LEN, SPI_CELL_PAYLOAD_LEN, SPI_PROTOCOL_VERSION, SpiCell,
-    StandardInputReport, UsbState, encode_records,
+    StandardInputReport, StandardOutputReport, UsbState, encode_records,
 };
 use hidshift::output_target::OutputTargetAvailability;
 use hidshift::runtime::message::RuntimeInputMessage;
@@ -130,6 +132,7 @@ async fn run_link(
     let mut last_valid_cell_ms = None;
     let mut last_heartbeat_ms = 0;
     let mut reported_availability = None;
+    let mut pending_wired_leds = None;
     let mut diagnostics = LinkDiagnostics::default();
     let mut ticker = Ticker::every(SPI_POLL_INTERVAL);
 
@@ -143,6 +146,7 @@ async fn run_link(
             desired_availability,
             &mut reported_availability,
         );
+        report_wired_leds(&runtime_sender, &mut pending_wired_leds);
 
         if last_valid_cell_ms
             .is_some_and(|last| now_ms.saturating_sub(last) >= LINK_LOSS_TIMEOUT_MS)
@@ -213,9 +217,13 @@ async fn run_link(
         sender.acknowledge(cell.header.cumulative_ack);
         match receiver.receive(&cell) {
             ReceiveDisposition::Accepted { .. } => {
-                if process_records(&cell, &mut hello_confirmed, &mut usb_state).is_err() {
-                    diagnostics.crc_or_codec_errors =
-                        diagnostics.crc_or_codec_errors.saturating_add(1);
+                match process_records(&cell, &mut hello_confirmed, &mut usb_state) {
+                    Ok(Some(leds)) => pending_wired_leds = Some(leds),
+                    Ok(None) => {}
+                    Err(()) => {
+                        diagnostics.crc_or_codec_errors =
+                            diagnostics.crc_or_codec_errors.saturating_add(1);
+                    }
                 }
             }
             ReceiveDisposition::Duplicate { .. } => {
@@ -323,7 +331,8 @@ fn process_records(
     cell: &SpiCell,
     hello_confirmed: &mut bool,
     usb_state: &mut Option<UsbState>,
-) -> Result<(), ()> {
+) -> Result<Option<KeyboardLedState>, ()> {
+    let mut wired_leds = None;
     let mut records = RecordIter::new(cell.payload(), cell.header.record_count);
     for record in records.by_ref() {
         let record = record.map_err(|_| ())?;
@@ -345,10 +354,21 @@ fn process_records(
                 *hello_confirmed = false;
                 *usb_state = None;
             }
+            RECORD_STANDARD_OUTPUT_REPORT => {
+                let report = StandardOutputReport::decode(record.data).map_err(|_| ())?;
+                if report.kind != 1 {
+                    return Err(());
+                }
+                let [bits] = report.data() else {
+                    return Err(());
+                };
+                wired_leds = Some(KeyboardLedState::from_bits_truncate(*bits));
+            }
             _ => {}
         }
     }
-    records.finish().map_err(|_| ())
+    records.finish().map_err(|_| ())?;
+    Ok(wired_leds)
 }
 
 fn availability(
@@ -393,6 +413,28 @@ fn report_availability(
         .is_ok()
     {
         *reported = Some(desired);
+    }
+}
+
+fn report_wired_leds(
+    sender: &Sender<
+        'static,
+        CriticalSectionRawMutex,
+        RuntimeInputMessage,
+        RUNTIME_INPUT_QUEUE_CAPACITY,
+    >,
+    pending: &mut Option<KeyboardLedState>,
+) {
+    let Some(leds) = *pending else {
+        return;
+    };
+    if sender
+        .try_send(RuntimeInputMessage::BridgeEvent(
+            BridgeEvent::WiredKeyboardLedChanged { leds },
+        ))
+        .is_ok()
+    {
+        *pending = None;
     }
 }
 
