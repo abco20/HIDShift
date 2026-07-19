@@ -1,4 +1,3 @@
-use crate::espnow_pairing::{ESPNOW_PAIRING_KEY_CHUNK_LEN, EspNowRole};
 use crate::ids::HostId;
 use crate::settings::{SettingId, SettingTarget};
 
@@ -25,11 +24,6 @@ const OP_GET_SCHEMA: u8 = 0x0b;
 const OP_GET_SETTING: u8 = 0x0c;
 const OP_SET_SETTING: u8 = 0x0d;
 const OP_GET_HOST_TIMING: u8 = 0x0e;
-const OP_GET_ESPNOW_INFO: u8 = 0x20;
-const OP_BEGIN_ESPNOW_PAIRING: u8 = 0x21;
-const OP_WRITE_ESPNOW_KEY: u8 = 0x22;
-const OP_COMMIT_ESPNOW_PAIRING: u8 = 0x23;
-const OP_FORGET_ESPNOW_PEER: u8 = 0x24;
 
 const PAYLOAD_NONE: u8 = 0;
 const PAYLOAD_STATUS: u8 = 1;
@@ -40,7 +34,6 @@ const PAYLOAD_HISTORY: u8 = 5;
 const PAYLOAD_SCHEMA: u8 = 6;
 const PAYLOAD_SETTING: u8 = 7;
 const PAYLOAD_HOST_TIMING: u8 = 8;
-const PAYLOAD_ESPNOW_INFO: u8 = 9;
 const STATUS_PAYLOAD_LEN: u8 = 10;
 const HOST_INFO_PAYLOAD_LEN: u8 = 15;
 const USB_DEVICE_PAYLOAD_LEN: u8 = 15;
@@ -49,7 +42,6 @@ const HISTORY_PAYLOAD_LEN: u8 = 15;
 const SCHEMA_PAYLOAD_LEN: u8 = 8;
 const SETTING_PAYLOAD_LEN: u8 = 8;
 const HOST_TIMING_PAYLOAD_LEN: u8 = 10;
-const ESPNOW_INFO_PAYLOAD_LEN: u8 = 15;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ManagementRequest {
@@ -83,29 +75,6 @@ impl ManagementRequest {
             },
             (OP_GET_DIAGNOSTICS, []) => ManagementCommand::GetDiagnostics,
             (OP_GET_HOST_TIMING, [host]) => ManagementCommand::GetHostTiming(HostId(*host)),
-            (OP_GET_ESPNOW_INFO, []) => ManagementCommand::GetEspNowInfo,
-            (OP_BEGIN_ESPNOW_PAIRING, [address @ .., channel]) if address.len() == 6 => {
-                ManagementCommand::BeginEspNowPairing {
-                    peer_address: address
-                        .try_into()
-                        .map_err(|_| ManagementProtocolError::InvalidArgument)?,
-                    channel: *channel,
-                }
-            }
-            (OP_WRITE_ESPNOW_KEY, [offset, length, chunk @ ..])
-                if chunk.len() == ESPNOW_PAIRING_KEY_CHUNK_LEN
-                    && usize::from(*length) <= ESPNOW_PAIRING_KEY_CHUNK_LEN =>
-            {
-                ManagementCommand::WriteEspNowKey {
-                    offset: *offset,
-                    length: *length,
-                    bytes: chunk
-                        .try_into()
-                        .map_err(|_| ManagementProtocolError::InvalidArgument)?,
-                }
-            }
-            (OP_COMMIT_ESPNOW_PAIRING, []) => ManagementCommand::CommitEspNowPairing,
-            (OP_FORGET_ESPNOW_PEER, []) => ManagementCommand::ForgetEspNowPeer,
             (OP_GET_HISTORY, [index]) => ManagementCommand::GetHistory { index: *index },
             (OP_GET_SCHEMA, []) => ManagementCommand::GetSchema,
             (OP_GET_SETTING, [id_low, id_high, scope, target]) => ManagementCommand::GetSetting {
@@ -135,25 +104,10 @@ impl ManagementRequest {
                 }
             }
             (
-                OP_GET_STATUS
-                | OP_SELECT_HOST
-                | OP_START_PAIRING
-                | OP_FORGET_HOST
-                | OP_GET_HOST_INFO
-                | OP_SET_HOST_NAME
-                | OP_CANCEL_PAIRING
-                | OP_GET_USB_DEVICE
-                | OP_GET_DIAGNOSTICS
-                | OP_GET_HISTORY
-                | OP_GET_SCHEMA
-                | OP_GET_SETTING
-                | OP_SET_SETTING
-                | OP_GET_HOST_TIMING
-                | OP_GET_ESPNOW_INFO
-                | OP_BEGIN_ESPNOW_PAIRING
-                | OP_WRITE_ESPNOW_KEY
-                | OP_COMMIT_ESPNOW_PAIRING
-                | OP_FORGET_ESPNOW_PEER,
+                OP_GET_STATUS | OP_SELECT_HOST | OP_START_PAIRING | OP_FORGET_HOST
+                | OP_GET_HOST_INFO | OP_SET_HOST_NAME | OP_CANCEL_PAIRING | OP_GET_USB_DEVICE
+                | OP_GET_DIAGNOSTICS | OP_GET_HISTORY | OP_GET_SCHEMA | OP_GET_SETTING
+                | OP_SET_SETTING | OP_GET_HOST_TIMING,
                 _,
             ) => {
                 return Err(ManagementProtocolError::InvalidArgument);
@@ -195,29 +149,6 @@ impl ManagementRequest {
             ManagementCommand::GetHostTiming(host_id) => {
                 encode_host_command(&mut bytes, OP_GET_HOST_TIMING, host_id)
             }
-            ManagementCommand::GetEspNowInfo => bytes[2] = OP_GET_ESPNOW_INFO,
-            ManagementCommand::BeginEspNowPairing {
-                peer_address,
-                channel,
-            } => {
-                bytes[2] = OP_BEGIN_ESPNOW_PAIRING;
-                bytes[3] = 7;
-                bytes[4..10].copy_from_slice(&peer_address);
-                bytes[10] = channel;
-            }
-            ManagementCommand::WriteEspNowKey {
-                offset,
-                length,
-                bytes: chunk,
-            } => {
-                bytes[2] = OP_WRITE_ESPNOW_KEY;
-                bytes[3] = 16;
-                bytes[4] = offset;
-                bytes[5] = length;
-                bytes[6..20].copy_from_slice(&chunk);
-            }
-            ManagementCommand::CommitEspNowPairing => bytes[2] = OP_COMMIT_ESPNOW_PAIRING,
-            ManagementCommand::ForgetEspNowPeer => bytes[2] = OP_FORGET_ESPNOW_PEER,
             ManagementCommand::GetHistory { index } => {
                 bytes[2] = OP_GET_HISTORY;
                 bytes[3] = 1;
@@ -286,31 +217,6 @@ pub enum ManagementCommand {
         target: SettingTarget,
         value: i32,
     },
-    GetEspNowInfo,
-    BeginEspNowPairing {
-        peer_address: [u8; 6],
-        channel: u8,
-    },
-    WriteEspNowKey {
-        offset: u8,
-        length: u8,
-        bytes: [u8; ESPNOW_PAIRING_KEY_CHUNK_LEN],
-    },
-    CommitEspNowPairing,
-    ForgetEspNowPeer,
-}
-
-impl ManagementCommand {
-    pub const fn is_espnow_pairing(self) -> bool {
-        matches!(
-            self,
-            Self::GetEspNowInfo
-                | Self::BeginEspNowPairing { .. }
-                | Self::WriteEspNowKey { .. }
-                | Self::CommitEspNowPairing
-                | Self::ForgetEspNowPeer
-        )
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -417,15 +323,6 @@ impl ManagementResponse {
                 bytes[6..10].copy_from_slice(&timing.last_connected_seconds.to_le_bytes());
                 bytes[10..14].copy_from_slice(&timing.last_disconnected_seconds.to_le_bytes());
                 bytes[14] = timing.last_disconnect_reason;
-            }
-            ManagementResponsePayload::EspNowInfo(info) => {
-                bytes[3] = PAYLOAD_ESPNOW_INFO;
-                bytes[4] = ESPNOW_INFO_PAYLOAD_LEN;
-                bytes[5] = u8::from(info.paired);
-                bytes[6] = info.role as u8;
-                bytes[7] = info.channel;
-                bytes[8..14].copy_from_slice(&info.local_address);
-                bytes[14..20].copy_from_slice(&info.peer_address);
             }
         }
         bytes
@@ -548,23 +445,6 @@ impl ManagementResponse {
                     last_disconnect_reason: bytes[14],
                 })
             }
-            (PAYLOAD_ESPNOW_INFO, ESPNOW_INFO_PAYLOAD_LEN) => {
-                ManagementResponsePayload::EspNowInfo(ManagementEspNowInfo {
-                    paired: bytes[5] != 0,
-                    role: match bytes[6] {
-                        1 => EspNowRole::UsbHost,
-                        2 => EspNowRole::UsbDevice,
-                        _ => return Err(ManagementProtocolError::InvalidArgument),
-                    },
-                    channel: bytes[7],
-                    local_address: bytes[8..14]
-                        .try_into()
-                        .map_err(|_| ManagementProtocolError::InvalidArgument)?,
-                    peer_address: bytes[14..20]
-                        .try_into()
-                        .map_err(|_| ManagementProtocolError::InvalidArgument)?,
-                })
-            }
             _ => return Err(ManagementProtocolError::InvalidArgument),
         };
         Ok(Self {
@@ -586,16 +466,6 @@ pub enum ManagementResponsePayload {
     Schema(ManagementSchema),
     Setting(ManagementSetting),
     HostTiming(ManagementHostTiming),
-    EspNowInfo(ManagementEspNowInfo),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ManagementEspNowInfo {
-    pub paired: bool,
-    pub role: EspNowRole,
-    pub channel: u8,
-    pub local_address: [u8; 6],
-    pub peer_address: [u8; 6],
 }
 
 #[repr(u8)]
@@ -609,8 +479,7 @@ pub enum ManagementResult {
     InvalidName = 5,
     InvalidSetting = 6,
     NotFound = 7,
-    InvalidPairing = 8,
-    Unavailable = 9,
+    Unavailable = 8,
 }
 
 impl ManagementResult {
@@ -624,8 +493,7 @@ impl ManagementResult {
             5 => Ok(Self::InvalidName),
             6 => Ok(Self::InvalidSetting),
             7 => Ok(Self::NotFound),
-            8 => Ok(Self::InvalidPairing),
-            9 => Ok(Self::Unavailable),
+            8 => Ok(Self::Unavailable),
             _ => Err(ManagementProtocolError::InvalidArgument),
         }
     }
@@ -913,18 +781,6 @@ mod tests {
                 target: SettingTarget::Host(HostId(2)),
                 value: 175,
             },
-            ManagementCommand::GetEspNowInfo,
-            ManagementCommand::BeginEspNowPairing {
-                peer_address: [1, 2, 3, 4, 5, 6],
-                channel: 6,
-            },
-            ManagementCommand::WriteEspNowKey {
-                offset: 0,
-                length: 14,
-                bytes: *b"pairing-key-00",
-            },
-            ManagementCommand::CommitEspNowPairing,
-            ManagementCommand::ForgetEspNowPeer,
         ] {
             let request = ManagementRequest {
                 request_id: 7,
@@ -1047,13 +903,6 @@ mod tests {
                 last_connected_seconds: 11,
                 last_disconnected_seconds: 22,
                 last_disconnect_reason: 0x13,
-            }),
-            ManagementResponsePayload::EspNowInfo(ManagementEspNowInfo {
-                paired: true,
-                role: EspNowRole::UsbHost,
-                channel: 6,
-                local_address: [1, 2, 3, 4, 5, 6],
-                peer_address: [6, 5, 4, 3, 2, 1],
             }),
         ];
         for payload in payloads {

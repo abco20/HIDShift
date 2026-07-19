@@ -10,22 +10,9 @@ publish = false
 name = "firmware"
 path = "src/main.rs"
 
-[[bin]]
-name = "bridge-device"
-path = "src/bin/bridge-device.rs"
-required-features = ["espnow-device"]
-
 [features]
-default = ["ble"]
-ble = ["esp-radio/ble"]
-diagnostic-input = []
+default = []
 hardware-e2e = []
-# Adds the two-board ESP-NOW transport. BLE HID/management remains enabled on
-# the Host firmware; both roles expose the wired management protocol.
-espnow = ["ble", "esp-radio/coex", "esp-radio/esp-now", "esp-radio/wifi"]
-# The PC-facing Device does not run BLE. Keeping the coexistence controller out
-# of this image avoids initializing an unused BT controller before Wi-Fi.
-espnow-device = ["esp-radio/esp-now", "esp-radio/wifi"]
 
 [dependencies]
 bt-hci = "0.8.1"
@@ -41,12 +28,10 @@ esp-alloc = { version = "0.10.0", default-features = false, features = ["compat"
 esp-backtrace = { version = "0.19.0", default-features = false, features = ["esp32s3", "panic-handler", "println"] }
 esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32s3"] }
 esp-hal = { version = "1.1.1", default-features = false, features = ["__bluetooth", "esp32s3", "rt", "unstable"] }
-# Coexistence runs BLE on the second core. Keep logger output and the wired E2E
-# management protocol from interleaving byte-by-byte across cores.
+# Keep logger output and the wired E2E management protocol from interleaving
+# byte-by-byte across interrupt contexts.
 esp-println = { version = "0.17.0", default-features = false, features = ["critical-section", "esp32s3", "log-04", "uart"] }
-# Wi-Fi/ESP-NOW is the two-board transport. Coexistence enables the controller
-# scheduler while the routing policy still sends input to one selected PC.
-esp-radio = { version = "1.0.0-beta.0", default-features = false, features = ["esp-alloc", "esp32s3", "log-04", "unstable"] }
+esp-radio = { version = "1.0.0-beta.0", default-features = false, features = ["ble", "esp-alloc", "esp32s3", "log-04", "unstable"] }
 esp-rtos = { version = "0.3.0", features = ["embassy", "esp-alloc", "esp-radio", "esp32s3"] }
 esp-storage = { version = "0.9.0", default-features = false, features = ["esp32s3"] }
 esp-synopsys-usb-otg = "0.4.2"

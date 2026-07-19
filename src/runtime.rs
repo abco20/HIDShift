@@ -772,11 +772,6 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                     ManagementResult::InvalidSetting
                 }
             }
-            ManagementCommand::GetEspNowInfo
-            | ManagementCommand::BeginEspNowPairing { .. }
-            | ManagementCommand::WriteEspNowKey { .. }
-            | ManagementCommand::CommitEspNowPairing
-            | ManagementCommand::ForgetEspNowPeer => ManagementResult::NotFound,
         };
 
         let payload = match request.command {

@@ -33,12 +33,8 @@ pub mod ble_notify;
 pub mod ble_runtime;
 pub mod bridge;
 pub mod e2e;
-pub mod espnow_pairing;
-pub mod espnow_pairing_management;
-pub mod espnow_security;
 pub mod ids;
 pub mod input;
-pub mod link;
 pub mod management;
 pub mod mouse_accumulator;
 pub mod reports;
@@ -47,7 +43,6 @@ pub mod runtime;
 pub mod settings;
 pub mod storage;
 pub mod target_control;
-pub mod transport;
 pub mod usb_hid;
 
 pub use ble::{
@@ -56,7 +51,8 @@ pub use ble::{
 };
 pub use ble_connection::{
     BleConnectionEntry, BleConnectionSlot, BleConnectionSlotError, BleConnectionSlots,
-    BleInputGate, BlePeerIdentity, resolve_host_id as resolve_ble_host_id,
+    BleConnectionTiming, BleInputGate, BlePeerIdentity, BlePhyPreference,
+    low_latency_ble_connection_timing, resolve_host_id as resolve_ble_host_id,
     restrict_advertising_to_bonded_peers,
 };
 pub use ble_notify::{
@@ -75,8 +71,8 @@ pub use bridge::{
     keyboard_led_event_from_ble_output,
 };
 pub use ids::{
-    DeviceId, HOST_SLOT_MAX, HOST_SLOT_MIN, HostId, HostSlot, InterfaceId, InvalidHostSlot,
-    ReportId, SlotId,
+    DeviceId, HOST_SLOT_COUNT, HOST_SLOT_MAX, HOST_SLOT_MIN, HostId, HostSlot, InterfaceId,
+    InvalidHostSlot, ReportId, SlotId,
 };
 pub use input::{
     ConsumerUsage, InputEvent, KeyCode, KeyUsage, KeyboardEvent, KeyboardFrame, KeyboardLedState,
@@ -87,10 +83,10 @@ pub use input::{
 pub use management::{
     MANAGEMENT_PROTOCOL_VERSION, MANAGEMENT_REQUEST_LEN, MANAGEMENT_REQUEST_UUID,
     MANAGEMENT_RESPONSE_LEN, MANAGEMENT_RESPONSE_UUID, MANAGEMENT_SERVICE_UUID, ManagementCommand,
-    ManagementDestination, ManagementDiagnostics, ManagementEspNowInfo, ManagementHistoryEvent,
-    ManagementHostInfo, ManagementHostName, ManagementHostStatus, ManagementHostTiming,
-    ManagementProtocolError, ManagementRequest, ManagementResponse, ManagementResponsePayload,
-    ManagementResult, ManagementSchema, ManagementSetting, ManagementStatus, ManagementUsbDevice,
+    ManagementDestination, ManagementDiagnostics, ManagementHistoryEvent, ManagementHostInfo,
+    ManagementHostName, ManagementHostStatus, ManagementHostTiming, ManagementProtocolError,
+    ManagementRequest, ManagementResponse, ManagementResponsePayload, ManagementResult,
+    ManagementSchema, ManagementSetting, ManagementStatus, ManagementUsbDevice,
     ManagementUsbStatus,
 };
 pub use reports::{
@@ -99,8 +95,7 @@ pub use reports::{
     BleHidNotificationError, BleHidReport, BleKeyboard6KroReport, BleKeyboardLedOutputReport,
     BleKeyboardOutputError, BleKeyboardReport, BleMouseReport, FEATURE_REPORT_TYPE,
     HID_INFORMATION, INPUT_REPORT_TYPE, KeyboardReportBuild, OUTPUT_REPORT_TYPE, ReportKind,
-    V1_CONSUMER_REPORT_MAP, V1_KEYBOARD_REPORT_MAP, V1_MOUSE_REPORT_MAP,
-    notifications_for_input_report, report_id, report_type,
+    V1_COMBINED_REPORT_MAP, notifications_for_input_report, report_id, report_type,
 };
 pub use routing::{ActiveTargetError, HostRouter};
 pub use runtime::{
@@ -145,10 +140,6 @@ pub use storage::{
 pub use target_control::{
     ButtonIntent, DebouncedButton, DebouncedButtonEvent, TargetSwitchControl,
 };
-pub use transport::{
-    BleConnectionTiming, BlePhyPreference, InputTransport, InputTransportRouter,
-    low_latency_ble_connection_timing,
-};
 pub use usb_hid::frame::{
     UsbInputFrameError, decode_standard_input_frame, events_to_standard_input_frame,
 };
@@ -157,6 +148,13 @@ pub use usb_hid::output::{
     BitPos, KeyboardLedOutputBytes, KeyboardLedOutputError, KeyboardLedOutputReport,
 };
 pub use usb_hid::runtime_adapter::runtime_input_from_usb_report;
+pub use usb_hid::source::{
+    OwnedUsbHidInputReport, USB_DEVICE_STRING_MAX_LEN, USB_HID_REPORT_DESCRIPTOR_MAX_LEN,
+    USB_HID_REPORT_MAX_LEN, UsbDeviceString, UsbHidControlRequest, UsbHidControlRequestKind,
+    UsbHidControlResponse, UsbHidControlResponseKind, UsbHidDeviceIdentity, UsbHidInputReport,
+    UsbHidInterfaceSnapshot, UsbHidReportBytes, UsbHidReportDescriptorBytes, UsbHidReportTarget,
+    UsbHidReportType, UsbHidSourceError, UsbHidSourceEvent,
+};
 pub use usb_hid::topology::{
     DefaultUsbTopologyManager, USB_TOPOLOGY_DEVICES_MAX, USB_TOPOLOGY_INTERFACES_MAX,
     UsbDeviceRoute, UsbDeviceTopologyEntry, UsbInterfaceTopologyEntry, UsbTopologyError,

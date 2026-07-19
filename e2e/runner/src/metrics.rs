@@ -1,8 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-const BRIDGE_GAME_LATENCY_P95_MAX_MS: f64 = 9.999;
-const BRIDGE_GAME_LATENCY_P99_MAX_MS: f64 = 15.0;
-const BLE_GAME_LATENCY_P95_MAX_MS: f64 = 15.0;
+const BLE_GAME_LATENCY_P95_MAX_MS: f64 = 9.999;
+const BLE_GAME_LATENCY_P99_MAX_MS: f64 = 15.0;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct LatencyStats {
@@ -30,24 +29,8 @@ pub struct PerformanceBaseline {
     pub mouse: LatencyStats,
 }
 
-pub fn bridge_game_latency_passes(stats: &LatencyStats) -> bool {
-    stats.p95_ms <= BRIDGE_GAME_LATENCY_P95_MAX_MS && stats.p99_ms <= BRIDGE_GAME_LATENCY_P99_MAX_MS
-}
-
 pub fn ble_game_latency_passes(stats: &LatencyStats) -> bool {
-    stats.p95_ms <= BLE_GAME_LATENCY_P95_MAX_MS
-}
-
-pub fn merge_latency(a: &LatencyStats, b: &LatencyStats) -> LatencyStats {
-    LatencyStats {
-        samples: a.samples + b.samples,
-        mean_ms: (a.mean_ms * a.samples as f64 + b.mean_ms * b.samples as f64)
-            / (a.samples + b.samples).max(1) as f64,
-        p50_ms: a.p50_ms.max(b.p50_ms),
-        p95_ms: a.p95_ms.max(b.p95_ms),
-        p99_ms: a.p99_ms.max(b.p99_ms),
-        max_ms: a.max_ms.max(b.max_ms),
-    }
+    stats.p95_ms <= BLE_GAME_LATENCY_P95_MAX_MS && stats.p99_ms <= BLE_GAME_LATENCY_P99_MAX_MS
 }
 
 pub fn latency_stats(mut values: Vec<f64>) -> LatencyStats {
@@ -121,15 +104,9 @@ mod tests {
     }
 
     #[test]
-    fn bridge_gate_requires_sub_10ms_p95_and_15ms_p99() {
-        assert!(bridge_game_latency_passes(&sample(9.9, 14.9)));
-        assert!(!bridge_game_latency_passes(&sample(10.0, 14.9)));
-        assert!(!bridge_game_latency_passes(&sample(9.9, 15.1)));
-    }
-
-    #[test]
-    fn ble_gate_allows_15ms_p95_without_an_espnow_p99_limit() {
-        assert!(ble_game_latency_passes(&sample(15.0, 30.0)));
-        assert!(!ble_game_latency_passes(&sample(15.001, 15.001)));
+    fn ble_gate_requires_sub_10ms_p95_and_15ms_p99() {
+        assert!(ble_game_latency_passes(&sample(9.9, 14.9)));
+        assert!(!ble_game_latency_passes(&sample(10.0, 14.9)));
+        assert!(!ble_game_latency_passes(&sample(9.9, 15.1)));
     }
 }

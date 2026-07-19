@@ -23,6 +23,6 @@ The repository selects this copy through `[patch.crates-io]` in the root
 L2CAP parameter updates and ordered immediate notification submission.
 
 Validation consists of the crate library tests, all HIDShift host tests, the
-ESP32-S3 firmware build matrix, and the BLE/ESP-NOW coexistence hardware E2E.
+ESP32-S3 firmware build, and the direct BLE hardware E2E.
 The crate's standalone `tests/gatt.rs` expects a platform-specific serial
 adapter argument and is not a self-contained host test.

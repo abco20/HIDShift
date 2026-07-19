@@ -8,9 +8,7 @@ use crate::input::{
     ConsumerFrame, ConsumerUsage, InputFrame, KeyUsage, KeyboardFrame, ModifierState, MouseButtons,
     MouseFrame, MouseMovement, StandardInputFrame,
 };
-use crate::transport::InputTransport;
-
-pub const E2E_PROTOCOL_VERSION: u8 = 1;
+pub const E2E_PROTOCOL_VERSION: u8 = 2;
 pub const E2E_PACKET_LEN: usize = 20;
 pub const E2E_LINE_PREFIX: &[u8] = b"@HIDSHIFT-E2E:";
 pub const E2E_LINE_LEN: usize = E2E_LINE_PREFIX.len() + E2E_PACKET_LEN * 2;
@@ -20,15 +18,9 @@ pub const E2E_PROBE_BLE_ADDRESS_RAW: [u8; 6] = [0x01, 0xe2, 0xe2, 0xe2, 0xe2, 0x
 const OP_HELLO: u8 = 0x01;
 const OP_RELEASE_ALL: u8 = 0x02;
 const OP_READ_TIMESTAMP: u8 = 0x03;
-const OP_ENTER_DEVICE_DOWNLOAD: u8 = 0x04;
-const OP_DROP_NEXT_INPUT: u8 = 0x05;
-const OP_DROP_NEXT_INPUT_BURST: u8 = 0x06;
-const OP_SELECT_TRANSPORT: u8 = 0x07;
 const OP_KEYBOARD: u8 = 0x10;
 const OP_MOUSE: u8 = 0x11;
 const OP_CONSUMER: u8 = 0x12;
-const OP_VENDOR_INPUT: u8 = 0x13;
-const OP_MOUSE_BURST: u8 = 0x14;
 
 const TEST_DEVICE_ID: DeviceId = DeviceId(0xfe);
 const TEST_INTERFACE_ID: InterfaceId = InterfaceId(0xfe);
@@ -45,18 +37,6 @@ pub enum E2eCommand {
     ReadTimestamp {
         target_sequence: u32,
     },
-    EnterDeviceDownload,
-    DropNextInput {
-        lane: E2eInputLane,
-    },
-    /// Drops the primary frame and suppresses its timed recovery snapshots.
-    /// The following new input must recover it from the rolling journal.
-    DropNextInputBurst {
-        lane: E2eInputLane,
-    },
-    SelectTransport {
-        transport: InputTransport,
-    },
     ReleaseAll,
     Keyboard {
         modifiers: u8,
@@ -69,29 +49,9 @@ pub enum E2eCommand {
         wheel: i8,
         pan: i8,
     },
-    /// Generates several motion reports inside firmware from one UART packet.
-    /// This isolates radio-scheduler pressure from diagnostic UART throughput.
-    MouseBurst {
-        count: u8,
-        x: i16,
-        y: i16,
-    },
     Consumer {
         usage: u16,
     },
-    /// Generates a deterministic vendor report in bridge firmware. The data
-    /// itself is expanded there so a 63-byte report fits this fixed UART packet.
-    VendorInput {
-        len: u8,
-        seed: u8,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
-pub enum E2eInputLane {
-    Motion = 1,
-    Critical = 2,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -111,25 +71,16 @@ impl E2ePacket {
     /// Input packets deliberately avoid synchronous logging because UART log
     /// output is slow enough to perturb the latency being measured.
     pub const fn requests_acknowledgement(self) -> bool {
-        matches!(
-            self.command,
-            E2eCommand::Hello
-                | E2eCommand::EnterDeviceDownload
-                | E2eCommand::SelectTransport { .. }
-        )
+        matches!(self.command, E2eCommand::Hello)
     }
 
     pub const fn carries_input(self) -> bool {
         matches!(
             self.command,
             E2eCommand::ReleaseAll
-                | E2eCommand::DropNextInput { .. }
-                | E2eCommand::DropNextInputBurst { .. }
                 | E2eCommand::Keyboard { .. }
                 | E2eCommand::Mouse { .. }
-                | E2eCommand::MouseBurst { .. }
                 | E2eCommand::Consumer { .. }
-                | E2eCommand::VendorInput { .. }
         )
     }
 
@@ -142,19 +93,6 @@ impl E2ePacket {
             E2eCommand::ReadTimestamp { target_sequence } => {
                 bytes[1] = OP_READ_TIMESTAMP;
                 bytes[6..10].copy_from_slice(&target_sequence.to_le_bytes());
-            }
-            E2eCommand::EnterDeviceDownload => bytes[1] = OP_ENTER_DEVICE_DOWNLOAD,
-            E2eCommand::DropNextInput { lane } => {
-                bytes[1] = OP_DROP_NEXT_INPUT;
-                bytes[6] = lane as u8;
-            }
-            E2eCommand::DropNextInputBurst { lane } => {
-                bytes[1] = OP_DROP_NEXT_INPUT_BURST;
-                bytes[6] = lane as u8;
-            }
-            E2eCommand::SelectTransport { transport } => {
-                bytes[1] = OP_SELECT_TRANSPORT;
-                bytes[6] = transport as u8;
             }
             E2eCommand::ReleaseAll => bytes[1] = OP_RELEASE_ALL,
             E2eCommand::Keyboard { modifiers, keys } => {
@@ -180,17 +118,6 @@ impl E2ePacket {
                 bytes[1] = OP_CONSUMER;
                 bytes[6..8].copy_from_slice(&usage.to_le_bytes());
             }
-            E2eCommand::VendorInput { len, seed } => {
-                bytes[1] = OP_VENDOR_INPUT;
-                bytes[6] = len;
-                bytes[7] = seed;
-            }
-            E2eCommand::MouseBurst { count, x, y } => {
-                bytes[1] = OP_MOUSE_BURST;
-                bytes[6] = count;
-                bytes[7..9].copy_from_slice(&x.to_le_bytes());
-                bytes[9..11].copy_from_slice(&y.to_le_bytes());
-            }
         }
         let checksum = crc16_ccitt_false(&bytes[..E2E_PACKET_LEN - 2]);
         bytes[E2E_PACKET_LEN - 2..].copy_from_slice(&checksum.to_le_bytes());
@@ -214,28 +141,6 @@ impl E2ePacket {
             OP_READ_TIMESTAMP => E2eCommand::ReadTimestamp {
                 target_sequence: u32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]),
             },
-            OP_ENTER_DEVICE_DOWNLOAD => E2eCommand::EnterDeviceDownload,
-            OP_DROP_NEXT_INPUT => E2eCommand::DropNextInput {
-                lane: match bytes[6] {
-                    1 => E2eInputLane::Motion,
-                    2 => E2eInputLane::Critical,
-                    _ => return Err(E2eProtocolError::InvalidPayload),
-                },
-            },
-            OP_DROP_NEXT_INPUT_BURST => E2eCommand::DropNextInputBurst {
-                lane: match bytes[6] {
-                    1 => E2eInputLane::Motion,
-                    2 => E2eInputLane::Critical,
-                    _ => return Err(E2eProtocolError::InvalidPayload),
-                },
-            },
-            OP_SELECT_TRANSPORT => E2eCommand::SelectTransport {
-                transport: match bytes[6] {
-                    1 => InputTransport::Ble,
-                    2 => InputTransport::EspNow,
-                    _ => return Err(E2eProtocolError::InvalidPayload),
-                },
-            },
             OP_RELEASE_ALL => E2eCommand::ReleaseAll,
             OP_KEYBOARD => E2eCommand::Keyboard {
                 modifiers: bytes[6],
@@ -253,16 +158,6 @@ impl E2ePacket {
             OP_CONSUMER => E2eCommand::Consumer {
                 usage: u16::from_le_bytes([bytes[6], bytes[7]]),
             },
-            OP_VENDOR_INPUT => E2eCommand::VendorInput {
-                len: bytes[6],
-                seed: bytes[7],
-            },
-            OP_MOUSE_BURST if bytes[6] != 0 => E2eCommand::MouseBurst {
-                count: bytes[6],
-                x: i16::from_le_bytes([bytes[7], bytes[8]]),
-                y: i16::from_le_bytes([bytes[9], bytes[10]]),
-            },
-            OP_MOUSE_BURST => return Err(E2eProtocolError::InvalidPayload),
             _ => return Err(E2eProtocolError::UnknownCommand),
         };
         Ok(Self { sequence, command })
@@ -306,14 +201,7 @@ impl E2ePacket {
             })
         };
         match self.command {
-            E2eCommand::Hello
-            | E2eCommand::ReadTimestamp { .. }
-            | E2eCommand::EnterDeviceDownload
-            | E2eCommand::DropNextInput { .. }
-            | E2eCommand::DropNextInputBurst { .. }
-            | E2eCommand::MouseBurst { .. }
-            | E2eCommand::SelectTransport { .. } => Ok([None, None, None]),
-            E2eCommand::VendorInput { .. } => Ok([None, None, None]),
+            E2eCommand::Hello | E2eCommand::ReadTimestamp { .. } => Ok([None, None, None]),
             E2eCommand::ReleaseAll => Ok([
                 Some(standard(
                     Some(KeyboardFrame::new(ModifierState::empty())),
@@ -408,21 +296,11 @@ pub fn crc16_ccitt_false(bytes: &[u8]) -> u16 {
 mod tests {
     use super::*;
 
-    fn commands() -> [E2eCommand; 12] {
+    fn commands() -> [E2eCommand; 6] {
         [
             E2eCommand::Hello,
             E2eCommand::ReadTimestamp {
                 target_sequence: 0x1234_5678,
-            },
-            E2eCommand::EnterDeviceDownload,
-            E2eCommand::DropNextInput {
-                lane: E2eInputLane::Critical,
-            },
-            E2eCommand::DropNextInputBurst {
-                lane: E2eInputLane::Critical,
-            },
-            E2eCommand::SelectTransport {
-                transport: InputTransport::EspNow,
             },
             E2eCommand::ReleaseAll,
             E2eCommand::Keyboard {
@@ -437,15 +315,6 @@ mod tests {
                 pan: 3,
             },
             E2eCommand::Consumer { usage: 0x00e9 },
-            E2eCommand::VendorInput {
-                len: 63,
-                seed: 0xa5,
-            },
-            E2eCommand::MouseBurst {
-                count: 48,
-                x: 1,
-                y: -1,
-            },
         ]
     }
 
@@ -458,12 +327,7 @@ mod tests {
             };
             assert_eq!(
                 packet.requests_acknowledgement(),
-                matches!(
-                    command,
-                    E2eCommand::Hello
-                        | E2eCommand::EnterDeviceDownload
-                        | E2eCommand::SelectTransport { .. }
-                )
+                matches!(command, E2eCommand::Hello)
             );
         }
     }
@@ -479,10 +343,7 @@ mod tests {
                 packet.carries_input(),
                 !matches!(
                     command,
-                    E2eCommand::Hello
-                        | E2eCommand::ReadTimestamp { .. }
-                        | E2eCommand::EnterDeviceDownload
-                        | E2eCommand::SelectTransport { .. }
+                    E2eCommand::Hello | E2eCommand::ReadTimestamp { .. }
                 )
             );
         }

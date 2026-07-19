@@ -2,33 +2,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, ensure};
-use hidshift::espnow_pairing::EspNowRole;
-
-pub fn assign_bridge_roles(
-    discovered: impl IntoIterator<Item = (PathBuf, EspNowRole)>,
-) -> Result<(PathBuf, PathBuf)> {
-    let mut host = None;
-    let mut device = None;
-    for (path, role) in discovered {
-        let slot = match role {
-            EspNowRole::UsbHost => &mut host,
-            EspNowRole::UsbDevice => &mut device,
-        };
-        ensure!(
-            slot.is_none(),
-            "multiple running boards report the {role:?} role"
-        );
-        *slot = Some(path);
-    }
-    let host = host.context(
-        "no running ESP-NOW Host role found; provide both --host-port and --device-port for initial provisioning",
-    )?;
-    let device = device.context(
-        "no running ESP-NOW Device role found; provide both --host-port and --device-port for initial provisioning",
-    )?;
-    Ok((host, device))
-}
+use anyhow::{Context, Result};
 
 pub fn serial_by_path_candidates(directory: &Path) -> Result<Vec<PathBuf>> {
     let mut seen = HashSet::new();
@@ -57,6 +31,16 @@ pub fn parse_chip_type(output: &str) -> Option<String> {
     })
 }
 
+pub fn parse_mac_address(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("MAC address:")
+            .map(str::trim)
+            .filter(|address| address.len() == 17)
+            .map(str::to_ascii_lowercase)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,25 +57,10 @@ mod tests {
     }
 
     #[test]
-    fn bridge_roles_come_from_management_not_hardware_identity() {
-        let host = PathBuf::from("/dev/serial/by-path/board-a");
-        let device = PathBuf::from("/dev/serial/by-path/board-b");
-        assert_eq!(
-            assign_bridge_roles([
-                (device.clone(), EspNowRole::UsbDevice),
-                (host.clone(), EspNowRole::UsbHost),
-            ])
-            .unwrap(),
-            (host, device)
-        );
-        assert!(assign_bridge_roles([]).is_err());
-        assert!(
-            assign_bridge_roles([
-                (PathBuf::from("board-a"), EspNowRole::UsbHost),
-                (PathBuf::from("board-b"), EspNowRole::UsbHost),
-            ])
-            .is_err()
-        );
+    fn mac_parser_identifies_two_serial_paths_for_the_same_board() {
+        let info = "Chip type: esp32s3\nMAC address:       12:34:56:78:9A:BC\n";
+        assert_eq!(parse_mac_address(info), Some("12:34:56:78:9a:bc".into()));
+        assert_eq!(parse_mac_address("Connecting..."), None);
     }
 
     #[test]

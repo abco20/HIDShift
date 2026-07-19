@@ -3,6 +3,7 @@ pub struct HostId(pub u8);
 
 pub const HOST_SLOT_MIN: u8 = 1;
 pub const HOST_SLOT_MAX: u8 = 4;
+pub const HOST_SLOT_COUNT: usize = (HOST_SLOT_MAX - HOST_SLOT_MIN + 1) as usize;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InvalidHostSlot(pub u8);
@@ -66,6 +67,7 @@ mod tests {
 
     #[test]
     fn host_slot_rejects_zero_and_out_of_range_values() {
+        assert_eq!(HOST_SLOT_COUNT, 4);
         assert_eq!(HostSlot::try_from(0), Err(InvalidHostSlot(0)));
         assert_eq!(HostSlot::try_from(5), Err(InvalidHostSlot(5)));
         assert_eq!(HostSlot::try_from(4).unwrap().get(), 4);

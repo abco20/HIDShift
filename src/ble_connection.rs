@@ -48,6 +48,35 @@ pub const fn restrict_advertising_to_bonded_peers(
     bonded_peer_count != 0 && !pairing_open
 }
 
+/// Stack-independent timing policy for interactive BLE HID links.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlePhyPreference {
+    Le1M,
+    Le2M,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BleConnectionTiming {
+    pub interval_min_us: u32,
+    pub interval_max_us: u32,
+    pub peripheral_latency: u16,
+    pub supervision_timeout_ms: u32,
+    pub preferred_phy: BlePhyPreference,
+}
+
+pub const fn low_latency_ble_connection_timing() -> BleConnectionTiming {
+    BleConnectionTiming {
+        // Peripheral latency permits skipping idle events only. As soon as an
+        // input notification is pending, the peripheral can use the next
+        // 7.5-ms connection event without a parameter change on target switch.
+        interval_min_us: 7_500,
+        interval_max_us: 7_500,
+        peripheral_latency: 19,
+        supervision_timeout_ms: 4_000,
+        preferred_phy: BlePhyPreference::Le2M,
+    }
+}
+
 fn host_index<const HOSTS: usize>(host_id: HostId) -> Option<usize> {
     let index = host_id.validated().ok()?.get().checked_sub(1)? as usize;
     (index < HOSTS).then_some(index)
@@ -206,13 +235,17 @@ impl<const SLOTS: usize> BleConnectionSlots<SLOTS> {
     /// Returns whether an already-connected peripheral should advertise an
     /// additional slot.
     ///
-    /// Keeping connectable advertising active during normal HID operation
-    /// consumes the same 2.4-GHz radio as BLE connection events and Wi-Fi.
-    /// Additional peers therefore connect only while the user has explicitly
-    /// opened a pairing/reconnect window. Initial connection advertising is
-    /// handled separately when no slots are connected.
-    pub fn should_advertise_additional_connection(&self, connection_window_open: bool) -> bool {
-        connection_window_open && self.should_advertise()
+    /// Advertising remains enabled while a registered session has not yet
+    /// reconnected. It stops once every retained peer is connected, avoiding
+    /// permanent advertising load without making a second host wait for the
+    /// active host to disconnect.
+    pub fn should_advertise_additional_connection(
+        &self,
+        pairing_window_open: bool,
+        retained_session_count: usize,
+    ) -> bool {
+        self.should_advertise()
+            && (pairing_window_open || self.connected_count() < retained_session_count)
     }
 
     pub fn is_connected(&self, slot: usize) -> bool {
@@ -288,6 +321,20 @@ mod tests {
         assert!(!restrict_advertising_to_bonded_peers(0, false));
         assert!(restrict_advertising_to_bonded_peers(1, false));
         assert!(!restrict_advertising_to_bonded_peers(1, true));
+    }
+
+    #[test]
+    fn low_latency_policy_skips_only_idle_connection_events() {
+        let timing = low_latency_ble_connection_timing();
+
+        assert_eq!(timing.interval_min_us, 7_500);
+        assert_eq!(timing.interval_max_us, 7_500);
+        assert_eq!(timing.peripheral_latency, 19);
+        assert_eq!(timing.preferred_phy, BlePhyPreference::Le2M);
+        assert!(
+            timing.supervision_timeout_ms * 1_000
+                > 2 * u32::from(timing.peripheral_latency + 1) * timing.interval_max_us
+        );
     }
     use crate::storage::{FixedName, StoredHostProfile, StoredSecurityLevel};
 
@@ -365,15 +412,17 @@ mod tests {
     }
 
     #[test]
-    fn additional_connection_advertising_requires_an_explicit_window() {
+    fn additional_connection_advertising_restores_retained_sessions() {
         let mut slots = BleConnectionSlots::<2>::new();
         slots.connect_first_free(HostId(1), peer(1)).unwrap();
 
-        assert!(!slots.should_advertise_additional_connection(false));
-        assert!(slots.should_advertise_additional_connection(true));
+        assert!(!slots.should_advertise_additional_connection(false, 1));
+        assert!(slots.should_advertise_additional_connection(false, 2));
+        assert!(slots.should_advertise_additional_connection(true, 1));
 
         slots.connect_first_free(HostId(2), peer(2)).unwrap();
-        assert!(!slots.should_advertise_additional_connection(true));
+        assert!(!slots.should_advertise_additional_connection(false, 2));
+        assert!(!slots.should_advertise_additional_connection(true, 2));
     }
 
     #[test]

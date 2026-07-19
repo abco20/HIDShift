@@ -2,7 +2,6 @@ use esp_bootloader_esp_idf::partitions::{
     DataPartitionSubType, PARTITION_TABLE_MAX_LEN, PartitionType, read_partition_table,
 };
 use esp_storage::FlashStorage;
-use hidshift::espnow_pairing::EspNowPairing;
 use hidshift::storage::{
     NorFlashStorageBackend, STORAGE_PARTITION_REQUIRED_LEN, StorageFlashLayout,
 };
@@ -13,35 +12,6 @@ pub const STORAGE_PARTITION_LABEL: &str = "bridge";
 pub enum FirmwareStorageBackend {
     Flash(NorFlashStorageBackend<FlashStorage<'static>>),
     Memory(InMemoryStorageBackend),
-}
-
-impl FirmwareStorageBackend {
-    pub fn restored_pairing(&self) -> Option<EspNowPairing> {
-        match self {
-            Self::Flash(backend) => backend.restored_pairing(),
-            Self::Memory(backend) => backend.pairing,
-        }
-    }
-
-    pub fn write_pairing(&mut self, pairing: EspNowPairing) -> Result<(), StorageError> {
-        match self {
-            Self::Flash(backend) => backend.write_pairing(pairing),
-            Self::Memory(backend) => {
-                backend.pairing = Some(pairing);
-                Ok(())
-            }
-        }
-    }
-
-    pub fn clear_pairing(&mut self) -> Result<(), StorageError> {
-        match self {
-            Self::Flash(backend) => backend.clear_pairing(),
-            Self::Memory(backend) => {
-                backend.pairing = None;
-                Ok(())
-            }
-        }
-    }
 }
 
 impl StorageSlotBackend for FirmwareStorageBackend {
@@ -105,7 +75,7 @@ fn new_flash_storage_backend(
         });
     }
 
-    NorFlashStorageBackend::new_with_pairing(flash, StorageFlashLayout::new(partition.offset()))
+    NorFlashStorageBackend::new(flash, StorageFlashLayout::new(partition.offset()))
         .map_err(FirmwareStorageInitError::Storage)
 }
 
@@ -119,14 +89,12 @@ enum FirmwareStorageInitError {
 
 pub struct InMemoryStorageBackend {
     slots: [[u8; STORAGE_IMAGE_LEN]; 2],
-    pairing: Option<EspNowPairing>,
 }
 
 impl InMemoryStorageBackend {
     pub const fn new() -> Self {
         Self {
             slots: [[0; STORAGE_IMAGE_LEN]; 2],
-            pairing: None,
         }
     }
 }

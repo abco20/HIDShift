@@ -48,26 +48,10 @@ jobs:
         with:
           name: licenses
           path: licenses
-      - name: Build BLE production firmware
+      - name: Build production firmware
         run: >-
           cargo +esp build --locked -Zbuild-std=core,alloc --release
           --manifest-path firmware/Cargo.toml --bin firmware
-          --target xtensa-esp32s3-none-elf
-      - name: Preserve BLE production image
-        run: >-
-          mkdir -p target/release-artifacts && cp
-          target/xtensa-esp32s3-none-elf/release/firmware
-          target/release-artifacts/hidshift-ble.elf
-      - name: Build ESP-NOW production firmware
-        run: >-
-          cargo +esp build --locked -Zbuild-std=core,alloc --release
-          --manifest-path firmware/Cargo.toml --bin firmware --features espnow
-          --target xtensa-esp32s3-none-elf
-      - name: Build ESP-NOW Device production firmware
-        run: >-
-          cargo +esp build --locked -Zbuild-std=core,alloc --release
-          --manifest-path firmware/Cargo.toml --no-default-features
-          --bin bridge-device --features espnow-device
           --target xtensa-esp32s3-none-elf
       - name: Install espflash
         uses: taiki-e/install-action@v2
@@ -80,28 +64,13 @@ jobs:
           version="${RELEASE_TAG#v}"
           package="hidshift-firmware-${version}-esp32s3"
           mkdir -p "dist/${package}"
-          # The default build is the backwards-compatible BLE-only image.
-          # The ESP-NOW build uses the same Host bin name, so copy each role
-          # immediately after both builds have completed.
-          cp target/release-artifacts/hidshift-ble.elf "dist/${package}/hidshift.elf"
-          cp target/xtensa-esp32s3-none-elf/release/firmware "dist/${package}/hidshift-espnow-host.elf"
-          cp target/xtensa-esp32s3-none-elf/release/bridge-device "dist/${package}/hidshift-espnow-device.elf"
+          cp target/xtensa-esp32s3-none-elf/release/firmware "dist/${package}/hidshift.elf"
           cp partitions/bridge.csv README.md LICENSE THIRD_PARTY_NOTICES.md "dist/${package}/"
           cp licenses/THIRD_PARTY_LICENSES_FIRMWARE.html "dist/${package}/THIRD_PARTY_LICENSES.html"
           espflash save-image --chip esp32s3 --merge --skip-padding \
             --flash-size 4mb --partition-table partitions/bridge.csv \
             --target-app-partition factory \
             "dist/${package}/hidshift.elf" "dist/${package}/hidshift-factory.bin"
-          espflash save-image --chip esp32s3 --merge --skip-padding \
-            --flash-size 4mb --partition-table partitions/bridge.csv \
-            --target-app-partition factory \
-            "dist/${package}/hidshift-espnow-host.elf" \
-            "dist/${package}/hidshift-espnow-host-factory.bin"
-          espflash save-image --chip esp32s3 --merge --skip-padding \
-            --flash-size 4mb --partition-table partitions/bridge.csv \
-            --target-app-partition factory \
-            "dist/${package}/hidshift-espnow-device.elf" \
-            "dist/${package}/hidshift-espnow-device-factory.bin"
           tar -C dist -czf "dist/${package}.tar.gz" "${package}"
       - uses: actions/upload-artifact@v4
         with:
