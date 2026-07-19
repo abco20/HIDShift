@@ -1,0 +1,231 @@
+use crate::reports::{
+    CONSUMER_REPORT_LEN, ConsumerReport, KEYBOARD_REPORT_LEN, Keyboard6KroReport, MOUSE_REPORT_LEN,
+    MouseReport, StandardHidReport,
+};
+
+pub const RECORD_HELLO: u8 = 0x01;
+pub const RECORD_HELLO_ACK: u8 = 0x02;
+pub const RECORD_HEARTBEAT: u8 = 0x03;
+pub const RECORD_LINK_RESET: u8 = 0x04;
+pub const RECORD_PROFILE_BEGIN: u8 = 0x10;
+pub const RECORD_PROFILE_CHUNK: u8 = 0x11;
+pub const RECORD_PROFILE_COMMIT: u8 = 0x12;
+pub const RECORD_PROFILE_RESULT: u8 = 0x13;
+pub const RECORD_ACTIVATE_PROFILE: u8 = 0x14;
+pub const RECORD_FORCE_FALLBACK: u8 = 0x15;
+pub const RECORD_USB_STATE: u8 = 0x20;
+pub const RECORD_CONTROL_REQUEST: u8 = 0x21;
+pub const RECORD_CONTROL_RESPONSE: u8 = 0x22;
+pub const RECORD_CONTROL_CANCEL: u8 = 0x23;
+pub const RECORD_RAW_ENDPOINT_IN: u8 = 0x24;
+pub const RECORD_RAW_ENDPOINT_OUT: u8 = 0x25;
+pub const RECORD_STANDARD_INPUT_REPORT: u8 = 0x26;
+pub const RECORD_STANDARD_OUTPUT_REPORT: u8 = 0x27;
+pub const RECORD_STANDARD_RELEASE_ALL: u8 = 0x28;
+pub const RECORD_GET_DIAGNOSTICS: u8 = 0x30;
+pub const RECORD_DIAGNOSTICS: u8 = 0x31;
+pub const RECORD_TEST_FAULT: u8 = 0x32;
+
+pub const HELLO_WIRE_LEN: usize = 12;
+pub const STANDARD_INPUT_HEADER_LEN: usize = 5;
+pub const STANDARD_INPUT_MAX_LEN: usize = STANDARD_INPUT_HEADER_LEN + KEYBOARD_REPORT_LEN;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum InterchipRole {
+    Host = 1,
+    Device = 2,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Hello {
+    pub role: InterchipRole,
+    pub protocol_version: u8,
+    pub firmware_major: u8,
+    pub firmware_minor: u8,
+    pub capabilities: u32,
+    pub active_profile_hash: u32,
+}
+
+impl Hello {
+    pub const fn encode(self) -> [u8; HELLO_WIRE_LEN] {
+        let mut bytes = [0; HELLO_WIRE_LEN];
+        bytes[0] = self.role as u8;
+        bytes[1] = self.protocol_version;
+        bytes[2] = self.firmware_major;
+        bytes[3] = self.firmware_minor;
+        let capabilities = self.capabilities.to_le_bytes();
+        bytes[4] = capabilities[0];
+        bytes[5] = capabilities[1];
+        bytes[6] = capabilities[2];
+        bytes[7] = capabilities[3];
+        let profile = self.active_profile_hash.to_le_bytes();
+        bytes[8] = profile[0];
+        bytes[9] = profile[1];
+        bytes[10] = profile[2];
+        bytes[11] = profile[3];
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, MessageError> {
+        let [
+            role,
+            protocol_version,
+            firmware_major,
+            firmware_minor,
+            c0,
+            c1,
+            c2,
+            c3,
+            h0,
+            h1,
+            h2,
+            h3,
+        ] = bytes
+        else {
+            return Err(MessageError::InvalidLength);
+        };
+        let role = match *role {
+            1 => InterchipRole::Host,
+            2 => InterchipRole::Device,
+            _ => return Err(MessageError::InvalidRole),
+        };
+        Ok(Self {
+            role,
+            protocol_version: *protocol_version,
+            firmware_major: *firmware_major,
+            firmware_minor: *firmware_minor,
+            capabilities: u32::from_le_bytes([*c0, *c1, *c2, *c3]),
+            active_profile_hash: u32::from_le_bytes([*h0, *h1, *h2, *h3]),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StandardInputReport {
+    pub flags: u8,
+    pub sequence: u16,
+    pub report: StandardHidReport,
+}
+
+impl StandardInputReport {
+    pub fn encode(self) -> ([u8; STANDARD_INPUT_MAX_LEN], u8) {
+        let mut bytes = [0; STANDARD_INPUT_MAX_LEN];
+        bytes[1] = self.flags;
+        bytes[2..4].copy_from_slice(&self.sequence.to_le_bytes());
+        let data: &[u8] = match &self.report {
+            StandardHidReport::Keyboard(report) => {
+                bytes[0] = 1;
+                report.as_bytes()
+            }
+            StandardHidReport::Mouse(report) => {
+                bytes[0] = 2;
+                report.as_bytes()
+            }
+            StandardHidReport::Consumer(report) => {
+                bytes[0] = 3;
+                report.as_bytes()
+            }
+        };
+        bytes[4] = data.len() as u8;
+        bytes[STANDARD_INPUT_HEADER_LEN..STANDARD_INPUT_HEADER_LEN + data.len()]
+            .copy_from_slice(data);
+        (bytes, (STANDARD_INPUT_HEADER_LEN + data.len()) as u8)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, StandardInputReportError> {
+        if bytes.len() < STANDARD_INPUT_HEADER_LEN {
+            return Err(StandardInputReportError::InvalidLength);
+        }
+        let data_len = bytes[4] as usize;
+        if bytes.len() != STANDARD_INPUT_HEADER_LEN + data_len {
+            return Err(StandardInputReportError::InvalidLength);
+        }
+        let data = &bytes[STANDARD_INPUT_HEADER_LEN..];
+        let report = match bytes[0] {
+            1 if data_len == KEYBOARD_REPORT_LEN => {
+                let mut raw = [0; KEYBOARD_REPORT_LEN];
+                raw.copy_from_slice(data);
+                StandardHidReport::Keyboard(Keyboard6KroReport::from_bytes(raw))
+            }
+            2 if data_len == MOUSE_REPORT_LEN => {
+                let mut raw = [0; MOUSE_REPORT_LEN];
+                raw.copy_from_slice(data);
+                StandardHidReport::Mouse(MouseReport::from_bytes(raw))
+            }
+            3 if data_len == CONSUMER_REPORT_LEN => {
+                let mut raw = [0; CONSUMER_REPORT_LEN];
+                raw.copy_from_slice(data);
+                StandardHidReport::Consumer(ConsumerReport::from_usage_id(u16::from_le_bytes(raw)))
+            }
+            1..=3 => return Err(StandardInputReportError::InvalidReportLength),
+            _ => return Err(StandardInputReportError::InvalidKind),
+        };
+        Ok(Self {
+            flags: bytes[1],
+            sequence: u16::from_le_bytes([bytes[2], bytes[3]]),
+            report,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MessageError {
+    InvalidLength,
+    InvalidRole,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StandardInputReportError {
+    InvalidLength,
+    InvalidKind,
+    InvalidReportLength,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hello_round_trips_without_native_layout_assumptions() {
+        let hello = Hello {
+            role: InterchipRole::Host,
+            protocol_version: 1,
+            firmware_major: 2,
+            firmware_minor: 3,
+            capabilities: 0x1234_5678,
+            active_profile_hash: 0xaabb_ccdd,
+        };
+        assert_eq!(Hello::decode(&hello.encode()), Ok(hello));
+    }
+
+    #[test]
+    fn every_standard_report_round_trips() {
+        let reports = [
+            StandardHidReport::Keyboard(Keyboard6KroReport::from_bytes([1, 0, 4, 5, 0, 0, 0, 0])),
+            StandardHidReport::Mouse(MouseReport::from_bytes([1, 2, 3, 4, 5])),
+            StandardHidReport::Consumer(ConsumerReport::from_usage_id(0x00e9)),
+        ];
+        for report in reports {
+            let message = StandardInputReport {
+                flags: 0x80,
+                sequence: 42,
+                report,
+            };
+            let (bytes, len) = message.encode();
+            assert_eq!(
+                StandardInputReport::decode(&bytes[..len as usize]),
+                Ok(message)
+            );
+        }
+    }
+
+    #[test]
+    fn kind_specific_length_is_enforced() {
+        let invalid = [1, 0, 0, 0, 1, 0];
+        assert_eq!(
+            StandardInputReport::decode(&invalid),
+            Err(StandardInputReportError::InvalidReportLength)
+        );
+    }
+}

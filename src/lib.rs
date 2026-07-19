@@ -32,9 +32,12 @@ pub mod ble_connection;
 pub mod ble_notify;
 pub mod ble_runtime;
 pub mod bridge;
+pub mod checksum;
 pub mod e2e;
 pub mod ids;
 pub mod input;
+#[cfg(feature = "dual-s3-wired")]
+pub mod interchip;
 pub mod management;
 pub mod mouse_accumulator;
 pub mod output_target;
