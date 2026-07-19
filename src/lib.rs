@@ -37,6 +37,8 @@ pub mod ids;
 pub mod input;
 pub mod management;
 pub mod mouse_accumulator;
+#[cfg(feature = "dual-s3-wired")]
+pub mod output_target;
 pub mod reports;
 pub mod routing;
 pub mod runtime;
@@ -77,7 +79,7 @@ pub use ids::{
 pub use input::{
     ConsumerUsage, InputEvent, KeyCode, KeyUsage, KeyboardEvent, KeyboardFrame, KeyboardLedState,
     KeyboardSuppression, Modifier, ModifierState, MouseButton, MouseButtons, MouseFrame,
-    MouseMovement, MouseReport, PhysicalInputState, PhysicalKeyboardState, PhysicalMouseState,
+    MouseInputReport, MouseMovement, PhysicalInputState, PhysicalKeyboardState, PhysicalMouseState,
     StandardInputFrame, VisibleKeyboardState,
 };
 pub use management::{
@@ -89,13 +91,20 @@ pub use management::{
     ManagementSchema, ManagementSetting, ManagementStatus, ManagementUsbDevice,
     ManagementUsbStatus,
 };
+#[cfg(feature = "dual-s3-wired")]
+pub use output_target::{
+    MirrorCandidateId, MirrorConfiguration, OutputTarget, OutputTargetAvailability,
+    OutputTargetState, StoredMirrorTarget, StoredOutputTarget, StoredPresentationConfig,
+    UsbPresentation, effective_presentation,
+};
 pub use reports::{
     BLE_HID_INPUT_REPORT_MAX_LEN, BLE_HID_NOTIFICATIONS_PER_REPORT_MAX, BLE_HID_NOTIFY_MAX_LEN,
     BleConsumerReport, BleHidCharacteristic, BleHidInputReport, BleHidNotification,
     BleHidNotificationError, BleHidReport, BleKeyboard6KroReport, BleKeyboardLedOutputReport,
-    BleKeyboardOutputError, BleKeyboardReport, BleMouseReport, FEATURE_REPORT_TYPE,
-    HID_INFORMATION, INPUT_REPORT_TYPE, KeyboardReportBuild, OUTPUT_REPORT_TYPE, ReportKind,
-    V1_COMBINED_REPORT_MAP, notifications_for_input_report, report_id, report_type,
+    BleKeyboardOutputError, BleKeyboardReport, BleMouseReport, ConsumerReport, FEATURE_REPORT_TYPE,
+    HID_INFORMATION, INPUT_REPORT_TYPE, Keyboard6KroReport, KeyboardReportBuild, MouseReport,
+    OUTPUT_REPORT_TYPE, ReportKind, StandardHidReport, V1_COMBINED_REPORT_MAP,
+    notifications_for_input_report, report_id, report_type,
 };
 pub use routing::{ActiveTargetError, HostRouter};
 pub use runtime::{

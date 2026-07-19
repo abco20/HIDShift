@@ -1,4 +1,8 @@
+#[cfg(feature = "dual-s3-wired")]
+use crate::ids::HostSlot;
 use crate::ids::{HOST_SLOT_COUNT, HostId};
+#[cfg(feature = "dual-s3-wired")]
+use crate::output_target::{StoredMirrorTarget, StoredOutputTarget, StoredPresentationConfig};
 use crate::settings::{GlobalSettings, HostSettings};
 
 pub const MAX_HOST_NAME_LEN: usize = 32;
@@ -112,6 +116,8 @@ pub struct StorageState {
     pub last_active_host: Option<HostId>,
     pub global_settings: GlobalSettings,
     pub host_settings: [HostSettings; STORED_HOSTS_MAX],
+    #[cfg(feature = "dual-s3-wired")]
+    pub presentation: StoredPresentationConfig,
     hosts: heapless::Vec<StoredHostProfile, STORED_HOSTS_MAX>,
 }
 
@@ -122,6 +128,8 @@ impl StorageState {
             last_active_host: None,
             global_settings: GlobalSettings::DEFAULT,
             host_settings: [HostSettings::DEFAULT; STORED_HOSTS_MAX],
+            #[cfg(feature = "dual-s3-wired")]
+            presentation: StoredPresentationConfig::DEFAULT,
             hosts: heapless::Vec::new(),
         }
     }
@@ -166,6 +174,8 @@ impl StorageState {
 pub enum StorageError {
     HostCapacity,
     InvalidHostId,
+    #[cfg(feature = "dual-s3-wired")]
+    InvalidOutputTarget,
     DuplicateHostId,
     ActiveHostMissing,
     ImageTooShort,
@@ -484,6 +494,8 @@ pub fn encode_storage_image(state: &StorageState) -> Result<[u8; STORAGE_IMAGE_L
     image[16] = state.hosts.len() as u8;
     image[17] = state.last_active_host.map_or(0xff, |host| host.0);
     encode_global_settings(state.global_settings, &mut image[18..30]);
+    #[cfg(feature = "dual-s3-wired")]
+    encode_presentation_config(state.presentation, &mut image[30..32]);
     for (index, settings) in state.host_settings.iter().copied().enumerate() {
         let offset = 32 + index * 12;
         encode_host_settings(settings, &mut image[offset..offset + 12]);
@@ -538,6 +550,10 @@ pub fn decode_storage_image(image: &[u8]) -> Result<StorageState, StorageError> 
         id => Some(HostId(id)),
     };
     state.global_settings = decode_global_settings(&image[18..30])?;
+    #[cfg(feature = "dual-s3-wired")]
+    {
+        state.presentation = decode_presentation_config(&image[30..32])?;
+    }
     for index in 0..STORED_HOSTS_MAX {
         let offset = 32 + index * 12;
         state.host_settings[index] = decode_host_settings(&image[offset..offset + 12])?;
@@ -553,6 +569,33 @@ pub fn decode_storage_image(image: &[u8]) -> Result<StorageState, StorageError> 
     state.validate()?;
 
     Ok(state)
+}
+
+#[cfg(feature = "dual-s3-wired")]
+fn encode_presentation_config(config: StoredPresentationConfig, out: &mut [u8]) {
+    out[0] = match config.output_target {
+        StoredOutputTarget::Wired => 0,
+        StoredOutputTarget::Ble(slot) => slot.get(),
+    };
+    out[1] = config
+        .mirror_target
+        .map_or(0, |target| 0x80 | (target.0 & 0x7f));
+}
+
+#[cfg(feature = "dual-s3-wired")]
+fn decode_presentation_config(bytes: &[u8]) -> Result<StoredPresentationConfig, StorageError> {
+    let output_target = match bytes[0] {
+        0 => StoredOutputTarget::Wired,
+        slot @ 1..=4 => StoredOutputTarget::Ble(
+            HostSlot::try_from(slot).map_err(|_| StorageError::InvalidOutputTarget)?,
+        ),
+        _ => return Err(StorageError::InvalidOutputTarget),
+    };
+    let mirror_target = (bytes[1] & 0x80 != 0).then_some(StoredMirrorTarget(bytes[1] & 0x7f));
+    Ok(StoredPresentationConfig {
+        output_target,
+        mirror_target,
+    })
 }
 
 pub fn select_newest_valid_storage_image<'a>(
@@ -1136,6 +1179,24 @@ mod tests {
 
         assert_eq!(decoded, state);
         assert_eq!(&image[0..4], &STORAGE_MAGIC);
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    #[test]
+    fn storage_image_round_trips_output_and_mirror_independently() {
+        let mut state = StorageState::new(43);
+        state.presentation = StoredPresentationConfig {
+            output_target: StoredOutputTarget::Ble(HostSlot::try_from(3).unwrap()),
+            mirror_target: Some(StoredMirrorTarget(17)),
+        };
+
+        let decoded = decode_storage_image(&encode_storage_image(&state).unwrap()).unwrap();
+
+        assert_eq!(decoded.presentation, state.presentation);
+        assert_eq!(
+            decoded.presentation.output_target.as_output_target(),
+            crate::output_target::OutputTarget::Ble(HostId(3))
+        );
     }
 
     #[test]

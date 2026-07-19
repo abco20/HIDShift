@@ -14,7 +14,7 @@ pub use keyboard::{
 };
 pub use leds::KeyboardLedState;
 pub use mouse::{
-    MouseButton, MouseButtons, MouseFrame, MouseMovement, MouseReport, PhysicalMouseState,
+    MouseButton, MouseButtons, MouseFrame, MouseInputReport, MouseMovement, PhysicalMouseState,
 };
 pub use movement_queue::{
     UsbMovementCoalescer, UsbMovementCoalescerError, UsbMovementCoalescerStats,
@@ -71,7 +71,7 @@ pub enum InputError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputEvent {
     Keyboard(KeyboardEvent),
-    Mouse(MouseReport),
+    Mouse(MouseInputReport),
     Consumer(ConsumerUsage),
 }
 

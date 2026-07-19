@@ -13,6 +13,7 @@ path = "src/main.rs"
 [features]
 default = []
 hardware-e2e = []
+dual-s3-wired = ["hidshift/dual-s3-wired"]
 
 [dependencies]
 bt-hci = "0.8.1"

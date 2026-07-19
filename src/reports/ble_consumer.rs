@@ -4,11 +4,11 @@ pub const CONSUMER_REPORT_ID: u8 = 3;
 pub const CONSUMER_REPORT_LEN: usize = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BleConsumerReport {
+pub struct ConsumerReport {
     bytes: [u8; CONSUMER_REPORT_LEN],
 }
 
-impl BleConsumerReport {
+impl ConsumerReport {
     pub const fn from_usage(usage: ConsumerUsage) -> Self {
         Self {
             bytes: usage.0.to_le_bytes(),
@@ -31,6 +31,8 @@ impl BleConsumerReport {
         &self.bytes
     }
 }
+
+pub type BleConsumerReport = ConsumerReport;
 
 #[cfg(test)]
 mod tests {
