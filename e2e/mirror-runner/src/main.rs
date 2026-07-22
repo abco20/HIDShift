@@ -18,6 +18,7 @@ use hidshift::management::{
     ManagementCommand, ManagementOutputTarget, ManagementResult,
 };
 use hidshift::fallback::{FALLBACK_USB_PRODUCT_ID, FALLBACK_USB_VENDOR_ID};
+use hidshift::ids::HostId;
 use hidshift::mirror::validate_mirror_image;
 use hidshift::output_target::MirrorCandidateId;
 use hidshift_client::{
@@ -278,6 +279,33 @@ fn run() -> Result<(), Box<dyn Error>> {
         Duration::from_secs(3),
     )?;
     println!("T14 passed: Caps Lock LED reached raw endpoint 0x01 unchanged");
+
+    send_management_command(
+        &mut *serial,
+        &mut client,
+        ManagementCommand::SelectOutputTarget(ManagementOutputTarget::Ble(HostId(1))),
+        "SELECT_OUTPUT_TARGET(BLE 1)",
+    )?;
+    wait_for_usb_identity(
+        &mut *serial,
+        FALLBACK_USB_VENDOR_ID,
+        FALLBACK_USB_PRODUCT_ID,
+        Duration::from_secs(arguments.usb_timeout_seconds),
+    )?;
+    println!("T20/T22 passed: BLE selection forced fallback while retaining Mirror A");
+    send_management_command(
+        &mut *serial,
+        &mut client,
+        ManagementCommand::SelectOutputTarget(ManagementOutputTarget::Wired),
+        "SELECT_OUTPUT_TARGET(Wired)",
+    )?;
+    wait_for_usb_identity(
+        &mut *serial,
+        vid_a,
+        pid_a,
+        Duration::from_secs(arguments.usb_timeout_seconds),
+    )?;
+    println!("T21 passed: Wired selection restored saved Mirror A");
 
     if arguments.skip_hidraw {
         println!("T15 skipped explicitly: Linux hidraw access was not requested");
