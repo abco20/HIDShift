@@ -643,6 +643,13 @@ fn report_raw_endpoint_out(
             report.data().len(),
             report.data()
         );
+        #[cfg(feature = "hardware-e2e")]
+        log::info!(
+            "@HIDSHIFT-MIRROR:RAW_OUT_CRC,{:02X},{},{:04X}",
+            report.endpoint_address,
+            report.data().len(),
+            hidshift::checksum::crc16_ccitt_false(report.data())
+        );
         *pending = None;
     }
 }

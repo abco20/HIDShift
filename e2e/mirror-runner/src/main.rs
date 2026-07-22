@@ -7,10 +7,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use hidshift::checksum::{crc32_ieee};
+use hidshift::checksum::{crc16_ccitt_false, crc32_ieee};
 use hidshift::e2e_mirror::{
-    MirrorE2ePacket, OPCODE_HELLO, OPCODE_INJECT_ENDPOINT_IN, OPCODE_REGISTER_BEGIN,
-    OPCODE_REGISTER_CHUNK, OPCODE_REGISTER_COMMIT,
+    MIRROR_E2E_PAYLOAD_MAX, MirrorE2ePacket, OPCODE_HELLO, OPCODE_INJECT_ENDPOINT_IN,
+    OPCODE_REGISTER_BEGIN, OPCODE_REGISTER_CHUNK, OPCODE_REGISTER_COMMIT,
+    raw_injection_transfer_id,
 };
 use hidshift::management::{
     ManagementCommand, ManagementOutputTarget, ManagementResult,
@@ -30,6 +31,9 @@ struct Arguments {
     device_flash_port: Option<PathBuf>,
     #[arg(long)]
     skip_flash: bool,
+    /// Skip T15 when the Linux hidraw node is not accessible to this user.
+    #[arg(long)]
+    skip_hidraw: bool,
     #[arg(long, default_value = "e2e/fixtures/mirror/composite-a.hsmi")]
     profile_a: PathBuf,
     #[arg(long, default_value = "e2e/fixtures/mirror/mouse-b.hsmi")]
@@ -103,6 +107,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     wait_for_key_event(&mut keyboard_events, 30, 0, Duration::from_secs(3))?;
     println!("T13 passed: raw endpoint 0x81 produced KEY_A press/release in evdev");
 
+    // Force an edge even when Caps Lock was already enabled by an earlier run.
+    set_keyboard_led(&mut keyboard_events, 1, false)?;
     set_keyboard_led(&mut keyboard_events, 1, true)?;
     wait_for_text(
         &mut *serial,
@@ -110,6 +116,28 @@ fn run() -> Result<(), Box<dyn Error>> {
         Duration::from_secs(3),
     )?;
     println!("T14 passed: Caps Lock LED reached raw endpoint 0x01 unchanged");
+
+    if arguments.skip_hidraw {
+        println!("T15 skipped explicitly: Linux hidraw access was not requested");
+    } else {
+        let mut vendor_hidraw = open_hidraw(vid_a, pid_a, 1, Duration::from_secs(3))?;
+        let vendor_report = core::array::from_fn::<_, 64, _>(|index| {
+            if index == 0 { 0x10 } else { index as u8 }
+        });
+        inject_endpoint(&mut *serial, &mut sequence, 0x82, &vendor_report)?;
+        wait_for_hidraw_report(&mut vendor_hidraw, &vendor_report, Duration::from_secs(3))?;
+        vendor_hidraw.write_all(&vendor_report)?;
+        let expected_crc = format!(
+            "@HIDSHIFT-MIRROR:RAW_OUT_CRC,02,64,{:04X}",
+            crc16_ccitt_false(&vendor_report)
+        );
+        wait_for_text(
+            &mut *serial,
+            expected_crc.as_bytes(),
+            Duration::from_secs(3),
+        )?;
+        println!("T15 passed: 64-byte Vendor IN/OUT report preserved through hidraw");
+    }
 
     register_profile(&mut *serial, &profile_b, 2, &mut sequence, true)?;
     wait_for_text(
@@ -143,20 +171,27 @@ fn inject_endpoint(
     endpoint_address: u8,
     data: &[u8],
 ) -> Result<(), Box<dyn Error>> {
-    let current = *sequence;
-    send_mirror(
-        serial,
-        MirrorE2ePacket::new(
-            OPCODE_INJECT_ENDPOINT_IN,
-            current,
-            0,
-            u32::from(endpoint_address),
-            data,
-        )
-        .map_err(|error| format!("INJECT_ENDPOINT_IN packet: {error:?}"))?,
-    )?;
-    *sequence = sequence.wrapping_add(1);
-    let expected = format!("@HIDSHIFT-MIRROR:INJECTED,{current}");
+    let total_length = u8::try_from(data.len()).map_err(|_| "raw report exceeds 255 bytes")?;
+    let transfer_id = raw_injection_transfer_id(endpoint_address, total_length);
+    let mut offset = 0;
+    let mut final_sequence = 0;
+    for chunk in data.chunks(MIRROR_E2E_PAYLOAD_MAX) {
+        final_sequence = *sequence;
+        send_mirror(
+            serial,
+            MirrorE2ePacket::new(
+                OPCODE_INJECT_ENDPOINT_IN,
+                final_sequence,
+                transfer_id,
+                offset as u32,
+                chunk,
+            )
+            .map_err(|error| format!("INJECT_ENDPOINT_IN packet: {error:?}"))?,
+        )?;
+        *sequence = sequence.wrapping_add(1);
+        offset += chunk.len();
+    }
+    let expected = format!("@HIDSHIFT-MIRROR:INJECTED,{final_sequence}");
     wait_for_text(serial, expected.as_bytes(), Duration::from_secs(3))
 }
 
@@ -218,6 +253,78 @@ fn set_keyboard_led(
     }
     Err(last_error
         .map_or_else(|| "no keyboard evdev node".into(), |error| error.into()))
+}
+
+fn open_hidraw(
+    vid: u16,
+    pid: u16,
+    interface_number: u8,
+    timeout: Duration,
+) -> Result<fs::File, Box<dyn Error>> {
+    let deadline = Instant::now() + timeout;
+    let mut inaccessible = None;
+    while Instant::now() < deadline {
+        for entry in fs::read_dir("/sys/class/hidraw")? {
+            let path = entry?.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Ok(device_path) = fs::canonicalize(path.join("device")) else {
+                continue;
+            };
+            if ancestor_hex(&device_path, "idVendor") != Some(vid)
+                || ancestor_hex(&device_path, "idProduct") != Some(pid)
+                || ancestor_hex(&device_path, "bInterfaceNumber")
+                    != Some(u16::from(interface_number))
+            {
+                continue;
+            }
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(Path::new("/dev").join(name))
+            {
+                Ok(file) => return Ok(file),
+                Err(error) => inaccessible = Some((name.to_owned(), error)),
+            }
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    if let Some((name, error)) = inaccessible {
+        return Err(format!(
+            "/dev/{name} matches {vid:04x}:{pid:04x} interface {interface_number} but cannot be opened read/write ({error}); configure hidraw udev permissions or pass --skip-hidraw"
+        )
+        .into());
+    }
+    Err(format!(
+        "no hidraw node found for {vid:04x}:{pid:04x} interface {interface_number}"
+    )
+    .into())
+}
+
+fn ancestor_hex(path: &Path, file_name: &str) -> Option<u16> {
+    path.ancestors()
+        .find_map(|ancestor| read_hex(ancestor.join(file_name)))
+}
+
+fn wait_for_hidraw_report(
+    file: &mut fs::File,
+    expected: &[u8],
+    timeout: Duration,
+) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + timeout;
+    let mut report = [0; 64];
+    while Instant::now() < deadline {
+        match file.read(&mut report) {
+            Ok(length) if &report[..length] == expected => return Ok(()),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error.into()),
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    Err("timeout waiting for expected hidraw report".into())
 }
 
 fn wait_for_key_event(

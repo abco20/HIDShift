@@ -18,6 +18,95 @@ pub const OPCODE_RESET_MOCK_STATUS: u8 = 0x23;
 pub const OPCODE_INJECT_SPI_CRC_FAILURE: u8 = 0x30;
 pub const OPCODE_RESET_DEVICE_S3: u8 = 0x31;
 pub const OPCODE_DROP_SPI_CELLS: u8 = 0x32;
+pub const MIRROR_RAW_REPORT_MAX: usize = 64;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MirrorRawInjection {
+    pub endpoint_address: u8,
+    length: u8,
+    data: [u8; MIRROR_RAW_REPORT_MAX],
+}
+
+impl MirrorRawInjection {
+    pub const fn data(&self) -> &[u8] {
+        self.data.split_at(self.length as usize).0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MirrorRawInjectionError {
+    InvalidEndpoint,
+    InvalidTotalLength,
+    InvalidOffset,
+    TransferMismatch,
+}
+
+pub struct MirrorRawInjectionReceiver {
+    endpoint_address: u8,
+    total_length: u8,
+    received: u8,
+    data: [u8; MIRROR_RAW_REPORT_MAX],
+}
+
+impl MirrorRawInjectionReceiver {
+    pub const fn new() -> Self {
+        Self {
+            endpoint_address: 0,
+            total_length: 0,
+            received: 0,
+            data: [0; MIRROR_RAW_REPORT_MAX],
+        }
+    }
+
+    pub fn push(
+        &mut self,
+        packet: &MirrorE2ePacket,
+    ) -> Result<Option<MirrorRawInjection>, MirrorRawInjectionError> {
+        let endpoint_address = packet.transfer_id as u8;
+        let total_length = (packet.transfer_id >> 8) as u8;
+        if packet.transfer_id >> 16 != 0 || endpoint_address & 0x80 == 0 {
+            return Err(MirrorRawInjectionError::InvalidEndpoint);
+        }
+        if total_length == 0 || usize::from(total_length) > MIRROR_RAW_REPORT_MAX {
+            return Err(MirrorRawInjectionError::InvalidTotalLength);
+        }
+        if packet.offset == 0 {
+            self.endpoint_address = endpoint_address;
+            self.total_length = total_length;
+            self.received = 0;
+        } else if endpoint_address != self.endpoint_address || total_length != self.total_length {
+            return Err(MirrorRawInjectionError::TransferMismatch);
+        }
+        if packet.offset != u32::from(self.received)
+            || usize::from(self.received) + packet.payload().len() > usize::from(total_length)
+        {
+            return Err(MirrorRawInjectionError::InvalidOffset);
+        }
+        let start = usize::from(self.received);
+        self.data[start..start + packet.payload().len()].copy_from_slice(packet.payload());
+        self.received += packet.payload().len() as u8;
+        if self.received != total_length {
+            return Ok(None);
+        }
+        let injection = MirrorRawInjection {
+            endpoint_address,
+            length: total_length,
+            data: self.data,
+        };
+        self.received = 0;
+        Ok(Some(injection))
+    }
+}
+
+impl Default for MirrorRawInjectionReceiver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub const fn raw_injection_transfer_id(endpoint_address: u8, total_length: u8) -> u32 {
+    endpoint_address as u32 | ((total_length as u32) << 8)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MirrorE2ePacket {
@@ -196,6 +285,62 @@ mod tests {
         assert_eq!(
             MirrorE2ePacket::decode(&bytes),
             Err(MirrorE2eError::CrcMismatch)
+        );
+    }
+
+    #[test]
+    fn raw_injection_reassembles_a_64_byte_report_without_changing_bytes() {
+        let expected = core::array::from_fn::<_, 64, _>(|index| index as u8);
+        let transfer_id = raw_injection_transfer_id(0x82, 64);
+        let first = MirrorE2ePacket::new(
+            OPCODE_INJECT_ENDPOINT_IN,
+            10,
+            transfer_id,
+            0,
+            &expected[..47],
+        )
+        .unwrap();
+        let second = MirrorE2ePacket::new(
+            OPCODE_INJECT_ENDPOINT_IN,
+            11,
+            transfer_id,
+            47,
+            &expected[47..],
+        )
+        .unwrap();
+        let mut receiver = MirrorRawInjectionReceiver::new();
+        assert_eq!(receiver.push(&first), Ok(None));
+        let completed = receiver.push(&second).unwrap().unwrap();
+        assert_eq!(completed.endpoint_address, 0x82);
+        assert_eq!(completed.data(), &expected);
+    }
+
+    #[test]
+    fn raw_injection_rejects_a_gap_or_directionless_endpoint() {
+        let mut receiver = MirrorRawInjectionReceiver::new();
+        let invalid_endpoint = MirrorE2ePacket::new(
+            OPCODE_INJECT_ENDPOINT_IN,
+            1,
+            raw_injection_transfer_id(0x02, 1),
+            0,
+            &[1],
+        )
+        .unwrap();
+        assert_eq!(
+            receiver.push(&invalid_endpoint),
+            Err(MirrorRawInjectionError::InvalidEndpoint)
+        );
+        let gap = MirrorE2ePacket::new(
+            OPCODE_INJECT_ENDPOINT_IN,
+            2,
+            raw_injection_transfer_id(0x82, 64),
+            1,
+            &[1],
+        )
+        .unwrap();
+        assert_eq!(
+            receiver.push(&gap),
+            Err(MirrorRawInjectionError::TransferMismatch)
         );
     }
 }
