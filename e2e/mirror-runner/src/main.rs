@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -103,6 +103,14 @@ fn run() -> Result<(), Box<dyn Error>> {
     wait_for_key_event(&mut keyboard_events, 30, 0, Duration::from_secs(3))?;
     println!("T13 passed: raw endpoint 0x81 produced KEY_A press/release in evdev");
 
+    set_keyboard_led(&mut keyboard_events, 1, true)?;
+    wait_for_text(
+        &mut *serial,
+        b"@HIDSHIFT-MIRROR:RAW_OUT,01,1,[02]",
+        Duration::from_secs(3),
+    )?;
+    println!("T14 passed: Caps Lock LED reached raw endpoint 0x01 unchanged");
+
     register_profile(&mut *serial, &profile_b, 2, &mut sequence, true)?;
     wait_for_text(
         &mut *serial,
@@ -173,6 +181,7 @@ fn open_input_events(
             }
             if let Ok(file) = OpenOptions::new()
                 .read(true)
+                .write(true)
                 .custom_flags(libc::O_NONBLOCK)
                 .open(Path::new("/dev/input").join(name))
             {
@@ -185,6 +194,30 @@ fn open_input_events(
         std::thread::sleep(Duration::from_millis(25));
     }
     Err(format!("no evdev nodes found for {vid:04x}:{pid:04x}").into())
+}
+
+fn set_keyboard_led(
+    files: &mut [fs::File],
+    led_code: u16,
+    enabled: bool,
+) -> Result<(), Box<dyn Error>> {
+    const INPUT_EVENT_LEN: usize = 24;
+    const EV_SYN: u16 = 0;
+    const EV_LED: u16 = 0x11;
+    let mut events = [0u8; INPUT_EVENT_LEN * 2];
+    events[16..18].copy_from_slice(&EV_LED.to_ne_bytes());
+    events[18..20].copy_from_slice(&led_code.to_ne_bytes());
+    events[20..24].copy_from_slice(&i32::from(enabled).to_ne_bytes());
+    events[INPUT_EVENT_LEN + 16..INPUT_EVENT_LEN + 18].copy_from_slice(&EV_SYN.to_ne_bytes());
+    let mut last_error = None;
+    for file in files {
+        match file.write_all(&events) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error
+        .map_or_else(|| "no keyboard evdev node".into(), |error| error.into()))
 }
 
 fn wait_for_key_event(

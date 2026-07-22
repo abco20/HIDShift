@@ -636,6 +636,13 @@ fn report_raw_endpoint_out(
         .try_send(RuntimeInputMessage::MirrorEndpointOut(report))
         .is_ok()
     {
+        #[cfg(feature = "hardware-e2e")]
+        log::info!(
+            "@HIDSHIFT-MIRROR:RAW_OUT,{:02X},{},{:02X?}",
+            report.endpoint_address,
+            report.data().len(),
+            report.data()
+        );
         *pending = None;
     }
 }
