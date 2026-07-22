@@ -192,6 +192,7 @@ dependencies = [
  "clap",
  "hidshift",
  "hidshift-client",
+ "libc",
  "serialport",
 ]
 

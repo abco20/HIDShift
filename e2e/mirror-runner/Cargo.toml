@@ -10,3 +10,4 @@ clap = { version = "4.5", features = ["derive"] }
 hidshift = { path = "../..", features = ["dual-s3-wired", "hardware-e2e"] }
 hidshift-client = { path = "../../tools/hidshift-client" }
 serialport = { version = "4.8", default-features = false }
+libc = "0.2"

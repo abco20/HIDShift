@@ -37,6 +37,9 @@ pub const PROFILE_CHUNK_HEADER_LEN: usize = 8;
 pub const PROFILE_CHUNK_MAX_DATA_LEN: usize = 96;
 pub const PROFILE_RESULT_WIRE_LEN: usize = 12;
 pub const ACTIVATE_PROFILE_WIRE_LEN: usize = 8;
+pub const RAW_ENDPOINT_HEADER_LEN: usize = 6;
+pub const RAW_ENDPOINT_MAX_DATA_LEN: usize = 64;
+pub const RAW_ENDPOINT_MAX_WIRE_LEN: usize = RAW_ENDPOINT_HEADER_LEN + RAW_ENDPOINT_MAX_DATA_LEN;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -124,6 +127,61 @@ pub struct ProfileBegin {
     pub total_length: u32,
     pub crc32: u32,
     pub profile_hash: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RawEndpointReport {
+    pub endpoint_address: u8,
+    pub packet_sequence: u16,
+    length: u8,
+    data: [u8; RAW_ENDPOINT_MAX_DATA_LEN],
+}
+
+impl RawEndpointReport {
+    pub fn new(
+        endpoint_address: u8,
+        packet_sequence: u16,
+        data: &[u8],
+    ) -> Result<Self, MessageError> {
+        if data.len() > RAW_ENDPOINT_MAX_DATA_LEN {
+            return Err(MessageError::InvalidLength);
+        }
+        let mut report = Self {
+            endpoint_address,
+            packet_sequence,
+            length: data.len() as u8,
+            data: [0; RAW_ENDPOINT_MAX_DATA_LEN],
+        };
+        report.data[..data.len()].copy_from_slice(data);
+        Ok(report)
+    }
+
+    pub const fn data(&self) -> &[u8] {
+        self.data.split_at(self.length as usize).0
+    }
+
+    pub fn encode(self, out: &mut [u8]) -> Result<usize, MessageError> {
+        let length = RAW_ENDPOINT_HEADER_LEN + self.data().len();
+        if out.len() < length {
+            return Err(MessageError::InvalidLength);
+        }
+        out[0] = self.endpoint_address;
+        out[1] = 0;
+        out[2..4].copy_from_slice(&self.packet_sequence.to_le_bytes());
+        out[4..6].copy_from_slice(&(self.data().len() as u16).to_le_bytes());
+        out[6..length].copy_from_slice(self.data());
+        Ok(length)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, MessageError> {
+        if bytes.len() < RAW_ENDPOINT_HEADER_LEN
+            || bytes[1] != 0
+            || usize::from(read_u16(&bytes[4..6])) != bytes.len() - RAW_ENDPOINT_HEADER_LEN
+        {
+            return Err(MessageError::InvalidLength);
+        }
+        Self::new(bytes[0], read_u16(&bytes[2..4]), &bytes[6..])
+    }
 }
 
 impl ProfileBegin {
@@ -520,6 +578,10 @@ fn read_u32(bytes: &[u8]) -> u32 {
     u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
+fn read_u16(bytes: &[u8]) -> u16 {
+    u16::from_le_bytes([bytes[0], bytes[1]])
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StandardInputReportError {
     InvalidLength,
@@ -644,6 +706,21 @@ mod tests {
             profile_hash: 0xaabb_ccdd,
         };
         assert_eq!(ActivateProfile::decode(&activate.encode()), Ok(activate));
+    }
+
+    #[test]
+    fn raw_endpoint_report_preserves_endpoint_sequence_and_payload() {
+        let report = RawEndpointReport::new(0x82, 0xfffe, &[0x10; 64]).unwrap();
+        let mut encoded = [0; RAW_ENDPOINT_MAX_WIRE_LEN];
+        let length = report.encode(&mut encoded).unwrap();
+        assert_eq!(RawEndpointReport::decode(&encoded[..length]), Ok(report));
+        assert_eq!(report.data(), &[0x10; 64]);
+
+        encoded[1] = 1;
+        assert_eq!(
+            RawEndpointReport::decode(&encoded[..length]),
+            Err(MessageError::InvalidLength)
+        );
     }
 
     #[test]

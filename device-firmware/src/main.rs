@@ -28,7 +28,7 @@ use usb_device::bus::UsbBus;
 use usb_device::device::{
     StringDescriptors, UsbDevice, UsbDeviceBuilder, UsbDeviceState, UsbRev, UsbVidPid,
 };
-use usb_dynamic::DynamicUsb;
+use usb_dynamic::{DynamicUsb, RawPacket};
 use usb_fallback::FallbackUsb;
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -198,6 +198,10 @@ trait PresentationRuntime<B: UsbBus> {
         None
     }
     fn restore_standard_output(&mut self, _report: StandardOutputReport) {}
+    fn take_raw_output(&mut self) -> Option<RawPacket> {
+        None
+    }
+    fn restore_raw_output(&mut self, _packet: RawPacket) {}
     fn usb_state(&self, configured: bool, profile_hash: u32) -> UsbState;
     fn is_fallback(&self) -> bool;
 }
@@ -240,9 +244,28 @@ impl<B: UsbBus> PresentationRuntime<B> for DynamicUsb<'_, B> {
     }
 
     fn enqueue_link_event(&mut self, event: DeviceLinkEvent) {
-        if matches!(event, DeviceLinkEvent::StandardInput(_) | DeviceLinkEvent::ReleaseAll) {
-            self.drop_standard_report();
+        match event {
+            DeviceLinkEvent::RawEndpointIn(report) => {
+                if RawPacket::new(report.endpoint_address, report.data())
+                    .and_then(|packet| self.enqueue_input(packet))
+                    .is_err()
+                {
+                    self.dropped_packets = self.dropped_packets.saturating_add(1);
+                }
+            }
+            DeviceLinkEvent::StandardInput(_) | DeviceLinkEvent::ReleaseAll => {
+                self.drop_standard_report();
+            }
+            _ => {}
         }
+    }
+
+    fn take_raw_output(&mut self) -> Option<RawPacket> {
+        self.take_output()
+    }
+
+    fn restore_raw_output(&mut self, packet: RawPacket) {
+        self.restore_output(packet);
     }
 
     fn usb_state(&self, _configured: bool, profile_hash: u32) -> UsbState {
@@ -292,10 +315,17 @@ fn run<'a, B: UsbBus, P: PresentationRuntime<B>>(
         Err((error, _, _, _)) => fatal("initial slave DMA queue", error),
     };
     let mut pending_profile_result = None;
+    let mut raw_output_sequence = 1u16;
 
     loop {
         while !transfer.is_done() {
-            service_usb(&mut usb_device, &mut presentation, &mut link, &mut current_usb_state);
+            service_usb(
+                &mut usb_device,
+                &mut presentation,
+                &mut link,
+                &mut current_usb_state,
+                &mut raw_output_sequence,
+            );
             if ever_linked && now_ms().saturating_sub(last_valid_spi_ms) >= SPI_LINK_LOSS_TIMEOUT_MS
             {
                 let _ = usb_device.force_reset();
@@ -417,7 +447,13 @@ fn run<'a, B: UsbBus, P: PresentationRuntime<B>>(
             Err((error, _, _, _)) => fatal("slave DMA requeue", error),
         };
 
-        service_usb(&mut usb_device, &mut presentation, &mut link, &mut current_usb_state);
+        service_usb(
+            &mut usb_device,
+            &mut presentation,
+            &mut link,
+            &mut current_usb_state,
+            &mut raw_output_sequence,
+        );
     }
 }
 
@@ -467,6 +503,7 @@ fn service_usb<B: UsbBus, P: PresentationRuntime<B>>(
     presentation: &mut P,
     link: &mut DeviceLink,
     current_usb_state: &mut UsbState,
+    raw_output_sequence: &mut u16,
 ) {
     presentation.poll(usb_device);
     let now_ms = now_ms();
@@ -474,6 +511,20 @@ fn service_usb<B: UsbBus, P: PresentationRuntime<B>>(
         && !link.queue_standard_output(output, now_ms)
     {
         presentation.restore_standard_output(output);
+    }
+    if let Some(packet) = presentation.take_raw_output() {
+        let sent = hidshift::interchip::RawEndpointReport::new(
+            packet.endpoint_address(),
+            *raw_output_sequence,
+            packet.data(),
+        )
+        .is_ok_and(|report| link.queue_raw_endpoint_out(report, now_ms));
+        if sent {
+            *raw_output_sequence = next_nonzero(*raw_output_sequence);
+        }
+        if !sent {
+            presentation.restore_raw_output(packet);
+        }
     }
 
     let next_usb_state = presentation.usb_state(
@@ -483,6 +534,14 @@ fn service_usb<B: UsbBus, P: PresentationRuntime<B>>(
     if next_usb_state != *current_usb_state {
         *current_usb_state = next_usb_state;
         link.update_usb_state(*current_usb_state, now_ms);
+    }
+}
+
+const fn next_nonzero(value: u16) -> u16 {
+    if value == u16::MAX || value == 0 {
+        1
+    } else {
+        value + 1
     }
 }
 

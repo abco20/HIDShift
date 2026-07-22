@@ -1,13 +1,16 @@
 use std::error::Error;
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 use hidshift::checksum::{crc32_ieee};
 use hidshift::e2e_mirror::{
-    MirrorE2ePacket, OPCODE_HELLO, OPCODE_REGISTER_BEGIN, OPCODE_REGISTER_CHUNK,
-    OPCODE_REGISTER_COMMIT,
+    MirrorE2ePacket, OPCODE_HELLO, OPCODE_INJECT_ENDPOINT_IN, OPCODE_REGISTER_BEGIN,
+    OPCODE_REGISTER_CHUNK, OPCODE_REGISTER_COMMIT,
 };
 use hidshift::management::{
     ManagementCommand, ManagementOutputTarget, ManagementResult,
@@ -88,6 +91,18 @@ fn run() -> Result<(), Box<dyn Error>> {
     )?;
     println!("T10-T12 passed: registered and enumerated {vid_a:04x}:{pid_a:04x}");
 
+    let mut keyboard_events = open_input_events(vid_a, pid_a, Duration::from_secs(3))?;
+    inject_endpoint(
+        &mut *serial,
+        &mut sequence,
+        0x81,
+        &[0, 0, 0x04, 0, 0, 0, 0, 0],
+    )?;
+    wait_for_key_event(&mut keyboard_events, 30, 1, Duration::from_secs(3))?;
+    inject_endpoint(&mut *serial, &mut sequence, 0x81, &[0; 8])?;
+    wait_for_key_event(&mut keyboard_events, 30, 0, Duration::from_secs(3))?;
+    println!("T13 passed: raw endpoint 0x81 produced KEY_A press/release in evdev");
+
     register_profile(&mut *serial, &profile_b, 2, &mut sequence, true)?;
     wait_for_text(
         &mut *serial,
@@ -112,6 +127,97 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     println!("T19 passed: invalid Profile rejected and Profile B preserved");
     Ok(())
+}
+
+fn inject_endpoint(
+    serial: &mut dyn SerialPort,
+    sequence: &mut u32,
+    endpoint_address: u8,
+    data: &[u8],
+) -> Result<(), Box<dyn Error>> {
+    let current = *sequence;
+    send_mirror(
+        serial,
+        MirrorE2ePacket::new(
+            OPCODE_INJECT_ENDPOINT_IN,
+            current,
+            0,
+            u32::from(endpoint_address),
+            data,
+        )
+        .map_err(|error| format!("INJECT_ENDPOINT_IN packet: {error:?}"))?,
+    )?;
+    *sequence = sequence.wrapping_add(1);
+    let expected = format!("@HIDSHIFT-MIRROR:INJECTED,{current}");
+    wait_for_text(serial, expected.as_bytes(), Duration::from_secs(3))
+}
+
+fn open_input_events(
+    vid: u16,
+    pid: u16,
+    timeout: Duration,
+) -> Result<Vec<fs::File>, Box<dyn Error>> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let mut files = Vec::new();
+        for entry in fs::read_dir("/sys/class/input")? {
+            let path = entry?.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if !name.starts_with("event")
+                || read_hex(path.join("device/id/vendor")) != Some(vid)
+                || read_hex(path.join("device/id/product")) != Some(pid)
+            {
+                continue;
+            }
+            if let Ok(file) = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(Path::new("/dev/input").join(name))
+            {
+                files.push(file);
+            }
+        }
+        if !files.is_empty() {
+            return Ok(files);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Err(format!("no evdev nodes found for {vid:04x}:{pid:04x}").into())
+}
+
+fn wait_for_key_event(
+    files: &mut [fs::File],
+    key_code: u16,
+    value: i32,
+    timeout: Duration,
+) -> Result<(), Box<dyn Error>> {
+    const INPUT_EVENT_LEN: usize = 24;
+    const EV_KEY: u16 = 1;
+    let deadline = Instant::now() + timeout;
+    let mut bytes = [0; INPUT_EVENT_LEN * 8];
+    while Instant::now() < deadline {
+        for file in files.iter_mut() {
+            match file.read(&mut bytes) {
+                Ok(length) => {
+                    for event in bytes[..length].chunks_exact(INPUT_EVENT_LEN) {
+                        let event_type = u16::from_ne_bytes([event[16], event[17]]);
+                        let code = u16::from_ne_bytes([event[18], event[19]]);
+                        let event_value =
+                            i32::from_ne_bytes([event[20], event[21], event[22], event[23]]);
+                        if event_type == EV_KEY && code == key_code && event_value == value {
+                            return Ok(());
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    Err(format!("timeout waiting for evdev key code {key_code} value {value}").into())
 }
 
 fn register_profile(

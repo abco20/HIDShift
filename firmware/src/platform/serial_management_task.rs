@@ -11,13 +11,13 @@ use hidshift::runtime::message::RuntimeInputMessage;
 use hidshift::e2e::{E2eCommand, E2ePacket};
 #[cfg(all(feature = "hardware-e2e", feature = "dual-s3-wired"))]
 use hidshift::e2e_mirror::{
-    MirrorE2ePacket, OPCODE_CLEAR_CANDIDATES, OPCODE_HELLO, OPCODE_REGISTER_BEGIN,
-    OPCODE_REGISTER_CHUNK, OPCODE_REGISTER_COMMIT,
+    MirrorE2ePacket, OPCODE_CLEAR_CANDIDATES, OPCODE_HELLO, OPCODE_INJECT_ENDPOINT_IN,
+    OPCODE_REGISTER_BEGIN, OPCODE_REGISTER_CHUNK, OPCODE_REGISTER_COMMIT,
 };
 #[cfg(all(feature = "hardware-e2e", feature = "dual-s3-wired"))]
 use hidshift::interchip::{
     ProfileBegin, ProfileChunk, ProfileResultStatus, ProfileTransferEncoder,
-    ProfileTransferReceiver,
+    ProfileTransferReceiver, RawEndpointReport,
 };
 #[cfg(all(feature = "hardware-e2e", feature = "dual-s3-wired"))]
 use hidshift::mirror::HSMI_MAX_SIZE;
@@ -242,6 +242,30 @@ pub async fn serial_management_task(
                                 })
                                 .await;
                             log::info!("@HIDSHIFT-MIRROR:CLEARED,{}", packet.sequence);
+                        }
+                        OPCODE_INJECT_ENDPOINT_IN if packet.offset <= u32::from(u8::MAX) => {
+                            match RawEndpointReport::new(
+                                packet.offset as u8,
+                                packet.sequence as u16,
+                                packet.payload(),
+                            ) {
+                                Ok(report) => {
+                                    device_sender
+                                        .send(DeviceTaskCommand::RawEndpointIn(report))
+                                        .await;
+                                    log::info!(
+                                        "@HIDSHIFT-MIRROR:INJECTED,{},{:02x},{}",
+                                        packet.sequence,
+                                        packet.offset,
+                                        packet.payload().len()
+                                    );
+                                }
+                                Err(error) => log::warn!(
+                                    "@HIDSHIFT-MIRROR:ERROR,{},inject,{:?}",
+                                    packet.sequence,
+                                    error
+                                ),
+                            }
                         }
                         _ => log::warn!(
                             "@HIDSHIFT-MIRROR:ERROR,{},opcode,{}",

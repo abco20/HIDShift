@@ -1,18 +1,20 @@
 use heapless::Vec;
 
 use super::message::{
-    ActivateProfile, CAPABILITY_DYNAMIC_PROFILE, CAPABILITY_FALLBACK_PROFILE,
-    CAPABILITY_PROFILE_FLASH_CACHE, CAPABILITY_STANDARD_WIRED_HID, CAPABILITY_USB_STATE_REPORTING,
-    ProfileBegin, ProfileChunk, ProfileChunkData, ProfileResult, RECORD_ACTIVATE_PROFILE,
-    RECORD_FORCE_FALLBACK, RECORD_HEARTBEAT, RECORD_HELLO, RECORD_HELLO_ACK, RECORD_LINK_RESET,
-    RECORD_PROFILE_BEGIN, RECORD_PROFILE_CHUNK, RECORD_PROFILE_COMMIT, RECORD_PROFILE_RESULT,
+    ActivateProfile, CAPABILITY_DYNAMIC_PROFILE, CAPABILITY_ENDPOINT_IN, CAPABILITY_ENDPOINT_OUT,
+    CAPABILITY_FALLBACK_PROFILE, CAPABILITY_PROFILE_FLASH_CACHE, CAPABILITY_STANDARD_WIRED_HID,
+    CAPABILITY_USB_STATE_REPORTING, ProfileBegin, ProfileChunk, ProfileChunkData, ProfileResult,
+    RECORD_ACTIVATE_PROFILE, RECORD_FORCE_FALLBACK, RECORD_HEARTBEAT, RECORD_HELLO,
+    RECORD_HELLO_ACK, RECORD_LINK_RESET, RECORD_PROFILE_BEGIN, RECORD_PROFILE_CHUNK,
+    RECORD_PROFILE_COMMIT, RECORD_PROFILE_RESULT, RECORD_RAW_ENDPOINT_IN, RECORD_RAW_ENDPOINT_OUT,
     RECORD_STANDARD_INPUT_REPORT, RECORD_STANDARD_OUTPUT_REPORT, RECORD_STANDARD_RELEASE_ALL,
     RECORD_USB_STATE,
 };
 use super::{
-    Hello, InterchipRole, ReceiveDisposition, Record, RecordIter, ReliableReceiver, ReliableSender,
-    RetransmitAction, SPI_CELL_LEN, SPI_CELL_PAYLOAD_LEN, SPI_PROTOCOL_VERSION, SpiCell,
-    StandardInputReport, StandardOutputReport, UsbState, encode_records,
+    Hello, InterchipRole, RawEndpointReport, ReceiveDisposition, Record, RecordIter,
+    ReliableReceiver, ReliableSender, RetransmitAction, SPI_CELL_LEN, SPI_CELL_PAYLOAD_LEN,
+    SPI_PROTOCOL_VERSION, SpiCell, StandardInputReport, StandardOutputReport, UsbState,
+    encode_records,
 };
 
 const DEVICE_CAPABILITIES: u32 =
@@ -29,6 +31,7 @@ pub enum DeviceLinkEvent {
     ProfileBegin(ProfileBegin),
     ProfileChunk(ProfileChunkData),
     ProfileCommit { transfer_id: u32 },
+    RawEndpointIn(RawEndpointReport),
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -66,7 +69,11 @@ impl DeviceLink {
         Self::with_capabilities(
             session_id,
             usb_state,
-            DEVICE_CAPABILITIES | CAPABILITY_DYNAMIC_PROFILE | CAPABILITY_PROFILE_FLASH_CACHE,
+            DEVICE_CAPABILITIES
+                | CAPABILITY_DYNAMIC_PROFILE
+                | CAPABILITY_PROFILE_FLASH_CACHE
+                | CAPABILITY_ENDPOINT_IN
+                | CAPABILITY_ENDPOINT_OUT,
             active_profile_hash,
         )
     }
@@ -120,6 +127,18 @@ impl DeviceLink {
             return false;
         }
         self.next_cell = self.queue_record(RECORD_PROFILE_RESULT, &result.encode(), now_ms);
+        self.next_cell.is_some()
+    }
+
+    pub fn queue_raw_endpoint_out(&mut self, report: RawEndpointReport, now_ms: u64) -> bool {
+        if !self.host_compatible || self.next_cell.is_some() {
+            return false;
+        }
+        let mut data = [0; super::message::RAW_ENDPOINT_MAX_WIRE_LEN];
+        let Ok(length) = report.encode(&mut data) else {
+            return false;
+        };
+        self.next_cell = self.queue_record(RECORD_RAW_ENDPOINT_OUT, &data[..length], now_ms);
         self.next_cell.is_some()
     }
 
@@ -258,6 +277,14 @@ impl DeviceLink {
                             transfer_id: u32::from_le_bytes(bytes),
                         },
                     );
+                }
+                RECORD_RAW_ENDPOINT_IN if self.host_compatible => {
+                    match RawEndpointReport::decode(record.data) {
+                        Ok(report) => {
+                            self.push_event(events, DeviceLinkEvent::RawEndpointIn(report))
+                        }
+                        Err(_) => self.mark_malformed(),
+                    }
                 }
                 RECORD_STANDARD_INPUT_REPORT if self.host_compatible => {
                     match StandardInputReport::decode(record.data) {
@@ -669,5 +696,31 @@ mod tests {
             events.as_slice(),
             &[DeviceLinkEvent::ActivateProfile(activate)]
         );
+    }
+
+    #[test]
+    fn raw_endpoint_input_is_delivered_without_rewriting_report_bytes() {
+        let mut device = DeviceLink::new_with_profile_storage(2, fallback_state(), 0);
+        let mut host = ReliableSender::new(1);
+        let hello = Hello {
+            role: InterchipRole::Host,
+            protocol_version: SPI_PROTOCOL_VERSION,
+            firmware_major: 0,
+            firmware_minor: 2,
+            capabilities: CAPABILITY_ENDPOINT_IN,
+            active_profile_hash: 0,
+        }
+        .encode();
+        let mut events = Vec::<_, 2>::new();
+        device.handle_transaction(&host_cell(&mut host, RECORD_HELLO, &hello), 0, &mut events);
+        let report = RawEndpointReport::new(0x82, 9, &[0x10, 0xaa, 0xbb]).unwrap();
+        let mut encoded = [0; super::super::message::RAW_ENDPOINT_MAX_WIRE_LEN];
+        let length = report.encode(&mut encoded).unwrap();
+        device.handle_transaction(
+            &host_cell(&mut host, RECORD_RAW_ENDPOINT_IN, &encoded[..length]),
+            1,
+            &mut events,
+        );
+        assert_eq!(events.as_slice(), &[DeviceLinkEvent::RawEndpointIn(report)]);
     }
 }

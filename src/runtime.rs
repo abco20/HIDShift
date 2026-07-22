@@ -4,7 +4,7 @@ use crate::ids::{DeviceId, HostId, InterfaceId};
 #[cfg(feature = "dual-s3-wired")]
 use crate::interchip::{
     ActivateProfile, ProfileBegin, ProfileChunkData, ProfileResult, ProfileResultStatus,
-    ProfileTransferCommand,
+    ProfileTransferCommand, RawEndpointReport,
 };
 use crate::management::{
     ManagementCommand, ManagementDestination, ManagementDiagnostics, ManagementHistoryEvent,
@@ -179,6 +179,8 @@ pub enum RuntimeInput<'a> {
     #[cfg(feature = "dual-s3-wired")]
     DeviceProfileResult(ProfileResult),
     #[cfg(feature = "dual-s3-wired")]
+    MirrorEndpointOut(RawEndpointReport),
+    #[cfg(feature = "dual-s3-wired")]
     MirrorCandidateRegistered {
         candidate: MirrorCandidateId,
         profile_hash: Option<u32>,
@@ -211,6 +213,8 @@ pub struct BridgeRuntime<const HOSTS: usize, const USB_INTERFACES: usize> {
     mirror_candidate_hashes: [Option<u32>; 4],
     #[cfg(feature = "dual-s3-wired")]
     pending_mirror_candidate: Option<(MirrorCandidateId, u32)>,
+    #[cfg(feature = "dual-s3-wired")]
+    last_mirror_endpoint_out: Option<RawEndpointReport>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -265,6 +269,8 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             mirror_candidate_hashes: [None; 4],
             #[cfg(feature = "dual-s3-wired")]
             pending_mirror_candidate: None,
+            #[cfg(feature = "dual-s3-wired")]
+            last_mirror_endpoint_out: None,
         }
     }
 
@@ -275,6 +281,11 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
     #[cfg(feature = "dual-s3-wired")]
     pub const fn last_profile_result(&self) -> Option<ProfileResult> {
         self.last_profile_result
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    pub const fn last_mirror_endpoint_out(&self) -> Option<RawEndpointReport> {
+        self.last_mirror_endpoint_out
     }
 
     #[cfg(feature = "dual-s3-wired")]
@@ -536,6 +547,12 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                 if let Some((candidate, profile_hash)) = accepted_candidate {
                     self.activate_selected_mirror_candidate(candidate, profile_hash, commands)?;
                 }
+                Ok(())
+            }
+            #[cfg(feature = "dual-s3-wired")]
+            RuntimeInput::MirrorEndpointOut(report) => {
+                commands.clear();
+                self.last_mirror_endpoint_out = Some(report);
                 Ok(())
             }
             #[cfg(feature = "dual-s3-wired")]
@@ -2191,6 +2208,7 @@ pub enum DeviceTaskCommand {
     ProfileCommit {
         transfer_id: u32,
     },
+    RawEndpointIn(RawEndpointReport),
 }
 
 #[cfg(feature = "dual-s3-wired")]
@@ -2211,6 +2229,7 @@ impl DeviceTaskCommand {
             Self::ProfileBegin(_) | Self::ProfileChunk(_) | Self::ProfileCommit { .. } => {
                 CommandClass::BestEffort
             }
+            Self::RawEndpointIn(_) => CommandClass::Realtime,
         }
     }
 }
@@ -3261,6 +3280,21 @@ mod tests {
                 profile_hash: 0x3333_3333,
             })
         )));
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    #[test]
+    fn mirrored_endpoint_output_preserves_endpoint_sequence_and_payload() {
+        let mut runtime = BridgeRuntime::<4, 1>::new(0);
+        let mut commands = heapless::Vec::<RuntimeCommand, 4>::new();
+        let report = RawEndpointReport::new(0x02, 17, &[0x10, 0xaa, 0xbb]).unwrap();
+
+        runtime
+            .handle_input::<4, 4, 2>(RuntimeInput::MirrorEndpointOut(report), &mut commands)
+            .unwrap();
+
+        assert!(commands.is_empty());
+        assert_eq!(runtime.last_mirror_endpoint_out(), Some(report));
     }
 
     #[test]

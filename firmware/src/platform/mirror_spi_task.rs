@@ -11,12 +11,12 @@ use hidshift::interchip::message::{
     CAPABILITY_DYNAMIC_PROFILE, CAPABILITY_FALLBACK_PROFILE, CAPABILITY_STANDARD_WIRED_HID,
     CAPABILITY_USB_STATE_REPORTING, RECORD_ACTIVATE_PROFILE, RECORD_FORCE_FALLBACK,
     RECORD_HEARTBEAT, RECORD_HELLO, RECORD_HELLO_ACK, RECORD_LINK_RESET, RECORD_PROFILE_BEGIN,
-    RECORD_PROFILE_CHUNK, RECORD_PROFILE_COMMIT, RECORD_PROFILE_RESULT,
-    RECORD_STANDARD_INPUT_REPORT, RECORD_STANDARD_OUTPUT_REPORT, RECORD_STANDARD_RELEASE_ALL,
-    RECORD_USB_STATE,
+    RECORD_PROFILE_CHUNK, RECORD_PROFILE_COMMIT, RECORD_PROFILE_RESULT, RECORD_RAW_ENDPOINT_IN,
+    RECORD_RAW_ENDPOINT_OUT, RECORD_STANDARD_INPUT_REPORT, RECORD_STANDARD_OUTPUT_REPORT,
+    RECORD_STANDARD_RELEASE_ALL, RECORD_USB_STATE,
 };
 use hidshift::interchip::{
-    Hello, InterchipRole, ProfileResult, ReceiveDisposition, Record, RecordIter,
+    Hello, InterchipRole, ProfileResult, RawEndpointReport, ReceiveDisposition, Record, RecordIter,
     ReliableCommandSlot, ReliableReceiver, ReliableSender, RetransmitAction, SPI_CELL_LEN,
     SPI_CELL_PAYLOAD_LEN, SPI_PROTOCOL_VERSION, SpiCell, StandardInputReport, StandardOutputReport,
     UsbState, encode_records,
@@ -139,6 +139,7 @@ async fn run_link(
     let mut reported_availability = None;
     let mut pending_wired_leds = None;
     let mut pending_profile_result = None;
+    let mut pending_raw_endpoint_out = None;
     // Keep the command until the Device S3 acknowledges its cell. If the
     // device reboots between dequeue and delivery, the link session is
     // renegotiated and this command is sent again instead of being lost.
@@ -158,6 +159,7 @@ async fn run_link(
         );
         report_wired_leds(&runtime_sender, &mut pending_wired_leds);
         report_profile_result(&runtime_sender, &mut pending_profile_result);
+        report_raw_endpoint_out(&runtime_sender, &mut pending_raw_endpoint_out);
 
         if last_valid_cell_ms
             .is_some_and(|last| now_ms.saturating_sub(last) >= LINK_LOSS_TIMEOUT_MS)
@@ -268,6 +270,9 @@ async fn run_link(
                         }
                         if let Some(result) = processed.profile_result {
                             pending_profile_result = Some(result);
+                        }
+                        if let Some(report) = processed.raw_endpoint_out {
+                            pending_raw_endpoint_out = Some(report);
                         }
                     }
                     Err(()) => {
@@ -402,6 +407,11 @@ fn queue_command(
             now_ms,
         )
         .map_err(|_| ()),
+        DeviceTaskCommand::RawEndpointIn(report) => {
+            let mut data = [0; hidshift::interchip::message::RAW_ENDPOINT_MAX_WIRE_LEN];
+            let length = report.encode(&mut data).map_err(|_| ())?;
+            queue_record(sender, RECORD_RAW_ENDPOINT_IN, &data[..length], now_ms).map_err(|_| ())
+        }
     }
 }
 
@@ -450,6 +460,7 @@ fn retransmit_or_idle(
 struct ProcessedRecords {
     wired_leds: Option<KeyboardLedState>,
     profile_result: Option<ProfileResult>,
+    raw_endpoint_out: Option<RawEndpointReport>,
 }
 
 fn process_records(
@@ -510,6 +521,10 @@ fn process_records(
                     result.detail
                 );
                 processed.profile_result = Some(result);
+            }
+            RECORD_RAW_ENDPOINT_OUT => {
+                processed.raw_endpoint_out =
+                    Some(RawEndpointReport::decode(record.data).map_err(|_| ())?);
             }
             _ => {}
         }
@@ -599,6 +614,26 @@ fn report_profile_result(
     };
     if sender
         .try_send(RuntimeInputMessage::DeviceProfileResult(result))
+        .is_ok()
+    {
+        *pending = None;
+    }
+}
+
+fn report_raw_endpoint_out(
+    sender: &Sender<
+        'static,
+        CriticalSectionRawMutex,
+        RuntimeInputMessage,
+        RUNTIME_INPUT_QUEUE_CAPACITY,
+    >,
+    pending: &mut Option<RawEndpointReport>,
+) {
+    let Some(report) = *pending else {
+        return;
+    };
+    if sender
+        .try_send(RuntimeInputMessage::MirrorEndpointOut(report))
         .is_ok()
     {
         *pending = None;

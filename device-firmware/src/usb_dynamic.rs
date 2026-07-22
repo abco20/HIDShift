@@ -141,6 +141,12 @@ impl<'a, B: UsbBus> DynamicUsb<'a, B> {
         self.pending_out.pop_front()
     }
 
+    pub fn restore_output(&mut self, packet: RawPacket) {
+        if self.pending_out.push_front(packet).is_err() {
+            self.dropped_packets = self.dropped_packets.saturating_add(1);
+        }
+    }
+
     pub const fn configured(&self) -> bool {
         self.configured
     }
