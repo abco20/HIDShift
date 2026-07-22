@@ -51,6 +51,11 @@ pub enum RuntimeInputMessage {
     DiagnosticsEvent(RuntimeDiagnosticsEvent),
     #[cfg(feature = "dual-s3-wired")]
     DeviceProfileResult(crate::interchip::ProfileResult),
+    #[cfg(feature = "dual-s3-wired")]
+    MirrorCandidateRegistered {
+        candidate: crate::output_target::MirrorCandidateId,
+        profile_hash: Option<u32>,
+    },
     RestoreStorage(StorageState),
 }
 
@@ -110,6 +115,14 @@ impl RuntimeInputMessage {
             Self::DiagnosticsEvent(event) => RuntimeInput::DiagnosticsEvent(*event),
             #[cfg(feature = "dual-s3-wired")]
             Self::DeviceProfileResult(result) => RuntimeInput::DeviceProfileResult(*result),
+            #[cfg(feature = "dual-s3-wired")]
+            Self::MirrorCandidateRegistered {
+                candidate,
+                profile_hash,
+            } => RuntimeInput::MirrorCandidateRegistered {
+                candidate: *candidate,
+                profile_hash: *profile_hash,
+            },
             Self::RestoreStorage(storage) => RuntimeInput::RestoreStorage(storage),
         }
     }
@@ -169,6 +182,14 @@ impl TryFrom<RuntimeInput<'_>> for RuntimeInputMessage {
             RuntimeInput::DiagnosticsEvent(event) => Ok(Self::DiagnosticsEvent(event)),
             #[cfg(feature = "dual-s3-wired")]
             RuntimeInput::DeviceProfileResult(result) => Ok(Self::DeviceProfileResult(result)),
+            #[cfg(feature = "dual-s3-wired")]
+            RuntimeInput::MirrorCandidateRegistered {
+                candidate,
+                profile_hash,
+            } => Ok(Self::MirrorCandidateRegistered {
+                candidate,
+                profile_hash,
+            }),
             RuntimeInput::RestoreStorage(storage) => Ok(Self::RestoreStorage(storage.clone())),
         }
     }

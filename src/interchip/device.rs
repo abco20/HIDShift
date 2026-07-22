@@ -1,12 +1,13 @@
 use heapless::Vec;
 
 use super::message::{
-    CAPABILITY_DYNAMIC_PROFILE, CAPABILITY_FALLBACK_PROFILE, CAPABILITY_PROFILE_FLASH_CACHE,
-    CAPABILITY_STANDARD_WIRED_HID, CAPABILITY_USB_STATE_REPORTING, ProfileBegin, ProfileChunk,
-    ProfileChunkData, ProfileResult, RECORD_FORCE_FALLBACK, RECORD_HEARTBEAT, RECORD_HELLO,
-    RECORD_HELLO_ACK, RECORD_LINK_RESET, RECORD_PROFILE_BEGIN, RECORD_PROFILE_CHUNK,
-    RECORD_PROFILE_COMMIT, RECORD_PROFILE_RESULT, RECORD_STANDARD_INPUT_REPORT,
-    RECORD_STANDARD_OUTPUT_REPORT, RECORD_STANDARD_RELEASE_ALL, RECORD_USB_STATE,
+    ActivateProfile, CAPABILITY_DYNAMIC_PROFILE, CAPABILITY_FALLBACK_PROFILE,
+    CAPABILITY_PROFILE_FLASH_CACHE, CAPABILITY_STANDARD_WIRED_HID, CAPABILITY_USB_STATE_REPORTING,
+    ProfileBegin, ProfileChunk, ProfileChunkData, ProfileResult, RECORD_ACTIVATE_PROFILE,
+    RECORD_FORCE_FALLBACK, RECORD_HEARTBEAT, RECORD_HELLO, RECORD_HELLO_ACK, RECORD_LINK_RESET,
+    RECORD_PROFILE_BEGIN, RECORD_PROFILE_CHUNK, RECORD_PROFILE_COMMIT, RECORD_PROFILE_RESULT,
+    RECORD_STANDARD_INPUT_REPORT, RECORD_STANDARD_OUTPUT_REPORT, RECORD_STANDARD_RELEASE_ALL,
+    RECORD_USB_STATE,
 };
 use super::{
     Hello, InterchipRole, ReceiveDisposition, Record, RecordIter, ReliableReceiver, ReliableSender,
@@ -24,6 +25,7 @@ pub enum DeviceLinkEvent {
     StandardInput(StandardInputReport),
     ReleaseAll,
     ForceFallback { operation_id: u32 },
+    ActivateProfile(ActivateProfile),
     ProfileBegin(ProfileBegin),
     ProfileChunk(ProfileChunkData),
     ProfileCommit { transfer_id: u32 },
@@ -161,6 +163,15 @@ impl DeviceLink {
         };
         self.diagnostics.valid_cells = self.diagnostics.valid_cells.saturating_add(1);
         self.sender.acknowledge(cell.header.cumulative_ack);
+        if self.receiver.session_id() != Some(cell.header.session_id) {
+            self.host_compatible = false;
+            if !contains_compatible_host_hello(&cell) {
+                self.receiver.reset_session(cell.header.session_id);
+                return;
+            }
+        } else if !self.host_compatible && !contains_compatible_host_hello(&cell) {
+            return;
+        }
         match self.receiver.receive(&cell) {
             ReceiveDisposition::Accepted { .. } => {}
             ReceiveDisposition::Duplicate { .. } => {
@@ -210,6 +221,14 @@ impl DeviceLink {
                         },
                     );
                     self.next_cell = self.queue_usb_state(now_ms);
+                }
+                RECORD_ACTIVATE_PROFILE if self.host_compatible => {
+                    match ActivateProfile::decode(record.data) {
+                        Ok(activate) => {
+                            self.push_event(events, DeviceLinkEvent::ActivateProfile(activate))
+                        }
+                        Err(_) => self.mark_malformed(),
+                    }
                 }
                 RECORD_PROFILE_BEGIN if self.host_compatible => {
                     match ProfileBegin::decode(record.data) {
@@ -342,6 +361,20 @@ impl DeviceLink {
     }
 }
 
+fn contains_compatible_host_hello(cell: &SpiCell) -> bool {
+    let mut records = RecordIter::new(cell.payload(), cell.header.record_count);
+    let found = records.by_ref().any(|record| {
+        let Ok(record) = record else {
+            return false;
+        };
+        record.record_type == RECORD_HELLO
+            && Hello::decode(record.data).is_ok_and(|hello| {
+                hello.role == InterchipRole::Host && hello.protocol_version == SPI_PROTOCOL_VERSION
+            })
+    });
+    found && records.finish().is_ok()
+}
+
 const fn nonzero_session(value: u32) -> u32 {
     if value == 0 { 1 } else { value }
 }
@@ -444,6 +477,92 @@ mod tests {
     }
 
     #[test]
+    fn new_host_session_must_repeat_hello_before_commands_are_acked() {
+        let mut device = DeviceLink::new(2, fallback_state());
+        let mut original_host = ReliableSender::new(1);
+        let hello = Hello {
+            role: InterchipRole::Host,
+            protocol_version: SPI_PROTOCOL_VERSION,
+            firmware_major: 0,
+            firmware_minor: 2,
+            capabilities: DEVICE_CAPABILITIES,
+            active_profile_hash: 0,
+        }
+        .encode();
+        let mut events = Vec::<_, 4>::new();
+        device.handle_transaction(
+            &host_cell(&mut original_host, RECORD_HELLO, &hello),
+            0,
+            &mut events,
+        );
+        assert!(device.host_compatible());
+
+        let mut restarted_host = ReliableSender::new(9);
+        let report = StandardInputReport {
+            flags: 0,
+            sequence: 1,
+            report: StandardHidReport::Keyboard(Keyboard6KroReport::from_bytes([
+                0, 0, 4, 0, 0, 0, 0, 0,
+            ])),
+        };
+        let (wire, length) = report.encode();
+        device.handle_transaction(
+            &host_cell(
+                &mut restarted_host,
+                RECORD_STANDARD_INPUT_REPORT,
+                &wire[..length as usize],
+            ),
+            1,
+            &mut events,
+        );
+
+        assert!(!device.host_compatible());
+        assert!(events.is_empty());
+        assert_eq!(device.receiver.cumulative_ack(), 0);
+
+        restarted_host.reset_session(9);
+        device.handle_transaction(
+            &host_cell(&mut restarted_host, RECORD_HELLO, &hello),
+            2,
+            &mut events,
+        );
+        assert!(device.host_compatible());
+    }
+
+    #[test]
+    fn link_reset_requires_a_new_hello_before_more_commands_are_acked() {
+        let mut device = DeviceLink::new(2, fallback_state());
+        let mut host = ReliableSender::new(1);
+        let hello = Hello {
+            role: InterchipRole::Host,
+            protocol_version: SPI_PROTOCOL_VERSION,
+            firmware_major: 0,
+            firmware_minor: 2,
+            capabilities: DEVICE_CAPABILITIES,
+            active_profile_hash: 0,
+        }
+        .encode();
+        let mut events = Vec::<_, 4>::new();
+        device.handle_transaction(&host_cell(&mut host, RECORD_HELLO, &hello), 0, &mut events);
+        device.handle_transaction(
+            &host_cell(&mut host, RECORD_LINK_RESET, &[]),
+            1,
+            &mut events,
+        );
+        assert!(!device.host_compatible());
+        let ack_before = device.receiver.cumulative_ack();
+
+        device.handle_transaction(
+            &host_cell(&mut host, RECORD_STANDARD_RELEASE_ALL, &[]),
+            2,
+            &mut events,
+        );
+
+        assert!(events.is_empty());
+        assert_eq!(device.receiver.cumulative_ack(), ack_before);
+    }
+
+    #[test]
     fn standard_output_is_sent_only_after_compatible_hello() {
         let mut device = DeviceLink::new(2, fallback_state());
         let output = StandardOutputReport::new(1, &[0x02]).unwrap();
@@ -510,5 +629,45 @@ mod tests {
             })
             .unwrap();
         assert_eq!(received, chunk);
+    }
+
+    #[test]
+    fn activation_is_delivered_only_after_a_compatible_hello() {
+        let mut device = DeviceLink::new_with_profile_storage(2, fallback_state(), 0);
+        let mut host = ReliableSender::new(1);
+        let activate = ActivateProfile {
+            operation_id: 12,
+            profile_hash: 0x1122_3344,
+        };
+        let mut events = Vec::<_, 2>::new();
+        device.handle_transaction(
+            &host_cell(&mut host, RECORD_ACTIVATE_PROFILE, &activate.encode()),
+            0,
+            &mut events,
+        );
+        assert!(events.is_empty());
+
+        let hello = Hello {
+            role: InterchipRole::Host,
+            protocol_version: SPI_PROTOCOL_VERSION,
+            firmware_major: 0,
+            firmware_minor: 2,
+            capabilities: CAPABILITY_DYNAMIC_PROFILE,
+            active_profile_hash: 0,
+        }
+        .encode();
+        // The unacknowledged pre-HELLO record remains sender-pending. A real
+        // Host link starts a fresh session before its handshake.
+        host.reset_session(1);
+        device.handle_transaction(&host_cell(&mut host, RECORD_HELLO, &hello), 1, &mut events);
+        device.handle_transaction(
+            &host_cell(&mut host, RECORD_ACTIVATE_PROFILE, &activate.encode()),
+            2,
+            &mut events,
+        );
+        assert_eq!(
+            events.as_slice(),
+            &[DeviceLinkEvent::ActivateProfile(activate)]
+        );
     }
 }

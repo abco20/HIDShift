@@ -44,9 +44,26 @@ impl ProfileStoreBackend for DeviceProfileBackend {
     type Error = ProfileFlashError;
 
     fn read(&mut self, offset: usize, out: &mut [u8]) -> Result<(), Self::Error> {
-        self.flash
-            .read(self.absolute(offset)?, out)
-            .map_err(|_| ProfileFlashError::Read)
+        const READ_SIZE: usize = 4;
+        let address = self.absolute(offset)?;
+        if offset % READ_SIZE != 0 {
+            return Err(ProfileFlashError::Bounds);
+        }
+        let aligned_length = out.len() / READ_SIZE * READ_SIZE;
+        if aligned_length != 0 {
+            self.flash
+                .read(address, &mut out[..aligned_length])
+                .map_err(|_| ProfileFlashError::Read)?;
+        }
+        if aligned_length != out.len() {
+            let mut tail = [0; READ_SIZE];
+            self.flash
+                .read(address + aligned_length as u32, &mut tail)
+                .map_err(|_| ProfileFlashError::Read)?;
+            let remaining = out.len() - aligned_length;
+            out[aligned_length..].copy_from_slice(&tail[..remaining]);
+        }
+        Ok(())
     }
 
     fn erase(&mut self, offset: usize, length: usize) -> Result<(), Self::Error> {
@@ -59,9 +76,26 @@ impl ProfileStoreBackend for DeviceProfileBackend {
     }
 
     fn write(&mut self, offset: usize, data: &[u8]) -> Result<(), Self::Error> {
-        self.flash
-            .write(self.absolute(offset)?, data)
-            .map_err(|_| ProfileFlashError::Write)
+        const WRITE_SIZE: usize = 4;
+        let address = self.absolute(offset)?;
+        if offset % WRITE_SIZE != 0 {
+            return Err(ProfileFlashError::Bounds);
+        }
+        let aligned_length = data.len() / WRITE_SIZE * WRITE_SIZE;
+        if aligned_length != 0 {
+            self.flash
+                .write(address, &data[..aligned_length])
+                .map_err(|_| ProfileFlashError::Write)?;
+        }
+        let tail = &data[aligned_length..];
+        if !tail.is_empty() {
+            let mut padded = [0xff; WRITE_SIZE];
+            padded[..tail.len()].copy_from_slice(tail);
+            self.flash
+                .write(address + aligned_length as u32, &padded)
+                .map_err(|_| ProfileFlashError::Write)?;
+        }
+        Ok(())
     }
 }
 
@@ -89,17 +123,24 @@ pub enum ProfileFlashError {
     Write,
 }
 
-pub fn storage_error_result<E>(
-    error: ProfileStoreError<E>,
+pub fn storage_error_result(
+    error: ProfileStoreError<ProfileFlashError>,
     transfer_id: u32,
     profile_hash: u32,
 ) -> hidshift::interchip::ProfileResult {
-    let _ = error;
+    let detail = match error {
+        ProfileStoreError::Backend(ProfileFlashError::Bounds) => 1,
+        ProfileStoreError::Backend(ProfileFlashError::Read) => 2,
+        ProfileStoreError::Backend(ProfileFlashError::Erase) => 3,
+        ProfileStoreError::Backend(ProfileFlashError::Write) => 4,
+        ProfileStoreError::ImageTooLarge => 5,
+        ProfileStoreError::ReadBackMismatch => 6,
+    };
     hidshift::interchip::ProfileResult {
         transfer_id,
         profile_hash,
         status: hidshift::interchip::ProfileResultStatus::StorageError,
         reject_reason: hidshift::mirror::MirrorRejectReason::StorageFailure as u8,
-        detail: 0,
+        detail,
     }
 }

@@ -11,12 +11,12 @@ pub use cell::{
 };
 pub use device::{DeviceLink, DeviceLinkDiagnostics, DeviceLinkEvent};
 pub use message::{
-    CAPABILITY_CONTROL_FORWARDING, CAPABILITY_DYNAMIC_PROFILE, CAPABILITY_ENDPOINT_IN,
-    CAPABILITY_ENDPOINT_OUT, CAPABILITY_FALLBACK_PROFILE, CAPABILITY_PROFILE_FLASH_CACHE,
-    CAPABILITY_STANDARD_WIRED_HID, CAPABILITY_USB_STATE_REPORTING, Hello, InterchipRole,
-    PROFILE_CHUNK_MAX_DATA_LEN, ProfileBegin, ProfileChunk, ProfileChunkData, ProfileResult,
-    ProfileResultStatus, StandardInputReport, StandardInputReportError, StandardOutputReport,
-    StandardOutputReportError, UsbState,
+    ACTIVATE_PROFILE_WIRE_LEN, ActivateProfile, CAPABILITY_CONTROL_FORWARDING,
+    CAPABILITY_DYNAMIC_PROFILE, CAPABILITY_ENDPOINT_IN, CAPABILITY_ENDPOINT_OUT,
+    CAPABILITY_FALLBACK_PROFILE, CAPABILITY_PROFILE_FLASH_CACHE, CAPABILITY_STANDARD_WIRED_HID,
+    CAPABILITY_USB_STATE_REPORTING, Hello, InterchipRole, PROFILE_CHUNK_MAX_DATA_LEN, ProfileBegin,
+    ProfileChunk, ProfileChunkData, ProfileResult, ProfileResultStatus, StandardInputReport,
+    StandardInputReportError, StandardOutputReport, StandardOutputReportError, UsbState,
 };
 pub use profile_transfer::{
     CommittedProfile, ProfileChunkDisposition, ProfileTransferCommand, ProfileTransferEncoder,
@@ -24,6 +24,6 @@ pub use profile_transfer::{
 };
 pub use record::{Record, RecordCodecError, RecordIter, RecordRef, encode_records};
 pub use reliable::{
-    ReceiveDisposition, ReliableReceiver, ReliableSender, RetransmitAction, SPI_TX_WINDOW,
-    SenderError,
+    ReceiveDisposition, ReliableCommandSlot, ReliableReceiver, ReliableSender, RetransmitAction,
+    SPI_TX_WINDOW, SenderError,
 };

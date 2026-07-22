@@ -30,6 +30,10 @@ const OP_GET_HOST_TIMING: u8 = 0x0e;
 const OP_SELECT_OUTPUT_TARGET: u8 = 0x0f;
 #[cfg(feature = "dual-s3-wired")]
 const OP_GET_OUTPUT_TARGET_STATUS: u8 = 0x10;
+#[cfg(feature = "dual-s3-wired")]
+const OP_SET_MIRROR_TARGET: u8 = 0x13;
+#[cfg(feature = "dual-s3-wired")]
+const OP_CLEAR_MIRROR_TARGET: u8 = 0x14;
 
 const PAYLOAD_NONE: u8 = 0;
 const PAYLOAD_STATUS: u8 = 1;
@@ -91,6 +95,12 @@ impl ManagementRequest {
             }
             #[cfg(feature = "dual-s3-wired")]
             (OP_GET_OUTPUT_TARGET_STATUS, []) => ManagementCommand::GetOutputTargetStatus,
+            #[cfg(feature = "dual-s3-wired")]
+            (OP_SET_MIRROR_TARGET, [candidate]) => ManagementCommand::SetMirrorTarget(
+                crate::output_target::MirrorCandidateId(*candidate),
+            ),
+            #[cfg(feature = "dual-s3-wired")]
+            (OP_CLEAR_MIRROR_TARGET, []) => ManagementCommand::ClearMirrorTarget,
             (OP_GET_HISTORY, [index]) => ManagementCommand::GetHistory { index: *index },
             (OP_GET_SCHEMA, []) => ManagementCommand::GetSchema,
             (OP_GET_SETTING, [id_low, id_high, scope, target]) => ManagementCommand::GetSetting {
@@ -129,7 +139,13 @@ impl ManagementRequest {
                 return Err(ManagementProtocolError::InvalidArgument);
             }
             #[cfg(feature = "dual-s3-wired")]
-            (OP_SELECT_OUTPUT_TARGET | OP_GET_OUTPUT_TARGET_STATUS, _) => {
+            (
+                OP_SELECT_OUTPUT_TARGET
+                | OP_GET_OUTPUT_TARGET_STATUS
+                | OP_SET_MIRROR_TARGET
+                | OP_CLEAR_MIRROR_TARGET,
+                _,
+            ) => {
                 return Err(ManagementProtocolError::InvalidArgument);
             }
             _ => return Err(ManagementProtocolError::UnknownCommand),
@@ -179,6 +195,14 @@ impl ManagementRequest {
             }
             #[cfg(feature = "dual-s3-wired")]
             ManagementCommand::GetOutputTargetStatus => bytes[2] = OP_GET_OUTPUT_TARGET_STATUS,
+            #[cfg(feature = "dual-s3-wired")]
+            ManagementCommand::SetMirrorTarget(candidate) => {
+                bytes[2] = OP_SET_MIRROR_TARGET;
+                bytes[3] = 1;
+                bytes[4] = candidate.0;
+            }
+            #[cfg(feature = "dual-s3-wired")]
+            ManagementCommand::ClearMirrorTarget => bytes[2] = OP_CLEAR_MIRROR_TARGET,
             ManagementCommand::GetHistory { index } => {
                 bytes[2] = OP_GET_HISTORY;
                 bytes[3] = 1;
@@ -251,6 +275,10 @@ pub enum ManagementCommand {
     SelectOutputTarget(ManagementOutputTarget),
     #[cfg(feature = "dual-s3-wired")]
     GetOutputTargetStatus,
+    #[cfg(feature = "dual-s3-wired")]
+    SetMirrorTarget(crate::output_target::MirrorCandidateId),
+    #[cfg(feature = "dual-s3-wired")]
+    ClearMirrorTarget,
 }
 
 #[cfg(feature = "dual-s3-wired")]
@@ -1013,6 +1041,8 @@ mod tests {
             ManagementCommand::SelectOutputTarget(ManagementOutputTarget::Wired),
             ManagementCommand::SelectOutputTarget(ManagementOutputTarget::Ble(HostId(4))),
             ManagementCommand::GetOutputTargetStatus,
+            ManagementCommand::SetMirrorTarget(crate::output_target::MirrorCandidateId(0)),
+            ManagementCommand::ClearMirrorTarget,
         ] {
             let request = ManagementRequest {
                 request_id: 19,

@@ -413,6 +413,7 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
             }
             OutputTarget::Ble(host_id) => {
                 self.state.hosts.set_active_target(host_id)?;
+                push_action(out, BridgeAction::EnsureFallback { operation_id })?;
                 push_action(out, BridgeAction::ActivateInput { host_id })?;
                 self.apply_active_host_leds(out)?;
                 self.refresh_selected_target_availability();
@@ -806,6 +807,11 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
         self.state.hosts.can_send(host_id, kind)
     }
 
+    #[cfg(feature = "dual-s3-wired")]
+    pub fn set_mirror_target(&mut self, target: Option<crate::output_target::StoredMirrorTarget>) {
+        self.state.mirror_target = target;
+    }
+
     pub fn storage_state(&self, generation: u32) -> Result<StorageState, StorageError> {
         let storage = self.state.hosts.storage_state(generation)?;
         #[cfg(feature = "dual-s3-wired")]
@@ -1080,6 +1086,10 @@ pub enum BridgeAction {
     },
     #[cfg(feature = "dual-s3-wired")]
     ActivateWired {
+        operation_id: u32,
+    },
+    #[cfg(feature = "dual-s3-wired")]
+    EnsureFallback {
         operation_id: u32,
     },
     PersistProfiles,

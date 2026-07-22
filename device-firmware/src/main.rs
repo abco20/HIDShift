@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+mod boot_presentation;
+mod usb_dynamic;
 mod usb_fallback;
 mod profile_store;
 
@@ -15,21 +17,25 @@ use hidshift::fallback::{
 };
 use hidshift::interchip::{
     DeviceLink, DeviceLinkEvent, ProfileResult, ProfileResultStatus, ProfileTransferError,
-    ProfileTransferReceiver, SPI_CELL_LEN, UsbState,
+    ProfileTransferReceiver, SPI_CELL_LEN, StandardOutputReport, UsbState,
 };
-use hidshift::mirror::{HSMI_MAX_SIZE, MirrorRejectReason, ProfileCommitOutcome};
+use hidshift::mirror::{
+    HSMI_MAX_SIZE, MirrorRejectReason, ProfileCommitOutcome, UsbDevicePlan, validate_mirror_image,
+};
 use static_cell::StaticCell;
 use usb_device::LangID;
 use usb_device::bus::UsbBus;
 use usb_device::device::{
-    StringDescriptors, UsbDevice, UsbDeviceBuilder, UsbDeviceState, UsbVidPid,
+    StringDescriptors, UsbDevice, UsbDeviceBuilder, UsbDeviceState, UsbRev, UsbVidPid,
 };
+use usb_dynamic::DynamicUsb;
 use usb_fallback::FallbackUsb;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
 static USB_ENDPOINT_MEMORY: StaticCell<[u32; 1024]> = StaticCell::new();
 static PROFILE_STAGING: StaticCell<[u8; HSMI_MAX_SIZE]> = StaticCell::new();
+static PROFILE_ACTIVE_IMAGE: StaticCell<[u8; HSMI_MAX_SIZE]> = StaticCell::new();
 const SPI_LINK_LOSS_TIMEOUT_MS: u64 = 1_500;
 
 #[esp_hal::main]
@@ -45,32 +51,13 @@ fn main() -> ! {
             None
         }
     };
-    let active_profile_hash = profile_store
-        .as_mut()
-        .and_then(|store| store.active().ok().flatten())
-        .map_or(0, |profile| profile.profile_hash);
+    let dynamic_plan = load_boot_profile(&mut profile_store);
     let profile_receiver =
         ProfileTransferReceiver::new(PROFILE_STAGING.init([0; HSMI_MAX_SIZE]));
 
     let usb = esp_hal::otg_fs::Usb::new(peripherals.USB0, peripherals.GPIO20, peripherals.GPIO19);
     let endpoint_memory = USB_ENDPOINT_MEMORY.init([0; 1024]);
     let usb_bus = esp_hal::otg_fs::UsbBus::new(usb, endpoint_memory);
-    let fallback = FallbackUsb::new(&usb_bus);
-    let usb_builder = match UsbDeviceBuilder::new(
-        &usb_bus,
-        UsbVidPid(FALLBACK_USB_VENDOR_ID, FALLBACK_USB_PRODUCT_ID),
-    )
-    .strings(&[StringDescriptors::new(LangID::EN_US)
-        .manufacturer(FALLBACK_USB_MANUFACTURER)
-        .product(FALLBACK_USB_PRODUCT)])
-    {
-        Ok(builder) => builder,
-        Err(error) => fatal("USB strings", error),
-    };
-    let usb_device = usb_builder
-        .device_release(FALLBACK_USB_DEVICE_RELEASE)
-        .build();
-
     let (rx_buffer, rx_descriptors, tx_buffer, tx_descriptors) =
         esp_hal::dma_buffers!(SPI_CELL_LEN);
     let dma_rx = match DmaRxBuf::new(rx_descriptors, rx_buffer) {
@@ -88,33 +75,210 @@ fn main() -> ! {
         .with_miso(peripherals.GPIO13)
         .with_dma(peripherals.DMA_CH0);
 
-    run(
-        spi,
-        dma_rx,
-        dma_tx,
-        session_id,
-        usb_device,
-        fallback,
-        profile_store,
-        profile_receiver,
-        active_profile_hash,
-    )
+    if let Some((profile_hash, plan)) = dynamic_plan {
+        let dynamic = match DynamicUsb::new(&usb_bus, plan) {
+            Ok(dynamic) => dynamic,
+            Err(error) => fatal("dynamic endpoints", error),
+        };
+        let usb_device = build_dynamic_device(&usb_bus, &dynamic);
+        run(
+            spi,
+            dma_rx,
+            dma_tx,
+            session_id,
+            usb_device,
+            dynamic,
+            profile_store,
+            profile_receiver,
+            profile_hash,
+        )
+    } else {
+        let fallback = FallbackUsb::new(&usb_bus);
+        let usb_builder = match UsbDeviceBuilder::new(
+            &usb_bus,
+            UsbVidPid(FALLBACK_USB_VENDOR_ID, FALLBACK_USB_PRODUCT_ID),
+        )
+        .strings(&[StringDescriptors::new(LangID::EN_US)
+            .manufacturer(FALLBACK_USB_MANUFACTURER)
+            .product(FALLBACK_USB_PRODUCT)])
+        {
+            Ok(builder) => builder,
+            Err(error) => fatal("USB strings", error),
+        };
+        let usb_device = usb_builder
+            .device_release(FALLBACK_USB_DEVICE_RELEASE)
+            .build();
+        run(
+            spi,
+            dma_rx,
+            dma_tx,
+            session_id,
+            usb_device,
+            fallback,
+            profile_store,
+            profile_receiver,
+            0,
+        )
+    }
 }
 
-fn run<'a, B: UsbBus>(
+fn load_boot_profile(
+    store: &mut Option<profile_store::DeviceProfileStore>,
+) -> Option<(u32, UsbDevicePlan<'static>)> {
+    let Some(profile_hash) = boot_presentation::take_mirror_profile() else {
+        log::info!("device-presentation: fallback boot");
+        return None;
+    };
+    log::info!("device-presentation: requested mirror {:08x}", profile_hash);
+    let Some(store) = store.as_mut() else {
+        log::error!("device-presentation: mirror storage unavailable");
+        return None;
+    };
+    let Some(profile) = store.find(profile_hash).ok().flatten() else {
+        log::error!("device-presentation: profile {:08x} not found", profile_hash);
+        return None;
+    };
+    let image = PROFILE_ACTIVE_IMAGE.init([0; HSMI_MAX_SIZE]);
+    if let Err(error) = store.read_profile(profile, image) {
+        log::error!("device-presentation: profile read failed {:?}", error);
+        return None;
+    }
+    let image: &'static [u8] = &image[..profile.length];
+    let plan = match validate_mirror_image(image) {
+        Ok(plan) => plan,
+        Err(error) => {
+            log::error!("device-presentation: stored profile invalid {:?}", error);
+            return None;
+        }
+    };
+    log::info!("device-presentation: mirror {:08x} ready", profile_hash);
+    Some((profile_hash, plan))
+}
+
+fn build_dynamic_device<'a, B: UsbBus>(
+    alloc: &'a usb_device::bus::UsbBusAllocator<B>,
+    dynamic: &DynamicUsb<'a, B>,
+) -> UsbDevice<'a, B> {
+    let plan = dynamic.plan();
+    let device = plan.device_descriptor;
+    let configuration = plan.configuration_descriptor;
+    let usb_revision = if u16::from_le_bytes([device[2], device[3]]) >= 0x0210 {
+        UsbRev::Usb210
+    } else {
+        UsbRev::Usb200
+    };
+    let builder = UsbDeviceBuilder::new(
+        alloc,
+        UsbVidPid(
+            u16::from_le_bytes([device[8], device[9]]),
+            u16::from_le_bytes([device[10], device[11]]),
+        ),
+    )
+    .device_class(device[4])
+    .device_sub_class(device[5])
+    .device_protocol(device[6])
+    .device_release(u16::from_le_bytes([device[12], device[13]]))
+    .usb_rev(usb_revision)
+    .self_powered(configuration[7] & 0x40 != 0);
+    let builder = match builder.max_packet_size_0(device[7]) {
+        Ok(builder) => builder,
+        Err(error) => fatal("dynamic EP0", error),
+    };
+    let builder = match builder.max_power(usize::from(configuration[8]) * 2) {
+        Ok(builder) => builder,
+        Err(error) => fatal("dynamic power", error),
+    };
+    builder.build()
+}
+
+trait PresentationRuntime<B: UsbBus> {
+    fn poll(&mut self, usb_device: &mut UsbDevice<'_, B>);
+    fn enqueue_link_event(&mut self, event: DeviceLinkEvent);
+    fn take_standard_output(&mut self) -> Option<StandardOutputReport> {
+        None
+    }
+    fn restore_standard_output(&mut self, _report: StandardOutputReport) {}
+    fn usb_state(&self, configured: bool, profile_hash: u32) -> UsbState;
+    fn is_fallback(&self) -> bool;
+}
+
+impl<B: UsbBus> PresentationRuntime<B> for FallbackUsb<'_, B> {
+    fn poll(&mut self, usb_device: &mut UsbDevice<'_, B>) {
+        usb_device.poll(&mut [
+            &mut self.keyboard,
+            &mut self.mouse,
+            &mut self.consumer,
+        ]);
+        self.service();
+    }
+
+    fn enqueue_link_event(&mut self, event: DeviceLinkEvent) {
+        self.enqueue_link_event(event);
+    }
+
+    fn take_standard_output(&mut self) -> Option<StandardOutputReport> {
+        self.take_keyboard_output()
+    }
+
+    fn restore_standard_output(&mut self, report: StandardOutputReport) {
+        self.restore_keyboard_output(report);
+    }
+
+    fn usb_state(&self, configured: bool, _profile_hash: u32) -> UsbState {
+        fallback_usb_state(configured)
+    }
+
+    fn is_fallback(&self) -> bool {
+        true
+    }
+}
+
+impl<B: UsbBus> PresentationRuntime<B> for DynamicUsb<'_, B> {
+    fn poll(&mut self, usb_device: &mut UsbDevice<'_, B>) {
+        usb_device.poll(&mut [self]);
+        self.service();
+    }
+
+    fn enqueue_link_event(&mut self, event: DeviceLinkEvent) {
+        if matches!(event, DeviceLinkEvent::StandardInput(_) | DeviceLinkEvent::ReleaseAll) {
+            self.drop_standard_report();
+        }
+    }
+
+    fn usb_state(&self, _configured: bool, profile_hash: u32) -> UsbState {
+        UsbState {
+            attached: true,
+            configured: self.configured(),
+            fallback_active: false,
+            healthy: true,
+            active_profile_hash: profile_hash,
+            error_code: 0,
+        }
+    }
+
+    fn is_fallback(&self) -> bool {
+        false
+    }
+}
+
+fn run<'a, B: UsbBus, P: PresentationRuntime<B>>(
     spi: esp_hal::spi::slave::dma::SpiDma<'static, esp_hal::Blocking>,
     mut dma_rx: DmaRxBuf,
     mut dma_tx: DmaTxBuf,
     session_id: u32,
     mut usb_device: UsbDevice<'a, B>,
-    mut fallback: FallbackUsb<'a, B>,
+    mut presentation: P,
     mut profile_store: Option<profile_store::DeviceProfileStore>,
     mut profile_receiver: ProfileTransferReceiver<'static>,
-    active_profile_hash: u32,
+    presentation_profile_hash: u32,
 ) -> ! {
-    let mut current_usb_state = fallback_usb_state(false);
+    let mut current_usb_state = presentation.usb_state(false, presentation_profile_hash);
     let mut link = if profile_store.is_some() {
-        DeviceLink::new_with_profile_storage(session_id, current_usb_state, active_profile_hash)
+        DeviceLink::new_with_profile_storage(
+            session_id,
+            current_usb_state,
+            presentation_profile_hash,
+        )
     } else {
         DeviceLink::new(session_id, current_usb_state)
     };
@@ -131,12 +295,7 @@ fn run<'a, B: UsbBus>(
 
     loop {
         while !transfer.is_done() {
-            service_usb(
-                &mut usb_device,
-                &mut fallback,
-                &mut link,
-                &mut current_usb_state,
-            );
+            service_usb(&mut usb_device, &mut presentation, &mut link, &mut current_usb_state);
             if ever_linked && now_ms().saturating_sub(last_valid_spi_ms) >= SPI_LINK_LOSS_TIMEOUT_MS
             {
                 let _ = usb_device.force_reset();
@@ -211,8 +370,35 @@ fn run<'a, B: UsbBus>(
                         profile_receiver.clear_committed();
                     }
                     pending_profile_result = Some(result);
+                    log::info!(
+                        "device-profile: transfer={} status={} reason={}",
+                        result.transfer_id,
+                        result.status as u8,
+                        result.reject_reason
+                    );
                 }
-                event => fallback.enqueue_link_event(event),
+                DeviceLinkEvent::ActivateProfile(activate) => {
+                    log::info!(
+                        "device-presentation: activate op={} hash={:08x}",
+                        activate.operation_id,
+                        activate.profile_hash
+                    );
+                    if activate.profile_hash != presentation_profile_hash
+                        && profile_store
+                            .as_mut()
+                            .and_then(|store| store.find(activate.profile_hash).ok().flatten())
+                            .is_some()
+                    {
+                        boot_presentation::request_mirror(activate.profile_hash);
+                        let _ = usb_device.force_reset();
+                        restart_presentation();
+                    }
+                }
+                DeviceLinkEvent::ForceFallback { .. } if !presentation.is_fallback() => {
+                    let _ = usb_device.force_reset();
+                    restart_presentation();
+                }
+                event => presentation.enqueue_link_event(event),
             }
         }
         if let Some(result) = pending_profile_result
@@ -231,13 +417,31 @@ fn run<'a, B: UsbBus>(
             Err((error, _, _, _)) => fatal("slave DMA requeue", error),
         };
 
-        service_usb(
-            &mut usb_device,
-            &mut fallback,
-            &mut link,
-            &mut current_usb_state,
-        );
+        service_usb(&mut usb_device, &mut presentation, &mut link, &mut current_usb_state);
     }
+}
+
+fn restart_presentation() -> ! {
+    // The digital-core software reset preserves RTC persistent memory while
+    // resetting USB, SPI and DMA. A CPU-only reset is insufficient because it
+    // leaves the active SPI slave DMA transaction behind.
+    soft_disconnect_usb();
+    esp_hal::system::software_reset();
+}
+
+fn soft_disconnect_usb() {
+    // Synopsys OTG DCTL.SDIS (bit 1) disconnects the pull-up. The current
+    // usb-device adapter does not implement UsbBus::force_reset, so perform
+    // the hardware operation explicitly before resetting the CPU.
+    const DCTL_OFFSET: usize = 0x804;
+    const SOFT_DISCONNECT: u32 = 1 << 1;
+    let dctl = (esp_hal::peripherals::USB0::PTR as usize + DCTL_OFFSET) as *mut u32;
+    // SAFETY: run() exclusively owns USB0, and no USB access occurs after
+    // setting SDIS because this function immediately resets the CPU.
+    unsafe {
+        dctl.write_volatile(dctl.read_volatile() | SOFT_DISCONNECT);
+    }
+    esp_hal::delay::Delay::new().delay_millis(5);
 }
 
 fn profile_transfer_error_result(
@@ -258,26 +462,24 @@ fn profile_transfer_error_result(
     }
 }
 
-fn service_usb<B: UsbBus>(
+fn service_usb<B: UsbBus, P: PresentationRuntime<B>>(
     usb_device: &mut UsbDevice<'_, B>,
-    fallback: &mut FallbackUsb<'_, B>,
+    presentation: &mut P,
     link: &mut DeviceLink,
     current_usb_state: &mut UsbState,
 ) {
-    usb_device.poll(&mut [
-        &mut fallback.keyboard,
-        &mut fallback.mouse,
-        &mut fallback.consumer,
-    ]);
-    fallback.service();
+    presentation.poll(usb_device);
     let now_ms = now_ms();
-    if let Some(output) = fallback.take_keyboard_output()
+    if let Some(output) = presentation.take_standard_output()
         && !link.queue_standard_output(output, now_ms)
     {
-        fallback.restore_keyboard_output(output);
+        presentation.restore_standard_output(output);
     }
 
-    let next_usb_state = fallback_usb_state(usb_device.state() == UsbDeviceState::Configured);
+    let next_usb_state = presentation.usb_state(
+        usb_device.state() == UsbDeviceState::Configured,
+        current_usb_state.active_profile_hash,
+    );
     if next_usb_state != *current_usb_state {
         *current_usb_state = next_usb_state;
         link.update_usb_state(*current_usb_state, now_ms);

@@ -135,7 +135,7 @@ fn validate_configuration<'a>(
     let mut interfaces = Vec::<HidInterfacePlan<'a>, MIRROR_HID_INTERFACES_MAX>::new();
     let mut endpoints = Vec::<EndpointPlan, MIRROR_ENDPOINTS_MAX>::new();
     let mut endpoint_addresses = Vec::<u8, MIRROR_ENDPOINTS_MAX>::new();
-    let mut current_interface: Option<(u8, u8, u8, u8, usize, Option<u16>)> = None;
+    let mut current_interface: Option<ParsedInterface<'a>> = None;
     let mut offset = 9;
     while offset < config.len() {
         let length = descriptor_length(config, offset)?;
@@ -159,14 +159,14 @@ fn validate_configuration<'a>(
                 {
                     return Err(MirrorRejectReason::MalformedImage);
                 }
-                current_interface = Some((
-                    descriptor[2],
-                    descriptor[6],
-                    descriptor[7],
-                    descriptor[4],
-                    0,
-                    None,
-                ));
+                current_interface = Some(ParsedInterface {
+                    number: descriptor[2],
+                    subclass: descriptor[6],
+                    protocol: descriptor[7],
+                    expected_endpoints: descriptor[4],
+                    actual_endpoints: 0,
+                    hid_descriptor: None,
+                });
             }
             0x21 => {
                 let Some(current) = current_interface.as_mut() else {
@@ -189,7 +189,10 @@ fn validate_configuration<'a>(
                     }
                     hid_offset += 3;
                 }
-                current.5 = declared_report;
+                if declared_report.is_none() || current.hid_descriptor.is_some() {
+                    return Err(MirrorRejectReason::InvalidDescriptorLength);
+                }
+                current.hid_descriptor = Some(descriptor);
             }
             0x05 => {
                 let Some(current) = current_interface.as_mut() else {
@@ -224,13 +227,13 @@ fn validate_configuration<'a>(
                     .map_err(|_| MirrorRejectReason::EndpointResourceExhausted)?;
                 endpoints
                     .push(EndpointPlan {
-                        interface_number: current.0,
+                        interface_number: current.number,
                         address,
                         max_packet_size,
                         interval: descriptor[6],
                     })
                     .map_err(|_| MirrorRejectReason::EndpointResourceExhausted)?;
-                current.4 += 1;
+                current.actual_endpoints += 1;
             }
             _ => {}
         }
@@ -258,32 +261,44 @@ fn validate_configuration<'a>(
 fn finish_interface<'a>(
     interfaces: &mut Vec<HidInterfacePlan<'a>, MIRROR_HID_INTERFACES_MAX>,
     reports: &Vec<(u8, &'a [u8]), MIRROR_HID_INTERFACES_MAX>,
-    current: Option<(u8, u8, u8, u8, usize, Option<u16>)>,
+    current: Option<ParsedInterface<'a>>,
 ) -> Result<(), MirrorRejectReason> {
-    let Some((number, subclass, protocol, expected_endpoints, actual_endpoints, report_length)) =
-        current
-    else {
+    let Some(current) = current else {
         return Ok(());
     };
-    if usize::from(expected_endpoints) != actual_endpoints {
+    if usize::from(current.expected_endpoints) != current.actual_endpoints {
         return Err(MirrorRejectReason::InvalidDescriptorLength);
     }
     let report = reports
         .iter()
-        .find(|(interface_number, _)| *interface_number == number)
+        .find(|(interface_number, _)| *interface_number == current.number)
         .map(|(_, descriptor)| *descriptor)
         .ok_or(MirrorRejectReason::MissingReportDescriptor)?;
-    if report_length != Some(report.len() as u16) {
+    let hid_descriptor = current
+        .hid_descriptor
+        .ok_or(MirrorRejectReason::InvalidDescriptorLength)?;
+    let report_length = u16::from_le_bytes([hid_descriptor[7], hid_descriptor[8]]);
+    if report_length != report.len() as u16 {
         return Err(MirrorRejectReason::InvalidDescriptorLength);
     }
     interfaces
         .push(HidInterfacePlan {
-            interface_number: number,
-            subclass,
-            protocol,
+            interface_number: current.number,
+            subclass: current.subclass,
+            protocol: current.protocol,
+            hid_descriptor,
             report_descriptor: report,
         })
         .map_err(|_| MirrorRejectReason::EndpointResourceExhausted)
+}
+
+struct ParsedInterface<'a> {
+    number: u8,
+    subclass: u8,
+    protocol: u8,
+    expected_endpoints: u8,
+    actual_endpoints: usize,
+    hid_descriptor: Option<&'a [u8]>,
 }
 
 fn descriptor_length(bytes: &[u8], offset: usize) -> Result<usize, MirrorRejectReason> {
@@ -365,6 +380,9 @@ mod tests {
         assert_eq!(plan.endpoints.len(), 1);
         assert_eq!(plan.endpoints[0].address, 0x81);
         assert_eq!(plan.endpoints[0].max_packet_size, 8);
+        assert_eq!(plan.interface_descriptor(0, 0x21), Some(&CONFIG[18..27]));
+        assert_eq!(plan.interface_descriptor(0, 0x22), Some(REPORT.as_slice()));
+        assert_eq!(plan.device_descriptor(0x02, 0, 0), Some(CONFIG.as_slice()));
     }
 
     #[test]

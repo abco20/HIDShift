@@ -9,15 +9,17 @@ use hidshift::bridge::{BridgeEvent, NotifyReason};
 use hidshift::input::KeyboardLedState;
 use hidshift::interchip::message::{
     CAPABILITY_DYNAMIC_PROFILE, CAPABILITY_FALLBACK_PROFILE, CAPABILITY_STANDARD_WIRED_HID,
-    CAPABILITY_USB_STATE_REPORTING, RECORD_FORCE_FALLBACK, RECORD_HEARTBEAT, RECORD_HELLO,
-    RECORD_HELLO_ACK, RECORD_LINK_RESET, RECORD_PROFILE_BEGIN, RECORD_PROFILE_CHUNK,
-    RECORD_PROFILE_COMMIT, RECORD_PROFILE_RESULT, RECORD_STANDARD_INPUT_REPORT,
-    RECORD_STANDARD_OUTPUT_REPORT, RECORD_STANDARD_RELEASE_ALL, RECORD_USB_STATE,
+    CAPABILITY_USB_STATE_REPORTING, RECORD_ACTIVATE_PROFILE, RECORD_FORCE_FALLBACK,
+    RECORD_HEARTBEAT, RECORD_HELLO, RECORD_HELLO_ACK, RECORD_LINK_RESET, RECORD_PROFILE_BEGIN,
+    RECORD_PROFILE_CHUNK, RECORD_PROFILE_COMMIT, RECORD_PROFILE_RESULT,
+    RECORD_STANDARD_INPUT_REPORT, RECORD_STANDARD_OUTPUT_REPORT, RECORD_STANDARD_RELEASE_ALL,
+    RECORD_USB_STATE,
 };
 use hidshift::interchip::{
-    Hello, InterchipRole, ProfileResult, ReceiveDisposition, Record, RecordIter, ReliableReceiver,
-    ReliableSender, RetransmitAction, SPI_CELL_LEN, SPI_CELL_PAYLOAD_LEN, SPI_PROTOCOL_VERSION,
-    SpiCell, StandardInputReport, StandardOutputReport, UsbState, encode_records,
+    Hello, InterchipRole, ProfileResult, ReceiveDisposition, Record, RecordIter,
+    ReliableCommandSlot, ReliableReceiver, ReliableSender, RetransmitAction, SPI_CELL_LEN,
+    SPI_CELL_PAYLOAD_LEN, SPI_PROTOCOL_VERSION, SpiCell, StandardInputReport, StandardOutputReport,
+    UsbState, encode_records,
 };
 use hidshift::output_target::OutputTargetAvailability;
 use hidshift::runtime::message::RuntimeInputMessage;
@@ -137,6 +139,10 @@ async fn run_link(
     let mut reported_availability = None;
     let mut pending_wired_leds = None;
     let mut pending_profile_result = None;
+    // Keep the command until the Device S3 acknowledges its cell. If the
+    // device reboots between dequeue and delivery, the link session is
+    // renegotiated and this command is sent again instead of being lost.
+    let mut pending_command = ReliableCommandSlot::new();
     let mut diagnostics = LinkDiagnostics::default();
     let mut ticker = Ticker::every(SPI_POLL_INTERVAL);
 
@@ -168,14 +174,27 @@ async fn run_link(
         sender.set_cumulative_ack(receiver.cumulative_ack());
         let tx_cell = if sender.pending_len() == 0 && !hello_confirmed {
             queue_hello(&mut sender, now_ms)
-        } else if sender.pending_len() < hidshift::interchip::SPI_TX_WINDOW && hello_confirmed {
-            if let Ok(command) = command_receiver.try_receive() {
-                queue_command(&mut sender, command, &mut report_sequence, now_ms)
-                    .inspect_err(|_| {
+        } else if sender.pending_len() == 0 && hello_confirmed {
+            if pending_command.value().is_none()
+                && let Ok(command) = command_receiver.try_receive()
+            {
+                pending_command.stage(command);
+            }
+            let command = pending_command.value();
+            if let Some(command) = command {
+                match queue_command(&mut sender, command, &mut report_sequence, now_ms) {
+                    Ok(cell) => {
+                        pending_command.mark_queued();
+                        Some(cell)
+                    }
+                    Err(()) => {
+                        pending_command.mark_queued();
+                        let _ = pending_command.acknowledge(true);
                         diagnostics.command_encode_errors =
                             diagnostics.command_encode_errors.saturating_add(1);
-                    })
-                    .ok()
+                        None
+                    }
+                }
             } else if now_ms.saturating_sub(last_heartbeat_ms) >= HEARTBEAT_INTERVAL_MS {
                 last_heartbeat_ms = now_ms;
                 queue_record(&mut sender, RECORD_HEARTBEAT, &[], now_ms).ok()
@@ -219,11 +238,31 @@ async fn run_link(
         };
         diagnostics.valid_cells = diagnostics.valid_cells.saturating_add(1);
         last_valid_cell_ms = Some(now_ms);
-        sender.acknowledge(cell.header.cumulative_ack);
-        match receiver.receive(&cell) {
+        let disposition = receiver.receive(&cell);
+        let remote_session_changed = matches!(
+            disposition,
+            ReceiveDisposition::Accepted {
+                session_changed: true,
+                ..
+            } | ReceiveDisposition::SessionChanged
+        );
+        let mut acknowledged = if remote_session_changed {
+            hello_confirmed = false;
+            usb_state = None;
+            session_id = nonzero_session(session_id.wrapping_add(1));
+            sender.reset_session(session_id);
+            pending_command.sender_reset();
+            diagnostics.resets = diagnostics.resets.saturating_add(1);
+            false
+        } else {
+            sender.acknowledge(cell.header.cumulative_ack) > 0
+        };
+        let mut processed_records = ProcessedRecords::default();
+        match disposition {
             ReceiveDisposition::Accepted { .. } => {
                 match process_records(&cell, &mut hello_confirmed, &mut usb_state) {
                     Ok(processed) => {
+                        processed_records = processed;
                         if let Some(leds) = processed.wired_leds {
                             pending_wired_leds = Some(leds);
                         }
@@ -245,6 +284,50 @@ async fn run_link(
             }
             ReceiveDisposition::SessionChanged | ReceiveDisposition::Empty => {}
         }
+        let profile_commit_confirmed = matches!(
+            (pending_command.value(), processed_records.profile_result),
+            (
+                Some(DeviceTaskCommand::ProfileCommit { transfer_id }),
+                Some(result)
+            ) if transfer_id == result.transfer_id
+        );
+        if profile_commit_confirmed {
+            let _ = pending_command.complete();
+            if acknowledged {
+                sender.discard_pending();
+            } else {
+                hello_confirmed = false;
+                usb_state = None;
+                session_id = nonzero_session(session_id.wrapping_add(1));
+                sender.reset_session(session_id);
+                diagnostics.resets = diagnostics.resets.saturating_add(1);
+            }
+        }
+        if !remote_session_changed && !hello_confirmed && pending_command.value().is_some() {
+            session_id = nonzero_session(session_id.wrapping_add(1));
+            sender.reset_session(session_id);
+            pending_command.sender_reset();
+            acknowledged = false;
+            diagnostics.resets = diagnostics.resets.saturating_add(1);
+        }
+        if acknowledged && !profile_commit_confirmed {
+            let completed = pending_command
+                .value()
+                .is_none_or(|command| command_completed(command, usb_state));
+            let _ = pending_command.acknowledge(completed);
+        }
+    }
+}
+
+fn command_completed(command: DeviceTaskCommand, usb_state: Option<UsbState>) -> bool {
+    match command {
+        DeviceTaskCommand::ActivateMirror(activate) => usb_state.is_some_and(|state| {
+            !state.fallback_active && state.active_profile_hash == activate.profile_hash
+        }),
+        DeviceTaskCommand::ActivateFallback { .. } => {
+            usb_state.is_some_and(|state| state.fallback_active)
+        }
+        _ => true,
     }
 }
 
@@ -294,6 +377,16 @@ fn queue_command(
             now_ms,
         )
         .map_err(|_| ()),
+        DeviceTaskCommand::ActivateMirror(activate) => {
+            let cell = queue_record(sender, RECORD_ACTIVATE_PROFILE, &activate.encode(), now_ms)
+                .map_err(|_| ())?;
+            log::info!(
+                "mirror-spi: activate op={} hash={:08x}",
+                activate.operation_id,
+                activate.profile_hash
+            );
+            Ok(cell)
+        }
         DeviceTaskCommand::ProfileBegin(begin) => {
             queue_record(sender, RECORD_PROFILE_BEGIN, &begin.encode(), now_ms).map_err(|_| ())
         }
@@ -369,6 +462,16 @@ fn process_records(
     for record in records.by_ref() {
         let record = record.map_err(|_| ())?;
         match record.record_type {
+            RECORD_HELLO => {
+                let hello = Hello::decode(record.data).map_err(|_| ())?;
+                if hello.role != InterchipRole::Device
+                    || hello.protocol_version != SPI_PROTOCOL_VERSION
+                {
+                    return Err(());
+                }
+                *hello_confirmed = false;
+                *usb_state = None;
+            }
             RECORD_HELLO_ACK => {
                 let hello = Hello::decode(record.data).map_err(|_| ())?;
                 *hello_confirmed = hello.role == InterchipRole::Device
@@ -397,8 +500,16 @@ fn process_records(
                 processed.wired_leds = Some(KeyboardLedState::from_bits_truncate(*bits));
             }
             RECORD_PROFILE_RESULT => {
-                processed.profile_result =
-                    Some(ProfileResult::decode(record.data).map_err(|_| ())?);
+                let result = ProfileResult::decode(record.data).map_err(|_| ())?;
+                log::info!(
+                    "mirror-spi: profile result transfer={} hash={:08x} status={} reason={} detail={}",
+                    result.transfer_id,
+                    result.profile_hash,
+                    result.status as u8,
+                    result.reject_reason,
+                    result.detail
+                );
+                processed.profile_result = Some(result);
             }
             _ => {}
         }

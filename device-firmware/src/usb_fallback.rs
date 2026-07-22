@@ -49,6 +49,7 @@ impl<'a, B: UsbBus> FallbackUsb<'a, B> {
                 self.enqueue(StandardHidReport::Consumer(ConsumerReport::release()));
             }
             DeviceLinkEvent::ForceFallback { .. } => {}
+            DeviceLinkEvent::ActivateProfile(_) => {}
             DeviceLinkEvent::ProfileBegin(_)
             | DeviceLinkEvent::ProfileChunk(_)
             | DeviceLinkEvent::ProfileCommit { .. } => {}

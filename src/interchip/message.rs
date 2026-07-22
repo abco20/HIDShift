@@ -36,6 +36,7 @@ pub const PROFILE_BEGIN_WIRE_LEN: usize = 16;
 pub const PROFILE_CHUNK_HEADER_LEN: usize = 8;
 pub const PROFILE_CHUNK_MAX_DATA_LEN: usize = 96;
 pub const PROFILE_RESULT_WIRE_LEN: usize = 12;
+pub const ACTIVATE_PROFILE_WIRE_LEN: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -295,6 +296,39 @@ impl ProfileResult {
             status,
             reject_reason: bytes[9],
             detail: u16::from_le_bytes([bytes[10], bytes[11]]),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActivateProfile {
+    pub operation_id: u32,
+    pub profile_hash: u32,
+}
+
+impl ActivateProfile {
+    pub const fn encode(self) -> [u8; ACTIVATE_PROFILE_WIRE_LEN] {
+        let operation = self.operation_id.to_le_bytes();
+        let profile = self.profile_hash.to_le_bytes();
+        [
+            operation[0],
+            operation[1],
+            operation[2],
+            operation[3],
+            profile[0],
+            profile[1],
+            profile[2],
+            profile[3],
+        ]
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, MessageError> {
+        if bytes.len() != ACTIVATE_PROFILE_WIRE_LEN {
+            return Err(MessageError::InvalidLength);
+        }
+        Ok(Self {
+            operation_id: read_u32(&bytes[..4]),
+            profile_hash: read_u32(&bytes[4..]),
         })
     }
 }
@@ -604,6 +638,12 @@ mod tests {
             detail: 42,
         };
         assert_eq!(ProfileResult::decode(&result.encode()), Ok(result));
+
+        let activate = ActivateProfile {
+            operation_id: 19,
+            profile_hash: 0xaabb_ccdd,
+        };
+        assert_eq!(ActivateProfile::decode(&activate.encode()), Ok(activate));
     }
 
     #[test]

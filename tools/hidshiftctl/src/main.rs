@@ -10,7 +10,7 @@ use futures_util::StreamExt;
 use hidshift::{
     MANAGEMENT_REQUEST_UUID, MANAGEMENT_RESPONSE_LEN, MANAGEMENT_RESPONSE_UUID,
     MANAGEMENT_SERVICE_UUID, ManagementCommand, ManagementHostStatus, ManagementOutputTarget,
-    ManagementResponse, ManagementResponsePayload, ManagementResult, SETTING_DESCRIPTORS,
+    ManagementResponse, ManagementResponsePayload, ManagementResult, MirrorCandidateId, SETTING_DESCRIPTORS,
     SettingScope, SettingTarget, setting_by_key,
 };
 use hidshift_client::{
@@ -95,6 +95,11 @@ enum CommandArgs {
         #[command(subcommand)]
         command: TargetArgs,
     },
+    /// Dynamic USB Mirrorの対象を選択・解除
+    Mirror {
+        #[command(subcommand)]
+        command: MirrorArgs,
+    },
     /// 新しいPCやスマートフォンのペアリングを開始
     Pair {
         #[arg(value_parser = clap::value_parser!(u8).range(1..=4))]
@@ -140,6 +145,16 @@ enum TargetArgs {
         slot: u8,
     },
     /// 選択中・稼働中の出力先とReady状態を表示
+    Status,
+}
+
+#[derive(Debug, Subcommand)]
+enum MirrorArgs {
+    /// 登録済みMirror candidateを選択
+    Select { candidate: u8 },
+    /// Mirror設定を解除
+    Clear,
+    /// Mirror設定と現在のUSB presentationを表示
     Status,
 }
 
@@ -960,6 +975,15 @@ where
                 )),
             ),
             TargetArgs::Status => {
+                CliCommand::Request(ManagementCommand::GetOutputTargetStatus)
+            }
+        },
+        CommandArgs::Mirror { command } => match command {
+            MirrorArgs::Select { candidate } => CliCommand::Request(
+                ManagementCommand::SetMirrorTarget(MirrorCandidateId(candidate)),
+            ),
+            MirrorArgs::Clear => CliCommand::Request(ManagementCommand::ClearMirrorTarget),
+            MirrorArgs::Status => {
                 CliCommand::Request(ManagementCommand::GetOutputTargetStatus)
             }
         },

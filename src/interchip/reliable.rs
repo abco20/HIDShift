@@ -2,6 +2,62 @@ use super::cell::{SPI_CELL_PAYLOAD_LEN, SpiCell};
 
 pub const SPI_TX_WINDOW: usize = 4;
 
+/// Holds one application command across link-session renegotiation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReliableCommandSlot<T> {
+    value: Option<T>,
+    queued: bool,
+}
+
+impl<T: Copy> ReliableCommandSlot<T> {
+    pub const fn new() -> Self {
+        Self {
+            value: None,
+            queued: false,
+        }
+    }
+
+    pub fn stage(&mut self, value: T) {
+        self.value = Some(value);
+        self.queued = false;
+    }
+
+    pub const fn value(self) -> Option<T> {
+        self.value
+    }
+
+    pub fn mark_queued(&mut self) {
+        self.queued = self.value.is_some();
+    }
+
+    pub fn sender_reset(&mut self) {
+        self.queued = false;
+    }
+
+    pub fn acknowledge(&mut self, command_completed: bool) -> Option<T> {
+        if !self.queued {
+            return None;
+        }
+        self.queued = false;
+        if command_completed {
+            self.value.take()
+        } else {
+            None
+        }
+    }
+
+    pub fn complete(&mut self) -> Option<T> {
+        self.queued = false;
+        self.value.take()
+    }
+}
+
+impl<T: Copy> Default for ReliableCommandSlot<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PendingCell {
     cell: SpiCell,
@@ -40,6 +96,12 @@ impl ReliableSender {
         self.next_sequence = 1;
         self.cumulative_ack = 0;
         self.pending = [None; SPI_TX_WINDOW];
+    }
+
+    pub fn discard_pending(&mut self) -> usize {
+        let discarded = self.pending_len();
+        self.pending = [None; SPI_TX_WINDOW];
+        discarded
     }
 
     pub fn queue(
@@ -142,6 +204,15 @@ impl ReliableReceiver {
         self.cumulative_ack
     }
 
+    pub const fn session_id(self) -> Option<u32> {
+        self.session_id
+    }
+
+    pub fn reset_session(&mut self, session_id: u32) {
+        self.session_id = Some(session_id);
+        self.cumulative_ack = 0;
+    }
+
     pub fn receive(&mut self, cell: &SpiCell) -> ReceiveDisposition {
         let session_changed = self.session_id != Some(cell.header.session_id);
         if session_changed {
@@ -228,6 +299,37 @@ fn is_recent_sequence(candidate: u16, cumulative_ack: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_survives_session_reset_and_replacement_hello_ack() {
+        let mut slot = ReliableCommandSlot::new();
+        slot.stage(7u8);
+        slot.mark_queued();
+        slot.sender_reset();
+
+        assert_eq!(slot.acknowledge(true), None);
+        assert_eq!(slot.value(), Some(7));
+
+        slot.mark_queued();
+        assert_eq!(slot.acknowledge(false), None);
+        assert_eq!(slot.value(), Some(7));
+        slot.mark_queued();
+        assert_eq!(slot.acknowledge(true), Some(7));
+        assert_eq!(slot.value(), None);
+
+        slot.stage(9);
+        assert_eq!(slot.complete(), Some(9));
+        assert_eq!(slot.value(), None);
+    }
+
+    #[test]
+    fn semantic_ack_can_discard_pending_transport_cell() {
+        let mut sender = ReliableSender::new(1);
+        sender.queue(&[1], 1, 0).unwrap();
+        assert_eq!(sender.pending_len(), 1);
+        assert_eq!(sender.discard_pending(), 1);
+        assert_eq!(sender.pending_len(), 0);
+    }
 
     #[test]
     fn four_cell_window_and_cumulative_ack_release_prefix() {

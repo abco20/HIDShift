@@ -98,6 +98,18 @@ impl<B: ProfileStoreBackend> ProfileStore<B> {
         })
     }
 
+    pub fn find(
+        &mut self,
+        profile_hash: u32,
+    ) -> Result<Option<StoredProfile>, ProfileStoreError<B::Error>> {
+        let a = self.read_metadata(ProfileSlot::A)?;
+        let b = self.read_metadata(ProfileSlot::B)?;
+        Ok([a, b]
+            .into_iter()
+            .flatten()
+            .find(|profile| profile.profile_hash == profile_hash))
+    }
+
     pub fn read_profile(
         &mut self,
         profile: StoredProfile,
@@ -293,6 +305,9 @@ mod tests {
         let mut readback = [0; 9];
         store.read_profile(second, &mut readback).unwrap();
         assert_eq!(&readback, b"profile-b");
+        assert_eq!(store.find(1).unwrap(), Some(first));
+        assert_eq!(store.find(2).unwrap(), Some(second));
+        assert_eq!(store.find(3).unwrap(), None);
     }
 
     #[test]

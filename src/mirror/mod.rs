@@ -10,7 +10,11 @@ pub use image::{
     StringDescriptorTable, StringRecord, serialize_mirror_image,
 };
 pub use parser::{MirrorImageParseError, parse_mirror_image};
-pub use plan::{EndpointPlan, HidInterfacePlan, UsbDevicePlan};
+pub use plan::{
+    EndpointPlan, HidInterfacePlan, MIRROR_ENDPOINTS_MAX, MIRROR_HID_INTERFACES_MAX,
+    USB_DESCRIPTOR_BOS, USB_DESCRIPTOR_CONFIGURATION, USB_DESCRIPTOR_DEVICE, USB_DESCRIPTOR_HID,
+    USB_DESCRIPTOR_HID_REPORT, USB_DESCRIPTOR_STRING, UsbDevicePlan,
+};
 pub use store::{
     MIRROR_PROFILE_PARTITION_LEN, ProfileCommitOutcome, ProfileSlot, ProfileStore,
     ProfileStoreBackend, ProfileStoreError, StoredProfile,
