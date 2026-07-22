@@ -1,9 +1,14 @@
+pub mod control;
 pub mod image;
 pub mod parser;
 pub mod plan;
 pub mod store;
 pub mod validator;
 
+pub use control::{
+    MIRROR_CONTROL_TIMEOUT_MS, MirrorControlForwarder, MirrorControlForwarderError,
+    PendingMirrorControl,
+};
 pub use image::{
     HSMI_HEADER_LEN, HSMI_MAGIC, HSMI_MAX_SIZE, HSMI_VERSION, HidReportDescriptorTable,
     HidReportRecord, MirrorImage, MirrorImageEncodeError, MirrorImageHeader, MirrorImageSource,
