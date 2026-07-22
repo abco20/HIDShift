@@ -279,6 +279,8 @@ async fn startup_task(
         &spawner,
         esp32s3_platform::serial_management_task::serial_management_task(
             RUNTIME_INPUT_CHANNEL.sender(),
+            #[cfg(all(feature = "hardware-e2e", feature = "dual-s3-wired"))]
+            DEVICE_COMMAND_CHANNEL.sender(),
             uart0,
             gpio44,
             boot_session_id,

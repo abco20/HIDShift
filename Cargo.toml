@@ -16,6 +16,7 @@ exclude = [
     "device-firmware",
     "e2e/probe-firmware",
     "e2e/runner",
+    "e2e/mirror-runner",
     "tools/hidshift-client",
     "tools/hidshiftctl",
     "vendor/trouble-host-0.6.0",
@@ -27,12 +28,20 @@ resolver = "3"
 name = "hidshift"
 path = "src/lib.rs"
 
+[[example]]
+name = "generate_mirror_fixtures"
+path = "examples/generate_mirror_fixtures.rs"
+required-features = ["dual-s3-wired"]
+
 [features]
 default = []
 # Enables the transport-independent wired-output and dual-ESP32 core. Hardware
 # integration is enabled separately by the firmware crate feature of the same
 # name, so the default single-S3 BLE firmware keeps its current resource use.
 dual-s3-wired = []
+# Test-only synthetic Mirror transport. Firmware propagates this exclusively
+# from its hardware-e2e build so production binaries contain no fixture API.
+hardware-e2e = []
 
 [dependencies]
 bitflags = "2.10.0"

@@ -9,6 +9,32 @@ use hidshift::runtime::message::RuntimeInputMessage;
 
 #[cfg(feature = "hardware-e2e")]
 use hidshift::e2e::{E2eCommand, E2ePacket};
+#[cfg(all(feature = "hardware-e2e", feature = "dual-s3-wired"))]
+use hidshift::e2e_mirror::{
+    MirrorE2ePacket, OPCODE_CLEAR_CANDIDATES, OPCODE_HELLO, OPCODE_REGISTER_BEGIN,
+    OPCODE_REGISTER_CHUNK, OPCODE_REGISTER_COMMIT,
+};
+#[cfg(all(feature = "hardware-e2e", feature = "dual-s3-wired"))]
+use hidshift::interchip::{
+    ProfileBegin, ProfileChunk, ProfileResultStatus, ProfileTransferEncoder,
+    ProfileTransferReceiver,
+};
+#[cfg(all(feature = "hardware-e2e", feature = "dual-s3-wired"))]
+use hidshift::mirror::HSMI_MAX_SIZE;
+#[cfg(all(feature = "hardware-e2e", feature = "dual-s3-wired"))]
+use hidshift::output_target::MirrorCandidateId;
+#[cfg(all(feature = "hardware-e2e", feature = "dual-s3-wired"))]
+use hidshift::runtime::{DeviceTaskCommand, RUNTIME_DEVICE_COMMAND_QUEUE_CAPACITY};
+#[cfg(all(feature = "hardware-e2e", feature = "dual-s3-wired"))]
+use static_cell::StaticCell;
+
+#[cfg(all(feature = "hardware-e2e", feature = "dual-s3-wired"))]
+static MIRROR_E2E_STAGING: StaticCell<[u8; HSMI_MAX_SIZE]> = StaticCell::new();
+
+#[cfg(feature = "hardware-e2e")]
+const SERIAL_LINE_CAPACITY: usize = 160;
+#[cfg(not(feature = "hardware-e2e"))]
+const SERIAL_LINE_CAPACITY: usize = 64;
 
 #[embassy_executor::task]
 pub async fn serial_management_task(
@@ -17,6 +43,12 @@ pub async fn serial_management_task(
         CriticalSectionRawMutex,
         RuntimeInputMessage,
         RUNTIME_INPUT_QUEUE_CAPACITY,
+    >,
+    #[cfg(all(feature = "hardware-e2e", feature = "dual-s3-wired"))] device_sender: Sender<
+        'static,
+        CriticalSectionRawMutex,
+        DeviceTaskCommand,
+        RUNTIME_DEVICE_COMMAND_QUEUE_CAPACITY,
     >,
     uart: UART0<'static>,
     rx: GPIO44<'static>,
@@ -27,13 +59,16 @@ pub async fn serial_management_task(
         return;
     };
     let mut uart = uart.with_rx(rx).into_async();
-    let mut line = [0u8; 64];
+    let mut line = [0u8; SERIAL_LINE_CAPACITY];
     let mut line_len = 0usize;
     let mut byte = [0u8; 1];
 
     log::info!("firmware: wired management ready on UART0 RX GPIO44");
     #[cfg(feature = "hardware-e2e")]
     log::info!("@HIDSHIFT-E2E:READY,1");
+    #[cfg(all(feature = "hardware-e2e", feature = "dual-s3-wired"))]
+    let mut mirror_receiver =
+        ProfileTransferReceiver::new(MIRROR_E2E_STAGING.init([0; HSMI_MAX_SIZE]));
     loop {
         match uart.read_async(&mut byte).await {
             Ok(1) if byte[0] == b'\n' || byte[0] == b'\r' => {
@@ -116,6 +151,105 @@ pub async fn serial_management_task(
                         }
                     }
                 }
+                #[cfg(all(feature = "hardware-e2e", feature = "dual-s3-wired"))]
+                if let Ok(packet) = MirrorE2ePacket::decode_line(&line[..line_len]) {
+                    match packet.opcode {
+                        OPCODE_HELLO => {
+                            log::info!("@HIDSHIFT-MIRROR:READY,{},1", packet.sequence);
+                        }
+                        OPCODE_REGISTER_BEGIN if packet.payload().len() == 8 => {
+                            mirror_receiver.cancel();
+                            mirror_receiver.clear_committed();
+                            let begin = ProfileBegin {
+                                transfer_id: packet.transfer_id,
+                                total_length: packet.offset,
+                                crc32: read_u32(&packet.payload()[..4]),
+                                profile_hash: read_u32(&packet.payload()[4..8]),
+                            };
+                            match mirror_receiver.begin(begin) {
+                                Ok(()) => log::info!(
+                                    "@HIDSHIFT-MIRROR:BEGIN,{},{}",
+                                    packet.sequence,
+                                    packet.transfer_id
+                                ),
+                                Err(error) => log::warn!(
+                                    "@HIDSHIFT-MIRROR:ERROR,{},begin,{:?}",
+                                    packet.sequence,
+                                    error
+                                ),
+                            }
+                        }
+                        OPCODE_REGISTER_CHUNK => {
+                            match mirror_receiver.chunk(ProfileChunk {
+                                transfer_id: packet.transfer_id,
+                                offset: packet.offset,
+                                data: packet.payload(),
+                            }) {
+                                Ok(_) => log::info!(
+                                    "@HIDSHIFT-MIRROR:CHUNK,{},{}",
+                                    packet.sequence,
+                                    packet.offset
+                                ),
+                                Err(error) => log::warn!(
+                                    "@HIDSHIFT-MIRROR:ERROR,{},chunk,{:?}",
+                                    packet.sequence,
+                                    error
+                                ),
+                            }
+                        }
+                        OPCODE_REGISTER_COMMIT => {
+                            let result = mirror_receiver.commit(packet.transfer_id);
+                            if result.status == ProfileResultStatus::Accepted
+                                && let Some((metadata, image)) = mirror_receiver.committed()
+                            {
+                                if let Ok(transfer) = ProfileTransferEncoder::new(
+                                    metadata.transfer_id,
+                                    metadata.profile_hash,
+                                    image,
+                                ) {
+                                    for command in transfer {
+                                        device_sender.send(command.into()).await;
+                                    }
+                                    sender
+                                        .send(RuntimeInputMessage::MirrorCandidateRegistered {
+                                            candidate: MirrorCandidateId(0),
+                                            profile_hash: Some(metadata.profile_hash),
+                                        })
+                                        .await;
+                                    log::info!(
+                                        "@HIDSHIFT-MIRROR:REGISTERED,{},{},{}",
+                                        packet.sequence,
+                                        metadata.profile_hash,
+                                        metadata.length
+                                    );
+                                }
+                            } else {
+                                log::warn!(
+                                    "@HIDSHIFT-MIRROR:ERROR,{},commit,{},{}",
+                                    packet.sequence,
+                                    result.status as u8,
+                                    result.reject_reason
+                                );
+                            }
+                        }
+                        OPCODE_CLEAR_CANDIDATES => {
+                            mirror_receiver.cancel();
+                            mirror_receiver.clear_committed();
+                            sender
+                                .send(RuntimeInputMessage::MirrorCandidateRegistered {
+                                    candidate: MirrorCandidateId(0),
+                                    profile_hash: None,
+                                })
+                                .await;
+                            log::info!("@HIDSHIFT-MIRROR:CLEARED,{}", packet.sequence);
+                        }
+                        _ => log::warn!(
+                            "@HIDSHIFT-MIRROR:ERROR,{},opcode,{}",
+                            packet.sequence,
+                            packet.opcode
+                        ),
+                    }
+                }
                 line_len = 0;
             }
             Ok(1) => {
@@ -130,6 +264,11 @@ pub async fn serial_management_task(
             Err(error) => log::warn!("firmware: management UART read failed: {:?}", error),
         }
     }
+}
+
+#[cfg(all(feature = "hardware-e2e", feature = "dual-s3-wired"))]
+fn read_u32(bytes: &[u8]) -> u32 {
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
 #[cfg(feature = "hardware-e2e")]
