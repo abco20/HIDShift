@@ -53,7 +53,7 @@ impl<'a, B: UsbBus> FallbackUsb<'a, B> {
             DeviceLinkEvent::ProfileBegin(_)
             | DeviceLinkEvent::ProfileChunk(_)
             | DeviceLinkEvent::ProfileCommit { .. } => {}
-            DeviceLinkEvent::RawEndpointIn(_) => {
+            DeviceLinkEvent::RawEndpointIn(_) | DeviceLinkEvent::ControlResponse(_) => {
                 self.dropped_reports = self.dropped_reports.saturating_add(1);
             }
         }

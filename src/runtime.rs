@@ -3,8 +3,8 @@ use crate::bridge::{Bridge, BridgeAction, BridgeError, BridgeEvent, BridgeStatus
 use crate::ids::{DeviceId, HostId, InterfaceId};
 #[cfg(feature = "dual-s3-wired")]
 use crate::interchip::{
-    ActivateProfile, ProfileBegin, ProfileChunkData, ProfileResult, ProfileResultStatus,
-    ProfileTransferCommand, RawEndpointReport,
+    ActivateProfile, MirrorControlRequest, MirrorControlResponse, ProfileBegin, ProfileChunkData,
+    ProfileResult, ProfileResultStatus, ProfileTransferCommand, RawEndpointReport,
 };
 use crate::management::{
     ManagementCommand, ManagementDestination, ManagementDiagnostics, ManagementHistoryEvent,
@@ -181,6 +181,8 @@ pub enum RuntimeInput<'a> {
     #[cfg(feature = "dual-s3-wired")]
     MirrorEndpointOut(RawEndpointReport),
     #[cfg(feature = "dual-s3-wired")]
+    MirrorControlRequest(MirrorControlRequest),
+    #[cfg(feature = "dual-s3-wired")]
     MirrorCandidateRegistered {
         candidate: MirrorCandidateId,
         profile_hash: Option<u32>,
@@ -215,6 +217,8 @@ pub struct BridgeRuntime<const HOSTS: usize, const USB_INTERFACES: usize> {
     pending_mirror_candidate: Option<(MirrorCandidateId, u32)>,
     #[cfg(feature = "dual-s3-wired")]
     last_mirror_endpoint_out: Option<RawEndpointReport>,
+    #[cfg(feature = "dual-s3-wired")]
+    last_mirror_control_request: Option<MirrorControlRequest>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -271,6 +275,8 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             pending_mirror_candidate: None,
             #[cfg(feature = "dual-s3-wired")]
             last_mirror_endpoint_out: None,
+            #[cfg(feature = "dual-s3-wired")]
+            last_mirror_control_request: None,
         }
     }
 
@@ -286,6 +292,11 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
     #[cfg(feature = "dual-s3-wired")]
     pub const fn last_mirror_endpoint_out(&self) -> Option<RawEndpointReport> {
         self.last_mirror_endpoint_out
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    pub const fn last_mirror_control_request(&self) -> Option<MirrorControlRequest> {
+        self.last_mirror_control_request
     }
 
     #[cfg(feature = "dual-s3-wired")]
@@ -553,6 +564,12 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             RuntimeInput::MirrorEndpointOut(report) => {
                 commands.clear();
                 self.last_mirror_endpoint_out = Some(report);
+                Ok(())
+            }
+            #[cfg(feature = "dual-s3-wired")]
+            RuntimeInput::MirrorControlRequest(request) => {
+                commands.clear();
+                self.last_mirror_control_request = Some(request);
                 Ok(())
             }
             #[cfg(feature = "dual-s3-wired")]
@@ -2209,6 +2226,7 @@ pub enum DeviceTaskCommand {
         transfer_id: u32,
     },
     RawEndpointIn(RawEndpointReport),
+    ControlResponse(MirrorControlResponse),
 }
 
 #[cfg(feature = "dual-s3-wired")]
@@ -2230,6 +2248,7 @@ impl DeviceTaskCommand {
                 CommandClass::BestEffort
             }
             Self::RawEndpointIn(_) => CommandClass::Realtime,
+            Self::ControlResponse(_) => CommandClass::Critical,
         }
     }
 }
@@ -3295,6 +3314,21 @@ mod tests {
 
         assert!(commands.is_empty());
         assert_eq!(runtime.last_mirror_endpoint_out(), Some(report));
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    #[test]
+    fn mirrored_control_request_preserves_request_identity_and_setup_packet() {
+        let mut runtime = BridgeRuntime::<4, 1>::new(0);
+        let mut commands = heapless::Vec::<RuntimeCommand, 4>::new();
+        let request = MirrorControlRequest::new(42, [0xa1, 1, 0x10, 3, 1, 0, 17, 0], &[]).unwrap();
+
+        runtime
+            .handle_input::<4, 4, 2>(RuntimeInput::MirrorControlRequest(request), &mut commands)
+            .unwrap();
+
+        assert!(commands.is_empty());
+        assert_eq!(runtime.last_mirror_control_request(), Some(request));
     }
 
     #[test]

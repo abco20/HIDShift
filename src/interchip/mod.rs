@@ -14,10 +14,10 @@ pub use message::{
     ACTIVATE_PROFILE_WIRE_LEN, ActivateProfile, CAPABILITY_CONTROL_FORWARDING,
     CAPABILITY_DYNAMIC_PROFILE, CAPABILITY_ENDPOINT_IN, CAPABILITY_ENDPOINT_OUT,
     CAPABILITY_FALLBACK_PROFILE, CAPABILITY_PROFILE_FLASH_CACHE, CAPABILITY_STANDARD_WIRED_HID,
-    CAPABILITY_USB_STATE_REPORTING, Hello, InterchipRole, PROFILE_CHUNK_MAX_DATA_LEN, ProfileBegin,
-    ProfileChunk, ProfileChunkData, ProfileResult, ProfileResultStatus, RawEndpointReport,
-    StandardInputReport, StandardInputReportError, StandardOutputReport, StandardOutputReportError,
-    UsbState,
+    CAPABILITY_USB_STATE_REPORTING, ControlStatus, Hello, InterchipRole, MirrorControlRequest,
+    MirrorControlResponse, PROFILE_CHUNK_MAX_DATA_LEN, ProfileBegin, ProfileChunk,
+    ProfileChunkData, ProfileResult, ProfileResultStatus, RawEndpointReport, StandardInputReport,
+    StandardInputReportError, StandardOutputReport, StandardOutputReportError, UsbState,
 };
 pub use profile_transfer::{
     CommittedProfile, ProfileChunkDisposition, ProfileTransferCommand, ProfileTransferEncoder,

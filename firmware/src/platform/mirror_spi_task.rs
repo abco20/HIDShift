@@ -8,18 +8,19 @@ use esp_hal::time::Rate;
 use hidshift::bridge::{BridgeEvent, NotifyReason};
 use hidshift::input::KeyboardLedState;
 use hidshift::interchip::message::{
-    CAPABILITY_DYNAMIC_PROFILE, CAPABILITY_FALLBACK_PROFILE, CAPABILITY_STANDARD_WIRED_HID,
-    CAPABILITY_USB_STATE_REPORTING, RECORD_ACTIVATE_PROFILE, RECORD_FORCE_FALLBACK,
-    RECORD_HEARTBEAT, RECORD_HELLO, RECORD_HELLO_ACK, RECORD_LINK_RESET, RECORD_PROFILE_BEGIN,
-    RECORD_PROFILE_CHUNK, RECORD_PROFILE_COMMIT, RECORD_PROFILE_RESULT, RECORD_RAW_ENDPOINT_IN,
-    RECORD_RAW_ENDPOINT_OUT, RECORD_STANDARD_INPUT_REPORT, RECORD_STANDARD_OUTPUT_REPORT,
-    RECORD_STANDARD_RELEASE_ALL, RECORD_USB_STATE,
+    CAPABILITY_CONTROL_FORWARDING, CAPABILITY_DYNAMIC_PROFILE, CAPABILITY_FALLBACK_PROFILE,
+    CAPABILITY_STANDARD_WIRED_HID, CAPABILITY_USB_STATE_REPORTING, RECORD_ACTIVATE_PROFILE,
+    RECORD_CONTROL_REQUEST, RECORD_CONTROL_RESPONSE, RECORD_FORCE_FALLBACK, RECORD_HEARTBEAT,
+    RECORD_HELLO, RECORD_HELLO_ACK, RECORD_LINK_RESET, RECORD_PROFILE_BEGIN, RECORD_PROFILE_CHUNK,
+    RECORD_PROFILE_COMMIT, RECORD_PROFILE_RESULT, RECORD_RAW_ENDPOINT_IN, RECORD_RAW_ENDPOINT_OUT,
+    RECORD_STANDARD_INPUT_REPORT, RECORD_STANDARD_OUTPUT_REPORT, RECORD_STANDARD_RELEASE_ALL,
+    RECORD_USB_STATE,
 };
 use hidshift::interchip::{
-    Hello, InterchipRole, ProfileResult, RawEndpointReport, ReceiveDisposition, Record, RecordIter,
-    ReliableCommandSlot, ReliableReceiver, ReliableSender, RetransmitAction, SPI_CELL_LEN,
-    SPI_CELL_PAYLOAD_LEN, SPI_PROTOCOL_VERSION, SpiCell, StandardInputReport, StandardOutputReport,
-    UsbState, encode_records,
+    Hello, InterchipRole, MirrorControlRequest, ProfileResult, RawEndpointReport,
+    ReceiveDisposition, Record, RecordIter, ReliableCommandSlot, ReliableReceiver, ReliableSender,
+    RetransmitAction, SPI_CELL_LEN, SPI_CELL_PAYLOAD_LEN, SPI_PROTOCOL_VERSION, SpiCell,
+    StandardInputReport, StandardOutputReport, UsbState, encode_records,
 };
 use hidshift::output_target::OutputTargetAvailability;
 use hidshift::runtime::message::RuntimeInputMessage;
@@ -35,7 +36,8 @@ const LINK_LOSS_TIMEOUT_MS: u64 = 1_500;
 const HOST_CAPABILITIES: u32 = CAPABILITY_DYNAMIC_PROFILE
     | CAPABILITY_FALLBACK_PROFILE
     | CAPABILITY_STANDARD_WIRED_HID
-    | CAPABILITY_USB_STATE_REPORTING;
+    | CAPABILITY_USB_STATE_REPORTING
+    | CAPABILITY_CONTROL_FORWARDING;
 const REQUIRED_DEVICE_CAPABILITIES: u32 =
     CAPABILITY_FALLBACK_PROFILE | CAPABILITY_STANDARD_WIRED_HID | CAPABILITY_USB_STATE_REPORTING;
 
@@ -140,6 +142,7 @@ async fn run_link(
     let mut pending_wired_leds = None;
     let mut pending_profile_result = None;
     let mut pending_raw_endpoint_out = None;
+    let mut pending_control_request = None;
     // Keep the command until the Device S3 acknowledges its cell. If the
     // device reboots between dequeue and delivery, the link session is
     // renegotiated and this command is sent again instead of being lost.
@@ -160,6 +163,7 @@ async fn run_link(
         report_wired_leds(&runtime_sender, &mut pending_wired_leds);
         report_profile_result(&runtime_sender, &mut pending_profile_result);
         report_raw_endpoint_out(&runtime_sender, &mut pending_raw_endpoint_out);
+        report_control_request(&runtime_sender, &mut pending_control_request);
 
         if last_valid_cell_ms
             .is_some_and(|last| now_ms.saturating_sub(last) >= LINK_LOSS_TIMEOUT_MS)
@@ -273,6 +277,9 @@ async fn run_link(
                         }
                         if let Some(report) = processed.raw_endpoint_out {
                             pending_raw_endpoint_out = Some(report);
+                        }
+                        if let Some(request) = processed.control_request {
+                            pending_control_request = Some(request);
                         }
                     }
                     Err(()) => {
@@ -412,6 +419,11 @@ fn queue_command(
             let length = report.encode(&mut data).map_err(|_| ())?;
             queue_record(sender, RECORD_RAW_ENDPOINT_IN, &data[..length], now_ms).map_err(|_| ())
         }
+        DeviceTaskCommand::ControlResponse(response) => {
+            let mut data = [0; hidshift::interchip::message::CONTROL_RESPONSE_MAX_WIRE_LEN];
+            let length = response.encode(&mut data).map_err(|_| ())?;
+            queue_record(sender, RECORD_CONTROL_RESPONSE, &data[..length], now_ms).map_err(|_| ())
+        }
     }
 }
 
@@ -461,6 +473,7 @@ struct ProcessedRecords {
     wired_leds: Option<KeyboardLedState>,
     profile_result: Option<ProfileResult>,
     raw_endpoint_out: Option<RawEndpointReport>,
+    control_request: Option<MirrorControlRequest>,
 }
 
 fn process_records(
@@ -525,6 +538,10 @@ fn process_records(
             RECORD_RAW_ENDPOINT_OUT => {
                 processed.raw_endpoint_out =
                     Some(RawEndpointReport::decode(record.data).map_err(|_| ())?);
+            }
+            RECORD_CONTROL_REQUEST => {
+                processed.control_request =
+                    Some(MirrorControlRequest::decode(record.data).map_err(|_| ())?);
             }
             _ => {}
         }
@@ -650,6 +667,26 @@ fn report_raw_endpoint_out(
             report.data().len(),
             hidshift::checksum::crc16_ccitt_false(report.data())
         );
+        *pending = None;
+    }
+}
+
+fn report_control_request(
+    sender: &Sender<
+        'static,
+        CriticalSectionRawMutex,
+        RuntimeInputMessage,
+        RUNTIME_INPUT_QUEUE_CAPACITY,
+    >,
+    pending: &mut Option<MirrorControlRequest>,
+) {
+    let Some(request) = *pending else {
+        return;
+    };
+    if sender
+        .try_send(RuntimeInputMessage::MirrorControlRequest(request))
+        .is_ok()
+    {
         *pending = None;
     }
 }

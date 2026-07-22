@@ -40,6 +40,11 @@ pub const ACTIVATE_PROFILE_WIRE_LEN: usize = 8;
 pub const RAW_ENDPOINT_HEADER_LEN: usize = 6;
 pub const RAW_ENDPOINT_MAX_DATA_LEN: usize = 64;
 pub const RAW_ENDPOINT_MAX_WIRE_LEN: usize = RAW_ENDPOINT_HEADER_LEN + RAW_ENDPOINT_MAX_DATA_LEN;
+pub const CONTROL_REQUEST_HEADER_LEN: usize = 14;
+pub const CONTROL_RESPONSE_HEADER_LEN: usize = 7;
+pub const CONTROL_DATA_MAX_LEN: usize = 92;
+pub const CONTROL_REQUEST_MAX_WIRE_LEN: usize = CONTROL_REQUEST_HEADER_LEN + CONTROL_DATA_MAX_LEN;
+pub const CONTROL_RESPONSE_MAX_WIRE_LEN: usize = CONTROL_RESPONSE_HEADER_LEN + CONTROL_DATA_MAX_LEN;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -181,6 +186,124 @@ impl RawEndpointReport {
             return Err(MessageError::InvalidLength);
         }
         Self::new(bytes[0], read_u16(&bytes[2..4]), &bytes[6..])
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MirrorControlRequest {
+    pub request_id: u32,
+    pub setup_packet: [u8; 8],
+    length: u8,
+    data: [u8; CONTROL_DATA_MAX_LEN],
+}
+
+impl MirrorControlRequest {
+    pub fn new(request_id: u32, setup_packet: [u8; 8], data: &[u8]) -> Result<Self, MessageError> {
+        if data.len() > CONTROL_DATA_MAX_LEN {
+            return Err(MessageError::InvalidLength);
+        }
+        let mut request = Self {
+            request_id,
+            setup_packet,
+            length: data.len() as u8,
+            data: [0; CONTROL_DATA_MAX_LEN],
+        };
+        request.data[..data.len()].copy_from_slice(data);
+        Ok(request)
+    }
+
+    pub const fn data(&self) -> &[u8] {
+        self.data.split_at(self.length as usize).0
+    }
+
+    pub fn encode(self, out: &mut [u8]) -> Result<usize, MessageError> {
+        let length = CONTROL_REQUEST_HEADER_LEN + self.data().len();
+        if out.len() < length {
+            return Err(MessageError::InvalidLength);
+        }
+        out[..4].copy_from_slice(&self.request_id.to_le_bytes());
+        out[4..12].copy_from_slice(&self.setup_packet);
+        out[12..14].copy_from_slice(&(self.data().len() as u16).to_le_bytes());
+        out[14..length].copy_from_slice(self.data());
+        Ok(length)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, MessageError> {
+        if bytes.len() < CONTROL_REQUEST_HEADER_LEN
+            || usize::from(read_u16(&bytes[12..14])) != bytes.len() - CONTROL_REQUEST_HEADER_LEN
+        {
+            return Err(MessageError::InvalidLength);
+        }
+        let mut setup_packet = [0; 8];
+        setup_packet.copy_from_slice(&bytes[4..12]);
+        Self::new(read_u32(&bytes[..4]), setup_packet, &bytes[14..])
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ControlStatus {
+    Success = 0,
+    Stall = 1,
+    Timeout = 2,
+    Disconnected = 3,
+    Unsupported = 4,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MirrorControlResponse {
+    pub request_id: u32,
+    pub status: ControlStatus,
+    length: u8,
+    data: [u8; CONTROL_DATA_MAX_LEN],
+}
+
+impl MirrorControlResponse {
+    pub fn new(request_id: u32, status: ControlStatus, data: &[u8]) -> Result<Self, MessageError> {
+        if data.len() > CONTROL_DATA_MAX_LEN {
+            return Err(MessageError::InvalidLength);
+        }
+        let mut response = Self {
+            request_id,
+            status,
+            length: data.len() as u8,
+            data: [0; CONTROL_DATA_MAX_LEN],
+        };
+        response.data[..data.len()].copy_from_slice(data);
+        Ok(response)
+    }
+
+    pub const fn data(&self) -> &[u8] {
+        self.data.split_at(self.length as usize).0
+    }
+
+    pub fn encode(self, out: &mut [u8]) -> Result<usize, MessageError> {
+        let length = CONTROL_RESPONSE_HEADER_LEN + self.data().len();
+        if out.len() < length {
+            return Err(MessageError::InvalidLength);
+        }
+        out[..4].copy_from_slice(&self.request_id.to_le_bytes());
+        out[4] = self.status as u8;
+        out[5..7].copy_from_slice(&(self.data().len() as u16).to_le_bytes());
+        out[7..length].copy_from_slice(self.data());
+        Ok(length)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, MessageError> {
+        if bytes.len() < CONTROL_RESPONSE_HEADER_LEN
+            || usize::from(read_u16(&bytes[5..7])) != bytes.len() - CONTROL_RESPONSE_HEADER_LEN
+        {
+            return Err(MessageError::InvalidLength);
+        }
+        let status = match bytes[4] {
+            0 => ControlStatus::Success,
+            1 => ControlStatus::Stall,
+            2 => ControlStatus::Timeout,
+            3 => ControlStatus::Disconnected,
+            4 => ControlStatus::Unsupported,
+            _ => return Err(MessageError::InvalidStatus),
+        };
+        Self::new(read_u32(&bytes[..4]), status, &bytes[7..])
     }
 }
 
@@ -720,6 +843,44 @@ mod tests {
         assert_eq!(
             RawEndpointReport::decode(&encoded[..length]),
             Err(MessageError::InvalidLength)
+        );
+    }
+
+    #[test]
+    fn mirror_control_messages_preserve_setup_status_and_data() {
+        let request =
+            MirrorControlRequest::new(0x1122_3344, [0xa1, 1, 0x10, 3, 1, 0, 17, 0], &[]).unwrap();
+        let mut request_bytes = [0; CONTROL_REQUEST_MAX_WIRE_LEN];
+        let request_len = request.encode(&mut request_bytes).unwrap();
+        assert_eq!(
+            MirrorControlRequest::decode(&request_bytes[..request_len]),
+            Ok(request)
+        );
+
+        let response =
+            MirrorControlResponse::new(request.request_id, ControlStatus::Success, &[0x10; 17])
+                .unwrap();
+        let mut response_bytes = [0; CONTROL_RESPONSE_MAX_WIRE_LEN];
+        let response_len = response.encode(&mut response_bytes).unwrap();
+        assert_eq!(
+            MirrorControlResponse::decode(&response_bytes[..response_len]),
+            Ok(response)
+        );
+    }
+
+    #[test]
+    fn mirror_control_messages_reject_oversize_and_unknown_status() {
+        assert_eq!(
+            MirrorControlRequest::new(1, [0; 8], &[0; CONTROL_DATA_MAX_LEN + 1]),
+            Err(MessageError::InvalidLength)
+        );
+        assert_eq!(
+            MirrorControlResponse::new(1, ControlStatus::Success, &[0; CONTROL_DATA_MAX_LEN + 1]),
+            Err(MessageError::InvalidLength)
+        );
+        assert_eq!(
+            MirrorControlResponse::decode(&[1, 0, 0, 0, 5, 0, 0]),
+            Err(MessageError::InvalidStatus)
         );
     }
 

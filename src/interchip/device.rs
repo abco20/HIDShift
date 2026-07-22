@@ -1,14 +1,15 @@
 use heapless::Vec;
 
 use super::message::{
-    ActivateProfile, CAPABILITY_DYNAMIC_PROFILE, CAPABILITY_ENDPOINT_IN, CAPABILITY_ENDPOINT_OUT,
-    CAPABILITY_FALLBACK_PROFILE, CAPABILITY_PROFILE_FLASH_CACHE, CAPABILITY_STANDARD_WIRED_HID,
-    CAPABILITY_USB_STATE_REPORTING, ProfileBegin, ProfileChunk, ProfileChunkData, ProfileResult,
-    RECORD_ACTIVATE_PROFILE, RECORD_FORCE_FALLBACK, RECORD_HEARTBEAT, RECORD_HELLO,
-    RECORD_HELLO_ACK, RECORD_LINK_RESET, RECORD_PROFILE_BEGIN, RECORD_PROFILE_CHUNK,
-    RECORD_PROFILE_COMMIT, RECORD_PROFILE_RESULT, RECORD_RAW_ENDPOINT_IN, RECORD_RAW_ENDPOINT_OUT,
-    RECORD_STANDARD_INPUT_REPORT, RECORD_STANDARD_OUTPUT_REPORT, RECORD_STANDARD_RELEASE_ALL,
-    RECORD_USB_STATE,
+    ActivateProfile, CAPABILITY_CONTROL_FORWARDING, CAPABILITY_DYNAMIC_PROFILE,
+    CAPABILITY_ENDPOINT_IN, CAPABILITY_ENDPOINT_OUT, CAPABILITY_FALLBACK_PROFILE,
+    CAPABILITY_PROFILE_FLASH_CACHE, CAPABILITY_STANDARD_WIRED_HID, CAPABILITY_USB_STATE_REPORTING,
+    MirrorControlRequest, MirrorControlResponse, ProfileBegin, ProfileChunk, ProfileChunkData,
+    ProfileResult, RECORD_ACTIVATE_PROFILE, RECORD_CONTROL_REQUEST, RECORD_CONTROL_RESPONSE,
+    RECORD_FORCE_FALLBACK, RECORD_HEARTBEAT, RECORD_HELLO, RECORD_HELLO_ACK, RECORD_LINK_RESET,
+    RECORD_PROFILE_BEGIN, RECORD_PROFILE_CHUNK, RECORD_PROFILE_COMMIT, RECORD_PROFILE_RESULT,
+    RECORD_RAW_ENDPOINT_IN, RECORD_RAW_ENDPOINT_OUT, RECORD_STANDARD_INPUT_REPORT,
+    RECORD_STANDARD_OUTPUT_REPORT, RECORD_STANDARD_RELEASE_ALL, RECORD_USB_STATE,
 };
 use super::{
     Hello, InterchipRole, RawEndpointReport, ReceiveDisposition, Record, RecordIter,
@@ -32,6 +33,7 @@ pub enum DeviceLinkEvent {
     ProfileChunk(ProfileChunkData),
     ProfileCommit { transfer_id: u32 },
     RawEndpointIn(RawEndpointReport),
+    ControlResponse(MirrorControlResponse),
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -73,7 +75,8 @@ impl DeviceLink {
                 | CAPABILITY_DYNAMIC_PROFILE
                 | CAPABILITY_PROFILE_FLASH_CACHE
                 | CAPABILITY_ENDPOINT_IN
-                | CAPABILITY_ENDPOINT_OUT,
+                | CAPABILITY_ENDPOINT_OUT
+                | CAPABILITY_CONTROL_FORWARDING,
             active_profile_hash,
         )
     }
@@ -139,6 +142,18 @@ impl DeviceLink {
             return false;
         };
         self.next_cell = self.queue_record(RECORD_RAW_ENDPOINT_OUT, &data[..length], now_ms);
+        self.next_cell.is_some()
+    }
+
+    pub fn queue_control_request(&mut self, request: MirrorControlRequest, now_ms: u64) -> bool {
+        if !self.host_compatible || self.next_cell.is_some() {
+            return false;
+        }
+        let mut data = [0; super::message::CONTROL_REQUEST_MAX_WIRE_LEN];
+        let Ok(length) = request.encode(&mut data) else {
+            return false;
+        };
+        self.next_cell = self.queue_record(RECORD_CONTROL_REQUEST, &data[..length], now_ms);
         self.next_cell.is_some()
     }
 
@@ -282,6 +297,14 @@ impl DeviceLink {
                     match RawEndpointReport::decode(record.data) {
                         Ok(report) => {
                             self.push_event(events, DeviceLinkEvent::RawEndpointIn(report))
+                        }
+                        Err(_) => self.mark_malformed(),
+                    }
+                }
+                RECORD_CONTROL_RESPONSE if self.host_compatible => {
+                    match MirrorControlResponse::decode(record.data) {
+                        Ok(response) => {
+                            self.push_event(events, DeviceLinkEvent::ControlResponse(response))
                         }
                         Err(_) => self.mark_malformed(),
                     }
@@ -722,5 +745,51 @@ mod tests {
             &mut events,
         );
         assert_eq!(events.as_slice(), &[DeviceLinkEvent::RawEndpointIn(report)]);
+    }
+
+    #[test]
+    fn control_request_and_response_preserve_request_id_and_payload() {
+        let mut device = DeviceLink::new_with_profile_storage(2, fallback_state(), 0);
+        let mut host = ReliableSender::new(1);
+        let hello = Hello {
+            role: InterchipRole::Host,
+            protocol_version: SPI_PROTOCOL_VERSION,
+            firmware_major: 0,
+            firmware_minor: 2,
+            capabilities: CAPABILITY_CONTROL_FORWARDING,
+            active_profile_hash: 0,
+        }
+        .encode();
+        let mut events = Vec::<_, 2>::new();
+        device.handle_transaction(&host_cell(&mut host, RECORD_HELLO, &hello), 0, &mut events);
+        let _ = device.next_transaction(1);
+
+        let request = MirrorControlRequest::new(23, [0xa1, 1, 0x10, 3, 1, 0, 17, 0], &[]).unwrap();
+        assert!(device.queue_control_request(request, 2));
+        let cell = SpiCell::decode(&device.next_transaction(2)).unwrap();
+        let record = RecordIter::new(cell.payload(), cell.header.record_count)
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.record_type, RECORD_CONTROL_REQUEST);
+        assert_eq!(MirrorControlRequest::decode(record.data), Ok(request));
+
+        let response = MirrorControlResponse::new(
+            request.request_id,
+            crate::interchip::ControlStatus::Success,
+            &[0x10; 17],
+        )
+        .unwrap();
+        let mut encoded = [0; super::super::message::CONTROL_RESPONSE_MAX_WIRE_LEN];
+        let length = response.encode(&mut encoded).unwrap();
+        device.handle_transaction(
+            &host_cell(&mut host, RECORD_CONTROL_RESPONSE, &encoded[..length]),
+            3,
+            &mut events,
+        );
+        assert_eq!(
+            events.as_slice(),
+            &[DeviceLinkEvent::ControlResponse(response)]
+        );
     }
 }
