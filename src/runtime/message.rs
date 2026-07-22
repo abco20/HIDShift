@@ -56,6 +56,8 @@ pub enum RuntimeInputMessage {
     #[cfg(feature = "dual-s3-wired")]
     MirrorControlRequest(crate::interchip::MirrorControlRequest),
     #[cfg(feature = "dual-s3-wired")]
+    DeviceUsbState(crate::interchip::UsbState),
+    #[cfg(feature = "dual-s3-wired")]
     MirrorCandidateRegistered {
         candidate: crate::output_target::MirrorCandidateId,
         profile_hash: Option<u32>,
@@ -123,6 +125,8 @@ impl RuntimeInputMessage {
             Self::MirrorEndpointOut(report) => RuntimeInput::MirrorEndpointOut(*report),
             #[cfg(feature = "dual-s3-wired")]
             Self::MirrorControlRequest(request) => RuntimeInput::MirrorControlRequest(*request),
+            #[cfg(feature = "dual-s3-wired")]
+            Self::DeviceUsbState(state) => RuntimeInput::DeviceUsbState(*state),
             #[cfg(feature = "dual-s3-wired")]
             Self::MirrorCandidateRegistered {
                 candidate,
@@ -194,6 +198,8 @@ impl TryFrom<RuntimeInput<'_>> for RuntimeInputMessage {
             RuntimeInput::MirrorEndpointOut(report) => Ok(Self::MirrorEndpointOut(report)),
             #[cfg(feature = "dual-s3-wired")]
             RuntimeInput::MirrorControlRequest(request) => Ok(Self::MirrorControlRequest(request)),
+            #[cfg(feature = "dual-s3-wired")]
+            RuntimeInput::DeviceUsbState(state) => Ok(Self::DeviceUsbState(state)),
             #[cfg(feature = "dual-s3-wired")]
             RuntimeInput::MirrorCandidateRegistered {
                 candidate,

@@ -143,6 +143,7 @@ async fn run_link(
     let mut pending_profile_result = None;
     let mut pending_raw_endpoint_out = None;
     let mut pending_control_request = None;
+    let mut pending_device_usb_state = None;
     // Keep the command until the Device S3 acknowledges its cell. If the
     // device reboots between dequeue and delivery, the link session is
     // renegotiated and this command is sent again instead of being lost.
@@ -164,6 +165,7 @@ async fn run_link(
         report_profile_result(&runtime_sender, &mut pending_profile_result);
         report_raw_endpoint_out(&runtime_sender, &mut pending_raw_endpoint_out);
         report_control_request(&runtime_sender, &mut pending_control_request);
+        report_device_usb_state(&runtime_sender, &mut pending_device_usb_state);
 
         if last_valid_cell_ms
             .is_some_and(|last| now_ms.saturating_sub(last) >= LINK_LOSS_TIMEOUT_MS)
@@ -280,6 +282,9 @@ async fn run_link(
                         }
                         if let Some(request) = processed.control_request {
                             pending_control_request = Some(request);
+                        }
+                        if let Some(state) = processed.usb_state {
+                            pending_device_usb_state = Some(state);
                         }
                     }
                     Err(()) => {
@@ -474,6 +479,7 @@ struct ProcessedRecords {
     profile_result: Option<ProfileResult>,
     raw_endpoint_out: Option<RawEndpointReport>,
     control_request: Option<MirrorControlRequest>,
+    usb_state: Option<UsbState>,
 }
 
 fn process_records(
@@ -507,7 +513,9 @@ fn process_records(
                 }
             }
             RECORD_USB_STATE => {
-                *usb_state = Some(UsbState::decode(record.data).map_err(|_| ())?);
+                let state = UsbState::decode(record.data).map_err(|_| ())?;
+                *usb_state = Some(state);
+                processed.usb_state = Some(state);
             }
             RECORD_LINK_RESET => {
                 *hello_confirmed = false;
@@ -687,6 +695,26 @@ fn report_control_request(
     };
     if sender
         .try_send(RuntimeInputMessage::MirrorControlRequest(request))
+        .is_ok()
+    {
+        *pending = None;
+    }
+}
+
+fn report_device_usb_state(
+    sender: &Sender<
+        'static,
+        CriticalSectionRawMutex,
+        RuntimeInputMessage,
+        RUNTIME_INPUT_QUEUE_CAPACITY,
+    >,
+    pending: &mut Option<UsbState>,
+) {
+    let Some(state) = *pending else {
+        return;
+    };
+    if sender
+        .try_send(RuntimeInputMessage::DeviceUsbState(state))
         .is_ok()
     {
         *pending = None;

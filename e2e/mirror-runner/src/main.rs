@@ -4,6 +4,7 @@ use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
@@ -59,7 +60,6 @@ fn run() -> Result<(), Box<dyn Error>> {
     if !arguments.skip_flash {
         return Err("automatic flashing is not implemented yet; pass --skip-flash".into());
     }
-    let _ = &arguments.device_flash_port;
     let profile_a = fs::read(&arguments.profile_a)?;
     let plan_a = validate_mirror_image(&profile_a)
         .map_err(|reason| format!("Profile A validation failed: {reason:?}"))?;
@@ -352,6 +352,19 @@ fn run() -> Result<(), Box<dyn Error>> {
         return Err("invalid Profile replaced the active presentation".into());
     }
     println!("T19 passed: invalid Profile rejected and Profile B preserved");
+
+    if let Some(device_port) = &arguments.device_flash_port {
+        reset_device_s3(device_port)?;
+        wait_for_usb_identity(
+            &mut *serial,
+            vid_b,
+            pid_b,
+            Duration::from_secs(arguments.usb_timeout_seconds),
+        )?;
+        println!("T24 passed: Device S3 reboot restored saved Profile B");
+    } else {
+        println!("T24 skipped: --device-flash-port was not provided");
+    }
     Ok(())
 }
 
@@ -684,6 +697,21 @@ fn send_normalized(
 ) -> Result<(), Box<dyn Error>> {
     serial.write_all(&packet.encode_line())?;
     serial.write_all(b"\n")?;
+    Ok(())
+}
+
+fn reset_device_s3(port: &Path) -> Result<(), Box<dyn Error>> {
+    let status = Command::new("espflash")
+        .args(["board-info", "--port"])
+        .arg(port)
+        .args(["--chip", "esp32s3"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if !status.success() {
+        return Err(format!("espflash failed to reset Device S3 on {}", port.display()).into());
+    }
     Ok(())
 }
 
