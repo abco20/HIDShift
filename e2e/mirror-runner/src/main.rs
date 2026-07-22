@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use hidshift::checksum::{crc16_ccitt_false, crc32_ieee};
+use hidshift::e2e::{E2eCommand, E2ePacket};
 use hidshift::e2e_mirror::{
     MIRROR_E2E_PAYLOAD_MAX, MirrorE2ePacket, OPCODE_HELLO, OPCODE_INJECT_ENDPOINT_IN,
     OPCODE_REGISTER_BEGIN, OPCODE_REGISTER_CHUNK, OPCODE_REGISTER_COMMIT,
@@ -16,6 +17,7 @@ use hidshift::e2e_mirror::{
 use hidshift::management::{
     ManagementCommand, ManagementOutputTarget, ManagementResult,
 };
+use hidshift::fallback::{FALLBACK_USB_PRODUCT_ID, FALLBACK_USB_VENDOR_ID};
 use hidshift::mirror::validate_mirror_image;
 use hidshift::output_target::MirrorCandidateId;
 use hidshift_client::{
@@ -78,6 +80,158 @@ fn run() -> Result<(), Box<dyn Error>> {
     wait_for_text(&mut *serial, b"@HIDSHIFT-MIRROR:READY,1,1", Duration::from_secs(3))?;
 
     let mut sequence = 2;
+    let mut client = ManagementClient::new(80);
+    send_management_command(
+        &mut *serial,
+        &mut client,
+        ManagementCommand::ClearMirrorTarget,
+        "CLEAR_MIRROR_TARGET",
+    )?;
+    send_management_command(
+        &mut *serial,
+        &mut client,
+        ManagementCommand::SelectOutputTarget(ManagementOutputTarget::Wired),
+        "SELECT_OUTPUT_TARGET(Wired)",
+    )?;
+    wait_for_usb_identity(
+        &mut *serial,
+        FALLBACK_USB_VENDOR_ID,
+        FALLBACK_USB_PRODUCT_ID,
+        Duration::from_secs(arguments.usb_timeout_seconds),
+    )?;
+    println!("T02 passed: HIDShift Wired fallback enumerated");
+
+    let mut fallback_events = open_input_events(
+        FALLBACK_USB_VENDOR_ID,
+        FALLBACK_USB_PRODUCT_ID,
+        3,
+        Duration::from_secs(3),
+    )?;
+    send_normalized(
+        &mut *serial,
+        E2ePacket {
+            sequence: 1_000,
+            command: E2eCommand::Keyboard {
+                modifiers: 0,
+                keys: [0x04, 0, 0, 0, 0, 0],
+            },
+        },
+    )?;
+    wait_for_key_event(&mut fallback_events, 30, 1, Duration::from_secs(3))?;
+    send_normalized(
+        &mut *serial,
+        E2ePacket {
+            sequence: 1_001,
+            command: E2eCommand::ReleaseAll,
+        },
+    )?;
+    wait_for_key_event(&mut fallback_events, 30, 0, Duration::from_secs(3))?;
+    println!("T03 passed: normalized keyboard injection reached fallback evdev");
+
+    for (sequence, command, event_type, code, value) in [
+        (
+            1_002,
+            E2eCommand::Mouse {
+                buttons: 0,
+                x: 12,
+                y: 0,
+                wheel: 0,
+                pan: 0,
+            },
+            2,
+            0,
+            12,
+        ),
+        (
+            1_003,
+            E2eCommand::Mouse {
+                buttons: 0,
+                x: 0,
+                y: -7,
+                wheel: 0,
+                pan: 0,
+            },
+            2,
+            1,
+            -7,
+        ),
+        (
+            1_004,
+            E2eCommand::Mouse {
+                buttons: 0,
+                x: 0,
+                y: 0,
+                wheel: 1,
+                pan: 0,
+            },
+            2,
+            8,
+            1,
+        ),
+        (
+            1_005,
+            E2eCommand::Mouse {
+                buttons: 0,
+                x: 0,
+                y: 0,
+                wheel: 0,
+                pan: 1,
+            },
+            2,
+            6,
+            1,
+        ),
+        (
+            1_006,
+            E2eCommand::Mouse {
+                buttons: 1,
+                x: 0,
+                y: 0,
+                wheel: 0,
+                pan: 0,
+            },
+            1,
+            0x110,
+            1,
+        ),
+    ] {
+        send_normalized(&mut *serial, E2ePacket { sequence, command })?;
+        wait_for_input_event(
+            &mut fallback_events,
+            event_type,
+            code,
+            value,
+            Duration::from_secs(3),
+        )?;
+    }
+    send_normalized(
+        &mut *serial,
+        E2ePacket {
+            sequence: 1_007,
+            command: E2eCommand::ReleaseAll,
+        },
+    )?;
+    wait_for_key_event(&mut fallback_events, 0x110, 0, Duration::from_secs(3))?;
+    println!("T04 passed: fallback mouse X/Y/wheel/pan/button reached evdev");
+
+    send_normalized(
+        &mut *serial,
+        E2ePacket {
+            sequence: 1_008,
+            command: E2eCommand::Consumer { usage: 0x00e9 },
+        },
+    )?;
+    wait_for_key_event(&mut fallback_events, 115, 1, Duration::from_secs(3))?;
+    send_normalized(
+        &mut *serial,
+        E2ePacket {
+            sequence: 1_009,
+            command: E2eCommand::ReleaseAll,
+        },
+    )?;
+    wait_for_key_event(&mut fallback_events, 115, 0, Duration::from_secs(3))?;
+    println!("T05 passed: fallback Consumer Volume Up reached evdev");
+
     register_profile(&mut *serial, &profile_a, 1, &mut sequence, true)?;
     wait_for_text(
         &mut *serial,
@@ -85,7 +239,6 @@ fn run() -> Result<(), Box<dyn Error>> {
         Duration::from_secs(10),
     )?;
 
-    let mut client = ManagementClient::new(80);
     activate_candidate_zero(&mut *serial, &mut client)?;
     wait_for_usb_identity(
         &mut *serial,
@@ -95,7 +248,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     )?;
     println!("T10-T12 passed: registered and enumerated {vid_a:04x}:{pid_a:04x}");
 
-    let mut keyboard_events = open_input_events(vid_a, pid_a, Duration::from_secs(3))?;
+    let mut keyboard_events = open_input_events(vid_a, pid_a, 1, Duration::from_secs(3))?;
     inject_endpoint(
         &mut *serial,
         &mut sequence,
@@ -198,6 +351,7 @@ fn inject_endpoint(
 fn open_input_events(
     vid: u16,
     pid: u16,
+    minimum_nodes: usize,
     timeout: Duration,
 ) -> Result<Vec<fs::File>, Box<dyn Error>> {
     let deadline = Instant::now() + timeout;
@@ -223,12 +377,15 @@ fn open_input_events(
                 files.push(file);
             }
         }
-        if !files.is_empty() {
+        if files.len() >= minimum_nodes {
             return Ok(files);
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    Err(format!("no evdev nodes found for {vid:04x}:{pid:04x}").into())
+    Err(format!(
+        "fewer than {minimum_nodes} evdev nodes found for {vid:04x}:{pid:04x}"
+    )
+    .into())
 }
 
 fn set_keyboard_led(
@@ -333,20 +490,36 @@ fn wait_for_key_event(
     value: i32,
     timeout: Duration,
 ) -> Result<(), Box<dyn Error>> {
+    wait_for_input_event(files, 1, key_code, value, timeout)
+}
+
+fn wait_for_input_event(
+    files: &mut [fs::File],
+    event_type: u16,
+    event_code: u16,
+    value: i32,
+    timeout: Duration,
+) -> Result<(), Box<dyn Error>> {
     const INPUT_EVENT_LEN: usize = 24;
-    const EV_KEY: u16 = 1;
     let deadline = Instant::now() + timeout;
     let mut bytes = [0; INPUT_EVENT_LEN * 8];
+    let mut observed = Vec::new();
     while Instant::now() < deadline {
         for file in files.iter_mut() {
             match file.read(&mut bytes) {
                 Ok(length) => {
                     for event in bytes[..length].chunks_exact(INPUT_EVENT_LEN) {
-                        let event_type = u16::from_ne_bytes([event[16], event[17]]);
+                        let observed_type = u16::from_ne_bytes([event[16], event[17]]);
                         let code = u16::from_ne_bytes([event[18], event[19]]);
                         let event_value =
                             i32::from_ne_bytes([event[20], event[21], event[22], event[23]]);
-                        if event_type == EV_KEY && code == key_code && event_value == value {
+                        if observed_type != 0 {
+                            if observed.len() == 16 {
+                                observed.remove(0);
+                            }
+                            observed.push((observed_type, code, event_value));
+                        }
+                        if observed_type == event_type && code == event_code && event_value == value {
                             return Ok(());
                         }
                     }
@@ -357,7 +530,10 @@ fn wait_for_key_event(
         }
         std::thread::sleep(Duration::from_millis(5));
     }
-    Err(format!("timeout waiting for evdev key code {key_code} value {value}").into())
+    Err(format!(
+        "timeout waiting for evdev type {event_type} code {event_code} value {value}; observed {observed:?}"
+    )
+    .into())
 }
 
 fn register_profile(
@@ -455,6 +631,15 @@ fn send_management_command(
 fn send_mirror(
     serial: &mut dyn SerialPort,
     packet: MirrorE2ePacket,
+) -> Result<(), Box<dyn Error>> {
+    serial.write_all(&packet.encode_line())?;
+    serial.write_all(b"\n")?;
+    Ok(())
+}
+
+fn send_normalized(
+    serial: &mut dyn SerialPort,
+    packet: E2ePacket,
 ) -> Result<(), Box<dyn Error>> {
     serial.write_all(&packet.encode_line())?;
     serial.write_all(b"\n")?;
