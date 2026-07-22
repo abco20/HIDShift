@@ -32,6 +32,10 @@ pub const STANDARD_INPUT_HEADER_LEN: usize = 5;
 pub const STANDARD_INPUT_MAX_LEN: usize = STANDARD_INPUT_HEADER_LEN + KEYBOARD_REPORT_LEN;
 pub const STANDARD_OUTPUT_MAX_DATA_LEN: usize = 8;
 pub const STANDARD_OUTPUT_WIRE_LEN: usize = 2 + STANDARD_OUTPUT_MAX_DATA_LEN;
+pub const PROFILE_BEGIN_WIRE_LEN: usize = 16;
+pub const PROFILE_CHUNK_HEADER_LEN: usize = 8;
+pub const PROFILE_CHUNK_MAX_DATA_LEN: usize = 96;
+pub const PROFILE_RESULT_WIRE_LEN: usize = 12;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -109,6 +113,188 @@ impl Hello {
             firmware_minor: *firmware_minor,
             capabilities: u32::from_le_bytes([*c0, *c1, *c2, *c3]),
             active_profile_hash: u32::from_le_bytes([*h0, *h1, *h2, *h3]),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProfileBegin {
+    pub transfer_id: u32,
+    pub total_length: u32,
+    pub crc32: u32,
+    pub profile_hash: u32,
+}
+
+impl ProfileBegin {
+    pub const fn encode(self) -> [u8; PROFILE_BEGIN_WIRE_LEN] {
+        let transfer = self.transfer_id.to_le_bytes();
+        let length = self.total_length.to_le_bytes();
+        let crc = self.crc32.to_le_bytes();
+        let hash = self.profile_hash.to_le_bytes();
+        [
+            transfer[0],
+            transfer[1],
+            transfer[2],
+            transfer[3],
+            length[0],
+            length[1],
+            length[2],
+            length[3],
+            crc[0],
+            crc[1],
+            crc[2],
+            crc[3],
+            hash[0],
+            hash[1],
+            hash[2],
+            hash[3],
+        ]
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, MessageError> {
+        if bytes.len() != PROFILE_BEGIN_WIRE_LEN {
+            return Err(MessageError::InvalidLength);
+        }
+        Ok(Self {
+            transfer_id: read_u32(&bytes[0..4]),
+            total_length: read_u32(&bytes[4..8]),
+            crc32: read_u32(&bytes[8..12]),
+            profile_hash: read_u32(&bytes[12..16]),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProfileChunk<'a> {
+    pub transfer_id: u32,
+    pub offset: u32,
+    pub data: &'a [u8],
+}
+
+impl<'a> ProfileChunk<'a> {
+    pub fn decode(bytes: &'a [u8]) -> Result<Self, MessageError> {
+        if !(PROFILE_CHUNK_HEADER_LEN..=PROFILE_CHUNK_HEADER_LEN + PROFILE_CHUNK_MAX_DATA_LEN)
+            .contains(&bytes.len())
+        {
+            return Err(MessageError::InvalidLength);
+        }
+        Ok(Self {
+            transfer_id: read_u32(&bytes[0..4]),
+            offset: read_u32(&bytes[4..8]),
+            data: &bytes[PROFILE_CHUNK_HEADER_LEN..],
+        })
+    }
+
+    pub fn encode(self, out: &mut [u8]) -> Result<usize, MessageError> {
+        let length = PROFILE_CHUNK_HEADER_LEN + self.data.len();
+        if self.data.len() > PROFILE_CHUNK_MAX_DATA_LEN || out.len() < length {
+            return Err(MessageError::InvalidLength);
+        }
+        out[0..4].copy_from_slice(&self.transfer_id.to_le_bytes());
+        out[4..8].copy_from_slice(&self.offset.to_le_bytes());
+        out[8..length].copy_from_slice(self.data);
+        Ok(length)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProfileChunkData {
+    transfer_id: u32,
+    offset: u32,
+    length: u8,
+    data: [u8; PROFILE_CHUNK_MAX_DATA_LEN],
+}
+
+impl ProfileChunkData {
+    pub fn from_borrowed(chunk: ProfileChunk<'_>) -> Result<Self, MessageError> {
+        if chunk.data.len() > PROFILE_CHUNK_MAX_DATA_LEN {
+            return Err(MessageError::InvalidLength);
+        }
+        let mut data = [0; PROFILE_CHUNK_MAX_DATA_LEN];
+        data[..chunk.data.len()].copy_from_slice(chunk.data);
+        Ok(Self {
+            transfer_id: chunk.transfer_id,
+            offset: chunk.offset,
+            length: chunk.data.len() as u8,
+            data,
+        })
+    }
+
+    pub const fn transfer_id(&self) -> u32 {
+        self.transfer_id
+    }
+
+    pub fn as_borrowed(&self) -> ProfileChunk<'_> {
+        ProfileChunk {
+            transfer_id: self.transfer_id,
+            offset: self.offset,
+            data: &self.data[..self.length as usize],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ProfileResultStatus {
+    Accepted = 0,
+    AlreadyStored = 1,
+    InvalidImage = 2,
+    Unsupported = 3,
+    ResourceExhausted = 4,
+    StorageError = 5,
+    Busy = 6,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProfileResult {
+    pub transfer_id: u32,
+    pub profile_hash: u32,
+    pub status: ProfileResultStatus,
+    pub reject_reason: u8,
+    pub detail: u16,
+}
+
+impl ProfileResult {
+    pub const fn encode(self) -> [u8; PROFILE_RESULT_WIRE_LEN] {
+        let transfer = self.transfer_id.to_le_bytes();
+        let hash = self.profile_hash.to_le_bytes();
+        let detail = self.detail.to_le_bytes();
+        [
+            transfer[0],
+            transfer[1],
+            transfer[2],
+            transfer[3],
+            hash[0],
+            hash[1],
+            hash[2],
+            hash[3],
+            self.status as u8,
+            self.reject_reason,
+            detail[0],
+            detail[1],
+        ]
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, MessageError> {
+        if bytes.len() != PROFILE_RESULT_WIRE_LEN {
+            return Err(MessageError::InvalidLength);
+        }
+        let status = match bytes[8] {
+            0 => ProfileResultStatus::Accepted,
+            1 => ProfileResultStatus::AlreadyStored,
+            2 => ProfileResultStatus::InvalidImage,
+            3 => ProfileResultStatus::Unsupported,
+            4 => ProfileResultStatus::ResourceExhausted,
+            5 => ProfileResultStatus::StorageError,
+            6 => ProfileResultStatus::Busy,
+            _ => return Err(MessageError::InvalidStatus),
+        };
+        Ok(Self {
+            transfer_id: read_u32(&bytes[0..4]),
+            profile_hash: read_u32(&bytes[4..8]),
+            status,
+            reject_reason: bytes[9],
+            detail: u16::from_le_bytes([bytes[10], bytes[11]]),
         })
     }
 }
@@ -293,6 +479,11 @@ pub enum MessageError {
     InvalidLength,
     InvalidRole,
     InvalidFlags,
+    InvalidStatus,
+}
+
+fn read_u32(bytes: &[u8]) -> u32 {
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -383,6 +574,48 @@ mod tests {
         assert_eq!(
             StandardInputReport::decode(&invalid),
             Err(StandardInputReportError::InvalidReportLength)
+        );
+    }
+
+    #[test]
+    fn profile_transfer_messages_round_trip() {
+        let begin = ProfileBegin {
+            transfer_id: 7,
+            total_length: 16_384,
+            crc32: 0x1234_5678,
+            profile_hash: 0xaabb_ccdd,
+        };
+        assert_eq!(ProfileBegin::decode(&begin.encode()), Ok(begin));
+
+        let chunk = ProfileChunk {
+            transfer_id: 7,
+            offset: 96,
+            data: &[1, 2, 3],
+        };
+        let mut encoded = [0; 104];
+        let length = chunk.encode(&mut encoded).unwrap();
+        assert_eq!(ProfileChunk::decode(&encoded[..length]), Ok(chunk));
+
+        let result = ProfileResult {
+            transfer_id: 7,
+            profile_hash: 0xaabb_ccdd,
+            status: ProfileResultStatus::Accepted,
+            reject_reason: 0,
+            detail: 42,
+        };
+        assert_eq!(ProfileResult::decode(&result.encode()), Ok(result));
+    }
+
+    #[test]
+    fn owned_profile_chunk_rejects_oversized_data_without_panicking() {
+        let data = [0; PROFILE_CHUNK_MAX_DATA_LEN + 1];
+        assert_eq!(
+            ProfileChunkData::from_borrowed(ProfileChunk {
+                transfer_id: 1,
+                offset: 0,
+                data: &data,
+            }),
+            Err(MessageError::InvalidLength)
         );
     }
 }

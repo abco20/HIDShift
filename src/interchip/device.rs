@@ -1,10 +1,12 @@
 use heapless::Vec;
 
 use super::message::{
-    CAPABILITY_FALLBACK_PROFILE, CAPABILITY_STANDARD_WIRED_HID, CAPABILITY_USB_STATE_REPORTING,
-    RECORD_FORCE_FALLBACK, RECORD_HEARTBEAT, RECORD_HELLO, RECORD_HELLO_ACK, RECORD_LINK_RESET,
-    RECORD_STANDARD_INPUT_REPORT, RECORD_STANDARD_OUTPUT_REPORT, RECORD_STANDARD_RELEASE_ALL,
-    RECORD_USB_STATE,
+    CAPABILITY_DYNAMIC_PROFILE, CAPABILITY_FALLBACK_PROFILE, CAPABILITY_PROFILE_FLASH_CACHE,
+    CAPABILITY_STANDARD_WIRED_HID, CAPABILITY_USB_STATE_REPORTING, ProfileBegin, ProfileChunk,
+    ProfileChunkData, ProfileResult, RECORD_FORCE_FALLBACK, RECORD_HEARTBEAT, RECORD_HELLO,
+    RECORD_HELLO_ACK, RECORD_LINK_RESET, RECORD_PROFILE_BEGIN, RECORD_PROFILE_CHUNK,
+    RECORD_PROFILE_COMMIT, RECORD_PROFILE_RESULT, RECORD_STANDARD_INPUT_REPORT,
+    RECORD_STANDARD_OUTPUT_REPORT, RECORD_STANDARD_RELEASE_ALL, RECORD_USB_STATE,
 };
 use super::{
     Hello, InterchipRole, ReceiveDisposition, Record, RecordIter, ReliableReceiver, ReliableSender,
@@ -22,6 +24,9 @@ pub enum DeviceLinkEvent {
     StandardInput(StandardInputReport),
     ReleaseAll,
     ForceFallback { operation_id: u32 },
+    ProfileBegin(ProfileBegin),
+    ProfileChunk(ProfileChunkData),
+    ProfileCommit { transfer_id: u32 },
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -42,10 +47,34 @@ pub struct DeviceLink {
     host_compatible: bool,
     usb_state: UsbState,
     diagnostics: DeviceLinkDiagnostics,
+    capabilities: u32,
+    active_profile_hash: u32,
 }
 
 impl DeviceLink {
     pub fn new(session_id: u32, usb_state: UsbState) -> Self {
+        Self::with_capabilities(session_id, usb_state, DEVICE_CAPABILITIES, 0)
+    }
+
+    pub fn new_with_profile_storage(
+        session_id: u32,
+        usb_state: UsbState,
+        active_profile_hash: u32,
+    ) -> Self {
+        Self::with_capabilities(
+            session_id,
+            usb_state,
+            DEVICE_CAPABILITIES | CAPABILITY_DYNAMIC_PROFILE | CAPABILITY_PROFILE_FLASH_CACHE,
+            active_profile_hash,
+        )
+    }
+
+    fn with_capabilities(
+        session_id: u32,
+        usb_state: UsbState,
+        capabilities: u32,
+        active_profile_hash: u32,
+    ) -> Self {
         let mut link = Self {
             sender: ReliableSender::new(nonzero_session(session_id)),
             receiver: ReliableReceiver::new(),
@@ -53,6 +82,8 @@ impl DeviceLink {
             host_compatible: false,
             usb_state,
             diagnostics: DeviceLinkDiagnostics::default(),
+            capabilities,
+            active_profile_hash,
         };
         link.next_cell = link.queue_hello(0);
         link
@@ -79,6 +110,14 @@ impl DeviceLink {
         }
         let data = report.encode();
         self.next_cell = self.queue_record(RECORD_STANDARD_OUTPUT_REPORT, &data, now_ms);
+        self.next_cell.is_some()
+    }
+
+    pub fn queue_profile_result(&mut self, result: ProfileResult, now_ms: u64) -> bool {
+        if !self.host_compatible || self.next_cell.is_some() {
+            return false;
+        }
+        self.next_cell = self.queue_record(RECORD_PROFILE_RESULT, &result.encode(), now_ms);
         self.next_cell.is_some()
     }
 
@@ -172,6 +211,35 @@ impl DeviceLink {
                     );
                     self.next_cell = self.queue_usb_state(now_ms);
                 }
+                RECORD_PROFILE_BEGIN if self.host_compatible => {
+                    match ProfileBegin::decode(record.data) {
+                        Ok(begin) => self.push_event(events, DeviceLinkEvent::ProfileBegin(begin)),
+                        Err(_) => self.mark_malformed(),
+                    }
+                }
+                RECORD_PROFILE_CHUNK if self.host_compatible => {
+                    match ProfileChunk::decode(record.data) {
+                        Ok(chunk) => match ProfileChunkData::from_borrowed(chunk) {
+                            Ok(chunk) => {
+                                self.push_event(events, DeviceLinkEvent::ProfileChunk(chunk))
+                            }
+                            Err(_) => self.mark_malformed(),
+                        },
+                        Err(_) => self.mark_malformed(),
+                    }
+                }
+                RECORD_PROFILE_COMMIT if self.host_compatible => {
+                    let Ok(bytes) = <[u8; 4]>::try_from(record.data) else {
+                        self.mark_malformed();
+                        continue;
+                    };
+                    self.push_event(
+                        events,
+                        DeviceLinkEvent::ProfileCommit {
+                            transfer_id: u32::from_le_bytes(bytes),
+                        },
+                    );
+                }
                 RECORD_STANDARD_INPUT_REPORT if self.host_compatible => {
                     match StandardInputReport::decode(record.data) {
                         Ok(report) => {
@@ -214,12 +282,12 @@ impl DeviceLink {
     }
 
     fn queue_hello(&mut self, now_ms: u64) -> Option<SpiCell> {
-        let hello = device_hello().encode();
+        let hello = self.device_hello().encode();
         self.queue_record(RECORD_HELLO, &hello, now_ms)
     }
 
     fn queue_hello_ack_and_usb_state(&mut self, now_ms: u64) -> Option<SpiCell> {
-        let hello = device_hello().encode();
+        let hello = self.device_hello().encode();
         let state = self.usb_state.encode();
         self.queue_records(
             &[
@@ -261,16 +329,16 @@ impl DeviceLink {
             .queue(&payload[..length as usize], count, now_ms)
             .ok()
     }
-}
 
-const fn device_hello() -> Hello {
-    Hello {
-        role: InterchipRole::Device,
-        protocol_version: SPI_PROTOCOL_VERSION,
-        firmware_major: 0,
-        firmware_minor: 2,
-        capabilities: DEVICE_CAPABILITIES,
-        active_profile_hash: 0,
+    const fn device_hello(&self) -> Hello {
+        Hello {
+            role: InterchipRole::Device,
+            protocol_version: SPI_PROTOCOL_VERSION,
+            firmware_major: 0,
+            firmware_minor: 2,
+            capabilities: self.capabilities,
+            active_profile_hash: self.active_profile_hash,
+        }
     }
 }
 
@@ -403,5 +471,44 @@ mod tests {
             .unwrap();
         assert_eq!(record.record_type, RECORD_STANDARD_OUTPUT_REPORT);
         assert_eq!(StandardOutputReport::decode(record.data), Ok(output));
+    }
+
+    #[test]
+    fn profile_records_preserve_chunk_offsets_and_payloads() {
+        let mut device = DeviceLink::new_with_profile_storage(2, fallback_state(), 0x1122_3344);
+        let mut host = ReliableSender::new(1);
+        let hello = Hello {
+            role: InterchipRole::Host,
+            protocol_version: SPI_PROTOCOL_VERSION,
+            firmware_major: 0,
+            firmware_minor: 2,
+            capabilities: CAPABILITY_DYNAMIC_PROFILE,
+            active_profile_hash: 0,
+        }
+        .encode();
+        let mut events = Vec::<_, 4>::new();
+        device.handle_transaction(&host_cell(&mut host, RECORD_HELLO, &hello), 0, &mut events);
+
+        let chunk = ProfileChunk {
+            transfer_id: 9,
+            offset: 96,
+            data: &[1, 2, 3, 4],
+        };
+        let mut encoded = [0; 104];
+        let length = chunk.encode(&mut encoded).unwrap();
+        device.handle_transaction(
+            &host_cell(&mut host, RECORD_PROFILE_CHUNK, &encoded[..length]),
+            1,
+            &mut events,
+        );
+
+        let received = events
+            .iter()
+            .find_map(|event| match event {
+                DeviceLinkEvent::ProfileChunk(chunk) => Some(chunk.as_borrowed()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(received, chunk);
     }
 }

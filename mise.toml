@@ -175,6 +175,8 @@ source "$export_file"
 espflash flash \
   --chip esp32s3 \
   --port "$HIDSHIFT_DEVICE_PORT" \
+  --partition-table partitions/bridge.csv \
+  --target-app-partition factory \
   device-firmware/target/xtensa-esp32s3-none-elf/release/hidshift-device
 """
 

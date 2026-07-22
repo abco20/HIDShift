@@ -8,15 +8,16 @@ use esp_hal::time::Rate;
 use hidshift::bridge::{BridgeEvent, NotifyReason};
 use hidshift::input::KeyboardLedState;
 use hidshift::interchip::message::{
-    CAPABILITY_FALLBACK_PROFILE, CAPABILITY_STANDARD_WIRED_HID, CAPABILITY_USB_STATE_REPORTING,
-    RECORD_FORCE_FALLBACK, RECORD_HEARTBEAT, RECORD_HELLO, RECORD_HELLO_ACK, RECORD_LINK_RESET,
-    RECORD_STANDARD_INPUT_REPORT, RECORD_STANDARD_OUTPUT_REPORT, RECORD_STANDARD_RELEASE_ALL,
-    RECORD_USB_STATE,
+    CAPABILITY_DYNAMIC_PROFILE, CAPABILITY_FALLBACK_PROFILE, CAPABILITY_STANDARD_WIRED_HID,
+    CAPABILITY_USB_STATE_REPORTING, RECORD_FORCE_FALLBACK, RECORD_HEARTBEAT, RECORD_HELLO,
+    RECORD_HELLO_ACK, RECORD_LINK_RESET, RECORD_PROFILE_BEGIN, RECORD_PROFILE_CHUNK,
+    RECORD_PROFILE_COMMIT, RECORD_PROFILE_RESULT, RECORD_STANDARD_INPUT_REPORT,
+    RECORD_STANDARD_OUTPUT_REPORT, RECORD_STANDARD_RELEASE_ALL, RECORD_USB_STATE,
 };
 use hidshift::interchip::{
-    Hello, InterchipRole, ReceiveDisposition, Record, RecordIter, ReliableReceiver, ReliableSender,
-    RetransmitAction, SPI_CELL_LEN, SPI_CELL_PAYLOAD_LEN, SPI_PROTOCOL_VERSION, SpiCell,
-    StandardInputReport, StandardOutputReport, UsbState, encode_records,
+    Hello, InterchipRole, ProfileResult, ReceiveDisposition, Record, RecordIter, ReliableReceiver,
+    ReliableSender, RetransmitAction, SPI_CELL_LEN, SPI_CELL_PAYLOAD_LEN, SPI_PROTOCOL_VERSION,
+    SpiCell, StandardInputReport, StandardOutputReport, UsbState, encode_records,
 };
 use hidshift::output_target::OutputTargetAvailability;
 use hidshift::runtime::message::RuntimeInputMessage;
@@ -29,8 +30,10 @@ const RETRANSMIT_TIMEOUT_MS: u64 = 5;
 const MAX_RETRANSMIT_ATTEMPTS: u8 = 8;
 const HEARTBEAT_INTERVAL_MS: u64 = 500;
 const LINK_LOSS_TIMEOUT_MS: u64 = 1_500;
-const HOST_CAPABILITIES: u32 =
-    CAPABILITY_FALLBACK_PROFILE | CAPABILITY_STANDARD_WIRED_HID | CAPABILITY_USB_STATE_REPORTING;
+const HOST_CAPABILITIES: u32 = CAPABILITY_DYNAMIC_PROFILE
+    | CAPABILITY_FALLBACK_PROFILE
+    | CAPABILITY_STANDARD_WIRED_HID
+    | CAPABILITY_USB_STATE_REPORTING;
 const REQUIRED_DEVICE_CAPABILITIES: u32 =
     CAPABILITY_FALLBACK_PROFILE | CAPABILITY_STANDARD_WIRED_HID | CAPABILITY_USB_STATE_REPORTING;
 
@@ -133,6 +136,7 @@ async fn run_link(
     let mut last_heartbeat_ms = 0;
     let mut reported_availability = None;
     let mut pending_wired_leds = None;
+    let mut pending_profile_result = None;
     let mut diagnostics = LinkDiagnostics::default();
     let mut ticker = Ticker::every(SPI_POLL_INTERVAL);
 
@@ -147,6 +151,7 @@ async fn run_link(
             &mut reported_availability,
         );
         report_wired_leds(&runtime_sender, &mut pending_wired_leds);
+        report_profile_result(&runtime_sender, &mut pending_profile_result);
 
         if last_valid_cell_ms
             .is_some_and(|last| now_ms.saturating_sub(last) >= LINK_LOSS_TIMEOUT_MS)
@@ -218,8 +223,14 @@ async fn run_link(
         match receiver.receive(&cell) {
             ReceiveDisposition::Accepted { .. } => {
                 match process_records(&cell, &mut hello_confirmed, &mut usb_state) {
-                    Ok(Some(leds)) => pending_wired_leds = Some(leds),
-                    Ok(None) => {}
+                    Ok(processed) => {
+                        if let Some(leds) = processed.wired_leds {
+                            pending_wired_leds = Some(leds);
+                        }
+                        if let Some(result) = processed.profile_result {
+                            pending_profile_result = Some(result);
+                        }
+                    }
                     Err(()) => {
                         diagnostics.crc_or_codec_errors =
                             diagnostics.crc_or_codec_errors.saturating_add(1);
@@ -283,6 +294,21 @@ fn queue_command(
             now_ms,
         )
         .map_err(|_| ()),
+        DeviceTaskCommand::ProfileBegin(begin) => {
+            queue_record(sender, RECORD_PROFILE_BEGIN, &begin.encode(), now_ms).map_err(|_| ())
+        }
+        DeviceTaskCommand::ProfileChunk(chunk) => {
+            let mut data = [0; 104];
+            let length = chunk.as_borrowed().encode(&mut data).map_err(|_| ())?;
+            queue_record(sender, RECORD_PROFILE_CHUNK, &data[..length], now_ms).map_err(|_| ())
+        }
+        DeviceTaskCommand::ProfileCommit { transfer_id } => queue_record(
+            sender,
+            RECORD_PROFILE_COMMIT,
+            &transfer_id.to_le_bytes(),
+            now_ms,
+        )
+        .map_err(|_| ()),
     }
 }
 
@@ -327,12 +353,18 @@ fn retransmit_or_idle(
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ProcessedRecords {
+    wired_leds: Option<KeyboardLedState>,
+    profile_result: Option<ProfileResult>,
+}
+
 fn process_records(
     cell: &SpiCell,
     hello_confirmed: &mut bool,
     usb_state: &mut Option<UsbState>,
-) -> Result<Option<KeyboardLedState>, ()> {
-    let mut wired_leds = None;
+) -> Result<ProcessedRecords, ()> {
+    let mut processed = ProcessedRecords::default();
     let mut records = RecordIter::new(cell.payload(), cell.header.record_count);
     for record in records.by_ref() {
         let record = record.map_err(|_| ())?;
@@ -362,13 +394,17 @@ fn process_records(
                 let [bits] = report.data() else {
                     return Err(());
                 };
-                wired_leds = Some(KeyboardLedState::from_bits_truncate(*bits));
+                processed.wired_leds = Some(KeyboardLedState::from_bits_truncate(*bits));
+            }
+            RECORD_PROFILE_RESULT => {
+                processed.profile_result =
+                    Some(ProfileResult::decode(record.data).map_err(|_| ())?);
             }
             _ => {}
         }
     }
     records.finish().map_err(|_| ())?;
-    Ok(wired_leds)
+    Ok(processed)
 }
 
 fn availability(
@@ -432,6 +468,26 @@ fn report_wired_leds(
         .try_send(RuntimeInputMessage::BridgeEvent(
             BridgeEvent::WiredKeyboardLedChanged { leds },
         ))
+        .is_ok()
+    {
+        *pending = None;
+    }
+}
+
+fn report_profile_result(
+    sender: &Sender<
+        'static,
+        CriticalSectionRawMutex,
+        RuntimeInputMessage,
+        RUNTIME_INPUT_QUEUE_CAPACITY,
+    >,
+    pending: &mut Option<ProfileResult>,
+) {
+    let Some(result) = *pending else {
+        return;
+    };
+    if sender
+        .try_send(RuntimeInputMessage::DeviceProfileResult(result))
         .is_ok()
     {
         *pending = None;

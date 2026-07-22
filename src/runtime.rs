@@ -1,6 +1,8 @@
 use crate::ble::{BleHostAdapterError, BleHostAdapterEvent, bridge_events_from_ble_host_event};
 use crate::bridge::{Bridge, BridgeAction, BridgeError, BridgeEvent, BridgeStatus, NotifyReason};
 use crate::ids::{DeviceId, HostId, InterfaceId};
+#[cfg(feature = "dual-s3-wired")]
+use crate::interchip::{ProfileBegin, ProfileChunkData, ProfileResult, ProfileTransferCommand};
 use crate::management::{
     ManagementCommand, ManagementDestination, ManagementDiagnostics, ManagementHistoryEvent,
     ManagementHostInfo, ManagementHostName, ManagementHostStatus, ManagementHostTiming,
@@ -169,6 +171,8 @@ pub enum RuntimeInput<'a> {
         name: FixedName,
     },
     DiagnosticsEvent(RuntimeDiagnosticsEvent),
+    #[cfg(feature = "dual-s3-wired")]
+    DeviceProfileResult(ProfileResult),
     RestoreStorage(&'a StorageState),
 }
 
@@ -191,6 +195,8 @@ pub struct BridgeRuntime<const HOSTS: usize, const USB_INTERFACES: usize> {
     status_sequence: u64,
     counters: RuntimeCounters,
     mouse_scale_remainders: [MouseScaleRemainders; HOSTS],
+    #[cfg(feature = "dual-s3-wired")]
+    last_profile_result: Option<ProfileResult>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -239,11 +245,18 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             status_sequence: 0,
             counters: RuntimeCounters::new(),
             mouse_scale_remainders: [MouseScaleRemainders::ZERO; HOSTS],
+            #[cfg(feature = "dual-s3-wired")]
+            last_profile_result: None,
         }
     }
 
     pub const fn bridge(&self) -> &Bridge<HOSTS> {
         &self.bridge
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    pub const fn last_profile_result(&self) -> Option<ProfileResult> {
+        self.last_profile_result
     }
 
     pub const fn storage_generation(&self) -> u32 {
@@ -445,6 +458,12 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             RuntimeInput::DiagnosticsEvent(event) => {
                 commands.clear();
                 self.apply_diagnostics_event(event);
+                Ok(())
+            }
+            #[cfg(feature = "dual-s3-wired")]
+            RuntimeInput::DeviceProfileResult(result) => {
+                commands.clear();
+                self.last_profile_result = Some(result);
                 Ok(())
             }
             RuntimeInput::RestoreStorage(storage) => {
@@ -1974,6 +1993,11 @@ pub enum DeviceTaskCommand {
     ActivateFallback {
         operation_id: u32,
     },
+    ProfileBegin(ProfileBegin),
+    ProfileChunk(ProfileChunkData),
+    ProfileCommit {
+        transfer_id: u32,
+    },
 }
 
 #[cfg(feature = "dual-s3-wired")]
@@ -1989,6 +2013,20 @@ impl DeviceTaskCommand {
                 | NotifyReason::SafetyRelease => CommandClass::Critical,
             },
             Self::ReleaseAll | Self::ActivateFallback { .. } => CommandClass::Critical,
+            Self::ProfileBegin(_) | Self::ProfileChunk(_) | Self::ProfileCommit { .. } => {
+                CommandClass::BestEffort
+            }
+        }
+    }
+}
+
+#[cfg(feature = "dual-s3-wired")]
+impl From<ProfileTransferCommand> for DeviceTaskCommand {
+    fn from(command: ProfileTransferCommand) -> Self {
+        match command {
+            ProfileTransferCommand::Begin(begin) => Self::ProfileBegin(begin),
+            ProfileTransferCommand::Chunk(chunk) => Self::ProfileChunk(chunk),
+            ProfileTransferCommand::Commit { transfer_id } => Self::ProfileCommit { transfer_id },
         }
     }
 }

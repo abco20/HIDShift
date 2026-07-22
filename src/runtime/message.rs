@@ -49,6 +49,8 @@ pub enum RuntimeInputMessage {
         name: crate::storage::FixedName,
     },
     DiagnosticsEvent(RuntimeDiagnosticsEvent),
+    #[cfg(feature = "dual-s3-wired")]
+    DeviceProfileResult(crate::interchip::ProfileResult),
     RestoreStorage(StorageState),
 }
 
@@ -106,6 +108,8 @@ impl RuntimeInputMessage {
                 name: *name,
             },
             Self::DiagnosticsEvent(event) => RuntimeInput::DiagnosticsEvent(*event),
+            #[cfg(feature = "dual-s3-wired")]
+            Self::DeviceProfileResult(result) => RuntimeInput::DeviceProfileResult(*result),
             Self::RestoreStorage(storage) => RuntimeInput::RestoreStorage(storage),
         }
     }
@@ -163,6 +167,8 @@ impl TryFrom<RuntimeInput<'_>> for RuntimeInputMessage {
                 Ok(Self::HostNameDiscovered { host_id, name })
             }
             RuntimeInput::DiagnosticsEvent(event) => Ok(Self::DiagnosticsEvent(event)),
+            #[cfg(feature = "dual-s3-wired")]
+            RuntimeInput::DeviceProfileResult(result) => Ok(Self::DeviceProfileResult(result)),
             RuntimeInput::RestoreStorage(storage) => Ok(Self::RestoreStorage(storage.clone())),
         }
     }
@@ -338,6 +344,23 @@ mod tests {
         assert_eq!(frame.report_id, Some(ReportId(1)));
         assert_eq!(frame.direction, HidDirection::Input);
         assert_eq!(frame.payload(), &[0xaa, 0xbb]);
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    #[test]
+    fn profile_result_message_reaches_runtime_without_transport_borrowing() {
+        let result = crate::interchip::ProfileResult {
+            transfer_id: 7,
+            profile_hash: 9,
+            status: crate::interchip::ProfileResultStatus::Accepted,
+            reject_reason: 0,
+            detail: 0,
+        };
+        let message = RuntimeInputMessage::DeviceProfileResult(result);
+        assert_eq!(
+            message.as_runtime_input(),
+            RuntimeInput::DeviceProfileResult(result)
+        );
     }
 
     #[test]

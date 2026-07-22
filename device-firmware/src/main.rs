@@ -2,6 +2,7 @@
 #![no_main]
 
 mod usb_fallback;
+mod profile_store;
 
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
@@ -12,7 +13,11 @@ use hidshift::fallback::{
     FALLBACK_USB_DEVICE_RELEASE, FALLBACK_USB_MANUFACTURER, FALLBACK_USB_PRODUCT,
     FALLBACK_USB_PRODUCT_ID, FALLBACK_USB_VENDOR_ID,
 };
-use hidshift::interchip::{DeviceLink, DeviceLinkEvent, SPI_CELL_LEN, UsbState};
+use hidshift::interchip::{
+    DeviceLink, DeviceLinkEvent, ProfileResult, ProfileResultStatus, ProfileTransferError,
+    ProfileTransferReceiver, SPI_CELL_LEN, UsbState,
+};
+use hidshift::mirror::{HSMI_MAX_SIZE, MirrorRejectReason, ProfileCommitOutcome};
 use static_cell::StaticCell;
 use usb_device::LangID;
 use usb_device::bus::UsbBus;
@@ -24,6 +29,7 @@ use usb_fallback::FallbackUsb;
 esp_bootloader_esp_idf::esp_app_desc!();
 
 static USB_ENDPOINT_MEMORY: StaticCell<[u32; 1024]> = StaticCell::new();
+static PROFILE_STAGING: StaticCell<[u8; HSMI_MAX_SIZE]> = StaticCell::new();
 const SPI_LINK_LOSS_TIMEOUT_MS: u64 = 1_500;
 
 #[esp_hal::main]
@@ -32,6 +38,19 @@ fn main() -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
     let session_id = nonzero_session(esp_hal::rng::Rng::new().random());
+    let mut profile_store = match profile_store::open(peripherals.FLASH) {
+        Ok(store) => Some(store),
+        Err(error) => {
+            log::error!("device-profile: storage unavailable {:?}", error);
+            None
+        }
+    };
+    let active_profile_hash = profile_store
+        .as_mut()
+        .and_then(|store| store.active().ok().flatten())
+        .map_or(0, |profile| profile.profile_hash);
+    let profile_receiver =
+        ProfileTransferReceiver::new(PROFILE_STAGING.init([0; HSMI_MAX_SIZE]));
 
     let usb = esp_hal::otg_fs::Usb::new(peripherals.USB0, peripherals.GPIO20, peripherals.GPIO19);
     let endpoint_memory = USB_ENDPOINT_MEMORY.init([0; 1024]);
@@ -69,7 +88,17 @@ fn main() -> ! {
         .with_miso(peripherals.GPIO13)
         .with_dma(peripherals.DMA_CH0);
 
-    run(spi, dma_rx, dma_tx, session_id, usb_device, fallback)
+    run(
+        spi,
+        dma_rx,
+        dma_tx,
+        session_id,
+        usb_device,
+        fallback,
+        profile_store,
+        profile_receiver,
+        active_profile_hash,
+    )
 }
 
 fn run<'a, B: UsbBus>(
@@ -79,9 +108,16 @@ fn run<'a, B: UsbBus>(
     session_id: u32,
     mut usb_device: UsbDevice<'a, B>,
     mut fallback: FallbackUsb<'a, B>,
+    mut profile_store: Option<profile_store::DeviceProfileStore>,
+    mut profile_receiver: ProfileTransferReceiver<'static>,
+    active_profile_hash: u32,
 ) -> ! {
     let mut current_usb_state = fallback_usb_state(false);
-    let mut link = DeviceLink::new(session_id, current_usb_state);
+    let mut link = if profile_store.is_some() {
+        DeviceLink::new_with_profile_storage(session_id, current_usb_state, active_profile_hash)
+    } else {
+        DeviceLink::new(session_id, current_usb_state)
+    };
     let mut ever_linked = false;
     let mut last_valid_spi_ms = now_ms();
     let initial_tx = link.next_transaction(now_ms());
@@ -91,6 +127,7 @@ fn run<'a, B: UsbBus>(
         Ok(transfer) => transfer,
         Err((error, _, _, _)) => fatal("initial slave DMA queue", error),
     };
+    let mut pending_profile_result = None;
 
     loop {
         while !transfer.is_done() {
@@ -118,7 +155,70 @@ fn run<'a, B: UsbBus>(
         }
         ever_linked |= link.host_compatible();
         for event in events {
-            fallback.enqueue_link_event(event);
+            match event {
+                DeviceLinkEvent::ProfileBegin(begin) => {
+                    if profile_store.is_none() {
+                        pending_profile_result = Some(ProfileResult {
+                            transfer_id: begin.transfer_id,
+                            profile_hash: begin.profile_hash,
+                            status: ProfileResultStatus::StorageError,
+                            reject_reason: MirrorRejectReason::StorageFailure as u8,
+                            detail: 0,
+                        });
+                    } else if let Err(error) = profile_receiver.begin(begin) {
+                        pending_profile_result = Some(profile_transfer_error_result(
+                            error,
+                            begin.transfer_id,
+                            begin.profile_hash,
+                        ));
+                    }
+                }
+                DeviceLinkEvent::ProfileChunk(chunk) => {
+                    if let Err(error) = profile_receiver.chunk(chunk.as_borrowed()) {
+                        pending_profile_result = Some(profile_transfer_error_result(
+                            error,
+                            chunk.transfer_id(),
+                            0,
+                        ));
+                    }
+                }
+                DeviceLinkEvent::ProfileCommit { transfer_id } => {
+                    let mut result = profile_receiver.commit(transfer_id);
+                    if result.status == ProfileResultStatus::Accepted {
+                        result = match (profile_store.as_mut(), profile_receiver.committed()) {
+                            (Some(store), Some((metadata, image))) => {
+                                match store.commit(image, metadata.profile_hash) {
+                                    Ok(ProfileCommitOutcome::Stored(_)) => result,
+                                    Ok(ProfileCommitOutcome::AlreadyStored(_)) => ProfileResult {
+                                        status: ProfileResultStatus::AlreadyStored,
+                                        ..result
+                                    },
+                                    Err(error) => profile_store::storage_error_result(
+                                        error,
+                                        transfer_id,
+                                        metadata.profile_hash,
+                                    ),
+                                }
+                            }
+                            _ => ProfileResult {
+                                transfer_id,
+                                profile_hash: result.profile_hash,
+                                status: ProfileResultStatus::StorageError,
+                                reject_reason: MirrorRejectReason::StorageFailure as u8,
+                                detail: 0,
+                            },
+                        };
+                        profile_receiver.clear_committed();
+                    }
+                    pending_profile_result = Some(result);
+                }
+                event => fallback.enqueue_link_event(event),
+            }
+        }
+        if let Some(result) = pending_profile_result
+            && link.queue_profile_result(result, now_ms)
+        {
+            pending_profile_result = None;
         }
 
         // Queue the next transaction before servicing USB. The slave remains
@@ -137,6 +237,24 @@ fn run<'a, B: UsbBus>(
             &mut link,
             &mut current_usb_state,
         );
+    }
+}
+
+fn profile_transfer_error_result(
+    error: ProfileTransferError,
+    transfer_id: u32,
+    profile_hash: u32,
+) -> ProfileResult {
+    ProfileResult {
+        transfer_id,
+        profile_hash,
+        status: if error == ProfileTransferError::Busy {
+            ProfileResultStatus::Busy
+        } else {
+            ProfileResultStatus::InvalidImage
+        },
+        reject_reason: MirrorRejectReason::MalformedImage as u8,
+        detail: 0,
     }
 }
 
