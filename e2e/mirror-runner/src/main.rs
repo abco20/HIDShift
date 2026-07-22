@@ -232,6 +232,15 @@ fn run() -> Result<(), Box<dyn Error>> {
     wait_for_key_event(&mut fallback_events, 115, 0, Duration::from_secs(3))?;
     println!("T05 passed: fallback Consumer Volume Up reached evdev");
 
+    set_keyboard_led(&mut fallback_events, 1, false)?;
+    set_keyboard_led(&mut fallback_events, 1, true)?;
+    wait_for_text(
+        &mut *serial,
+        b"@HIDSHIFT-MIRROR:WIRED_LEDS,02",
+        Duration::from_secs(3),
+    )?;
+    println!("T23 passed: fallback Caps Lock output crossed SPI to Host S3");
+
     register_profile(&mut *serial, &profile_a, 1, &mut sequence, true)?;
     wait_for_text(
         &mut *serial,
@@ -402,11 +411,15 @@ fn set_keyboard_led(
     events[20..24].copy_from_slice(&i32::from(enabled).to_ne_bytes());
     events[INPUT_EVENT_LEN + 16..INPUT_EVENT_LEN + 18].copy_from_slice(&EV_SYN.to_ne_bytes());
     let mut last_error = None;
+    let mut sent = false;
     for file in files {
         match file.write_all(&events) {
-            Ok(()) => return Ok(()),
+            Ok(()) => sent = true,
             Err(error) => last_error = Some(error),
         }
+    }
+    if sent {
+        return Ok(());
     }
     Err(last_error
         .map_or_else(|| "no keyboard evdev node".into(), |error| error.into()))

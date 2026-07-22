@@ -613,6 +613,8 @@ fn report_wired_leds(
         ))
         .is_ok()
     {
+        #[cfg(feature = "hardware-e2e")]
+        log::info!("@HIDSHIFT-MIRROR:WIRED_LEDS,{:02X}", leds.bits());
         *pending = None;
     }
 }
