@@ -462,6 +462,7 @@ fn flash_firmware(host_port: &Path, device_port: &Path) -> Result<(), Box<dyn Er
            --target xtensa-esp32s3-none-elf && \
          cargo +esp build --locked -Zbuild-std=core --release \
            --manifest-path device-firmware/Cargo.toml --bin hidshift-device \
+           --features hardware-e2e \
            --target xtensa-esp32s3-none-elf",
         export_file.display()
     );

@@ -60,7 +60,8 @@ HIDSHIFT_DEVICE_PORT=<DEVICE_UART> mise run device-firmware:flash
 ```
 
 `dual-s3-wired` is absent from the production one-board build.
-`hardware-e2e` adds test injection only and must not be used in production.
+`hardware-e2e` adds test injection and boot-time hardware diagnostics only and
+must not be used in production.
 
 On Linux, espflash may require the system packages `libudev-dev` and
 `pkg-config`. Install OS packages separately; mise tasks do not run `sudo` or

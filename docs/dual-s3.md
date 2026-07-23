@@ -43,8 +43,11 @@ interrupt packets, and a 16 KiB MirrorImage are accepted. Bulk, isochronous,
 non-HID interfaces, alternate settings, and multiple configurations are
 rejected before activation. A source device's Remote Wakeup capability is
 preserved in the Configuration Descriptor, including the standard
-SET/CLEAR_FEATURE and GET_STATUS state. Device S3 does not currently originate
-a resume signal while the Wired PC is suspended.
+SET/CLEAR_FEATURE and GET_STATUS state. Fallback also advertises Remote
+Wakeup. While USB is suspended, Device S3 emits one 10 ms resume signal for
+the first standard or mirrored input only when the PC has enabled Remote
+Wakeup. The pulse is advanced by the normal main loop instead of a blocking
+delay, so the fixed 500 us SPI polling schedule remains serviced.
 
 ## Build and flash
 
@@ -60,6 +63,17 @@ HIDSHIFT_DEVICE_PORT=/dev/serial/by-id/<device> mise run device-firmware:flash
 Host S3 connects to the USB Hub. Device S3 connects its native USB port to the
 Wired PC. Device USB contains HID only; use Host S3 BLE management during
 Mirror mode.
+
+For a non-suspend hardware check, build Device S3 with `--features
+hardware-e2e`. Its boot-only register self-test prints the following line on
+the Device S3 USB-UART and then continues normal enumeration:
+
+```text
+@HIDSHIFT-REMOTE-WAKE:clear-before=true,asserted=true,cleared=true
+```
+
+This verifies the PHY clock ungate and DCTL Remote Wakeup signal read-back.
+The production Device build omits the self-test.
 
 ## Management
 

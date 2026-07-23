@@ -10,6 +10,12 @@ publish = false
 name = "hidshift-device"
 path = "src/main.rs"
 
+[features]
+default = []
+# Enables only boot-time hardware self-tests and test diagnostics. Production
+# Device S3 builds intentionally omit these paths.
+hardware-e2e = ["hidshift/hardware-e2e"]
+
 [dependencies]
 esp-backtrace = { version = "0.19.0", default-features = false, features = ["esp32s3", "panic-handler", "println"] }
 esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32s3"] }

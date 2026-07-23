@@ -47,6 +47,8 @@ pub mod management;
 pub mod mirror;
 pub mod mouse_accumulator;
 pub mod output_target;
+#[cfg(feature = "dual-s3-wired")]
+pub mod remote_wakeup;
 pub mod reports;
 pub mod routing;
 pub mod runtime;

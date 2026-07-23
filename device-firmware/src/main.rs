@@ -2,9 +2,10 @@
 #![no_main]
 
 mod boot_presentation;
+mod profile_store;
 mod usb_dynamic;
 mod usb_fallback;
-mod profile_store;
+mod usb_signaling;
 
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
@@ -22,6 +23,7 @@ use hidshift::interchip::{
 use hidshift::mirror::{
     HSMI_MAX_SIZE, MirrorRejectReason, ProfileCommitOutcome, UsbDevicePlan, validate_mirror_image,
 };
+use hidshift::remote_wakeup::{RemoteWakeupAction, RemoteWakeupController};
 use static_cell::StaticCell;
 use usb_device::LangID;
 use usb_device::bus::UsbBus;
@@ -56,6 +58,8 @@ fn main() -> ! {
         ProfileTransferReceiver::new(PROFILE_STAGING.init([0; HSMI_MAX_SIZE]));
 
     let usb = esp_hal::otg_fs::Usb::new(peripherals.USB0, peripherals.GPIO20, peripherals.GPIO19);
+    #[cfg(feature = "hardware-e2e")]
+    usb_signaling::run_hardware_self_test();
     let endpoint_memory = USB_ENDPOINT_MEMORY.init([0; 1024]);
     let usb_bus = esp_hal::otg_fs::UsbBus::new(usb, endpoint_memory);
     let (rx_buffer, rx_descriptors, tx_buffer, tx_descriptors) =
@@ -107,6 +111,7 @@ fn main() -> ! {
         };
         let usb_device = usb_builder
             .device_release(FALLBACK_USB_DEVICE_RELEASE)
+            .supports_remote_wakeup(true)
             .build();
         run(
             spi,
@@ -333,6 +338,7 @@ fn run<'a, B: UsbBus, P: PresentationRuntime<B>>(
     };
     let mut pending_profile_result = None;
     let mut raw_output_sequence = 1u16;
+    let mut remote_wakeup = RemoteWakeupController::new();
 
     loop {
         while !transfer.is_done() {
@@ -342,6 +348,7 @@ fn run<'a, B: UsbBus, P: PresentationRuntime<B>>(
                 &mut link,
                 &mut current_usb_state,
                 &mut raw_output_sequence,
+                &mut remote_wakeup,
             );
             if ever_linked && now_ms().saturating_sub(last_valid_spi_ms) >= SPI_LINK_LOSS_TIMEOUT_MS
             {
@@ -453,7 +460,18 @@ fn run<'a, B: UsbBus, P: PresentationRuntime<B>>(
                     let _ = usb_device.force_reset();
                     restart_presentation();
                 }
-                event => presentation.enqueue_link_event(event),
+                event => {
+                    if link_event_is_usb_activity(&event)
+                        && let Some(action) = remote_wakeup.on_activity(
+                            transaction_ms,
+                            usb_device.state() == UsbDeviceState::Suspend,
+                            usb_device.remote_wakeup_enabled(),
+                        )
+                    {
+                        apply_remote_wakeup_action(action);
+                    }
+                    presentation.enqueue_link_event(event);
+                }
             }
         }
         // Profile flash erase/write is synchronous and can exceed the 1.5 s
@@ -485,6 +503,7 @@ fn run<'a, B: UsbBus, P: PresentationRuntime<B>>(
             &mut link,
             &mut current_usb_state,
             &mut raw_output_sequence,
+            &mut remote_wakeup,
         );
     }
 }
@@ -498,22 +517,7 @@ fn restart_presentation() -> ! {
 }
 
 fn soft_disconnect_usb() {
-    // Synopsys OTG DCTL.SDIS (bit 1) disconnects the pull-up. The current
-    // usb-device adapter does not implement UsbBus::force_reset, so perform
-    // the hardware operation explicitly before resetting the CPU.
-    const DCTL_OFFSET: usize = 0x804;
-    const SOFT_DISCONNECT: u32 = 1 << 1;
-    let dctl = (esp_hal::peripherals::USB0::PTR as usize + DCTL_OFFSET) as *mut u32;
-    // SAFETY: run() exclusively owns USB0, and no USB access occurs after
-    // setting SDIS because this function immediately resets the CPU.
-    unsafe {
-        dctl.write_volatile(dctl.read_volatile() | SOFT_DISCONNECT);
-    }
-    // Keep the pull-up absent long enough for Linux and Windows host
-    // controllers to observe a real disconnect before the new runtime
-    // descriptors appear. A 5 ms gap was intermittently cached as the old
-    // VID/PID during Profile A -> B switching.
-    esp_hal::delay::Delay::new().delay_millis(100);
+    usb_signaling::soft_disconnect();
 }
 
 fn profile_transfer_error_result(
@@ -540,9 +544,14 @@ fn service_usb<B: UsbBus, P: PresentationRuntime<B>>(
     link: &mut DeviceLink,
     current_usb_state: &mut UsbState,
     raw_output_sequence: &mut u16,
+    remote_wakeup: &mut RemoteWakeupController,
 ) {
     presentation.poll(usb_device);
     let now_ms = now_ms();
+    if let Some(action) = remote_wakeup.poll(now_ms, usb_device.state() == UsbDeviceState::Suspend)
+    {
+        apply_remote_wakeup_action(action);
+    }
     if let Some(output) = presentation.take_standard_output()
         && !link.queue_standard_output(output, now_ms)
     {
@@ -575,6 +584,29 @@ fn service_usb<B: UsbBus, P: PresentationRuntime<B>>(
     if next_usb_state != *current_usb_state {
         *current_usb_state = next_usb_state;
         link.update_usb_state(*current_usb_state, now_ms);
+    }
+}
+
+fn link_event_is_usb_activity(event: &DeviceLinkEvent) -> bool {
+    match event {
+        DeviceLinkEvent::StandardInput(report) => report.report.has_activity(),
+        // A completed mirrored interrupt IN transfer represents activity at
+        // the source boundary. Its bytes are intentionally opaque here:
+        // Report IDs and vendor reports must not be interpreted or rewritten.
+        DeviceLinkEvent::RawEndpointIn(report) => !report.data().is_empty(),
+        _ => false,
+    }
+}
+
+fn apply_remote_wakeup_action(action: RemoteWakeupAction) {
+    usb_signaling::apply(action);
+    match action {
+        RemoteWakeupAction::AssertSignal => {
+            log::info!("device-usb: remote wakeup signal asserted");
+        }
+        RemoteWakeupAction::ClearSignal => {
+            log::info!("device-usb: remote wakeup signal cleared");
+        }
     }
 }
 

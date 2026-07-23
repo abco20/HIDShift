@@ -34,6 +34,16 @@ impl StandardHidReport {
             Self::Consumer(_) => ReportKind::Consumer,
         }
     }
+
+    /// Returns whether this report carries an active press or relative
+    /// movement. Neutral/release reports must not wake a suspended USB host.
+    pub fn has_activity(self) -> bool {
+        match self {
+            Self::Keyboard(report) => report.as_bytes().iter().any(|byte| *byte != 0),
+            Self::Mouse(report) => report.as_bytes().iter().any(|byte| *byte != 0),
+            Self::Consumer(report) => report.as_bytes().iter().any(|byte| *byte != 0),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -79,4 +89,26 @@ pub enum ReportKind {
     Mouse,
     Consumer,
     KeyboardOutput,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn neutral_and_release_reports_are_not_user_activity() {
+        assert!(!StandardHidReport::Keyboard(Keyboard6KroReport::release()).has_activity());
+        assert!(!StandardHidReport::Mouse(MouseReport::release_buttons()).has_activity());
+        assert!(!StandardHidReport::Consumer(ConsumerReport::release()).has_activity());
+    }
+
+    #[test]
+    fn presses_and_relative_movement_are_user_activity() {
+        assert!(
+            StandardHidReport::Keyboard(Keyboard6KroReport::from_bytes([0, 0, 4, 0, 0, 0, 0, 0]))
+                .has_activity()
+        );
+        assert!(StandardHidReport::Mouse(MouseReport::from_bytes([0, 1, 0, 0, 0])).has_activity());
+        assert!(StandardHidReport::Consumer(ConsumerReport::from_usage_id(0x00e9)).has_activity());
+    }
 }
