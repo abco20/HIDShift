@@ -748,6 +748,14 @@ fn report_control_request(
         .try_send(RuntimeInputMessage::MirrorControlRequest(request))
         .is_ok()
     {
+        #[cfg(feature = "hardware-e2e")]
+        log::info!(
+            "@HIDSHIFT-MIRROR:CONTROL_REQUEST,{},{:02X?},{},{:04X}",
+            request.request_id,
+            request.setup_packet,
+            request.data().len(),
+            hidshift::checksum::crc16_ccitt_false(request.data())
+        );
         *pending = None;
     }
 }

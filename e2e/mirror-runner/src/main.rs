@@ -2,6 +2,7 @@ use std::error::Error;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -13,18 +14,14 @@ use hidshift::e2e::{E2eCommand, E2ePacket};
 use hidshift::e2e_mirror::{
     MIRROR_E2E_PAYLOAD_MAX, MirrorE2ePacket, OPCODE_HELLO, OPCODE_INJECT_ENDPOINT_IN,
     OPCODE_REGISTER_BEGIN, OPCODE_REGISTER_CHUNK, OPCODE_REGISTER_COMMIT,
-    raw_injection_transfer_id,
-};
-use hidshift::management::{
-    ManagementCommand, ManagementOutputTarget, ManagementResult,
+    OPCODE_SET_CONTROL_RESPONSE, raw_injection_transfer_id,
 };
 use hidshift::fallback::{FALLBACK_USB_PRODUCT_ID, FALLBACK_USB_VENDOR_ID};
 use hidshift::ids::HostId;
+use hidshift::management::{ManagementCommand, ManagementOutputTarget, ManagementResult};
 use hidshift::mirror::validate_mirror_image;
 use hidshift::output_target::MirrorCandidateId;
-use hidshift_client::{
-    ManagementClient, SerialResponseDecoder, encode_serial_request,
-};
+use hidshift_client::{ManagementClient, SerialResponseDecoder, encode_serial_request};
 use serialport::SerialPort;
 
 #[derive(Debug, Parser)]
@@ -42,7 +39,10 @@ struct Arguments {
     profile_a: PathBuf,
     #[arg(long, default_value = "e2e/fixtures/mirror/mouse-b.hsmi")]
     profile_b: PathBuf,
-    #[arg(long, default_value = "e2e/fixtures/mirror/invalid-duplicate-endpoint.hsmi")]
+    #[arg(
+        long,
+        default_value = "e2e/fixtures/mirror/invalid-duplicate-endpoint.hsmi"
+    )]
     invalid_profile: PathBuf,
     #[arg(long, default_value_t = 10)]
     usb_timeout_seconds: u64,
@@ -58,7 +58,11 @@ fn main() {
 fn run() -> Result<(), Box<dyn Error>> {
     let arguments = Arguments::parse();
     if !arguments.skip_flash {
-        return Err("automatic flashing is not implemented yet; pass --skip-flash".into());
+        let device_port = arguments
+            .device_flash_port
+            .as_deref()
+            .ok_or("--device-flash-port is required unless --skip-flash is used")?;
+        flash_firmware(&arguments.host_port, device_port)?;
     }
     let profile_a = fs::read(&arguments.profile_a)?;
     let plan_a = validate_mirror_image(&profile_a)
@@ -73,12 +77,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut serial = serialport::new(arguments.host_port.to_string_lossy(), 115_200)
         .timeout(Duration::from_millis(100))
         .open()?;
-    send_mirror(
-        &mut *serial,
-        MirrorE2ePacket::new(OPCODE_HELLO, 1, 0, 0, &[])
-            .map_err(|error| format!("HELLO packet: {error:?}"))?,
-    )?;
-    wait_for_text(&mut *serial, b"@HIDSHIFT-MIRROR:READY,1,1", Duration::from_secs(3))?;
+    wait_for_mirror_ready(&mut *serial)?;
 
     let mut sequence = 2;
     let mut client = ManagementClient::new(80);
@@ -311,9 +310,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         println!("T15 skipped explicitly: Linux hidraw access was not requested");
     } else {
         let mut vendor_hidraw = open_hidraw(vid_a, pid_a, 1, Duration::from_secs(3))?;
-        let vendor_report = core::array::from_fn::<_, 64, _>(|index| {
-            if index == 0 { 0x10 } else { index as u8 }
-        });
+        let vendor_report =
+            core::array::from_fn::<_, 64, _>(|index| if index == 0 { 0x10 } else { index as u8 });
         inject_endpoint(&mut *serial, &mut sequence, 0x82, &vendor_report)?;
         wait_for_hidraw_report(&mut vendor_hidraw, &vendor_report, Duration::from_secs(3))?;
         vendor_hidraw.write_all(&vendor_report)?;
@@ -327,6 +325,55 @@ fn run() -> Result<(), Box<dyn Error>> {
             Duration::from_secs(3),
         )?;
         println!("T15 passed: 64-byte Vendor IN/OUT report preserved through hidraw");
+
+        let expected_feature =
+            core::array::from_fn::<_, 17, _>(
+                |index| {
+                    if index == 0 { 0x10 } else { 0xa0 + index as u8 }
+                },
+            );
+        set_control_response(&mut *serial, &mut sequence, 0, &expected_feature)?;
+        let mut feature = [0u8; 17];
+        feature[0] = 0x10;
+        let length = hidraw_get_feature(&vendor_hidraw, &mut feature)?;
+        if length != feature.len() || feature != expected_feature {
+            return Err(format!(
+                "GET_REPORT mismatch: length={length} actual={feature:02x?} expected={expected_feature:02x?}"
+            )
+            .into());
+        }
+        wait_for_text(
+            &mut *serial,
+            b"[A1, 01, 10, 03, 01, 00, 11, 00],0",
+            Duration::from_secs(3),
+        )?;
+        println!("T16 passed: HIDIOCGFEATURE crossed deferred EP0 and preserved Report ID");
+
+        set_control_response(&mut *serial, &mut sequence, 0, &[])?;
+        let feature_set =
+            core::array::from_fn::<_, 17, _>(
+                |index| {
+                    if index == 0 { 0x10 } else { 0x50 + index as u8 }
+                },
+            );
+        let length = hidraw_set_feature(&vendor_hidraw, &feature_set)?;
+        if length != feature_set.len() {
+            return Err(format!(
+                "SET_REPORT length mismatch: {length} != {}",
+                feature_set.len()
+            )
+            .into());
+        }
+        let expected_request = format!(
+            "[21, 09, 10, 03, 01, 00, 11, 00],17,{:04X}",
+            crc16_ccitt_false(&feature_set)
+        );
+        wait_for_text(
+            &mut *serial,
+            expected_request.as_bytes(),
+            Duration::from_secs(3),
+        )?;
+        println!("T17 passed: HIDIOCSFEATURE payload and Report ID reached synthetic Host");
     }
 
     register_profile(&mut *serial, &profile_b, 2, &mut sequence, true)?;
@@ -368,6 +415,73 @@ fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn flash_firmware(host_port: &Path, device_port: &Path) -> Result<(), Box<dyn Error>> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("mirror-runner is not below the repository root")?;
+    let export_file = root.join(".mise/esp/export-esp.sh");
+    if !export_file.is_file() {
+        return Err("ESP toolchain is not installed; run `mise run esp:install`".into());
+    }
+
+    let build_script = format!(
+        "source '{}' && \
+         cargo +esp build --locked -Zbuild-std=core,alloc --release \
+           --manifest-path firmware/Cargo.toml --bin firmware \
+           --features hardware-e2e,dual-s3-wired \
+           --target xtensa-esp32s3-none-elf && \
+         cargo +esp build --locked -Zbuild-std=core --release \
+           --manifest-path device-firmware/Cargo.toml --bin hidshift-device \
+           --target xtensa-esp32s3-none-elf",
+        export_file.display()
+    );
+    run_command(
+        Command::new("bash")
+            .args(["-lc", &build_script])
+            .current_dir(root),
+        "build Host and Device S3 firmware",
+    )?;
+    run_command(
+        Command::new("espflash")
+            .args(["flash", "--chip", "esp32s3", "--port"])
+            .arg(device_port)
+            .args([
+                "--partition-table",
+                "partitions/bridge.csv",
+                "--target-app-partition",
+                "factory",
+                "device-firmware/target/xtensa-esp32s3-none-elf/release/hidshift-device",
+            ])
+            .current_dir(root),
+        "flash Device S3",
+    )?;
+    run_command(
+        Command::new("espflash")
+            .args(["flash", "--chip", "esp32s3", "--port"])
+            .arg(host_port)
+            .args([
+                "--partition-table",
+                "partitions/bridge.csv",
+                "--target-app-partition",
+                "factory",
+                "target/xtensa-esp32s3-none-elf/release/firmware",
+            ])
+            .current_dir(root),
+        "flash Host S3",
+    )?;
+    Ok(())
+}
+
+fn run_command(command: &mut Command, description: &str) -> Result<(), Box<dyn Error>> {
+    let status = command.status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{description} failed with {status}").into())
+    }
+}
+
 fn inject_endpoint(
     serial: &mut dyn SerialPort,
     sequence: &mut u32,
@@ -396,6 +510,71 @@ fn inject_endpoint(
     }
     let expected = format!("@HIDSHIFT-MIRROR:INJECTED,{final_sequence}");
     wait_for_text(serial, expected.as_bytes(), Duration::from_secs(3))
+}
+
+fn set_control_response(
+    serial: &mut dyn SerialPort,
+    sequence: &mut u32,
+    status: u8,
+    data: &[u8],
+) -> Result<(), Box<dyn Error>> {
+    if data.len() + 1 > MIRROR_E2E_PAYLOAD_MAX {
+        return Err("synthetic control response exceeds one Mirror E2E packet".into());
+    }
+    let mut payload = [0u8; MIRROR_E2E_PAYLOAD_MAX];
+    payload[0] = status;
+    payload[1..1 + data.len()].copy_from_slice(data);
+    let sent_sequence = *sequence;
+    send_mirror(
+        serial,
+        MirrorE2ePacket::new(
+            OPCODE_SET_CONTROL_RESPONSE,
+            sent_sequence,
+            0,
+            0,
+            &payload[..1 + data.len()],
+        )
+        .map_err(|error| format!("SET_CONTROL_RESPONSE packet: {error:?}"))?,
+    )?;
+    *sequence = sequence.wrapping_add(1);
+    let expected = format!("@HIDSHIFT-MIRROR:CONTROL_RESPONSE_SET,{sent_sequence}");
+    wait_for_text(serial, expected.as_bytes(), Duration::from_secs(3))
+}
+
+fn hidraw_get_feature(file: &fs::File, data: &mut [u8]) -> Result<usize, Box<dyn Error>> {
+    hidraw_feature_ioctl(file, data.as_mut_ptr(), data.len(), 0x07)
+}
+
+fn hidraw_set_feature(file: &fs::File, data: &[u8]) -> Result<usize, Box<dyn Error>> {
+    hidraw_feature_ioctl(file, data.as_ptr().cast_mut(), data.len(), 0x06)
+}
+
+fn hidraw_feature_ioctl(
+    file: &fs::File,
+    data: *mut u8,
+    length: usize,
+    number: u8,
+) -> Result<usize, Box<dyn Error>> {
+    if length > 0x3fff {
+        return Err("hidraw ioctl payload exceeds Linux _IOC size field".into());
+    }
+    let request = hidraw_feature_request(length, number);
+    // SAFETY: `data` points to `length` readable/writable bytes for the
+    // duration of the ioctl, and `file` is an open hidraw descriptor.
+    let result = unsafe { libc::ioctl(file.as_raw_fd(), request, data) };
+    if result < 0 {
+        Err(std::io::Error::last_os_error().into())
+    } else {
+        Ok(result as usize)
+    }
+}
+
+const fn hidraw_feature_request(length: usize, number: u8) -> u64 {
+    const IOC_READ_WRITE: u64 = 3;
+    (IOC_READ_WRITE << 30)
+        | ((length as u64) << 16)
+        | ((b'H' as u64) << 8)
+        | number as u64
 }
 
 fn open_input_events(
@@ -432,10 +611,7 @@ fn open_input_events(
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    Err(format!(
-        "fewer than {minimum_nodes} evdev nodes found for {vid:04x}:{pid:04x}"
-    )
-    .into())
+    Err(format!("fewer than {minimum_nodes} evdev nodes found for {vid:04x}:{pid:04x}").into())
 }
 
 fn set_keyboard_led(
@@ -462,8 +638,7 @@ fn set_keyboard_led(
     if sent {
         return Ok(());
     }
-    Err(last_error
-        .map_or_else(|| "no keyboard evdev node".into(), |error| error.into()))
+    Err(last_error.map_or_else(|| "no keyboard evdev node".into(), |error| error.into()))
 }
 
 fn open_hidraw(
@@ -508,10 +683,7 @@ fn open_hidraw(
         )
         .into());
     }
-    Err(format!(
-        "no hidraw node found for {vid:04x}:{pid:04x} interface {interface_number}"
-    )
-    .into())
+    Err(format!("no hidraw node found for {vid:04x}:{pid:04x} interface {interface_number}").into())
 }
 
 fn ancestor_hex(path: &Path, file_name: &str) -> Option<u16> {
@@ -573,7 +745,8 @@ fn wait_for_input_event(
                             }
                             observed.push((observed_type, code, event_value));
                         }
-                        if observed_type == event_type && code == event_code && event_value == value {
+                        if observed_type == event_type && code == event_code && event_value == value
+                        {
                             return Ok(());
                         }
                     }
@@ -618,13 +791,7 @@ fn register_profile(
         let offset = (index * 47) as u32;
         send_mirror(
             serial,
-            MirrorE2ePacket::new(
-                OPCODE_REGISTER_CHUNK,
-                *sequence,
-                transfer_id,
-                offset,
-                chunk,
-            )
+            MirrorE2ePacket::new(OPCODE_REGISTER_CHUNK, *sequence, transfer_id, offset, chunk)
                 .map_err(|error| format!("REGISTER_CHUNK packet: {error:?}"))?,
         )?;
         *sequence = sequence.wrapping_add(1);
@@ -682,19 +849,31 @@ fn send_management_command(
     Ok(())
 }
 
-fn send_mirror(
-    serial: &mut dyn SerialPort,
-    packet: MirrorE2ePacket,
-) -> Result<(), Box<dyn Error>> {
+fn send_mirror(serial: &mut dyn SerialPort, packet: MirrorE2ePacket) -> Result<(), Box<dyn Error>> {
     serial.write_all(&packet.encode_line())?;
     serial.write_all(b"\n")?;
     Ok(())
 }
 
-fn send_normalized(
-    serial: &mut dyn SerialPort,
-    packet: E2ePacket,
-) -> Result<(), Box<dyn Error>> {
+fn wait_for_mirror_ready(serial: &mut dyn SerialPort) -> Result<(), Box<dyn Error>> {
+    let hello = MirrorE2ePacket::new(OPCODE_HELLO, 1, 0, 0, &[])
+        .map_err(|error| format!("HELLO packet: {error:?}"))?;
+    for _ in 0..8 {
+        send_mirror(serial, hello)?;
+        if wait_for_text(
+            serial,
+            b"@HIDSHIFT-MIRROR:READY,1,1",
+            Duration::from_secs(1),
+        )
+        .is_ok()
+        {
+            return Ok(());
+        }
+    }
+    Err("Host S3 did not answer Mirror E2E HELLO".into())
+}
+
+fn send_normalized(serial: &mut dyn SerialPort, packet: E2ePacket) -> Result<(), Box<dyn Error>> {
     serial.write_all(&packet.encode_line())?;
     serial.write_all(b"\n")?;
     Ok(())
@@ -729,7 +908,10 @@ fn wait_for_text(
                 if !line.is_empty() {
                     eprintln!("host: {}", String::from_utf8_lossy(&line));
                 }
-                if line.windows(expected.len()).any(|window| window == expected) {
+                if line
+                    .windows(expected.len())
+                    .any(|window| window == expected)
+                {
                     return Ok(());
                 }
                 line.clear();
@@ -823,4 +1005,15 @@ fn plan_identity(device_descriptor: &[u8; 18]) -> (u16, u16) {
 
 const fn nonzero_hash(hash: u32) -> u32 {
     if hash == 0 { 1 } else { hash }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linux_hidraw_feature_requests_match_uapi_values() {
+        assert_eq!(hidraw_feature_request(17, 0x07), 0xc011_4807);
+        assert_eq!(hidraw_feature_request(17, 0x06), 0xc011_4806);
+    }
 }

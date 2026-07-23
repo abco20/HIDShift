@@ -64,6 +64,8 @@ pub enum RuntimeInputMessage {
     MirrorControlRequest(crate::interchip::MirrorControlRequest),
     #[cfg(feature = "dual-s3-wired")]
     MirrorControlCompleted(crate::interchip::MirrorControlResponse),
+    #[cfg(all(feature = "dual-s3-wired", feature = "hardware-e2e"))]
+    SyntheticMirrorControlResponse(crate::interchip::MirrorControlResponse),
     #[cfg(feature = "dual-s3-wired")]
     DeviceUsbState(crate::interchip::UsbState),
     #[cfg(feature = "dual-s3-wired")]
@@ -147,6 +149,10 @@ impl RuntimeInputMessage {
             #[cfg(feature = "dual-s3-wired")]
             Self::MirrorControlCompleted(response) => {
                 RuntimeInput::MirrorControlCompleted(*response)
+            }
+            #[cfg(all(feature = "dual-s3-wired", feature = "hardware-e2e"))]
+            Self::SyntheticMirrorControlResponse(response) => {
+                RuntimeInput::SyntheticMirrorControlResponse(*response)
             }
             #[cfg(feature = "dual-s3-wired")]
             Self::DeviceUsbState(state) => RuntimeInput::DeviceUsbState(*state),
@@ -238,6 +244,10 @@ impl TryFrom<RuntimeInput<'_>> for RuntimeInputMessage {
             #[cfg(feature = "dual-s3-wired")]
             RuntimeInput::MirrorControlCompleted(response) => {
                 Ok(Self::MirrorControlCompleted(response))
+            }
+            #[cfg(all(feature = "dual-s3-wired", feature = "hardware-e2e"))]
+            RuntimeInput::SyntheticMirrorControlResponse(response) => {
+                Ok(Self::SyntheticMirrorControlResponse(response))
             }
             #[cfg(feature = "dual-s3-wired")]
             RuntimeInput::DeviceUsbState(state) => Ok(Self::DeviceUsbState(state)),

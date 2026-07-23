@@ -13,12 +13,12 @@ use hidshift::e2e::{E2eCommand, E2ePacket};
 use hidshift::e2e_mirror::{
     MirrorE2ePacket, MirrorRawInjectionReceiver, OPCODE_CLEAR_CANDIDATES, OPCODE_HELLO,
     OPCODE_INJECT_ENDPOINT_IN, OPCODE_REGISTER_BEGIN, OPCODE_REGISTER_CHUNK,
-    OPCODE_REGISTER_COMMIT,
+    OPCODE_REGISTER_COMMIT, OPCODE_SET_CONTROL_RESPONSE,
 };
 #[cfg(all(feature = "hardware-e2e", feature = "dual-s3-wired"))]
 use hidshift::interchip::{
-    ProfileBegin, ProfileChunk, ProfileResultStatus, ProfileTransferEncoder,
-    ProfileTransferReceiver, RawEndpointReport,
+    ControlStatus, MirrorControlResponse, ProfileBegin, ProfileChunk, ProfileResultStatus,
+    ProfileTransferEncoder, ProfileTransferReceiver, RawEndpointReport,
 };
 #[cfg(all(feature = "hardware-e2e", feature = "dual-s3-wired"))]
 use hidshift::mirror::HSMI_MAX_SIZE;
@@ -286,6 +286,36 @@ pub async fn serial_management_task(
                                 error
                             ),
                         },
+                        OPCODE_SET_CONTROL_RESPONSE if !packet.payload().is_empty() => {
+                            let status = match packet.payload()[0] {
+                                0 => Some(ControlStatus::Success),
+                                1 => Some(ControlStatus::Stall),
+                                2 => Some(ControlStatus::Timeout),
+                                3 => Some(ControlStatus::Disconnected),
+                                4 => Some(ControlStatus::Unsupported),
+                                _ => None,
+                            };
+                            match status.and_then(|status| {
+                                MirrorControlResponse::new(0, status, &packet.payload()[1..]).ok()
+                            }) {
+                                Some(response) => {
+                                    sender
+                                        .send(RuntimeInputMessage::SyntheticMirrorControlResponse(
+                                            response,
+                                        ))
+                                        .await;
+                                    log::info!(
+                                        "@HIDSHIFT-MIRROR:CONTROL_RESPONSE_SET,{},{}",
+                                        packet.sequence,
+                                        packet.payload().len() - 1
+                                    );
+                                }
+                                None => log::warn!(
+                                    "@HIDSHIFT-MIRROR:ERROR,{},control-response",
+                                    packet.sequence
+                                ),
+                            }
+                        }
                         _ => log::warn!(
                             "@HIDSHIFT-MIRROR:ERROR,{},opcode,{}",
                             packet.sequence,

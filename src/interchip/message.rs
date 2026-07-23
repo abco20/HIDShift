@@ -277,6 +277,11 @@ impl MirrorControlResponse {
         self.data.split_at(self.length as usize).0
     }
 
+    pub const fn with_request_id(mut self, request_id: u32) -> Self {
+        self.request_id = request_id;
+        self
+    }
+
     pub fn encode(self, out: &mut [u8]) -> Result<usize, MessageError> {
         let length = CONTROL_RESPONSE_HEADER_LEN + self.data().len();
         if out.len() < length {

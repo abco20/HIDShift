@@ -349,15 +349,13 @@ fn run<'a, B: UsbBus, P: PresentationRuntime<B>>(
             }
         }
         let (spi, (mut dma_rx, mut dma_tx)) = transfer.wait();
-        let now_ms = now_ms();
+        let transaction_ms = now_ms();
         let mut received = [0u8; SPI_CELL_LEN];
         received.copy_from_slice(dma_rx.as_slice());
         let mut events = heapless::Vec::<DeviceLinkEvent, 4>::new();
         let valid_cells_before = link.diagnostics().valid_cells;
-        link.handle_transaction(&received, now_ms, &mut events);
-        if link.diagnostics().valid_cells != valid_cells_before {
-            last_valid_spi_ms = now_ms;
-        }
+        link.handle_transaction(&received, transaction_ms, &mut events);
+        let received_valid_cell = link.diagnostics().valid_cells != valid_cells_before;
         ever_linked |= link.host_compatible();
         for event in events {
             match event {
@@ -447,6 +445,13 @@ fn run<'a, B: UsbBus, P: PresentationRuntime<B>>(
                 event => presentation.enqueue_link_event(event),
             }
         }
+        // Profile flash erase/write is synchronous and can exceed the 1.5 s
+        // peer-loss threshold. Count that local work from its completion, not
+        // from the start of the valid transaction that requested it.
+        let now_ms = now_ms();
+        if received_valid_cell {
+            last_valid_spi_ms = now_ms;
+        }
         if let Some(result) = pending_profile_result
             && link.queue_profile_result(result, now_ms)
         {
@@ -493,7 +498,11 @@ fn soft_disconnect_usb() {
     unsafe {
         dctl.write_volatile(dctl.read_volatile() | SOFT_DISCONNECT);
     }
-    esp_hal::delay::Delay::new().delay_millis(5);
+    // Keep the pull-up absent long enough for Linux and Windows host
+    // controllers to observe a real disconnect before the new runtime
+    // descriptors appear. A 5 ms gap was intermittently cached as the old
+    // VID/PID during Profile A -> B switching.
+    esp_hal::delay::Delay::new().delay_millis(100);
 }
 
 fn profile_transfer_error_result(

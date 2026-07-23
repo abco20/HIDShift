@@ -196,6 +196,8 @@ pub enum RuntimeInput<'a> {
     MirrorControlRequest(MirrorControlRequest),
     #[cfg(feature = "dual-s3-wired")]
     MirrorControlCompleted(MirrorControlResponse),
+    #[cfg(all(feature = "dual-s3-wired", feature = "hardware-e2e"))]
+    SyntheticMirrorControlResponse(MirrorControlResponse),
     #[cfg(feature = "dual-s3-wired")]
     DeviceUsbState(crate::interchip::UsbState),
     #[cfg(feature = "dual-s3-wired")]
@@ -246,6 +248,8 @@ pub struct BridgeRuntime<const HOSTS: usize, const USB_INTERFACES: usize> {
     last_mirror_control_request: Option<MirrorControlRequest>,
     #[cfg(feature = "dual-s3-wired")]
     presentation_transition_pending: bool,
+    #[cfg(all(feature = "dual-s3-wired", feature = "hardware-e2e"))]
+    synthetic_control_response: Option<MirrorControlResponse>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -306,6 +310,8 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             last_mirror_control_request: None,
             #[cfg(feature = "dual-s3-wired")]
             presentation_transition_pending: false,
+            #[cfg(all(feature = "dual-s3-wired", feature = "hardware-e2e"))]
+            synthetic_control_response: None,
         }
     }
 
@@ -359,6 +365,18 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         self.mirror_candidates
             .get(candidate)
             .and_then(|metadata| metadata.source_device)
+    }
+
+    #[cfg(all(feature = "dual-s3-wired", feature = "hardware-e2e"))]
+    fn active_synthetic_mirror(&self) -> bool {
+        if self.presentation_transition_pending
+            || self.bridge.state().output_target.active != Some(OutputTarget::Wired)
+        {
+            return false;
+        }
+        self.selected_mirror_candidate()
+            .and_then(|candidate| self.mirror_candidates.get(candidate))
+            .is_some_and(|metadata| metadata.synthetic)
     }
 
     #[cfg(feature = "dual-s3-wired")]
@@ -690,6 +708,19 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                         commands,
                         RuntimeCommand::UsbMirrorControlRequest { device_id, request },
                     )?;
+                } else {
+                    #[cfg(feature = "hardware-e2e")]
+                    if self.active_synthetic_mirror()
+                        && let Some(template) = self.synthetic_control_response
+                    {
+                        let response = template.with_request_id(request.request_id);
+                        push_command(
+                            commands,
+                            RuntimeCommand::DeviceCommand(DeviceTaskCommand::ControlResponse(
+                                response,
+                            )),
+                        )?;
+                    }
                 }
                 Ok(())
             }
@@ -700,6 +731,12 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                     commands,
                     RuntimeCommand::DeviceCommand(DeviceTaskCommand::ControlResponse(response)),
                 )?;
+                Ok(())
+            }
+            #[cfg(all(feature = "dual-s3-wired", feature = "hardware-e2e"))]
+            RuntimeInput::SyntheticMirrorControlResponse(response) => {
+                commands.clear();
+                self.synthetic_control_response = Some(response);
                 Ok(())
             }
             #[cfg(feature = "dual-s3-wired")]
@@ -1579,9 +1616,14 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             wired_ready: self.bridge.state().wired_availability
                 == crate::output_target::OutputTargetAvailability::Ready,
             ready_ble_mask,
-            // Mirror availability is added by the mirror supervisor. Merely
-            // storing a target never makes it effective.
-            effective_presentation: ManagementUsbPresentationKind::Fallback,
+            effective_presentation: if target.active == Some(OutputTarget::Wired)
+                && !self.presentation_transition_pending
+                && self.selected_mirror_candidate().is_some()
+            {
+                ManagementUsbPresentationKind::Mirror
+            } else {
+                ManagementUsbPresentationKind::Fallback
+            },
             mirror_configured: self.bridge.state().mirror_target.is_some(),
             operation_id: target.transition_operation_id,
         }
@@ -3461,6 +3503,49 @@ mod tests {
             runtime.bridge.state().mirror_target,
             Some(StoredMirrorTarget(MirrorStableId::synthetic(0x1122_3344)))
         );
+
+        #[cfg(feature = "hardware-e2e")]
+        {
+            runtime
+                .handle_input::<16, 16, 2>(
+                    RuntimeInput::DeviceUsbState(crate::interchip::UsbState {
+                        attached: true,
+                        configured: true,
+                        fallback_active: false,
+                        healthy: true,
+                        active_profile_hash: 0x1122_3344,
+                        error_code: 0,
+                    }),
+                    &mut commands,
+                )
+                .unwrap();
+            let template = MirrorControlResponse::new(
+                0,
+                crate::interchip::ControlStatus::Success,
+                &[0x10, 1, 2, 3],
+            )
+            .unwrap();
+            runtime
+                .handle_input::<16, 16, 2>(
+                    RuntimeInput::SyntheticMirrorControlResponse(template),
+                    &mut commands,
+                )
+                .unwrap();
+            let request =
+                MirrorControlRequest::new(77, [0xa1, 1, 0x10, 3, 1, 0, 17, 0], &[]).unwrap();
+            runtime
+                .handle_input::<16, 16, 2>(
+                    RuntimeInput::MirrorControlRequest(request),
+                    &mut commands,
+                )
+                .unwrap();
+            assert_eq!(
+                commands.as_slice(),
+                &[RuntimeCommand::DeviceCommand(
+                    DeviceTaskCommand::ControlResponse(template.with_request_id(77))
+                )]
+            );
+        }
 
         runtime
             .handle_input::<16, 16, 2>(
