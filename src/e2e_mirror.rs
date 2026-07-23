@@ -19,6 +19,12 @@ pub const OPCODE_INJECT_SPI_CRC_FAILURE: u8 = 0x30;
 pub const OPCODE_RESET_DEVICE_S3: u8 = 0x31;
 pub const OPCODE_DROP_SPI_CELLS: u8 = 0x32;
 pub const MIRROR_RAW_REPORT_MAX: usize = 64;
+pub const MIRROR_E2E_SPI_DROP_MAX: u32 = 10_000;
+
+pub fn requested_spi_drop_cells(packet: &MirrorE2ePacket) -> Option<u32> {
+    (packet.opcode == OPCODE_DROP_SPI_CELLS && packet.payload().is_empty())
+        .then(|| packet.transfer_id.clamp(1, MIRROR_E2E_SPI_DROP_MAX))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MirrorRawInjection {
@@ -342,5 +348,21 @@ mod tests {
             receiver.push(&gap),
             Err(MirrorRawInjectionError::TransferMismatch)
         );
+    }
+
+    #[test]
+    fn spi_drop_fault_requires_the_opcode_and_clamps_the_poll_count() {
+        let one = MirrorE2ePacket::new(OPCODE_DROP_SPI_CELLS, 1, 0, 0, &[]).unwrap();
+        let bounded = MirrorE2ePacket::new(OPCODE_DROP_SPI_CELLS, 2, u32::MAX, 0, &[]).unwrap();
+        let payload = MirrorE2ePacket::new(OPCODE_DROP_SPI_CELLS, 3, 4, 0, &[1]).unwrap();
+        let other = MirrorE2ePacket::new(OPCODE_INJECT_SPI_CRC_FAILURE, 4, 4, 0, &[]).unwrap();
+
+        assert_eq!(requested_spi_drop_cells(&one), Some(1));
+        assert_eq!(
+            requested_spi_drop_cells(&bounded),
+            Some(MIRROR_E2E_SPI_DROP_MAX)
+        );
+        assert_eq!(requested_spi_drop_cells(&payload), None);
+        assert_eq!(requested_spi_drop_cells(&other), None);
     }
 }

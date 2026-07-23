@@ -62,7 +62,10 @@ from a short or otherwise unrepresentative run.
 Fallback HID, and registers synthetic `.hsmi` candidates for dynamic Mirror
 tests. It verifies Linux evdev, raw endpoint reports, profile switching,
 invalid-image rejection, BLE/Wired presentation switching, LED output, and
-Device S3 reboot recovery without a physical test keyboard.
+Device S3 reboot recovery without a physical test keyboard. It also drops
+Host-side SPI polls long enough to exercise the 1.5-second link-loss path,
+asserting that Wired remains selected with no active failover target before
+Fallback recovers.
 
 A normal flashing run erases the Host settings partition and Device Mirror
 profile partition first, so every run exercises fresh Profile A/B commits.
@@ -80,3 +83,7 @@ Use `--skip-flash` to reuse loaded images. Explicit ports avoid confusing the
 two ESP32-S3 roles after Device S3 changes its native USB identity.
 `--skip-hidraw` omits Vendor and Feature Report cases when local udev policy
 does not grant read/write access to `/dev/hidraw*`; evdev cases still run.
+Use `--skip-flash --spi-loss-only --device-flash-port <device-s3>` for a short
+T26 run against already loaded hardware. This mode does not read or register
+Mirror fixture files; the Device port is used only to reset the intentionally
+offline SPI slave after the no-failover assertion.

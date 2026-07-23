@@ -13,9 +13,9 @@ use hidshift::checksum::{crc16_ccitt_false, crc32_ieee};
 use hidshift::e2e::{E2eCommand, E2ePacket};
 use hidshift::e2e_mirror::{
     MIRROR_E2E_PAYLOAD_MAX, MirrorE2ePacket, OPCODE_HELLO, OPCODE_INJECT_ENDPOINT_IN,
-    OPCODE_INJECT_SPI_CRC_FAILURE, OPCODE_READ_MOCK_STATUS, OPCODE_REGISTER_BEGIN,
-    OPCODE_REGISTER_CHUNK, OPCODE_REGISTER_COMMIT, OPCODE_RESET_MOCK_STATUS,
-    OPCODE_SET_CONTROL_RESPONSE, raw_injection_transfer_id,
+    OPCODE_DROP_SPI_CELLS, OPCODE_INJECT_SPI_CRC_FAILURE, OPCODE_READ_MOCK_STATUS,
+    OPCODE_REGISTER_BEGIN, OPCODE_REGISTER_CHUNK, OPCODE_REGISTER_COMMIT,
+    OPCODE_RESET_MOCK_STATUS, OPCODE_SET_CONTROL_RESPONSE, raw_injection_transfer_id,
 };
 use hidshift::fallback::{FALLBACK_USB_PRODUCT_ID, FALLBACK_USB_VENDOR_ID};
 use hidshift::ids::HostId;
@@ -23,7 +23,7 @@ use hidshift::management::{
     ManagementCommand, ManagementOutputTarget, ManagementResponsePayload, ManagementResult,
 };
 use hidshift::mirror::validate_mirror_image;
-use hidshift::output_target::MirrorCandidateId;
+use hidshift::output_target::{MirrorCandidateId, OutputTargetAvailability};
 use hidshift_client::{ManagementClient, SerialResponseDecoder, encode_serial_request};
 use serialport::SerialPort;
 
@@ -35,6 +35,9 @@ struct Arguments {
     device_flash_port: Option<PathBuf>,
     #[arg(long)]
     skip_flash: bool,
+    /// Run only the SPI link-loss/no-failover scenario against existing images.
+    #[arg(long)]
+    spi_loss_only: bool,
     /// Skip T15 when the Linux hidraw node is not accessible to this user.
     #[arg(long)]
     skip_hidraw: bool,
@@ -67,6 +70,47 @@ fn run() -> Result<(), Box<dyn Error>> {
             .ok_or("--device-flash-port is required unless --skip-flash is used")?;
         flash_firmware(&arguments.host_port, device_port)?;
     }
+    let mut serial = serialport::new(arguments.host_port.to_string_lossy(), 115_200)
+        .timeout(Duration::from_millis(100))
+        .open()?;
+    wait_for_mirror_ready(&mut *serial)?;
+
+    let mut sequence = 2;
+    let mut client = ManagementClient::new(80);
+    wait_for_management_ready(&mut *serial, &mut client, Duration::from_secs(30))?;
+    if arguments.spi_loss_only {
+        send_management_command(
+            &mut *serial,
+            &mut client,
+            ManagementCommand::ClearMirrorTarget,
+            "CLEAR_MIRROR_TARGET",
+        )?;
+        send_management_command(
+            &mut *serial,
+            &mut client,
+            ManagementCommand::SelectOutputTarget(ManagementOutputTarget::Wired),
+            "SELECT_OUTPUT_TARGET(Wired)",
+        )?;
+        wait_for_usb_identity(
+            &mut *serial,
+            FALLBACK_USB_VENDOR_ID,
+            FALLBACK_USB_PRODUCT_ID,
+            Duration::from_secs(arguments.usb_timeout_seconds),
+        )?;
+        let device_port = arguments
+            .device_flash_port
+            .as_deref()
+            .ok_or("--device-flash-port is required with --spi-loss-only to restore the link")?;
+        verify_spi_loss(
+            &mut *serial,
+            &mut sequence,
+            &mut client,
+            device_port,
+            arguments.usb_timeout_seconds,
+        )?;
+        return Ok(());
+    }
+
     let profile_a = fs::read(&arguments.profile_a)?;
     let plan_a = validate_mirror_image(&profile_a)
         .map_err(|reason| format!("Profile A validation failed: {reason:?}"))?;
@@ -77,13 +121,6 @@ fn run() -> Result<(), Box<dyn Error>> {
     let (vid_b, pid_b) = plan_identity(&plan_b.device_descriptor);
     let invalid_profile = fs::read(&arguments.invalid_profile)?;
 
-    let mut serial = serialport::new(arguments.host_port.to_string_lossy(), 115_200)
-        .timeout(Duration::from_millis(100))
-        .open()?;
-    wait_for_mirror_ready(&mut *serial)?;
-
-    let mut sequence = 2;
-    let mut client = ManagementClient::new(80);
     send_management_command(
         &mut *serial,
         &mut client,
@@ -243,6 +280,18 @@ fn run() -> Result<(), Box<dyn Error>> {
         Duration::from_secs(3),
     )?;
     println!("T23 passed: fallback Caps Lock output crossed SPI to Host S3");
+
+    if let Some(device_port) = arguments.device_flash_port.as_deref() {
+        verify_spi_loss(
+            &mut *serial,
+            &mut sequence,
+            &mut client,
+            device_port,
+            arguments.usb_timeout_seconds,
+        )?;
+    } else {
+        println!("T26 skipped: --device-flash-port is required to restore the SPI link");
+    }
 
     register_profile(&mut *serial, &profile_a, 1, &mut sequence, true)?;
     wait_for_text(
@@ -617,6 +666,59 @@ fn arm_spi_crc_failure(
     wait_for_text(serial, expected.as_bytes(), Duration::from_secs(3))
 }
 
+fn arm_spi_cell_drop(
+    serial: &mut dyn SerialPort,
+    sequence: &mut u32,
+    cells: u32,
+) -> Result<(), Box<dyn Error>> {
+    let sent_sequence = *sequence;
+    send_mirror(
+        serial,
+        MirrorE2ePacket::new(OPCODE_DROP_SPI_CELLS, sent_sequence, cells, 0, &[])
+            .map_err(|error| format!("DROP_SPI_CELLS packet: {error:?}"))?,
+    )?;
+    *sequence = sequence.wrapping_add(1);
+    let expected = format!("@HIDSHIFT-MIRROR:SPI_DROP_ARMED,{sent_sequence},{cells}");
+    wait_for_text(serial, expected.as_bytes(), Duration::from_secs(3))
+}
+
+fn verify_spi_loss(
+    serial: &mut dyn SerialPort,
+    sequence: &mut u32,
+    client: &mut ManagementClient,
+    device_port: &Path,
+    usb_timeout_seconds: u64,
+) -> Result<(), Box<dyn Error>> {
+    arm_spi_cell_drop(serial, sequence, 5_000)?;
+    std::thread::sleep(Duration::from_millis(1_650));
+    let status = output_target_status(serial, client)?;
+    if status.selected != ManagementOutputTarget::Wired
+        || status.active.is_some()
+        || status.availability != OutputTargetAvailability::Unavailable
+    {
+        return Err(format!(
+            "SPI loss unexpectedly changed/routed the target: selected={:?} active={:?} availability={:?}",
+            status.selected, status.active, status.availability
+        )
+        .into());
+    }
+    println!("T26 passed: SPI loss kept Wired selected with no active failover target");
+
+    // T26 models an unavailable inter-chip link. Reset the Device S3 after
+    // observing that terminal state so the remaining suite starts from a
+    // deterministic SPI slave DMA transaction.
+    reset_device_s3(device_port)?;
+    wait_for_wired_ready(serial, client, Duration::from_secs(10))?;
+    wait_for_usb_identity(
+        serial,
+        FALLBACK_USB_VENDOR_ID,
+        FALLBACK_USB_PRODUCT_ID,
+        Duration::from_secs(usb_timeout_seconds + 5),
+    )?;
+    println!("T26 cleanup: Device S3 reset restored Wired fallback");
+    Ok(())
+}
+
 fn assert_spi_crc_retry(
     serial: &mut dyn SerialPort,
     sequence: &mut u32,
@@ -968,6 +1070,69 @@ fn send_management_command(
         return Err(format!("{name} failed: {:?}", response.result).into());
     }
     Ok(())
+}
+
+fn wait_for_management_ready(
+    serial: &mut dyn SerialPort,
+    client: &mut ManagementClient,
+    timeout: Duration,
+) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let pending = client
+            .begin(ManagementCommand::GetOutputTargetStatus)
+            .map_err(|error| format!("management readiness request: {error:?}"))?;
+        serial.write_all(&encode_serial_request(pending))?;
+        match wait_management_response(serial, client, Duration::from_secs(1)) {
+            Ok(response) if response.result == ManagementResult::Ok => return Ok(()),
+            Ok(_) | Err(_) => {
+                client.cancel();
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+    Err("Host S3 management runtime did not become ready".into())
+}
+
+fn output_target_status(
+    serial: &mut dyn SerialPort,
+    client: &mut ManagementClient,
+) -> Result<hidshift::ManagementOutputTargetStatus, Box<dyn Error>> {
+    let pending = client
+        .begin(ManagementCommand::GetOutputTargetStatus)
+        .map_err(|error| format!("GET_OUTPUT_TARGET_STATUS request: {error:?}"))?;
+    serial.write_all(&encode_serial_request(pending))?;
+    let response = wait_management_response(serial, client, Duration::from_secs(2))?;
+    match (response.result, response.payload) {
+        (
+            ManagementResult::Ok,
+            ManagementResponsePayload::OutputTargetStatus(status),
+        ) => Ok(status),
+        (result, payload) => Err(format!(
+            "GET_OUTPUT_TARGET_STATUS failed: result={result:?} payload={payload:?}"
+        )
+        .into()),
+    }
+}
+
+fn wait_for_wired_ready(
+    serial: &mut dyn SerialPort,
+    client: &mut ManagementClient,
+    timeout: Duration,
+) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Ok(status) = output_target_status(serial, client)
+            && status.selected == ManagementOutputTarget::Wired
+            && status.active == Some(ManagementOutputTarget::Wired)
+            && status.wired_ready
+        {
+            return Ok(());
+        }
+        client.cancel();
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err("Wired target did not recover after Device S3 reset".into())
 }
 
 fn send_mirror(serial: &mut dyn SerialPort, packet: MirrorE2ePacket) -> Result<(), Box<dyn Error>> {

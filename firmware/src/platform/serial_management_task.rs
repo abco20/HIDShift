@@ -11,10 +11,10 @@ use hidshift::runtime::message::RuntimeInputMessage;
 use hidshift::e2e::{E2eCommand, E2ePacket};
 #[cfg(all(feature = "hardware-e2e", feature = "dual-s3-wired"))]
 use hidshift::e2e_mirror::{
-    MirrorE2ePacket, MirrorRawInjectionReceiver, OPCODE_CLEAR_CANDIDATES, OPCODE_HELLO,
-    OPCODE_INJECT_ENDPOINT_IN, OPCODE_INJECT_SPI_CRC_FAILURE, OPCODE_READ_MOCK_STATUS,
-    OPCODE_REGISTER_BEGIN, OPCODE_REGISTER_CHUNK, OPCODE_REGISTER_COMMIT, OPCODE_RESET_MOCK_STATUS,
-    OPCODE_SET_CONTROL_RESPONSE,
+    MirrorE2ePacket, MirrorRawInjectionReceiver, OPCODE_CLEAR_CANDIDATES, OPCODE_DROP_SPI_CELLS,
+    OPCODE_HELLO, OPCODE_INJECT_ENDPOINT_IN, OPCODE_INJECT_SPI_CRC_FAILURE,
+    OPCODE_READ_MOCK_STATUS, OPCODE_REGISTER_BEGIN, OPCODE_REGISTER_CHUNK, OPCODE_REGISTER_COMMIT,
+    OPCODE_RESET_MOCK_STATUS, OPCODE_SET_CONTROL_RESPONSE, requested_spi_drop_cells,
 };
 #[cfg(all(feature = "hardware-e2e", feature = "dual-s3-wired"))]
 use hidshift::interchip::{
@@ -326,6 +326,19 @@ pub async fn serial_management_task(
                                 count
                             );
                         }
+                        OPCODE_DROP_SPI_CELLS => match requested_spi_drop_cells(&packet) {
+                            Some(count) => {
+                                super::mirror_e2e_fault::request_spi_cell_drops(count);
+                                log::info!(
+                                    "@HIDSHIFT-MIRROR:SPI_DROP_ARMED,{},{}",
+                                    packet.sequence,
+                                    count
+                                );
+                            }
+                            None => {
+                                log::warn!("@HIDSHIFT-MIRROR:ERROR,{},spi-drop", packet.sequence)
+                            }
+                        },
                         OPCODE_READ_MOCK_STATUS => {
                             let status = super::mirror_e2e_fault::snapshot();
                             log::info!(

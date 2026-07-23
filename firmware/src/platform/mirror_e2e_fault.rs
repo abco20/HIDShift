@@ -4,6 +4,7 @@ static TX_CRC_FAILURES_REMAINING: AtomicU32 = AtomicU32::new(0);
 static LAST_CORRUPTED_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 static TX_CRC_FAILURES_INJECTED: AtomicU32 = AtomicU32::new(0);
 static TX_CRC_RETRANSMISSIONS_OBSERVED: AtomicU32 = AtomicU32::new(0);
+static SPI_CELLS_TO_DROP: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SpiFaultSnapshot {
@@ -14,6 +15,16 @@ pub struct SpiFaultSnapshot {
 
 pub fn request_tx_crc_failures(count: u32) {
     TX_CRC_FAILURES_REMAINING.fetch_add(count, Ordering::Relaxed);
+}
+
+pub fn request_spi_cell_drops(count: u32) {
+    let _ = SPI_CELLS_TO_DROP.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(count))
+    });
+}
+
+pub fn consume_spi_cell_drop() -> bool {
+    consume_one(&SPI_CELLS_TO_DROP)
 }
 
 pub fn corrupt_tx_if_requested(sequence: u16, encoded_cell: &mut [u8]) -> bool {
@@ -51,6 +62,7 @@ pub fn reset() {
     LAST_CORRUPTED_SEQUENCE.store(0, Ordering::Relaxed);
     TX_CRC_FAILURES_INJECTED.store(0, Ordering::Relaxed);
     TX_CRC_RETRANSMISSIONS_OBSERVED.store(0, Ordering::Relaxed);
+    SPI_CELLS_TO_DROP.store(0, Ordering::Relaxed);
 }
 
 fn consume_one(counter: &AtomicU32) -> bool {

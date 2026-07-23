@@ -192,6 +192,11 @@ async fn run_link(
             diagnostics.resets = diagnostics.resets.saturating_add(1);
         }
 
+        #[cfg(feature = "hardware-e2e")]
+        if super::mirror_e2e_fault::consume_spi_cell_drop() {
+            continue;
+        }
+
         sender.set_cumulative_ack(receiver.cumulative_ack());
         let retransmit =
             sender.poll_retransmit(now_ms, RETRANSMIT_TIMEOUT_MS, MAX_RETRANSMIT_ATTEMPTS);
