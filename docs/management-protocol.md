@@ -27,6 +27,19 @@ setting get/set. Response payloads are explicitly tagged and never inferred
 from an opcode. Result codes distinguish invalid host, missing host, existing
 bond, invalid name, invalid setting, missing indexed item, and internal errors.
 
+When schema capability bit 0 (`dual_s3_wired`) is set, clients may also use
+`SELECT_OUTPUT_TARGET`, `GET_OUTPUT_TARGET_STATUS`, `GET_MIRROR_CANDIDATE`,
+`SET_MIRROR_TARGET`, `CLEAR_MIRROR_TARGET`, and `FORCE_FALLBACK`.
+
+Output and Mirror selections are independent persisted values. Selecting BLE
+keeps the Mirror target but presents neutral Fallback USB. No command performs
+automatic failover. Mirror operations are asynchronous; status reports
+selected/active targets, availability, presentation, and operation ID.
+
+These commands remain available through Host S3 BLE Management while Device
+S3 presents mirrored USB. Device S3 exposes no management, serial, CDC, or
+vendor interface on its native USB connection.
+
 `src/settings.rs` declares the settings schema once. CLI and Web use the same
 compiled descriptors and verify the firmware schema version/count/hash before
 showing values. Wire IDs are stable numeric values; display labels and command

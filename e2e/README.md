@@ -55,3 +55,22 @@ retained two-host session. `--skip-linux` intentionally measures one link.
 Timestamped JSON results are written to ignored files in `e2e/results/`.
 `e2e/baseline.json` is the only tracked performance reference. Do not update it
 from a short or otherwise unrepresentative run.
+
+## Dual-S3 Wired and Mirror E2E
+
+`e2e/mirror-runner` flashes both S3 boards, uses normalized UART injection for
+Fallback HID, and registers synthetic `.hsmi` candidates for dynamic Mirror
+tests. It verifies Linux evdev, raw endpoint reports, profile switching,
+invalid-image rejection, BLE/Wired presentation switching, LED output, and
+Device S3 reboot recovery without a physical test keyboard.
+
+```sh
+cargo run --manifest-path e2e/mirror-runner/Cargo.toml -- \
+  --host-port /dev/serial/by-id/<host-s3> \
+  --device-flash-port /dev/serial/by-id/<device-s3>
+```
+
+Use `--skip-flash` to reuse loaded images. Explicit ports avoid confusing the
+two ESP32-S3 roles after Device S3 changes its native USB identity.
+`--skip-hidraw` omits Vendor and Feature Report cases when local udev policy
+does not grant read/write access to `/dev/hidraw*`; evdev cases still run.
