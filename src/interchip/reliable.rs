@@ -1,58 +1,55 @@
 use super::cell::{SPI_CELL_PAYLOAD_LEN, SpiCell};
+use heapless::Deque;
 
 pub const SPI_TX_WINDOW: usize = 4;
 
-/// Holds one application command across link-session renegotiation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ReliableCommandSlot<T> {
-    value: Option<T>,
-    queued: bool,
+/// Keeps application records aligned with the sender window so unacknowledged
+/// records can be rebuilt after a link-session reset.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReliableDeliveryQueue<T> {
+    inflight: Deque<T, SPI_TX_WINDOW>,
+    retry: Deque<T, SPI_TX_WINDOW>,
 }
 
-impl<T: Copy> ReliableCommandSlot<T> {
+impl<T> ReliableDeliveryQueue<T> {
     pub const fn new() -> Self {
         Self {
-            value: None,
-            queued: false,
+            inflight: Deque::new(),
+            retry: Deque::new(),
         }
     }
 
-    pub fn stage(&mut self, value: T) {
-        self.value = Some(value);
-        self.queued = false;
+    pub fn record_queued(&mut self, value: T) -> Result<(), T> {
+        self.inflight.push_back(value)
     }
 
-    pub const fn value(self) -> Option<T> {
-        self.value
-    }
-
-    pub fn mark_queued(&mut self) {
-        self.queued = self.value.is_some();
-    }
-
-    pub fn sender_reset(&mut self) {
-        self.queued = false;
-    }
-
-    pub fn acknowledge(&mut self, command_completed: bool) -> Option<T> {
-        if !self.queued {
-            return None;
-        }
-        self.queued = false;
-        if command_completed {
-            self.value.take()
-        } else {
-            None
+    pub fn acknowledge(&mut self, count: usize) {
+        for _ in 0..count {
+            let _ = self.inflight.pop_front();
         }
     }
 
-    pub fn complete(&mut self) -> Option<T> {
-        self.queued = false;
-        self.value.take()
+    pub fn next_retry(&mut self) -> Option<T> {
+        self.retry.pop_front()
+    }
+
+    pub fn retry_after_session_reset(&mut self) {
+        while let Some(value) = self.inflight.pop_back() {
+            // The combined retry + inflight population never exceeds the
+            // transport window, so this can fail only if invariants drift.
+            if let Err(value) = self.retry.push_front(value) {
+                let _ = self.inflight.push_back(value);
+                return;
+            }
+        }
+    }
+
+    pub fn has_inflight(&self) -> bool {
+        !self.inflight.is_empty()
     }
 }
 
-impl<T: Copy> Default for ReliableCommandSlot<T> {
+impl<T> Default for ReliableDeliveryQueue<T> {
     fn default() -> Self {
         Self::new()
     }
@@ -96,12 +93,6 @@ impl ReliableSender {
         self.next_sequence = 1;
         self.cumulative_ack = 0;
         self.pending = [None; SPI_TX_WINDOW];
-    }
-
-    pub fn discard_pending(&mut self) -> usize {
-        let discarded = self.pending_len();
-        self.pending = [None; SPI_TX_WINDOW];
-        discarded
     }
 
     pub fn queue(
@@ -301,34 +292,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn command_survives_session_reset_and_replacement_hello_ack() {
-        let mut slot = ReliableCommandSlot::new();
-        slot.stage(7u8);
-        slot.mark_queued();
-        slot.sender_reset();
+    fn delivery_queue_replays_only_unacknowledged_values_in_order() {
+        let mut delivery = ReliableDeliveryQueue::new();
+        for value in 1..=4 {
+            delivery.record_queued(value).unwrap();
+        }
+        delivery.acknowledge(2);
+        delivery.retry_after_session_reset();
 
-        assert_eq!(slot.acknowledge(true), None);
-        assert_eq!(slot.value(), Some(7));
-
-        slot.mark_queued();
-        assert_eq!(slot.acknowledge(false), None);
-        assert_eq!(slot.value(), Some(7));
-        slot.mark_queued();
-        assert_eq!(slot.acknowledge(true), Some(7));
-        assert_eq!(slot.value(), None);
-
-        slot.stage(9);
-        assert_eq!(slot.complete(), Some(9));
-        assert_eq!(slot.value(), None);
-    }
-
-    #[test]
-    fn semantic_ack_can_discard_pending_transport_cell() {
-        let mut sender = ReliableSender::new(1);
-        sender.queue(&[1], 1, 0).unwrap();
-        assert_eq!(sender.pending_len(), 1);
-        assert_eq!(sender.discard_pending(), 1);
-        assert_eq!(sender.pending_len(), 0);
+        assert_eq!(delivery.next_retry(), Some(3));
+        delivery.record_queued(3).unwrap();
+        assert_eq!(delivery.next_retry(), Some(4));
+        delivery.record_queued(4).unwrap();
+        delivery.acknowledge(2);
+        assert!(!delivery.has_inflight());
+        assert_eq!(delivery.next_retry(), None);
     }
 
     #[test]

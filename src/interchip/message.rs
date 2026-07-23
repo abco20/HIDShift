@@ -42,7 +42,7 @@ pub const RAW_ENDPOINT_MAX_DATA_LEN: usize = 64;
 pub const RAW_ENDPOINT_MAX_WIRE_LEN: usize = RAW_ENDPOINT_HEADER_LEN + RAW_ENDPOINT_MAX_DATA_LEN;
 pub const CONTROL_REQUEST_HEADER_LEN: usize = 14;
 pub const CONTROL_RESPONSE_HEADER_LEN: usize = 7;
-pub const CONTROL_DATA_MAX_LEN: usize = 92;
+pub const CONTROL_DATA_MAX_LEN: usize = 256;
 pub const CONTROL_REQUEST_MAX_WIRE_LEN: usize = CONTROL_REQUEST_HEADER_LEN + CONTROL_DATA_MAX_LEN;
 pub const CONTROL_RESPONSE_MAX_WIRE_LEN: usize = CONTROL_RESPONSE_HEADER_LEN + CONTROL_DATA_MAX_LEN;
 
@@ -193,7 +193,7 @@ impl RawEndpointReport {
 pub struct MirrorControlRequest {
     pub request_id: u32,
     pub setup_packet: [u8; 8],
-    length: u8,
+    length: u16,
     data: [u8; CONTROL_DATA_MAX_LEN],
 }
 
@@ -205,7 +205,7 @@ impl MirrorControlRequest {
         let mut request = Self {
             request_id,
             setup_packet,
-            length: data.len() as u8,
+            length: data.len() as u16,
             data: [0; CONTROL_DATA_MAX_LEN],
         };
         request.data[..data.len()].copy_from_slice(data);
@@ -254,7 +254,7 @@ pub enum ControlStatus {
 pub struct MirrorControlResponse {
     pub request_id: u32,
     pub status: ControlStatus,
-    length: u8,
+    length: u16,
     data: [u8; CONTROL_DATA_MAX_LEN],
 }
 
@@ -266,7 +266,7 @@ impl MirrorControlResponse {
         let mut response = Self {
             request_id,
             status,
-            length: data.len() as u8,
+            length: data.len() as u16,
             data: [0; CONTROL_DATA_MAX_LEN],
         };
         response.data[..data.len()].copy_from_slice(data);

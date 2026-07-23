@@ -12,10 +12,10 @@ use super::message::{
     RECORD_STANDARD_OUTPUT_REPORT, RECORD_STANDARD_RELEASE_ALL, RECORD_USB_STATE,
 };
 use super::{
-    Hello, InterchipRole, RawEndpointReport, ReceiveDisposition, Record, RecordIter,
-    ReliableReceiver, ReliableSender, RetransmitAction, SPI_CELL_LEN, SPI_CELL_PAYLOAD_LEN,
-    SPI_PROTOCOL_VERSION, SpiCell, StandardInputReport, StandardOutputReport, UsbState,
-    encode_records,
+    ControlRequestFragment, ControlResponseAssembler, ControlResponseFragment, Hello,
+    InterchipRole, RawEndpointReport, ReceiveDisposition, Record, RecordIter, ReliableReceiver,
+    ReliableSender, RetransmitAction, SPI_CELL_LEN, SPI_CELL_PAYLOAD_LEN, SPI_PROTOCOL_VERSION,
+    SpiCell, StandardInputReport, StandardOutputReport, UsbState, encode_records,
 };
 
 const DEVICE_CAPABILITIES: u32 =
@@ -56,6 +56,8 @@ pub struct DeviceLink {
     diagnostics: DeviceLinkDiagnostics,
     capabilities: u32,
     active_profile_hash: u32,
+    control_request_tx: Option<(MirrorControlRequest, u16)>,
+    control_response_assembler: ControlResponseAssembler,
 }
 
 impl DeviceLink {
@@ -96,6 +98,8 @@ impl DeviceLink {
             diagnostics: DeviceLinkDiagnostics::default(),
             capabilities,
             active_profile_hash,
+            control_request_tx: None,
+            control_response_assembler: ControlResponseAssembler::new(),
         };
         link.next_cell = link.queue_hello(0);
         link
@@ -146,36 +150,37 @@ impl DeviceLink {
     }
 
     pub fn queue_control_request(&mut self, request: MirrorControlRequest, now_ms: u64) -> bool {
-        if !self.host_compatible || self.next_cell.is_some() {
+        if !self.host_compatible || self.next_cell.is_some() || self.control_request_tx.is_some() {
             return false;
         }
-        let mut data = [0; super::message::CONTROL_REQUEST_MAX_WIRE_LEN];
-        let Ok(length) = request.encode(&mut data) else {
-            return false;
-        };
-        self.next_cell = self.queue_record(RECORD_CONTROL_REQUEST, &data[..length], now_ms);
+        self.control_request_tx = Some((request, 0));
+        self.next_cell = self.queue_next_control_request_fragment(now_ms);
         self.next_cell.is_some()
     }
 
     pub fn next_transaction(&mut self, now_ms: u64) -> [u8; SPI_CELL_LEN] {
         self.sender
             .set_cumulative_ack(self.receiver.cumulative_ack());
-        let cell = self.next_cell.take().or_else(|| {
-            match self.sender.poll_retransmit(
-                now_ms,
-                RETRANSMIT_TIMEOUT_MS,
-                MAX_RETRANSMIT_ATTEMPTS,
-            ) {
-                RetransmitAction::Send(cell) => Some(cell),
-                RetransmitAction::LinkResetRequired => {
-                    let session = nonzero_session(self.sender.session_id().wrapping_add(1));
-                    self.sender.reset_session(session);
-                    self.host_compatible = false;
-                    self.queue_record(RECORD_LINK_RESET, &[], now_ms)
+        let cell = self
+            .next_cell
+            .take()
+            .or_else(|| self.queue_next_control_request_fragment(now_ms))
+            .or_else(|| {
+                match self.sender.poll_retransmit(
+                    now_ms,
+                    RETRANSMIT_TIMEOUT_MS,
+                    MAX_RETRANSMIT_ATTEMPTS,
+                ) {
+                    RetransmitAction::Send(cell) => Some(cell),
+                    RetransmitAction::LinkResetRequired => {
+                        let session = nonzero_session(self.sender.session_id().wrapping_add(1));
+                        self.sender.reset_session(session);
+                        self.host_compatible = false;
+                        self.queue_record(RECORD_LINK_RESET, &[], now_ms)
+                    }
+                    RetransmitAction::Idle => None,
                 }
-                RetransmitAction::Idle => None,
-            }
-        });
+            });
         let mut cell = cell.unwrap_or_else(|| SpiCell::empty(self.sender.session_id()));
         cell.header.cumulative_ack = self.receiver.cumulative_ack();
         cell.encode().unwrap_or([0; SPI_CELL_LEN])
@@ -199,6 +204,8 @@ impl DeviceLink {
         self.sender.acknowledge(cell.header.cumulative_ack);
         if self.receiver.session_id() != Some(cell.header.session_id) {
             self.host_compatible = false;
+            self.control_request_tx = None;
+            self.control_response_assembler.reset();
             if !contains_compatible_host_hello(&cell) {
                 self.receiver.reset_session(cell.header.session_id);
                 return;
@@ -241,6 +248,8 @@ impl DeviceLink {
                 RECORD_HEARTBEAT => {}
                 RECORD_LINK_RESET => {
                     self.host_compatible = false;
+                    self.control_request_tx = None;
+                    self.control_response_assembler.reset();
                     self.next_cell = self.queue_hello(now_ms);
                 }
                 RECORD_FORCE_FALLBACK => {
@@ -302,10 +311,13 @@ impl DeviceLink {
                     }
                 }
                 RECORD_CONTROL_RESPONSE if self.host_compatible => {
-                    match MirrorControlResponse::decode(record.data) {
-                        Ok(response) => {
-                            self.push_event(events, DeviceLinkEvent::ControlResponse(response))
+                    match ControlResponseFragment::decode(record.data)
+                        .and_then(|fragment| self.control_response_assembler.push(fragment))
+                    {
+                        Ok(Some(response)) => {
+                            self.push_event(events, DeviceLinkEvent::ControlResponse(response));
                         }
+                        Ok(None) => {}
                         Err(_) => self.mark_malformed(),
                     }
                 }
@@ -378,6 +390,21 @@ impl DeviceLink {
     fn queue_usb_state(&mut self, now_ms: u64) -> Option<SpiCell> {
         let state = self.usb_state.encode();
         self.queue_record(RECORD_USB_STATE, &state, now_ms)
+    }
+
+    fn queue_next_control_request_fragment(&mut self, now_ms: u64) -> Option<SpiCell> {
+        let (request, offset) = self.control_request_tx?;
+        let fragment = ControlRequestFragment::from_request(request, usize::from(offset)).ok()?;
+        let mut data = [0; super::CONTROL_REQUEST_FRAGMENT_MAX_WIRE_LEN];
+        let length = fragment.encode(&mut data).ok()?;
+        let cell = self.queue_record(RECORD_CONTROL_REQUEST, &data[..length], now_ms)?;
+        let next_offset = usize::from(offset) + fragment.data().len();
+        if fragment.flags & super::CONTROL_FRAGMENT_LAST != 0 {
+            self.control_request_tx = None;
+        } else {
+            self.control_request_tx = Some((request, next_offset as u16));
+        }
+        Some(cell)
     }
 
     fn queue_record(&mut self, record_type: u8, data: &[u8], now_ms: u64) -> Option<SpiCell> {
@@ -764,29 +791,57 @@ mod tests {
         device.handle_transaction(&host_cell(&mut host, RECORD_HELLO, &hello), 0, &mut events);
         let _ = device.next_transaction(1);
 
-        let request = MirrorControlRequest::new(23, [0xa1, 1, 0x10, 3, 1, 0, 17, 0], &[]).unwrap();
+        let request =
+            MirrorControlRequest::new(23, [0xa1, 1, 0x10, 3, 1, 0, 17, 0], &[0x5a; 256]).unwrap();
         assert!(device.queue_control_request(request, 2));
-        let cell = SpiCell::decode(&device.next_transaction(2)).unwrap();
+        let mut request_assembler = super::super::ControlRequestAssembler::new();
+        let mut decoded_request = None;
+        let mut last_device_sequence = 0;
+        for now_ms in 2..4 {
+            let cell = SpiCell::decode(&device.next_transaction(now_ms)).unwrap();
+            last_device_sequence = cell.header.tx_sequence;
+            let record = RecordIter::new(cell.payload(), cell.header.record_count)
+                .next()
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.record_type, RECORD_CONTROL_REQUEST);
+            decoded_request = request_assembler
+                .push(ControlRequestFragment::decode(record.data).unwrap())
+                .unwrap()
+                .or(decoded_request);
+        }
+        host.set_cumulative_ack(last_device_sequence);
+        device.handle_transaction(&host_cell(&mut host, RECORD_HEARTBEAT, &[]), 4, &mut events);
+        host.acknowledge(2);
+        let cell = SpiCell::decode(&device.next_transaction(5)).unwrap();
         let record = RecordIter::new(cell.payload(), cell.header.record_count)
             .next()
             .unwrap()
             .unwrap();
-        assert_eq!(record.record_type, RECORD_CONTROL_REQUEST);
-        assert_eq!(MirrorControlRequest::decode(record.data), Ok(request));
+        decoded_request = request_assembler
+            .push(ControlRequestFragment::decode(record.data).unwrap())
+            .unwrap()
+            .or(decoded_request);
+        assert_eq!(decoded_request, Some(request));
 
         let response = MirrorControlResponse::new(
             request.request_id,
             crate::interchip::ControlStatus::Success,
-            &[0x10; 17],
+            &[0x10; 256],
         )
         .unwrap();
-        let mut encoded = [0; super::super::message::CONTROL_RESPONSE_MAX_WIRE_LEN];
-        let length = response.encode(&mut encoded).unwrap();
-        device.handle_transaction(
-            &host_cell(&mut host, RECORD_CONTROL_RESPONSE, &encoded[..length]),
-            3,
-            &mut events,
-        );
+        let mut offset = 0usize;
+        while offset < response.data().len() {
+            let fragment = ControlResponseFragment::from_response(response, offset).unwrap();
+            let mut encoded = [0; super::super::CONTROL_RESPONSE_FRAGMENT_MAX_WIRE_LEN];
+            let length = fragment.encode(&mut encoded).unwrap();
+            device.handle_transaction(
+                &host_cell(&mut host, RECORD_CONTROL_RESPONSE, &encoded[..length]),
+                6 + offset as u64,
+                &mut events,
+            );
+            offset += fragment.data().len();
+        }
         assert_eq!(
             events.as_slice(),
             &[DeviceLinkEvent::ControlResponse(response)]

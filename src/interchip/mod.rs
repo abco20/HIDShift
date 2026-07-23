@@ -1,4 +1,5 @@
 pub mod cell;
+pub mod control_fragment;
 pub mod device;
 pub mod message;
 pub mod profile_transfer;
@@ -8,6 +9,13 @@ pub mod reliable;
 pub use cell::{
     SPI_CELL_HEADER_LEN, SPI_CELL_LEN, SPI_CELL_MAGIC, SPI_CELL_PAYLOAD_LEN, SPI_PROTOCOL_VERSION,
     SpiCell, SpiCellError, SpiCellHeader,
+};
+pub use control_fragment::{
+    CONTROL_FRAGMENT_DATA_MAX_LEN, CONTROL_FRAGMENT_FIRST, CONTROL_FRAGMENT_LAST,
+    CONTROL_REQUEST_FRAGMENT_HEADER_LEN, CONTROL_REQUEST_FRAGMENT_MAX_WIRE_LEN,
+    CONTROL_RESPONSE_FRAGMENT_HEADER_LEN, CONTROL_RESPONSE_FRAGMENT_MAX_WIRE_LEN,
+    ControlFragmentError, ControlRequestAssembler, ControlRequestFragment,
+    ControlResponseAssembler, ControlResponseFragment,
 };
 pub use device::{DeviceLink, DeviceLinkDiagnostics, DeviceLinkEvent};
 pub use message::{
@@ -25,6 +33,6 @@ pub use profile_transfer::{
 };
 pub use record::{Record, RecordCodecError, RecordIter, RecordRef, encode_records};
 pub use reliable::{
-    ReceiveDisposition, ReliableCommandSlot, ReliableReceiver, ReliableSender, RetransmitAction,
+    ReceiveDisposition, ReliableDeliveryQueue, ReliableReceiver, ReliableSender, RetransmitAction,
     SPI_TX_WINDOW, SenderError,
 };

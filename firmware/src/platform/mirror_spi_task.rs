@@ -17,10 +17,12 @@ use hidshift::interchip::message::{
     RECORD_USB_STATE,
 };
 use hidshift::interchip::{
-    Hello, InterchipRole, MirrorControlRequest, ProfileResult, RawEndpointReport,
-    ReceiveDisposition, Record, RecordIter, ReliableCommandSlot, ReliableReceiver, ReliableSender,
-    RetransmitAction, SPI_CELL_LEN, SPI_CELL_PAYLOAD_LEN, SPI_PROTOCOL_VERSION, SpiCell,
-    StandardInputReport, StandardOutputReport, UsbState, encode_records,
+    CONTROL_FRAGMENT_LAST, ControlRequestAssembler, ControlRequestFragment,
+    ControlResponseFragment, Hello, InterchipRole, MirrorControlRequest, MirrorControlResponse,
+    ProfileResult, RawEndpointReport, ReceiveDisposition, Record, RecordIter,
+    ReliableDeliveryQueue, ReliableReceiver, ReliableSender, RetransmitAction, SPI_CELL_LEN,
+    SPI_CELL_PAYLOAD_LEN, SPI_PROTOCOL_VERSION, SPI_TX_WINDOW, SpiCell, StandardInputReport,
+    StandardOutputReport, UsbState, encode_records,
 };
 use hidshift::output_target::OutputTargetAvailability;
 use hidshift::runtime::message::RuntimeInputMessage;
@@ -51,6 +53,16 @@ struct LinkDiagnostics {
     retransmissions: u32,
     resets: u32,
     command_encode_errors: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WireCommand {
+    Command(DeviceTaskCommand),
+    ControlResponseFragment {
+        response: MirrorControlResponse,
+        offset: usize,
+    },
+    Heartbeat,
 }
 
 #[embassy_executor::task]
@@ -144,10 +156,9 @@ async fn run_link(
     let mut pending_raw_endpoint_out = None;
     let mut pending_control_request = None;
     let mut pending_device_usb_state = None;
-    // Keep the command until the Device S3 acknowledges its cell. If the
-    // device reboots between dequeue and delivery, the link session is
-    // renegotiated and this command is sent again instead of being lost.
-    let mut pending_command = ReliableCommandSlot::new();
+    let mut control_request_assembler = ControlRequestAssembler::new();
+    let mut delivery = ReliableDeliveryQueue::<WireCommand>::new();
+    let mut expanding_control_response: Option<(MirrorControlResponse, usize)> = None;
     let mut diagnostics = LinkDiagnostics::default();
     let mut ticker = Ticker::every(SPI_POLL_INTERVAL);
 
@@ -174,43 +185,98 @@ async fn run_link(
             usb_state = None;
             last_valid_cell_ms = None;
             session_id = nonzero_session(session_id.wrapping_add(1));
+            delivery.retry_after_session_reset();
             sender.reset_session(session_id);
             receiver = ReliableReceiver::new();
+            control_request_assembler.reset();
             diagnostics.resets = diagnostics.resets.saturating_add(1);
         }
 
         sender.set_cumulative_ack(receiver.cumulative_ack());
-        let tx_cell = if sender.pending_len() == 0 && !hello_confirmed {
-            queue_hello(&mut sender, now_ms)
-        } else if sender.pending_len() == 0 && hello_confirmed {
-            if pending_command.value().is_none()
-                && let Ok(command) = command_receiver.try_receive()
-            {
-                pending_command.stage(command);
+        let retransmit =
+            sender.poll_retransmit(now_ms, RETRANSMIT_TIMEOUT_MS, MAX_RETRANSMIT_ATTEMPTS);
+        let tx_cell = match retransmit {
+            RetransmitAction::Send(cell) => {
+                diagnostics.retransmissions = diagnostics.retransmissions.saturating_add(1);
+                Some(cell)
             }
-            let command = pending_command.value();
-            if let Some(command) = command {
-                match queue_command(&mut sender, command, &mut report_sequence, now_ms) {
-                    Ok(cell) => {
-                        pending_command.mark_queued();
-                        Some(cell)
+            RetransmitAction::LinkResetRequired => {
+                diagnostics.resets = diagnostics.resets.saturating_add(1);
+                delivery.retry_after_session_reset();
+                session_id = nonzero_session(session_id.wrapping_add(1));
+                sender.reset_session(session_id);
+                hello_confirmed = false;
+                usb_state = None;
+                control_request_assembler.reset();
+                queue_record(&mut sender, RECORD_LINK_RESET, &[], now_ms).ok()
+            }
+            RetransmitAction::Idle if !hello_confirmed && sender.pending_len() == 0 => {
+                queue_hello(&mut sender, now_ms)
+            }
+            RetransmitAction::Idle if hello_confirmed && sender.pending_len() < SPI_TX_WINDOW => {
+                let mut from_retry = false;
+                let wire_command = if let Some(command) = delivery.next_retry() {
+                    from_retry = true;
+                    Some(command)
+                } else if let Some((response, offset)) = expanding_control_response {
+                    Some(WireCommand::ControlResponseFragment { response, offset })
+                } else {
+                    match command_receiver.try_receive() {
+                        Ok(DeviceTaskCommand::ControlResponse(response)) => {
+                            expanding_control_response = Some((response, 0));
+                            Some(WireCommand::ControlResponseFragment {
+                                response,
+                                offset: 0,
+                            })
+                        }
+                        Ok(command) => Some(WireCommand::Command(command)),
+                        Err(_) => None,
                     }
-                    Err(()) => {
-                        pending_command.mark_queued();
-                        let _ = pending_command.acknowledge(true);
-                        diagnostics.command_encode_errors =
-                            diagnostics.command_encode_errors.saturating_add(1);
-                        None
+                };
+
+                if let Some(command) = wire_command {
+                    match queue_wire_command(&mut sender, command, &mut report_sequence, now_ms) {
+                        Ok((cell, control_progress)) => {
+                            if !from_retry
+                                && let Some((response, next_offset, last)) = control_progress
+                            {
+                                expanding_control_response =
+                                    (!last).then_some((response, next_offset));
+                            }
+                            if delivery.record_queued(command).is_err() {
+                                diagnostics.command_encode_errors =
+                                    diagnostics.command_encode_errors.saturating_add(1);
+                            }
+                            Some(cell)
+                        }
+                        Err(()) => {
+                            diagnostics.command_encode_errors =
+                                diagnostics.command_encode_errors.saturating_add(1);
+                            None
+                        }
                     }
+                } else if now_ms.saturating_sub(last_heartbeat_ms) >= HEARTBEAT_INTERVAL_MS {
+                    last_heartbeat_ms = now_ms;
+                    let command = WireCommand::Heartbeat;
+                    match queue_wire_command(&mut sender, command, &mut report_sequence, now_ms) {
+                        Ok((cell, _)) => {
+                            if delivery.record_queued(command).is_err() {
+                                diagnostics.command_encode_errors =
+                                    diagnostics.command_encode_errors.saturating_add(1);
+                            }
+                            Some(cell)
+                        }
+                        Err(()) => {
+                            diagnostics.command_encode_errors =
+                                diagnostics.command_encode_errors.saturating_add(1);
+                            None
+                        }
+                    }
+                } else {
+                    None
                 }
-            } else if now_ms.saturating_sub(last_heartbeat_ms) >= HEARTBEAT_INTERVAL_MS {
-                last_heartbeat_ms = now_ms;
-                queue_record(&mut sender, RECORD_HEARTBEAT, &[], now_ms).ok()
-            } else {
-                retransmit_or_idle(&mut sender, now_ms, &mut diagnostics)
             }
-        } else {
-            retransmit_or_idle(&mut sender, now_ms, &mut diagnostics)
+            RetransmitAction::Idle => None,
         };
 
         let tx_cell = match tx_cell {
@@ -254,23 +320,27 @@ async fn run_link(
                 ..
             } | ReceiveDisposition::SessionChanged
         );
-        let mut acknowledged = if remote_session_changed {
+        if remote_session_changed {
             hello_confirmed = false;
             usb_state = None;
             session_id = nonzero_session(session_id.wrapping_add(1));
+            delivery.retry_after_session_reset();
             sender.reset_session(session_id);
-            pending_command.sender_reset();
+            control_request_assembler.reset();
             diagnostics.resets = diagnostics.resets.saturating_add(1);
-            false
         } else {
-            sender.acknowledge(cell.header.cumulative_ack) > 0
-        };
-        let mut processed_records = ProcessedRecords::default();
+            let acknowledged = sender.acknowledge(cell.header.cumulative_ack);
+            delivery.acknowledge(acknowledged);
+        }
         match disposition {
             ReceiveDisposition::Accepted { .. } => {
-                match process_records(&cell, &mut hello_confirmed, &mut usb_state) {
+                match process_records(
+                    &cell,
+                    &mut hello_confirmed,
+                    &mut usb_state,
+                    &mut control_request_assembler,
+                ) {
                     Ok(processed) => {
-                        processed_records = processed;
                         if let Some(leds) = processed.wired_leds {
                             pending_wired_leds = Some(leds);
                         }
@@ -301,50 +371,13 @@ async fn run_link(
             }
             ReceiveDisposition::SessionChanged | ReceiveDisposition::Empty => {}
         }
-        let profile_commit_confirmed = matches!(
-            (pending_command.value(), processed_records.profile_result),
-            (
-                Some(DeviceTaskCommand::ProfileCommit { transfer_id }),
-                Some(result)
-            ) if transfer_id == result.transfer_id
-        );
-        if profile_commit_confirmed {
-            let _ = pending_command.complete();
-            if acknowledged {
-                sender.discard_pending();
-            } else {
-                hello_confirmed = false;
-                usb_state = None;
-                session_id = nonzero_session(session_id.wrapping_add(1));
-                sender.reset_session(session_id);
-                diagnostics.resets = diagnostics.resets.saturating_add(1);
-            }
-        }
-        if !remote_session_changed && !hello_confirmed && pending_command.value().is_some() {
+        if !remote_session_changed && !hello_confirmed && delivery.has_inflight() {
             session_id = nonzero_session(session_id.wrapping_add(1));
+            delivery.retry_after_session_reset();
             sender.reset_session(session_id);
-            pending_command.sender_reset();
-            acknowledged = false;
+            control_request_assembler.reset();
             diagnostics.resets = diagnostics.resets.saturating_add(1);
         }
-        if acknowledged && !profile_commit_confirmed {
-            let completed = pending_command
-                .value()
-                .is_none_or(|command| command_completed(command, usb_state));
-            let _ = pending_command.acknowledge(completed);
-        }
-    }
-}
-
-fn command_completed(command: DeviceTaskCommand, usb_state: Option<UsbState>) -> bool {
-    match command {
-        DeviceTaskCommand::ActivateMirror(activate) => usb_state.is_some_and(|state| {
-            !state.fallback_active && state.active_profile_hash == activate.profile_hash
-        }),
-        DeviceTaskCommand::ActivateFallback { .. } => {
-            usb_state.is_some_and(|state| state.fallback_active)
-        }
-        _ => true,
     }
 }
 
@@ -359,6 +392,27 @@ fn queue_hello(sender: &mut ReliableSender, now_ms: u64) -> Option<SpiCell> {
     }
     .encode();
     queue_record(sender, RECORD_HELLO, &hello, now_ms).ok()
+}
+
+fn queue_wire_command(
+    sender: &mut ReliableSender,
+    command: WireCommand,
+    report_sequence: &mut u16,
+    now_ms: u64,
+) -> Result<(SpiCell, Option<(MirrorControlResponse, usize, bool)>), ()> {
+    match command {
+        WireCommand::Command(command) => {
+            queue_command(sender, command, report_sequence, now_ms).map(|cell| (cell, None))
+        }
+        WireCommand::ControlResponseFragment { response, offset } => {
+            let (cell, next_offset, last) =
+                queue_control_response_fragment(sender, response, offset, now_ms)?;
+            Ok((cell, Some((response, next_offset, last))))
+        }
+        WireCommand::Heartbeat => {
+            queue_record(sender, RECORD_HEARTBEAT, &[], now_ms).map(|cell| (cell, None))
+        }
+    }
 }
 
 fn queue_command(
@@ -424,12 +478,26 @@ fn queue_command(
             let length = report.encode(&mut data).map_err(|_| ())?;
             queue_record(sender, RECORD_RAW_ENDPOINT_IN, &data[..length], now_ms).map_err(|_| ())
         }
-        DeviceTaskCommand::ControlResponse(response) => {
-            let mut data = [0; hidshift::interchip::message::CONTROL_RESPONSE_MAX_WIRE_LEN];
-            let length = response.encode(&mut data).map_err(|_| ())?;
-            queue_record(sender, RECORD_CONTROL_RESPONSE, &data[..length], now_ms).map_err(|_| ())
-        }
+        DeviceTaskCommand::ControlResponse(_) => Err(()),
     }
+}
+
+fn queue_control_response_fragment(
+    sender: &mut ReliableSender,
+    response: hidshift::interchip::MirrorControlResponse,
+    offset: usize,
+    now_ms: u64,
+) -> Result<(SpiCell, usize, bool), ()> {
+    let fragment = ControlResponseFragment::from_response(response, offset).map_err(|_| ())?;
+    let mut data = [0; hidshift::interchip::CONTROL_RESPONSE_FRAGMENT_MAX_WIRE_LEN];
+    let length = fragment.encode(&mut data).map_err(|_| ())?;
+    let cell =
+        queue_record(sender, RECORD_CONTROL_RESPONSE, &data[..length], now_ms).map_err(|_| ())?;
+    Ok((
+        cell,
+        offset + fragment.data().len(),
+        fragment.flags & CONTROL_FRAGMENT_LAST != 0,
+    ))
 }
 
 fn queue_record(
@@ -453,26 +521,6 @@ fn queue_record(
         .map_err(|_| ())
 }
 
-fn retransmit_or_idle(
-    sender: &mut ReliableSender,
-    now_ms: u64,
-    diagnostics: &mut LinkDiagnostics,
-) -> Option<SpiCell> {
-    match sender.poll_retransmit(now_ms, RETRANSMIT_TIMEOUT_MS, MAX_RETRANSMIT_ATTEMPTS) {
-        RetransmitAction::Send(cell) => {
-            diagnostics.retransmissions = diagnostics.retransmissions.saturating_add(1);
-            Some(cell)
-        }
-        RetransmitAction::LinkResetRequired => {
-            diagnostics.resets = diagnostics.resets.saturating_add(1);
-            let next_session = nonzero_session(sender.session_id().wrapping_add(1));
-            sender.reset_session(next_session);
-            queue_record(sender, RECORD_LINK_RESET, &[], now_ms).ok()
-        }
-        RetransmitAction::Idle => None,
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ProcessedRecords {
     wired_leds: Option<KeyboardLedState>,
@@ -486,6 +534,7 @@ fn process_records(
     cell: &SpiCell,
     hello_confirmed: &mut bool,
     usb_state: &mut Option<UsbState>,
+    control_request_assembler: &mut ControlRequestAssembler,
 ) -> Result<ProcessedRecords, ()> {
     let mut processed = ProcessedRecords::default();
     let mut records = RecordIter::new(cell.payload(), cell.header.record_count);
@@ -520,6 +569,7 @@ fn process_records(
             RECORD_LINK_RESET => {
                 *hello_confirmed = false;
                 *usb_state = None;
+                control_request_assembler.reset();
             }
             RECORD_STANDARD_OUTPUT_REPORT => {
                 let report = StandardOutputReport::decode(record.data).map_err(|_| ())?;
@@ -548,8 +598,9 @@ fn process_records(
                     Some(RawEndpointReport::decode(record.data).map_err(|_| ())?);
             }
             RECORD_CONTROL_REQUEST => {
-                processed.control_request =
-                    Some(MirrorControlRequest::decode(record.data).map_err(|_| ())?);
+                processed.control_request = control_request_assembler
+                    .push(ControlRequestFragment::decode(record.data).map_err(|_| ())?)
+                    .map_err(|_| ())?;
             }
             _ => {}
         }
