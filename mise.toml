@@ -14,16 +14,20 @@ rust = {
 description = "Run the host checks used by CI in order"
 run = [
   "cargo test --locked --all-targets",
+  "cargo test --locked --all-targets --features dual-s3-wired",
   "cargo fmt --check",
   "cargo check --locked --lib",
   "cargo clippy --locked --lib -- -D warnings",
+  "cargo clippy --locked --all-targets --features dual-s3-wired -- -D warnings",
   "cargo test --locked --manifest-path tools/hidshift-client/Cargo.toml",
   "cargo test --locked --manifest-path tools/hidshiftctl/Cargo.toml",
   "cargo test --locked --all-targets --manifest-path e2e/runner/Cargo.toml",
+  "cargo test --locked --all-targets --manifest-path e2e/mirror-runner/Cargo.toml",
   "cargo check --locked --manifest-path web/Cargo.toml --target wasm32-unknown-unknown",
   "cargo fmt --check --manifest-path tools/hidshift-client/Cargo.toml",
   "cargo fmt --check --manifest-path tools/hidshiftctl/Cargo.toml",
   "cargo fmt --check --manifest-path e2e/runner/Cargo.toml",
+  "cargo fmt --check --manifest-path e2e/mirror-runner/Cargo.toml",
   "cargo fmt --check --manifest-path web/Cargo.toml",
   "python3 -m unittest discover -s tools/release -p 'test_*.py'",
 ]

@@ -12,10 +12,10 @@ use clap::Parser;
 use hidshift::checksum::{crc16_ccitt_false, crc32_ieee};
 use hidshift::e2e::{E2eCommand, E2ePacket};
 use hidshift::e2e_mirror::{
-    MIRROR_E2E_PAYLOAD_MAX, MirrorE2ePacket, OPCODE_HELLO, OPCODE_INJECT_ENDPOINT_IN,
-    OPCODE_DROP_SPI_CELLS, OPCODE_INJECT_SPI_CRC_FAILURE, OPCODE_READ_MOCK_STATUS,
-    OPCODE_REGISTER_BEGIN, OPCODE_REGISTER_CHUNK, OPCODE_REGISTER_COMMIT,
-    OPCODE_RESET_MOCK_STATUS, OPCODE_SET_CONTROL_RESPONSE, raw_injection_transfer_id,
+    MIRROR_E2E_PAYLOAD_MAX, MirrorE2ePacket, OPCODE_DROP_SPI_CELLS, OPCODE_HELLO,
+    OPCODE_INJECT_ENDPOINT_IN, OPCODE_INJECT_SPI_CRC_FAILURE, OPCODE_READ_MOCK_STATUS,
+    OPCODE_REGISTER_BEGIN, OPCODE_REGISTER_CHUNK, OPCODE_REGISTER_COMMIT, OPCODE_RESET_MOCK_STATUS,
+    OPCODE_SET_CONTROL_RESPONSE, raw_injection_transfer_id,
 };
 use hidshift::fallback::{FALLBACK_USB_PRODUCT_ID, FALLBACK_USB_VENDOR_ID};
 use hidshift::ids::HostId;
@@ -764,10 +764,7 @@ fn hidraw_feature_ioctl(
 
 const fn hidraw_feature_request(length: usize, number: u8) -> u64 {
     const IOC_READ_WRITE: u64 = 3;
-    (IOC_READ_WRITE << 30)
-        | ((length as u64) << 16)
-        | ((b'H' as u64) << 8)
-        | number as u64
+    (IOC_READ_WRITE << 30) | ((length as u64) << 16) | ((b'H' as u64) << 8) | number as u64
 }
 
 fn open_input_events(
@@ -1049,10 +1046,7 @@ fn wait_for_mirror_candidate(
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    Err(format!(
-        "Mirror candidate 0 did not publish profile {expected_profile_hash:08x}"
-    )
-    .into())
+    Err(format!("Mirror candidate 0 did not publish profile {expected_profile_hash:08x}").into())
 }
 
 fn send_management_command(
@@ -1104,10 +1098,7 @@ fn output_target_status(
     serial.write_all(&encode_serial_request(pending))?;
     let response = wait_management_response(serial, client, Duration::from_secs(2))?;
     match (response.result, response.payload) {
-        (
-            ManagementResult::Ok,
-            ManagementResponsePayload::OutputTargetStatus(status),
-        ) => Ok(status),
+        (ManagementResult::Ok, ManagementResponsePayload::OutputTargetStatus(status)) => Ok(status),
         (result, payload) => Err(format!(
             "GET_OUTPUT_TARGET_STATUS failed: result={result:?} payload={payload:?}"
         )

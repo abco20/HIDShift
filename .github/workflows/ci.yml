@@ -26,16 +26,20 @@ jobs:
           sudo apt-get update && sudo apt-get install --yes
           libdbus-1-dev libudev-dev pkg-config
       - run: cargo test --locked --all-targets
+      - run: cargo test --locked --all-targets --features dual-s3-wired
       - run: cargo fmt --check
       - run: cargo check --locked --lib
       - run: cargo clippy --locked --lib -- -D warnings
+      - run: cargo clippy --locked --all-targets --features dual-s3-wired -- -D warnings
       - run: cargo test --locked --manifest-path tools/hidshift-client/Cargo.toml
       - run: cargo test --locked --manifest-path tools/hidshiftctl/Cargo.toml
       - run: cargo test --locked --all-targets --manifest-path e2e/runner/Cargo.toml
+      - run: cargo test --locked --all-targets --manifest-path e2e/mirror-runner/Cargo.toml
       - run: cargo check --locked --manifest-path web/Cargo.toml --target wasm32-unknown-unknown
       - run: cargo fmt --check --manifest-path tools/hidshift-client/Cargo.toml
       - run: cargo fmt --check --manifest-path tools/hidshiftctl/Cargo.toml
       - run: cargo fmt --check --manifest-path e2e/runner/Cargo.toml
+      - run: cargo fmt --check --manifest-path e2e/mirror-runner/Cargo.toml
       - run: cargo fmt --check --manifest-path web/Cargo.toml
       - name: Test release version validation
         run: python3 -m unittest discover -s tools/release -p 'test_*.py'
@@ -64,6 +68,29 @@ jobs:
         run: >-
           cargo +esp check --locked -Zbuild-std=core,alloc
           --manifest-path firmware/Cargo.toml --bin firmware
+          --features hardware-e2e
+          --target xtensa-esp32s3-none-elf
+      - name: Check dual-S3 Host firmware
+        run: >-
+          cargo +esp check --locked -Zbuild-std=core,alloc
+          --manifest-path firmware/Cargo.toml --bin firmware
+          --features dual-s3-wired
+          --target xtensa-esp32s3-none-elf
+      - name: Check dual-S3 hardware E2E Host firmware
+        run: >-
+          cargo +esp check --locked -Zbuild-std=core,alloc
+          --manifest-path firmware/Cargo.toml --bin firmware
+          --features dual-s3-wired,hardware-e2e
+          --target xtensa-esp32s3-none-elf
+      - name: Check dual-S3 Device firmware
+        run: >-
+          cargo +esp check --locked -Zbuild-std=core
+          --manifest-path device-firmware/Cargo.toml --bin hidshift-device
+          --target xtensa-esp32s3-none-elf
+      - name: Check dual-S3 hardware E2E Device firmware
+        run: >-
+          cargo +esp check --locked -Zbuild-std=core
+          --manifest-path device-firmware/Cargo.toml --bin hidshift-device
           --features hardware-e2e
           --target xtensa-esp32s3-none-elf
       - name: Check ESP32-S3 BLE Central probe
