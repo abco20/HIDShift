@@ -693,13 +693,23 @@ impl ChannelTaskSink {
             (hidshift::InterfaceId, hidshift::DeviceId),
             RUNTIME_USB_COMMAND_QUEUE_CAPACITY,
         >::new();
+        let critical_usb = queues
+            .usb
+            .iter()
+            .filter(|command| command.class() == hidshift::CommandClass::Critical)
+            .count();
+        if self.usb.free_capacity() < critical_usb {
+            return Err(ChannelTaskSendError::UsbQueueFull);
+        }
         for command in queues.usb.iter().copied() {
-            let key = (command.interface_id, command.device_id);
+            let Some(key) = command.led_target() else {
+                continue;
+            };
             if self
                 .pending_usb
                 .iter()
                 .flatten()
-                .any(|pending| (pending.interface_id, pending.device_id) == key)
+                .any(|pending| pending.led_target() == Some(key))
                 || new_pending.contains(&key)
             {
                 continue;
@@ -822,15 +832,17 @@ impl ChannelTaskSink {
         &mut self,
         command: UsbTaskCommand,
     ) -> Result<(), ChannelTaskSendError> {
+        if command.class() == hidshift::CommandClass::Critical {
+            self.usb.send(command).await;
+            return Ok(());
+        }
+        let Some(target) = command.led_target() else {
+            return Err(ChannelTaskSendError::UsbQueueFull);
+        };
         let slot = self
             .pending_usb
             .iter()
-            .position(|pending| {
-                pending.is_some_and(|pending| {
-                    pending.interface_id == command.interface_id
-                        && pending.device_id == command.device_id
-                })
-            })
+            .position(|pending| pending.is_some_and(|pending| pending.led_target() == Some(target)))
             .or_else(|| self.pending_usb.iter().position(Option::is_none))
             .ok_or(ChannelTaskSendError::UsbQueueFull)?;
         self.pending_usb[slot] = Some(command);

@@ -9,6 +9,37 @@ pub struct UsbHidReader<'d, A: UsbHostAllocator<'d>> {
     in_ch: A::Pipe<pipe::Interrupt, pipe::In>,
 }
 
+pub struct UsbRawOutWriter<'d, A: UsbHostAllocator<'d>> {
+    out_ch: A::Pipe<pipe::Interrupt, pipe::Out>,
+}
+
+impl<'d, A: UsbHostAllocator<'d>> UsbRawOutWriter<'d, A> {
+    pub fn new(
+        alloc: &A,
+        interface: HidInterfaceInfo,
+        enum_info: &EnumerationInfo,
+    ) -> Result<Option<Self>, HidError> {
+        if interface.interrupt_out_ep == 0 {
+            return Ok(None);
+        }
+        let out_ch = alloc
+            .alloc_pipe::<pipe::Interrupt, pipe::Out>(
+                enum_info.device_address,
+                &interrupt_out_endpoint_info(interface),
+                enum_info.split(),
+            )
+            .map_err(|_| HidError::NoPipe)?;
+        Ok(Some(Self { out_ch }))
+    }
+
+    pub async fn write(&mut self, data: &[u8]) -> Result<(), HidError> {
+        self.out_ch
+            .request_out(data, false)
+            .await
+            .map_err(Into::into)
+    }
+}
+
 impl<'d, A: UsbHostAllocator<'d>> UsbHidReader<'d, A> {
     pub fn new(
         alloc: &A,
@@ -99,6 +130,23 @@ impl<'d, A: UsbHostAllocator<'d>> UsbHidControl<'d, A> {
         }
         self.set_protocol(protocol).await
     }
+
+    pub async fn forward(
+        &mut self,
+        setup: [u8; 8],
+        data: &[u8],
+        response: &mut [u8],
+    ) -> Result<usize, HidError> {
+        if setup[0] & 0x80 != 0 {
+            self.ctrl_ch
+                .control_in(&setup, response)
+                .await
+                .map_err(Into::into)
+        } else {
+            self.ctrl_ch.control_out(&setup, data).await?;
+            Ok(0)
+        }
+    }
 }
 
 fn control_endpoint_info(enum_info: &EnumerationInfo) -> EndpointInfo {
@@ -119,5 +167,17 @@ fn interrupt_in_endpoint_info(interface: HidInterfaceInfo) -> EndpointInfo {
         ep_type: EndpointType::Interrupt,
         max_packet_size: interface.interrupt_in_mps,
         interval_ms: interface.interrupt_in_interval_ms,
+    }
+}
+
+fn interrupt_out_endpoint_info(interface: HidInterfaceInfo) -> EndpointInfo {
+    EndpointInfo {
+        addr: EndpointAddress::from_parts(
+            (interface.interrupt_out_ep & 0x0F) as usize,
+            UsbDirection::Out,
+        ),
+        ep_type: EndpointType::Interrupt,
+        max_packet_size: interface.interrupt_out_mps,
+        interval_ms: interface.interrupt_out_interval_ms,
     }
 }

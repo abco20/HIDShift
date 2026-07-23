@@ -297,6 +297,7 @@ impl From<RuntimeDispatchError> for RuntimeOwnerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::UsbTaskCommand;
     use crate::ble::BleHidAttribute;
     use crate::bridge::{BridgeError, BridgeEvent, BridgeStatus};
     use crate::ids::{DeviceId, HostId, InterfaceId};
@@ -320,7 +321,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(queues.usb.len(), 1);
-        assert_eq!(queues.usb[0].device_id, DeviceId(7));
+        assert_eq!(queues.usb[0].device_id(), DeviceId(7));
         assert_eq!(queues.ble.len(), 0);
         assert_eq!(queues.storage.len(), 0);
         assert_eq!(queues.status.len(), 0);
@@ -656,12 +657,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(queues.usb.len(), 1);
-        assert_eq!(
-            queues.usb[0].bytes,
-            KeyboardLedOutputReport::boot_keyboard()
-                .build(KeyboardLedState::CAPS_LOCK)
-                .unwrap()
-        );
+        assert!(matches!(
+            queues.usb[0],
+            UsbTaskCommand::KeyboardLedWrite { bytes, .. }
+                if bytes
+                    == KeyboardLedOutputReport::boot_keyboard()
+                        .build(KeyboardLedState::CAPS_LOCK)
+                        .unwrap()
+        ));
         assert_eq!(queues.ble.len(), 0);
         assert_eq!(queues.storage.len(), 0);
     }

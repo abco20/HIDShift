@@ -189,6 +189,8 @@ pub enum RuntimeInput<'a> {
     #[cfg(feature = "dual-s3-wired")]
     MirrorControlRequest(MirrorControlRequest),
     #[cfg(feature = "dual-s3-wired")]
+    MirrorControlCompleted(MirrorControlResponse),
+    #[cfg(feature = "dual-s3-wired")]
     DeviceUsbState(crate::interchip::UsbState),
     #[cfg(feature = "dual-s3-wired")]
     MirrorCandidateRegistered {
@@ -338,6 +340,19 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
     fn selected_mirror_candidate(&self) -> Option<MirrorCandidateId> {
         let selected = self.bridge.state().mirror_target?;
         self.mirror_candidates.resolve(selected.0).ok().flatten()
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    fn active_physical_mirror_source(&self) -> Option<DeviceId> {
+        if self.presentation_transition_pending
+            || self.bridge.state().output_target.active != Some(OutputTarget::Wired)
+        {
+            return None;
+        }
+        let candidate = self.selected_mirror_candidate()?;
+        self.mirror_candidates
+            .get(candidate)
+            .and_then(|metadata| metadata.source_device)
     }
 
     #[cfg(feature = "dual-s3-wired")]
@@ -641,12 +656,33 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             RuntimeInput::MirrorEndpointOut(report) => {
                 commands.clear();
                 self.last_mirror_endpoint_out = Some(report);
+                if let Some(device_id) = self.active_physical_mirror_source() {
+                    push_command(
+                        commands,
+                        RuntimeCommand::UsbMirrorEndpointOut { device_id, report },
+                    )?;
+                }
                 Ok(())
             }
             #[cfg(feature = "dual-s3-wired")]
             RuntimeInput::MirrorControlRequest(request) => {
                 commands.clear();
                 self.last_mirror_control_request = Some(request);
+                if let Some(device_id) = self.active_physical_mirror_source() {
+                    push_command(
+                        commands,
+                        RuntimeCommand::UsbMirrorControlRequest { device_id, request },
+                    )?;
+                }
+                Ok(())
+            }
+            #[cfg(feature = "dual-s3-wired")]
+            RuntimeInput::MirrorControlCompleted(response) => {
+                commands.clear();
+                push_command(
+                    commands,
+                    RuntimeCommand::DeviceCommand(DeviceTaskCommand::ControlResponse(response)),
+                )?;
                 Ok(())
             }
             #[cfg(feature = "dual-s3-wired")]
@@ -2336,6 +2372,16 @@ pub enum RuntimeCommand {
         device_id: DeviceId,
         bytes: KeyboardLedOutputBytes,
     },
+    #[cfg(feature = "dual-s3-wired")]
+    UsbMirrorEndpointOut {
+        device_id: DeviceId,
+        report: RawEndpointReport,
+    },
+    #[cfg(feature = "dual-s3-wired")]
+    UsbMirrorControlRequest {
+        device_id: DeviceId,
+        request: MirrorControlRequest,
+    },
     PersistStorage {
         state: StorageState,
         priority: StoragePersistPriority,
@@ -2496,19 +2542,54 @@ impl BleTaskCommand {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct UsbTaskCommand {
-    pub interface_id: InterfaceId,
-    pub device_id: DeviceId,
-    pub bytes: KeyboardLedOutputBytes,
+pub enum UsbTaskCommand {
+    KeyboardLedWrite {
+        interface_id: InterfaceId,
+        device_id: DeviceId,
+        bytes: KeyboardLedOutputBytes,
+    },
+    #[cfg(feature = "dual-s3-wired")]
+    MirrorEndpointOut {
+        device_id: DeviceId,
+        report: RawEndpointReport,
+    },
+    #[cfg(feature = "dual-s3-wired")]
+    MirrorControlRequest {
+        device_id: DeviceId,
+        request: MirrorControlRequest,
+    },
 }
 
 impl UsbTaskCommand {
     pub const fn class(self) -> CommandClass {
-        CommandClass::Realtime
+        match self {
+            Self::KeyboardLedWrite { .. } => CommandClass::Realtime,
+            #[cfg(feature = "dual-s3-wired")]
+            Self::MirrorEndpointOut { .. } | Self::MirrorControlRequest { .. } => {
+                CommandClass::Critical
+            }
+        }
     }
 
-    pub fn matches_target(self, interface_id: InterfaceId, device_id: DeviceId) -> bool {
-        self.interface_id == interface_id && self.device_id == device_id
+    pub const fn led_target(self) -> Option<(InterfaceId, DeviceId)> {
+        match self {
+            Self::KeyboardLedWrite {
+                interface_id,
+                device_id,
+                ..
+            } => Some((interface_id, device_id)),
+            #[cfg(feature = "dual-s3-wired")]
+            Self::MirrorEndpointOut { .. } | Self::MirrorControlRequest { .. } => None,
+        }
+    }
+
+    pub const fn device_id(self) -> DeviceId {
+        match self {
+            Self::KeyboardLedWrite { device_id, .. } => device_id,
+            #[cfg(feature = "dual-s3-wired")]
+            Self::MirrorEndpointOut { device_id, .. }
+            | Self::MirrorControlRequest { device_id, .. } => device_id,
+        }
     }
 }
 
@@ -2628,6 +2709,9 @@ impl<const BLE: usize, const USB: usize, const STORAGE: usize, const STATUS: usi
                 #[cfg(feature = "dual-s3-wired")]
                 RuntimeCommand::DeviceCommand(_) => device += 1,
                 RuntimeCommand::UsbKeyboardLedWrite { .. } => usb += 1,
+                #[cfg(feature = "dual-s3-wired")]
+                RuntimeCommand::UsbMirrorEndpointOut { .. }
+                | RuntimeCommand::UsbMirrorControlRequest { .. } => usb += 1,
                 RuntimeCommand::PersistStorage { .. } => storage += 1,
                 RuntimeCommand::StatusChanged(_) | RuntimeCommand::ManagementResponse { .. } => {
                     status += 1;
@@ -2674,10 +2758,26 @@ impl<const BLE: usize, const USB: usize, const STORAGE: usize, const STATUS: usi
                 bytes,
             } => self
                 .usb
-                .push(UsbTaskCommand {
+                .push(UsbTaskCommand::KeyboardLedWrite {
                     interface_id: *interface_id,
                     device_id: *device_id,
                     bytes: *bytes,
+                })
+                .map_err(|_| RuntimeDispatchError::UsbQueueCapacity),
+            #[cfg(feature = "dual-s3-wired")]
+            RuntimeCommand::UsbMirrorEndpointOut { device_id, report } => self
+                .usb
+                .push(UsbTaskCommand::MirrorEndpointOut {
+                    device_id: *device_id,
+                    report: *report,
+                })
+                .map_err(|_| RuntimeDispatchError::UsbQueueCapacity),
+            #[cfg(feature = "dual-s3-wired")]
+            RuntimeCommand::UsbMirrorControlRequest { device_id, request } => self
+                .usb
+                .push(UsbTaskCommand::MirrorControlRequest {
+                    device_id: *device_id,
+                    request: *request,
                 })
                 .map_err(|_| RuntimeDispatchError::UsbQueueCapacity),
             RuntimeCommand::PersistStorage { state, priority } => self
@@ -3543,6 +3643,107 @@ mod tests {
 
         assert!(commands.is_empty());
         assert_eq!(runtime.last_mirror_control_request(), Some(request));
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    #[test]
+    fn active_physical_mirror_routes_raw_and_control_to_original_device() {
+        let mut runtime = BridgeRuntime::<4, 1>::new(0);
+        let mut commands = heapless::Vec::<RuntimeCommand, 16>::new();
+        let candidate = MirrorCandidateId(1);
+        let stable_id = MirrorStableId::new(0x046d, 0xc547, None, 0x1234, &[2]).unwrap();
+        let profile_hash = 0x5566_7788;
+        runtime
+            .handle_input::<16, 16, 2>(
+                RuntimeInput::MirrorCandidateRegistered {
+                    candidate,
+                    stable_id,
+                    profile_hash: Some(profile_hash),
+                    synthetic: false,
+                    source_device: Some(DeviceId(7)),
+                },
+                &mut commands,
+            )
+            .unwrap();
+        runtime
+            .handle_input::<16, 16, 2>(
+                RuntimeInput::DeviceProfileResult(ProfileResult {
+                    transfer_id: 1,
+                    profile_hash,
+                    status: ProfileResultStatus::Accepted,
+                    reject_reason: 0,
+                    detail: 0,
+                }),
+                &mut commands,
+            )
+            .unwrap();
+        runtime
+            .handle_input::<16, 16, 2>(
+                management_request(ManagementCommand::SetMirrorTarget(candidate), 40),
+                &mut commands,
+            )
+            .unwrap();
+        runtime
+            .handle_input::<16, 16, 2>(
+                RuntimeInput::DeviceUsbState(crate::interchip::UsbState {
+                    attached: true,
+                    configured: true,
+                    fallback_active: false,
+                    healthy: true,
+                    active_profile_hash: profile_hash,
+                    error_code: 0,
+                }),
+                &mut commands,
+            )
+            .unwrap();
+
+        let report = RawEndpointReport::new(0x02, 17, &[0x10, 0xaa, 0xbb]).unwrap();
+        runtime
+            .handle_input::<16, 16, 2>(RuntimeInput::MirrorEndpointOut(report), &mut commands)
+            .unwrap();
+        assert_eq!(
+            commands.as_slice(),
+            &[RuntimeCommand::UsbMirrorEndpointOut {
+                device_id: DeviceId(7),
+                report,
+            }]
+        );
+
+        let request = MirrorControlRequest::new(42, [0xa1, 1, 0x10, 3, 1, 0, 17, 0], &[]).unwrap();
+        runtime
+            .handle_input::<16, 16, 2>(RuntimeInput::MirrorControlRequest(request), &mut commands)
+            .unwrap();
+        assert_eq!(
+            commands.as_slice(),
+            &[RuntimeCommand::UsbMirrorControlRequest {
+                device_id: DeviceId(7),
+                request,
+            }]
+        );
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    #[test]
+    fn completed_physical_control_request_returns_to_device_s3() {
+        let mut runtime = BridgeRuntime::<4, 1>::new(0);
+        let mut commands = heapless::Vec::<RuntimeCommand, 4>::new();
+        let response =
+            MirrorControlResponse::new(42, crate::interchip::ControlStatus::Success, &[1, 2, 3])
+                .unwrap();
+
+        runtime
+            .handle_input::<4, 4, 2>(
+                RuntimeInput::MirrorControlCompleted(response),
+                &mut commands,
+            )
+            .unwrap();
+
+        assert_eq!(
+            commands.as_slice(),
+            &[RuntimeCommand::DeviceCommand(
+                DeviceTaskCommand::ControlResponse(response)
+            )]
+        );
     }
 
     #[cfg(feature = "dual-s3-wired")]
@@ -4962,7 +5163,7 @@ mod tests {
         assert_eq!(queues.usb.len(), RUNTIME_USB_INTERFACES_MAX);
         assert_eq!(queues.storage.len(), 1);
         assert_eq!(queues.status.len(), 1);
-        assert_eq!(queues.usb[0].device_id, DeviceId(1));
+        assert_eq!(queues.usb[0].device_id(), DeviceId(1));
 
         runtime
             .handle_default_input(
@@ -5105,16 +5306,15 @@ mod tests {
 
     #[test]
     fn usb_led_command_rejects_reused_interface_for_a_different_device() {
-        let command = UsbTaskCommand {
+        let command = UsbTaskCommand::KeyboardLedWrite {
             interface_id: InterfaceId(3),
             device_id: DeviceId(7),
             bytes: KeyboardLedOutputReport::boot_keyboard()
                 .build(crate::input::KeyboardLedState::empty())
                 .unwrap(),
         };
-        assert!(command.matches_target(InterfaceId(3), DeviceId(7)));
-        assert!(!command.matches_target(InterfaceId(3), DeviceId(8)));
-        assert!(!command.matches_target(InterfaceId(4), DeviceId(7)));
+        assert_eq!(command.led_target(), Some((InterfaceId(3), DeviceId(7))));
+        assert_eq!(command.device_id(), DeviceId(7));
     }
 
     fn ready_runtime() -> BridgeRuntime<2, 1> {

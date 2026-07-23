@@ -34,13 +34,17 @@ use hidshift::usb_hid::topology::{DefaultUsbTopologyManager, UsbDeviceRoute};
 use static_cell::ConstStaticCell;
 
 #[cfg(feature = "dual-s3-wired")]
-use hidshift::interchip::ProfileTransferEncoder;
+use hidshift::interchip::{
+    CONTROL_DATA_MAX_LEN, ControlStatus, MirrorControlResponse, ProfileTransferEncoder,
+};
 #[cfg(feature = "dual-s3-wired")]
 use hidshift::mirror::{HSMI_MAX_SIZE, HidReportRecord, MirrorCaptureSource, StringRecord};
 #[cfg(feature = "dual-s3-wired")]
 use hidshift::{MirrorCandidateId, capture_mirror_profile};
 
 use super::usb_output_transport::UsbKeyboardLedWriter;
+#[cfg(feature = "dual-s3-wired")]
+use super::usb_transport::UsbRawOutWriter;
 use super::usb_transport::{UsbHidControl, UsbHidReader};
 
 const HOST_CHANNELS: usize = 8;
@@ -72,6 +76,8 @@ struct ActiveUsbInterfaceSlot<'d> {
     report_buf: [u8; REPORT_BUF_LEN],
     last_mouse_buttons: hidshift::input::MouseButtons,
     last_led_bytes: Option<hidshift::usb_hid::output::KeyboardLedOutputBytes>,
+    #[cfg(feature = "dual-s3-wired")]
+    raw_out: Option<UsbRawOutWriter<'d, FirmwareBusHandle<'d>>>,
 }
 
 // The USB task polls several nested futures while retaining up to eight HID
@@ -747,66 +753,7 @@ pub async fn usb_input_task(
                         .await;
                     }
                     Either3::Third(command) => {
-                        let Some(slot) = active_slots.iter_mut().find_map(|slot| {
-                            slot.as_mut().filter(|slot| {
-                                command.matches_target(slot.interface_id, slot.session.device_id())
-                            })
-                        }) else {
-                            log::warn!(
-                                "firmware: usb command interface missing got={}",
-                                command.interface_id.0
-                            );
-                            continue;
-                        };
-                        if slot.last_led_bytes == Some(command.bytes) {
-                            continue;
-                        }
-                        if slot.led_output {
-                            match UsbKeyboardLedWriter::new_for_interface(
-                                &bus_handle,
-                                slot.hid_info,
-                                &slot.enum_info,
-                            ) {
-                                Ok(mut led_writer) => {
-                                    match with_timeout(
-                                        Duration::from_millis(USB_LED_WRITE_TIMEOUT_MS),
-                                        led_writer.write_leds(command.bytes),
-                                    )
-                                    .await
-                                    {
-                                        Ok(Ok(())) => slot.last_led_bytes = Some(command.bytes),
-                                        Ok(Err(error)) => log::warn!(
-                                            "firmware: usb led write failed interface={} err={:?}",
-                                            slot.interface_id.0,
-                                            error
-                                        ),
-                                        Err(_) => {
-                                            log::warn!(
-                                                "firmware: usb led write timeout interface={}",
-                                                slot.interface_id.0
-                                            );
-                                            let _ =
-                                                sender
-                                                    .try_send(RuntimeInputMessage::DiagnosticsEvent(
-                                                    RuntimeDiagnosticsEvent::UsbLedWriteTimedOut,
-                                                ));
-                                        }
-                                    }
-                                }
-                                Err(error) => {
-                                    log::warn!(
-                                        "firmware: usb led writer unsupported interface={} err={:?}",
-                                        slot.interface_id.0,
-                                        error
-                                    );
-                                }
-                            }
-                        } else {
-                            log::debug!(
-                                "firmware: usb led write ignored interface={} no_led_output",
-                                slot.interface_id.0
-                            );
-                        }
+                        handle_usb_command(&sender, &bus_handle, &mut active_slots, command).await;
                     }
                 }
             }
@@ -876,68 +823,195 @@ pub async fn usb_input_task(
                     break;
                 }
                 Either::Second(command) => {
-                    let Some(slot) = active_slots.iter_mut().find_map(|slot| {
-                        slot.as_mut().filter(|slot| {
-                            command.matches_target(slot.interface_id, slot.session.device_id())
-                        })
-                    }) else {
-                        log::warn!(
-                            "firmware: usb command interface missing got={}",
-                            command.interface_id.0
-                        );
-                        continue;
-                    };
-                    if slot.last_led_bytes == Some(command.bytes) {
-                        continue;
-                    }
-                    if slot.led_output {
-                        match UsbKeyboardLedWriter::new_for_interface(
-                            &bus_handle,
-                            slot.hid_info,
-                            &slot.enum_info,
-                        ) {
-                            Ok(mut led_writer) => {
-                                match with_timeout(
-                                    Duration::from_millis(USB_LED_WRITE_TIMEOUT_MS),
-                                    led_writer.write_leds(command.bytes),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(())) => slot.last_led_bytes = Some(command.bytes),
-                                    Ok(Err(error)) => log::warn!(
-                                        "firmware: usb led write failed interface={} err={:?}",
-                                        slot.interface_id.0,
-                                        error
-                                    ),
-                                    Err(_) => {
-                                        log::warn!(
-                                            "firmware: usb led write timeout interface={}",
-                                            slot.interface_id.0
-                                        );
-                                        let _ =
-                                            sender.try_send(RuntimeInputMessage::DiagnosticsEvent(
-                                                RuntimeDiagnosticsEvent::UsbLedWriteTimedOut,
-                                            ));
-                                    }
-                                }
-                            }
-                            Err(error) => {
-                                log::warn!(
-                                    "firmware: usb led writer unsupported interface={} err={:?}",
-                                    slot.interface_id.0,
-                                    error
-                                );
-                            }
-                        }
-                    } else {
-                        log::debug!(
-                            "firmware: usb led write ignored interface={} no_led_output",
-                            slot.interface_id.0
-                        );
-                    }
+                    handle_usb_command(&sender, &bus_handle, &mut active_slots, command).await;
                 }
             }
         }
+    }
+}
+
+async fn handle_usb_command<'d>(
+    sender: &Sender<
+        'static,
+        CriticalSectionRawMutex,
+        RuntimeInputMessage,
+        RUNTIME_INPUT_QUEUE_CAPACITY,
+    >,
+    bus_handle: &FirmwareBusHandle<'d>,
+    active_slots: &mut [Option<ActiveUsbInterfaceSlot<'d>>; MAX_ACTIVE_USB_INTERFACES],
+    command: UsbTaskCommand,
+) {
+    match command {
+        UsbTaskCommand::KeyboardLedWrite {
+            interface_id,
+            device_id,
+            bytes,
+        } => {
+            let Some(slot) = active_slots.iter_mut().find_map(|slot| {
+                slot.as_mut().filter(|slot| {
+                    slot.interface_id == interface_id && slot.session.device_id() == device_id
+                })
+            }) else {
+                log::warn!(
+                    "firmware: usb LED target missing device={} interface={}",
+                    device_id.0,
+                    interface_id.0
+                );
+                return;
+            };
+            if slot.last_led_bytes == Some(bytes) {
+                return;
+            }
+            if !slot.led_output {
+                log::debug!(
+                    "firmware: usb LED ignored interface={} no_led_output",
+                    slot.interface_id.0
+                );
+                return;
+            }
+            match UsbKeyboardLedWriter::new_for_interface(
+                bus_handle,
+                slot.hid_info,
+                &slot.enum_info,
+            ) {
+                Ok(mut led_writer) => match with_timeout(
+                    Duration::from_millis(USB_LED_WRITE_TIMEOUT_MS),
+                    led_writer.write_leds(bytes),
+                )
+                .await
+                {
+                    Ok(Ok(())) => slot.last_led_bytes = Some(bytes),
+                    Ok(Err(error)) => log::warn!(
+                        "firmware: usb LED write failed interface={} err={:?}",
+                        slot.interface_id.0,
+                        error
+                    ),
+                    Err(_) => {
+                        log::warn!(
+                            "firmware: usb LED write timeout interface={}",
+                            slot.interface_id.0
+                        );
+                        let _ = sender.try_send(RuntimeInputMessage::DiagnosticsEvent(
+                            RuntimeDiagnosticsEvent::UsbLedWriteTimedOut,
+                        ));
+                    }
+                },
+                Err(error) => log::warn!(
+                    "firmware: usb LED writer unsupported interface={} err={:?}",
+                    slot.interface_id.0,
+                    error
+                ),
+            }
+        }
+        #[cfg(feature = "dual-s3-wired")]
+        UsbTaskCommand::MirrorEndpointOut { device_id, report } => {
+            let Some(slot) = active_slots.iter_mut().find_map(|slot| {
+                slot.as_mut().filter(|slot| {
+                    slot.session.device_id() == device_id
+                        && slot.hid_info.interrupt_out_ep == report.endpoint_address
+                })
+            }) else {
+                log::warn!(
+                    "firmware: mirror OUT target missing device={} endpoint=0x{:02x}",
+                    device_id.0,
+                    report.endpoint_address
+                );
+                return;
+            };
+            let Some(writer) = slot.raw_out.as_mut() else {
+                log::warn!(
+                    "firmware: mirror OUT pipe missing endpoint=0x{:02x}",
+                    report.endpoint_address
+                );
+                return;
+            };
+            match with_timeout(Duration::from_millis(250), writer.write(report.data())).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => log::warn!(
+                    "firmware: mirror OUT failed endpoint=0x{:02x} err={:?}",
+                    report.endpoint_address,
+                    error
+                ),
+                Err(_) => log::warn!(
+                    "firmware: mirror OUT timeout endpoint=0x{:02x}",
+                    report.endpoint_address
+                ),
+            }
+        }
+        #[cfg(feature = "dual-s3-wired")]
+        UsbTaskCommand::MirrorControlRequest { device_id, request } => {
+            let Some(slot) = active_slots
+                .iter()
+                .flatten()
+                .find(|slot| slot.session.device_id() == device_id)
+            else {
+                send_mirror_control_response(
+                    sender,
+                    MirrorControlResponse::new(
+                        request.request_id,
+                        ControlStatus::Disconnected,
+                        &[],
+                    ),
+                )
+                .await;
+                return;
+            };
+            let mut response_data = [0u8; CONTROL_DATA_MAX_LEN];
+            let mut control = match UsbHidControl::new(bus_handle, slot.hid_info, &slot.enum_info) {
+                Ok(control) => control,
+                Err(_) => {
+                    send_mirror_control_response(
+                        sender,
+                        MirrorControlResponse::new(
+                            request.request_id,
+                            ControlStatus::Disconnected,
+                            &[],
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let result = with_timeout(
+                Duration::from_millis(250),
+                control.forward(request.setup_packet, request.data(), &mut response_data),
+            )
+            .await;
+            let response = match result {
+                Ok(Ok(length)) => MirrorControlResponse::new(
+                    request.request_id,
+                    ControlStatus::Success,
+                    &response_data[..length],
+                ),
+                Ok(Err(HidError::Transfer(PipeError::Stall))) => {
+                    MirrorControlResponse::new(request.request_id, ControlStatus::Stall, &[])
+                }
+                Ok(Err(HidError::Transfer(PipeError::Disconnected))) => {
+                    MirrorControlResponse::new(request.request_id, ControlStatus::Disconnected, &[])
+                }
+                Ok(Err(_)) | Err(_) => {
+                    MirrorControlResponse::new(request.request_id, ControlStatus::Timeout, &[])
+                }
+            };
+            send_mirror_control_response(sender, response).await;
+        }
+    }
+}
+
+#[cfg(feature = "dual-s3-wired")]
+async fn send_mirror_control_response(
+    sender: &Sender<
+        'static,
+        CriticalSectionRawMutex,
+        RuntimeInputMessage,
+        RUNTIME_INPUT_QUEUE_CAPACITY,
+    >,
+    response: Result<MirrorControlResponse, hidshift::interchip::MessageError>,
+) {
+    if let Ok(response) = response {
+        sender
+            .send(RuntimeInputMessage::MirrorControlCompleted(response))
+            .await;
     }
 }
 
@@ -1203,6 +1277,14 @@ async fn attach_hid_interfaces_for_device<'d>(
                 return Err(());
             }
         };
+        #[cfg(feature = "dual-s3-wired")]
+        let raw_out = match UsbRawOutWriter::new(bus_handle, hid_info, enum_info) {
+            Ok(writer) => writer,
+            Err(error) => {
+                log::warn!("firmware: usb mirror OUT pipe unavailable: {:?}", error);
+                return Err(());
+            }
+        };
         log::info!(
             "firmware: usb runtime session ready device={} interface={} fields={} report_ids={} interval_ms={} out_ep=0x{:02x}",
             session.device_id().0,
@@ -1238,6 +1320,8 @@ async fn attach_hid_interfaces_for_device<'d>(
             report_buf: [0u8; REPORT_BUF_LEN],
             last_mouse_buttons: hidshift::input::MouseButtons::empty(),
             last_led_bytes: None,
+            #[cfg(feature = "dual-s3-wired")]
+            raw_out,
         });
     }
 
