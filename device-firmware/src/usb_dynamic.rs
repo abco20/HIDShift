@@ -1,6 +1,9 @@
 use heapless::{Deque, Vec};
-use hidshift::interchip::{ControlStatus, MirrorControlRequest, MirrorControlResponse};
+use hidshift::interchip::{
+    ControlStatus, MirrorControlRequest, MirrorControlResponse, StandardOutputReport,
+};
 use hidshift::mirror::{MIRROR_ENDPOINTS_MAX, MirrorControlForwarder, UsbDevicePlan};
+use hidshift::reports::{ConsumerReport, Keyboard6KroReport, MouseReport, StandardHidReport};
 use usb_device::UsbDirection;
 use usb_device::class_prelude::*;
 use usb_device::control::{Recipient, Request, RequestType};
@@ -8,6 +11,15 @@ use usb_device::endpoint::{EndpointAddress, EndpointType};
 
 const RAW_PACKET_MAX_LEN: usize = 64;
 const RAW_QUEUE_CAPACITY: usize = 16;
+const FALLBACK_INTERFACE_COUNT: usize = 3;
+const HID_GET_REPORT: u8 = 0x01;
+const HID_GET_IDLE: u8 = 0x02;
+const HID_GET_PROTOCOL: u8 = 0x03;
+const HID_SET_REPORT: u8 = 0x09;
+const HID_SET_IDLE: u8 = 0x0a;
+const HID_SET_PROTOCOL: u8 = 0x0b;
+const HID_REPORT_TYPE_INPUT: u8 = 1;
+const HID_REPORT_TYPE_OUTPUT: u8 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RawPacket {
@@ -68,8 +80,11 @@ pub struct DynamicUsb<'a, B: UsbBus> {
     outputs: Vec<OutputEndpoint<'a, B>, MIRROR_ENDPOINTS_MAX>,
     pending_in: Deque<RawPacket, RAW_QUEUE_CAPACITY>,
     pending_out: Deque<RawPacket, RAW_QUEUE_CAPACITY>,
-    configuration_value: u8,
-    configured: bool,
+    fallback: bool,
+    pending_standard_output: Option<StandardOutputReport>,
+    fallback_idle: [u8; FALLBACK_INTERFACE_COUNT],
+    fallback_protocol: [u8; FALLBACK_INTERFACE_COUNT],
+    fallback_last_input: [Option<RawPacket>; FALLBACK_INTERFACE_COUNT],
     control_forwarder: MirrorControlForwarder,
     pending_control_request: Option<MirrorControlRequest>,
     pending_control_response: Option<MirrorControlResponse>,
@@ -81,6 +96,7 @@ impl<'a, B: UsbBus> DynamicUsb<'a, B> {
     pub fn new(
         alloc: &'a UsbBusAllocator<B>,
         plan: UsbDevicePlan<'static>,
+        fallback: bool,
     ) -> Result<Self, DynamicUsbError> {
         let mut inputs = Vec::new();
         let mut outputs = Vec::new();
@@ -119,13 +135,16 @@ impl<'a, B: UsbBus> DynamicUsb<'a, B> {
             }
         }
         Ok(Self {
-            configuration_value: plan.configuration_descriptor[5],
             plan,
             inputs,
             outputs,
             pending_in: Deque::new(),
             pending_out: Deque::new(),
-            configured: false,
+            fallback,
+            pending_standard_output: None,
+            fallback_idle: [0; FALLBACK_INTERFACE_COUNT],
+            fallback_protocol: [1; FALLBACK_INTERFACE_COUNT],
+            fallback_last_input: [None; FALLBACK_INTERFACE_COUNT],
             control_forwarder: MirrorControlForwarder::new(),
             pending_control_request: None,
             pending_control_response: None,
@@ -149,6 +168,55 @@ impl<'a, B: UsbBus> DynamicUsb<'a, B> {
 
     pub fn take_output(&mut self) -> Option<RawPacket> {
         self.pending_out.pop_front()
+    }
+
+    pub fn take_standard_output(&mut self) -> Option<StandardOutputReport> {
+        self.pending_standard_output.take()
+    }
+
+    pub fn restore_standard_output(&mut self, report: StandardOutputReport) {
+        if self.pending_standard_output.is_none() {
+            self.pending_standard_output = Some(report);
+        }
+    }
+
+    pub fn enqueue_standard_report(&mut self, report: StandardHidReport) {
+        if !self.fallback {
+            self.drop_standard_report();
+            return;
+        }
+        let (interface, endpoint, data): (usize, u8, &[u8]) = match &report {
+            StandardHidReport::Keyboard(report) => (0, 0x81, report.as_bytes()),
+            StandardHidReport::Mouse(report) => {
+                let bytes = report.as_bytes();
+                let data = if self.fallback_protocol[1] == 0 {
+                    &bytes[..3]
+                } else {
+                    bytes
+                };
+                (1, 0x82, data)
+            }
+            StandardHidReport::Consumer(report) => (2, 0x83, report.as_bytes()),
+        };
+        match RawPacket::new(endpoint, data) {
+            Ok(packet) => {
+                self.fallback_last_input[interface] = Some(packet);
+                if self.pending_in.push_back(packet).is_err() {
+                    self.dropped_packets = self.dropped_packets.saturating_add(1);
+                }
+            }
+            Err(_) => self.dropped_packets = self.dropped_packets.saturating_add(1),
+        }
+    }
+
+    pub fn release_all_standard(&mut self) {
+        for report in [
+            StandardHidReport::Keyboard(Keyboard6KroReport::release()),
+            StandardHidReport::Mouse(MouseReport::release_buttons()),
+            StandardHidReport::Consumer(ConsumerReport::release()),
+        ] {
+            self.enqueue_standard_report(report);
+        }
     }
 
     pub fn take_control_request(&mut self) -> Option<MirrorControlRequest> {
@@ -175,12 +243,12 @@ impl<'a, B: UsbBus> DynamicUsb<'a, B> {
         }
     }
 
-    pub const fn configured(&self) -> bool {
-        self.configured
-    }
-
     pub const fn plan(&self) -> &UsbDevicePlan<'static> {
         &self.plan
+    }
+
+    pub const fn is_fallback(&self) -> bool {
+        self.fallback
     }
 
     pub fn drop_standard_report(&mut self) {
@@ -215,7 +283,12 @@ impl<'a, B: UsbBus> DynamicUsb<'a, B> {
             match output.endpoint.read(&mut data) {
                 Ok(length) => {
                     if let Ok(packet) = RawPacket::new(output.address, &data[..length]) {
-                        let _ = self.pending_out.push_back(packet);
+                        if self.fallback && output.address == 0x01 {
+                            self.pending_standard_output =
+                                StandardOutputReport::new(1, packet.data()).ok();
+                        } else {
+                            let _ = self.pending_out.push_back(packet);
+                        }
                     }
                 }
                 Err(UsbError::WouldBlock) => {}
@@ -254,11 +327,7 @@ impl<'a, B: UsbBus> DynamicUsb<'a, B> {
         }
     }
 
-    fn defer_control(
-        &mut self,
-        request: Request,
-        data: &[u8],
-    ) -> Result<(), DynamicUsbError> {
+    fn defer_control(&mut self, request: Request, data: &[u8]) -> Result<(), DynamicUsbError> {
         let setup = setup_packet(request);
         let forwarded = self
             .control_forwarder
@@ -281,18 +350,6 @@ impl<B: UsbBus> UsbClass<B> for DynamicUsb<'_, B> {
 
     fn control_in(&mut self, transfer: ControlIn<B>) {
         let request = *transfer.request();
-        if request.request_type == RequestType::Standard
-            && request.recipient == Recipient::Device
-            && request.request == Request::GET_CONFIGURATION
-        {
-            let value = if self.configured {
-                self.configuration_value
-            } else {
-                0
-            };
-            let _ = transfer.accept_with(&[value]);
-            return;
-        }
         if request.request_type == RequestType::Standard
             && request.request == Request::GET_DESCRIPTOR
         {
@@ -330,6 +387,44 @@ impl<B: UsbBus> UsbClass<B> for DynamicUsb<'_, B> {
             }
             return;
         }
+        if self.fallback
+            && request.request_type == RequestType::Class
+            && request.recipient == Recipient::Interface
+        {
+            if request.index > u16::from(u8::MAX) {
+                return;
+            }
+            let interface = usize::from(request.index as u8);
+            if interface >= FALLBACK_INTERFACE_COUNT {
+                return;
+            }
+            match request.request {
+                HID_GET_REPORT if (request.value >> 8) as u8 == HID_REPORT_TYPE_INPUT => {
+                    if let Some(report) = self.fallback_last_input[interface] {
+                        let _ = transfer.accept_with(report.data());
+                    } else {
+                        let zeroes = [0; 8];
+                        let length = match interface {
+                            0 => 8,
+                            1 if self.fallback_protocol[1] == 0 => 3,
+                            1 => 5,
+                            _ => 2,
+                        };
+                        let _ = transfer.accept_with(&zeroes[..length]);
+                    }
+                    return;
+                }
+                HID_GET_IDLE => {
+                    let _ = transfer.accept_with(&[self.fallback_idle[interface]]);
+                    return;
+                }
+                HID_GET_PROTOCOL if interface < 2 => {
+                    let _ = transfer.accept_with(&[self.fallback_protocol[interface]]);
+                    return;
+                }
+                _ => {}
+            }
+        }
         if should_forward_control(request) && self.defer_control(request, &[]).is_ok() {
             let _ = transfer.defer();
         }
@@ -337,24 +432,48 @@ impl<B: UsbBus> UsbClass<B> for DynamicUsb<'_, B> {
 
     fn control_out(&mut self, transfer: ControlOut<B>) {
         let request = *transfer.request();
-        if request.request_type == RequestType::Standard
-            && request.recipient == Recipient::Device
-            && request.request == Request::SET_CONFIGURATION
+        if self.fallback
+            && request.request_type == RequestType::Class
+            && request.recipient == Recipient::Interface
         {
-            match request.value as u8 {
-                0 => {
-                    self.configured = false;
-                    let _ = transfer.accept();
+            if request.index > u16::from(u8::MAX) {
+                let _ = transfer.reject();
+                return;
+            }
+            let interface = usize::from(request.index as u8);
+            if interface >= FALLBACK_INTERFACE_COUNT {
+                return;
+            }
+            match request.request {
+                HID_SET_REPORT
+                    if interface == 0 && (request.value >> 8) as u8 == HID_REPORT_TYPE_OUTPUT =>
+                {
+                    match StandardOutputReport::new(1, transfer.data()) {
+                        Ok(report) => {
+                            self.pending_standard_output = Some(report);
+                            let _ = transfer.accept();
+                        }
+                        Err(_) => {
+                            let _ = transfer.reject();
+                        }
+                    }
+                    return;
                 }
-                value if value == self.configuration_value => {
-                    self.configured = true;
+                HID_SET_IDLE => {
+                    self.fallback_idle[interface] = (request.value >> 8) as u8;
                     let _ = transfer.accept();
+                    return;
+                }
+                HID_SET_PROTOCOL if interface < 2 && request.value <= 1 => {
+                    self.fallback_protocol[interface] = request.value as u8;
+                    let _ = transfer.accept();
+                    return;
                 }
                 _ => {
                     let _ = transfer.reject();
+                    return;
                 }
             }
-            return;
         }
         if should_forward_control(request) {
             let data = transfer.data();
@@ -384,7 +503,10 @@ impl<B: UsbBus> UsbClass<B> for DynamicUsb<'_, B> {
         self.pending_control_request = None;
         self.pending_control_response = None;
         self.pending_control_direction = None;
-        self.configured = false;
+        self.pending_standard_output = None;
+        self.fallback_idle.fill(0);
+        self.fallback_protocol.fill(1);
+        self.fallback_last_input.fill(None);
     }
 }
 

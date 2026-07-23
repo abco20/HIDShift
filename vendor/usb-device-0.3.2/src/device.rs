@@ -66,6 +66,7 @@ pub(crate) struct Config<'a> {
     pub string_descriptors: heapless::Vec<StringDescriptors<'a>, 16>,
     pub self_powered: bool,
     pub supports_remote_wakeup: bool,
+    pub configuration_value: u8,
     pub composite_with_iads: bool,
     pub max_power: u8,
 }
@@ -73,7 +74,7 @@ pub(crate) struct Config<'a> {
 /// The bConfiguration value for the not configured state.
 pub const CONFIGURATION_NONE: u8 = 0;
 
-/// The bConfiguration value for the single configuration supported by this device.
+/// The default bConfiguration value for the single configuration supported by this device.
 pub const CONFIGURATION_VALUE: u8 = 1;
 
 /// The default value for bAlternateSetting for all interfaces.
@@ -424,7 +425,7 @@ impl<B: UsbBus> UsbDevice<'_, B> {
                 (Recipient::Device, Request::GET_CONFIGURATION) => {
                     usb_trace!("Processing Device::GetConfiguration");
                     let config = match self.device_state {
-                        UsbDeviceState::Configured => CONFIGURATION_VALUE,
+                        UsbDeviceState::Configured => self.config.configuration_value,
                         _ => CONFIGURATION_NONE,
                     };
 
@@ -478,7 +479,6 @@ impl<B: UsbBus> UsbDevice<'_, B> {
             let xfer = ControlOut::new(&mut self.control, &req);
 
             const CONFIGURATION_NONE_U16: u16 = CONFIGURATION_NONE as u16;
-            const CONFIGURATION_VALUE_U16: u16 = CONFIGURATION_VALUE as u16;
             const DEFAULT_ALTERNATE_SETTING_U16: u16 = DEFAULT_ALTERNATE_SETTING as u16;
 
             match (req.recipient, req.request, req.value) {
@@ -527,7 +527,9 @@ impl<B: UsbBus> UsbDevice<'_, B> {
                     xfer.accept()?;
                 }
 
-                (Recipient::Device, Request::SET_CONFIGURATION, CONFIGURATION_VALUE_U16) => {
+                (Recipient::Device, Request::SET_CONFIGURATION, value)
+                    if value == u16::from(self.config.configuration_value) =>
+                {
                     usb_debug!("Device configured");
                     self.device_state = UsbDeviceState::Configured;
                     xfer.accept()?;

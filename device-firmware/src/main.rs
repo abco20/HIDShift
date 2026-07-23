@@ -4,7 +4,6 @@
 mod boot_presentation;
 mod profile_store;
 mod usb_dynamic;
-mod usb_fallback;
 mod usb_signaling;
 
 use esp_backtrace as _;
@@ -12,10 +11,7 @@ use esp_hal::clock::CpuClock;
 use esp_hal::dma::{DmaRxBuf, DmaTxBuf};
 use esp_hal::spi::Mode;
 use esp_hal::spi::slave::Spi;
-use hidshift::fallback::{
-    FALLBACK_USB_DEVICE_RELEASE, FALLBACK_USB_MANUFACTURER, FALLBACK_USB_PRODUCT,
-    FALLBACK_USB_PRODUCT_ID, FALLBACK_USB_VENDOR_ID,
-};
+use hidshift::fallback::build_fallback_mirror_image;
 use hidshift::interchip::{
     DeviceLink, DeviceLinkEvent, ProfileResult, ProfileResultStatus, ProfileTransferError,
     ProfileTransferReceiver, SPI_CELL_LEN, StandardOutputReport, UsbState,
@@ -25,19 +21,16 @@ use hidshift::mirror::{
 };
 use hidshift::remote_wakeup::{RemoteWakeupAction, RemoteWakeupController};
 use static_cell::StaticCell;
-use usb_device::LangID;
 use usb_device::bus::UsbBus;
-use usb_device::device::{
-    StringDescriptors, UsbDevice, UsbDeviceBuilder, UsbDeviceState, UsbRev, UsbVidPid,
-};
+use usb_device::device::{UsbDevice, UsbDeviceBuilder, UsbDeviceState, UsbRev, UsbVidPid};
 use usb_dynamic::{DynamicUsb, RawPacket};
-use usb_fallback::FallbackUsb;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
 static USB_ENDPOINT_MEMORY: StaticCell<[u32; 1024]> = StaticCell::new();
 static PROFILE_STAGING: StaticCell<[u8; HSMI_MAX_SIZE]> = StaticCell::new();
 static PROFILE_ACTIVE_IMAGE: StaticCell<[u8; HSMI_MAX_SIZE]> = StaticCell::new();
+static FALLBACK_IMAGE: StaticCell<[u8; 1024]> = StaticCell::new();
 const SPI_LINK_LOSS_TIMEOUT_MS: u64 = 1_500;
 
 #[esp_hal::main]
@@ -53,9 +46,12 @@ fn main() -> ! {
             None
         }
     };
-    let dynamic_plan = load_boot_profile(&mut profile_store);
-    let profile_receiver =
-        ProfileTransferReceiver::new(PROFILE_STAGING.init([0; HSMI_MAX_SIZE]));
+    let (presentation_profile_hash, dynamic_plan, fallback) =
+        match load_boot_profile(&mut profile_store) {
+            Some((profile_hash, plan)) => (profile_hash, plan, false),
+            None => (0, load_fallback_profile(), true),
+        };
+    let profile_receiver = ProfileTransferReceiver::new(PROFILE_STAGING.init([0; HSMI_MAX_SIZE]));
 
     let usb = esp_hal::otg_fs::Usb::new(peripherals.USB0, peripherals.GPIO20, peripherals.GPIO19);
     #[cfg(feature = "hardware-e2e")]
@@ -79,51 +75,33 @@ fn main() -> ! {
         .with_miso(peripherals.GPIO13)
         .with_dma(peripherals.DMA_CH0);
 
-    if let Some((profile_hash, plan)) = dynamic_plan {
-        let dynamic = match DynamicUsb::new(&usb_bus, plan) {
-            Ok(dynamic) => dynamic,
-            Err(error) => fatal("dynamic endpoints", error),
-        };
-        let usb_device = build_dynamic_device(&usb_bus, &dynamic);
-        run(
-            spi,
-            dma_rx,
-            dma_tx,
-            session_id,
-            usb_device,
-            dynamic,
-            profile_store,
-            profile_receiver,
-            profile_hash,
-        )
-    } else {
-        let fallback = FallbackUsb::new(&usb_bus);
-        let usb_builder = match UsbDeviceBuilder::new(
-            &usb_bus,
-            UsbVidPid(FALLBACK_USB_VENDOR_ID, FALLBACK_USB_PRODUCT_ID),
-        )
-        .strings(&[StringDescriptors::new(LangID::EN_US)
-            .manufacturer(FALLBACK_USB_MANUFACTURER)
-            .product(FALLBACK_USB_PRODUCT)])
-        {
-            Ok(builder) => builder,
-            Err(error) => fatal("USB strings", error),
-        };
-        let usb_device = usb_builder
-            .device_release(FALLBACK_USB_DEVICE_RELEASE)
-            .supports_remote_wakeup(true)
-            .build();
-        run(
-            spi,
-            dma_rx,
-            dma_tx,
-            session_id,
-            usb_device,
-            fallback,
-            profile_store,
-            profile_receiver,
-            0,
-        )
+    let dynamic = match DynamicUsb::new(&usb_bus, dynamic_plan, fallback) {
+        Ok(dynamic) => dynamic,
+        Err(error) => fatal("dynamic endpoints", error),
+    };
+    let usb_device = build_dynamic_device(&usb_bus, &dynamic);
+    run(
+        spi,
+        dma_rx,
+        dma_tx,
+        session_id,
+        usb_device,
+        dynamic,
+        profile_store,
+        profile_receiver,
+        presentation_profile_hash,
+    )
+}
+
+fn load_fallback_profile() -> UsbDevicePlan<'static> {
+    let image = FALLBACK_IMAGE.init([0; 1024]);
+    let length = match build_fallback_mirror_image(image) {
+        Ok(length) => length,
+        Err(error) => fatal("fallback image", error),
+    };
+    match validate_mirror_image(&image[..length]) {
+        Ok(plan) => plan,
+        Err(error) => fatal("fallback plan", error),
     }
 }
 
@@ -140,7 +118,10 @@ fn load_boot_profile(
         return None;
     };
     let Some(profile) = store.find(profile_hash).ok().flatten() else {
-        log::error!("device-presentation: profile {:08x} not found", profile_hash);
+        log::error!(
+            "device-presentation: profile {:08x} not found",
+            profile_hash
+        );
         return None;
     };
     let image = PROFILE_ACTIVE_IMAGE.init([0; HSMI_MAX_SIZE]);
@@ -179,6 +160,7 @@ fn build_dynamic_device<'a, B: UsbBus>(
             u16::from_le_bytes([device[10], device[11]]),
         ),
     )
+    .configuration_value(configuration[5])
     .device_class(device[4])
     .device_sub_class(device[5])
     .device_protocol(device[6])
@@ -216,37 +198,6 @@ trait PresentationRuntime<B: UsbBus> {
     fn is_fallback(&self) -> bool;
 }
 
-impl<B: UsbBus> PresentationRuntime<B> for FallbackUsb<'_, B> {
-    fn poll(&mut self, usb_device: &mut UsbDevice<'_, B>) {
-        usb_device.poll(&mut [
-            &mut self.keyboard,
-            &mut self.mouse,
-            &mut self.consumer,
-        ]);
-        self.service();
-    }
-
-    fn enqueue_link_event(&mut self, event: DeviceLinkEvent) {
-        self.enqueue_link_event(event);
-    }
-
-    fn take_standard_output(&mut self) -> Option<StandardOutputReport> {
-        self.take_keyboard_output()
-    }
-
-    fn restore_standard_output(&mut self, report: StandardOutputReport) {
-        self.restore_keyboard_output(report);
-    }
-
-    fn usb_state(&self, configured: bool, _profile_hash: u32) -> UsbState {
-        fallback_usb_state(configured)
-    }
-
-    fn is_fallback(&self) -> bool {
-        true
-    }
-}
-
 impl<B: UsbBus> PresentationRuntime<B> for DynamicUsb<'_, B> {
     fn poll(&mut self, usb_device: &mut UsbDevice<'_, B>) {
         usb_device.poll(&mut [self]);
@@ -256,6 +207,12 @@ impl<B: UsbBus> PresentationRuntime<B> for DynamicUsb<'_, B> {
 
     fn enqueue_link_event(&mut self, event: DeviceLinkEvent) {
         match event {
+            DeviceLinkEvent::StandardInput(report) if self.is_fallback() => {
+                self.enqueue_standard_report(report.report);
+            }
+            DeviceLinkEvent::ReleaseAll if self.is_fallback() => {
+                self.release_all_standard();
+            }
             DeviceLinkEvent::RawEndpointIn(report) => {
                 if RawPacket::new(report.endpoint_address, report.data())
                     .and_then(|packet| self.enqueue_input(packet))
@@ -278,6 +235,14 @@ impl<B: UsbBus> PresentationRuntime<B> for DynamicUsb<'_, B> {
         self.take_output()
     }
 
+    fn take_standard_output(&mut self) -> Option<StandardOutputReport> {
+        self.take_standard_output()
+    }
+
+    fn restore_standard_output(&mut self, report: StandardOutputReport) {
+        self.restore_standard_output(report);
+    }
+
     fn restore_raw_output(&mut self, packet: RawPacket) {
         self.restore_output(packet);
     }
@@ -290,11 +255,11 @@ impl<B: UsbBus> PresentationRuntime<B> for DynamicUsb<'_, B> {
         self.restore_control_request(request);
     }
 
-    fn usb_state(&self, _configured: bool, profile_hash: u32) -> UsbState {
+    fn usb_state(&self, configured: bool, profile_hash: u32) -> UsbState {
         UsbState {
             attached: true,
-            configured: self.configured(),
-            fallback_active: false,
+            configured,
+            fallback_active: self.is_fallback(),
             healthy: true,
             active_profile_hash: profile_hash,
             error_code: 0,
@@ -302,7 +267,7 @@ impl<B: UsbBus> PresentationRuntime<B> for DynamicUsb<'_, B> {
     }
 
     fn is_fallback(&self) -> bool {
-        false
+        self.is_fallback()
     }
 }
 
@@ -365,8 +330,7 @@ fn run<'a, B: UsbBus, P: PresentationRuntime<B>>(
         let diagnostics_before = link.diagnostics();
         link.handle_transaction(&received, transaction_ms, &mut events);
         let diagnostics_after = link.diagnostics();
-        let received_valid_cell =
-            diagnostics_after.valid_cells != diagnostics_before.valid_cells;
+        let received_valid_cell = diagnostics_after.valid_cells != diagnostics_before.valid_cells;
         if diagnostics_after.host_session_changes != diagnostics_before.host_session_changes {
             // A Host firmware reset invalidates any partially received image.
             // Keeping it would make the next PROFILE_BEGIN look Busy and can
@@ -396,11 +360,8 @@ fn run<'a, B: UsbBus, P: PresentationRuntime<B>>(
                 }
                 DeviceLinkEvent::ProfileChunk(chunk) => {
                     if let Err(error) = profile_receiver.chunk(chunk.as_borrowed()) {
-                        pending_profile_result = Some(profile_transfer_error_result(
-                            error,
-                            chunk.transfer_id(),
-                            0,
-                        ));
+                        pending_profile_result =
+                            Some(profile_transfer_error_result(error, chunk.transfer_id(), 0));
                     }
                 }
                 DeviceLinkEvent::ProfileCommit { transfer_id } => {
@@ -631,15 +592,4 @@ fn fatal<T: core::fmt::Debug>(context: &str, error: T) -> ! {
 
 const fn nonzero_session(value: u32) -> u32 {
     if value == 0 { 1 } else { value }
-}
-
-const fn fallback_usb_state(configured: bool) -> UsbState {
-    UsbState {
-        attached: true,
-        configured,
-        fallback_active: true,
-        healthy: true,
-        active_profile_hash: 0,
-        error_code: 0,
-    }
 }

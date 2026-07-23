@@ -41,6 +41,11 @@ Mirror selection is stored separately:
 - BLE always uses normalized aggregated input. Device S3 remains neutral
   Fallback USB and the saved Mirror selection is retained.
 
+Fallback is a built-in MirrorImage and uses the same parser, validator,
+endpoint planner, descriptor path, and dynamic USB state machine as mirrored
+devices. Only its standard HID report adaptation and class semantics are
+profile-specific.
+
 Only one Full-Speed, HID-only, single-configuration device can be mirrored.
 Up to four HID interfaces, four IN endpoints, four OUT endpoints, 64-byte
 interrupt packets, and a 16 KiB MirrorImage are accepted. Bulk, isochronous,

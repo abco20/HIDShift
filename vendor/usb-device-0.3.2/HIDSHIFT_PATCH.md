@@ -9,7 +9,9 @@ The patch adds:
 - `UsbDevice::{complete_control_in, complete_control_out,
   reject_deferred_control}`;
 - preservation of the EP0 response state while a Mirror control request
-  crosses the SPI link.
+  crosses the SPI link;
+- a configurable non-zero `bConfigurationValue` that is advertised and
+  handled by the core `GET_CONFIGURATION`/`SET_CONFIGURATION` state machine.
 
 The normal single-S3 firmware does not depend on this crate. The Device
 firmware also enables the upstream `control-buffer-256` feature so HID Feature

@@ -97,6 +97,7 @@ impl<'a, B: UsbBus> UsbDeviceBuilder<'a, B> {
                 string_descriptors: heapless::Vec::new(),
                 self_powered: false,
                 supports_remote_wakeup: false,
+                configuration_value: crate::device::CONFIGURATION_VALUE,
                 composite_with_iads: false,
                 max_power: 50,
             },
@@ -144,6 +145,12 @@ impl<'a, B: UsbBus> UsbDeviceBuilder<'a, B> {
         ///
         /// Default: `false`
         supports_remote_wakeup: bool,
+
+        /// Sets the non-zero bConfigurationValue accepted by SET_CONFIGURATION.
+        ///
+        /// Dynamic descriptor users must set this to the value advertised by
+        /// their raw Configuration Descriptor.
+        configuration_value: u8,
 
         /// Sets which Usb 2 revision to comply to.
         ///

@@ -26,7 +26,7 @@ pub const FALLBACK_DEVICE_DESCRIPTOR: [u8; 18] = [
 ];
 
 pub const FALLBACK_CONFIGURATION_DESCRIPTOR: [u8; 91] = [
-    9, 0x02, 91, 0, 3, 1, 0, 0x80, 50, // configuration
+    9, 0x02, 91, 0, 3, 1, 0, 0xa0, 50, // configuration, Remote Wakeup
     9, 0x04, 0, 0, 2, 0x03, 0x01, 0x01, 0, // boot keyboard
     9, 0x21, 0x11, 0x01, 0, 1, 0x22, 65, 0, // keyboard HID
     7, 0x05, 0x81, 0x03, 8, 0, 1, // keyboard IN
@@ -206,6 +206,8 @@ mod tests {
 
         assert_eq!(plan.interfaces.len(), 3);
         assert_eq!(plan.endpoints.len(), 4);
+        assert!(plan.supports_remote_wakeup());
+        assert_eq!(plan.configuration_descriptor[5], 1);
         assert_eq!(
             plan.endpoints
                 .iter()

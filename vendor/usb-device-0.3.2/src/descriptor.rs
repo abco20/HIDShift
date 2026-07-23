@@ -154,7 +154,7 @@ impl DescriptorWriter<'_> {
                 0,
                 0,                           // wTotalLength
                 0,                           // bNumInterfaces
-                device::CONFIGURATION_VALUE, // bConfigurationValue
+                config.configuration_value,  // bConfigurationValue
                 0,                           // iConfiguration
                 0x80 | if config.self_powered { 0x40 } else { 0x00 }
                     | if config.supports_remote_wakeup {

@@ -128,6 +128,9 @@ fn validate_configuration<'a>(
     if usize::from(u16::from_le_bytes([config[2], config[3]])) != config.len() {
         return Err(MirrorRejectReason::InvalidDescriptorLength);
     }
+    if config[5] == 0 || config[7] & 0x9f != 0x80 {
+        return Err(MirrorRejectReason::MalformedImage);
+    }
     let mut interfaces = Vec::<HidInterfacePlan<'a>, MIRROR_HID_INTERFACES_MAX>::new();
     let mut endpoints = Vec::<EndpointPlan, MIRROR_ENDPOINTS_MAX>::new();
     let mut endpoint_addresses = Vec::<u8, MIRROR_ENDPOINTS_MAX>::new();
@@ -210,6 +213,9 @@ fn validate_configuration<'a>(
                 let max_packet_size = u16::from_le_bytes([descriptor[4], descriptor[5]]);
                 if max_packet_size == 0 || max_packet_size > 64 {
                     return Err(MirrorRejectReason::PacketTooLarge);
+                }
+                if descriptor[6] == 0 {
+                    return Err(MirrorRejectReason::InvalidDescriptorLength);
                 }
                 let direction_count = endpoints
                     .iter()
@@ -441,10 +447,49 @@ mod tests {
             Err(MirrorRejectReason::PacketTooLarge)
         );
 
+        let mut interval = CONFIG;
+        interval[33] = 0;
+        assert_eq!(
+            validate_mirror_image(encode(&interval, &reports, &mut out)),
+            Err(MirrorRejectReason::InvalidDescriptorLength)
+        );
+
         let mut wake = CONFIG;
         wake[7] |= 0x20;
         let plan = validate_mirror_image(encode(&wake, &reports, &mut out)).unwrap();
         assert!(plan.supports_remote_wakeup());
+    }
+
+    #[test]
+    fn configuration_value_and_attributes_are_usb_compliant() {
+        let reports = [HidReportRecord {
+            interface_number: 0,
+            descriptor: &REPORT,
+        }];
+        let mut out = [0; 256];
+
+        let mut zero_value = CONFIG;
+        zero_value[5] = 0;
+        assert_eq!(
+            validate_mirror_image(encode(&zero_value, &reports, &mut out)),
+            Err(MirrorRejectReason::MalformedImage)
+        );
+
+        let mut missing_reserved_one = CONFIG;
+        missing_reserved_one[7] = 0;
+        assert_eq!(
+            validate_mirror_image(encode(&missing_reserved_one, &reports, &mut out)),
+            Err(MirrorRejectReason::MalformedImage)
+        );
+
+        let mut non_default_value = CONFIG;
+        non_default_value[5] = 7;
+        assert_eq!(
+            validate_mirror_image(encode(&non_default_value, &reports, &mut out))
+                .unwrap()
+                .configuration_descriptor[5],
+            7
+        );
     }
 
     #[test]
