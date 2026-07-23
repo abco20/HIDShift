@@ -49,16 +49,8 @@ serial-port detection. It does not start a monitor. Firmware tasks use the
 project-local ESP environment automatically, so no shell profile changes are
 required.
 
-The normal task builds the one-board image. Build and flash the optional
-dual-S3 pair with:
-
-```sh
-mise run firmware:build-dual
-HIDSHIFT_HOST_PORT=<HOST_UART> mise run firmware:flash-dual
-mise run device-firmware:build
-HIDSHIFT_DEVICE_PORT=<DEVICE_UART> mise run device-firmware:flash
-```
-
+The normal task builds the one-board image. The optional dual-S3 build and
+flash procedure is documented in [docs/dual-s3.md](docs/dual-s3.md).
 `dual-s3-wired` is absent from the production one-board build.
 `hardware-e2e` adds test injection and boot-time hardware diagnostics only and
 must not be used in production.
@@ -82,9 +74,6 @@ Target switching does not wait for the old host to disconnect. The keyboard
 report is boot-compatible 6KRO; keys beyond the six-key limit are ignored until
 released.
 
-The one-board image cycles ready BLE hosts. The dual-S3 image cycles Wired,
-then ready BLE hosts 1–4, skipping unavailable targets.
-
 ## Management
 
 Management is available over BLE and serial. It covers status, target
@@ -106,9 +95,6 @@ cargo build --release --manifest-path tools/hidshiftctl/Cargo.toml
 tools/hidshiftctl/target/release/hidshiftctl --serial <PORT> status
 tools/hidshiftctl/target/release/hidshiftctl --ble status
 tools/hidshiftctl/target/release/hidshiftctl --ble pair 2
-tools/hidshiftctl/target/release/hidshiftctl --ble target usb
-tools/hidshiftctl/target/release/hidshiftctl --ble mirror list
-tools/hidshiftctl/target/release/hidshiftctl --ble mirror select 0
 ```
 
 When no BLE address is supplied, the CLI scans for `HIDShift`. The protocol is
