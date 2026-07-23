@@ -194,8 +194,13 @@ mod tests {
             RuntimeInputMessage::BridgeEvent(BridgeEvent::SelectOutputTarget {
                 target: crate::output_target::OutputTarget::Wired,
             }),
-            RuntimeInputMessage::BridgeEvent(BridgeEvent::WiredAvailabilityChanged {
-                availability: crate::output_target::OutputTargetAvailability::Ready,
+            RuntimeInputMessage::DeviceUsbState(crate::interchip::UsbState {
+                attached: true,
+                configured: true,
+                fallback_active: true,
+                healthy: true,
+                active_profile_hash: 0,
+                error_code: 0,
             }),
         ] {
             drive_runtime_message(&mut owner, &message, &mut sink).unwrap();

@@ -812,6 +812,28 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
         self.state.mirror_target = target;
     }
 
+    #[cfg(feature = "dual-s3-wired")]
+    pub fn begin_wired_presentation_transition(&mut self) -> Result<u32, BridgeError> {
+        self.state
+            .suppression
+            .keyboard
+            .capture_from(&self.state.input.keyboard)?;
+        self.state.suppression.mouse_buttons = self.state.input.mouse.buttons;
+        self.state.suppression.consumer = self.state.input.consumer;
+        self.state.wired_availability = OutputTargetAvailability::ConnectedNotReady;
+        Ok(self.state.output_target.begin_transition())
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    pub fn hold_wired_presentation_transition(&mut self) {
+        if self.state.wired_availability != OutputTargetAvailability::Unavailable {
+            self.state.wired_availability = OutputTargetAvailability::ConnectedNotReady;
+            self.state
+                .output_target
+                .set_availability(OutputTargetAvailability::ConnectedNotReady);
+        }
+    }
+
     pub fn storage_state(&self, generation: u32) -> Result<StorageState, StorageError> {
         let storage = self.state.hosts.storage_state(generation)?;
         #[cfg(feature = "dual-s3-wired")]

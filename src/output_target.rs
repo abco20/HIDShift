@@ -66,6 +66,13 @@ impl OutputTargetState {
             }
         };
     }
+
+    pub fn begin_transition(&mut self) -> u32 {
+        self.active = None;
+        self.availability = OutputTargetAvailability::ConnectedNotReady;
+        self.transition_operation_id = self.transition_operation_id.wrapping_add(1);
+        self.transition_operation_id
+    }
 }
 
 impl Default for OutputTargetState {

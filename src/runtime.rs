@@ -249,6 +249,10 @@ pub struct BridgeRuntime<const HOSTS: usize, const USB_INTERFACES: usize> {
     last_mirror_control_request: Option<MirrorControlRequest>,
     #[cfg(feature = "dual-s3-wired")]
     presentation_transition_pending: bool,
+    #[cfg(feature = "dual-s3-wired")]
+    transition_mirror_target: Option<MirrorCandidateId>,
+    #[cfg(feature = "dual-s3-wired")]
+    active_mirror_target: Option<MirrorCandidateId>,
     #[cfg(all(feature = "dual-s3-wired", feature = "hardware-e2e"))]
     synthetic_control_response: Option<MirrorControlResponse>,
 }
@@ -311,6 +315,10 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             last_mirror_control_request: None,
             #[cfg(feature = "dual-s3-wired")]
             presentation_transition_pending: false,
+            #[cfg(feature = "dual-s3-wired")]
+            transition_mirror_target: None,
+            #[cfg(feature = "dual-s3-wired")]
+            active_mirror_target: None,
             #[cfg(all(feature = "dual-s3-wired", feature = "hardware-e2e"))]
             synthetic_control_response: None,
         }
@@ -362,7 +370,7 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         {
             return None;
         }
-        let candidate = self.selected_mirror_candidate()?;
+        let candidate = self.active_mirror_target?;
         self.mirror_candidates
             .get(candidate)
             .and_then(|metadata| metadata.source_device)
@@ -375,20 +383,42 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         {
             return false;
         }
-        self.selected_mirror_candidate()
+        self.active_mirror_target
             .and_then(|candidate| self.mirror_candidates.get(candidate))
             .is_some_and(|metadata| metadata.synthetic)
     }
 
     #[cfg(feature = "dual-s3-wired")]
-    fn selected_mirror_profile_hash(&self) -> Option<u32> {
-        self.selected_mirror_candidate()
-            .and_then(|candidate| self.mirror_profile_hash(candidate))
+    fn begin_presentation_transition<const COMMANDS: usize>(
+        &mut self,
+        target: Option<MirrorCandidateId>,
+        commands: &mut heapless::Vec<RuntimeCommand, COMMANDS>,
+    ) -> Result<(), RuntimeError> {
+        let operation_id = self.bridge.begin_wired_presentation_transition()?;
+        self.presentation_transition_pending = true;
+        self.transition_mirror_target = target;
+        push_command(
+            commands,
+            RuntimeCommand::DeviceCommand(DeviceTaskCommand::ReleaseAll),
+        )?;
+        let command = match target {
+            Some(candidate) => {
+                let profile_hash = self
+                    .mirror_profile_hash(candidate)
+                    .ok_or(RuntimeError::MirrorCandidateUnavailable)?;
+                DeviceTaskCommand::ActivateMirror(ActivateProfile {
+                    operation_id,
+                    profile_hash,
+                })
+            }
+            None => DeviceTaskCommand::ActivateFallback { operation_id },
+        };
+        push_command(commands, RuntimeCommand::DeviceCommand(command))
     }
 
     #[cfg(feature = "dual-s3-wired")]
     fn activate_selected_mirror_candidate<const COMMANDS: usize>(
-        &self,
+        &mut self,
         candidate: MirrorCandidateId,
         profile_hash: u32,
         commands: &mut heapless::Vec<RuntimeCommand, COMMANDS>,
@@ -396,17 +426,8 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         if self.selected_mirror_candidate() == Some(candidate)
             && self.bridge.state().output_target.selected == OutputTarget::Wired
         {
-            push_command(
-                commands,
-                RuntimeCommand::DeviceCommand(DeviceTaskCommand::ReleaseAll),
-            )?;
-            push_command(
-                commands,
-                RuntimeCommand::DeviceCommand(DeviceTaskCommand::ActivateMirror(ActivateProfile {
-                    operation_id: self.bridge.state().output_target.transition_operation_id,
-                    profile_hash,
-                })),
-            )?;
+            debug_assert_eq!(self.mirror_profile_hash(candidate), Some(profile_hash));
+            self.begin_presentation_transition(Some(candidate), commands)?;
         }
         Ok(())
     }
@@ -664,16 +685,7 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                 if selected_candidate_replaced
                     && self.bridge.state().output_target.selected == OutputTarget::Wired
                 {
-                    push_command(
-                        commands,
-                        RuntimeCommand::DeviceCommand(DeviceTaskCommand::ReleaseAll),
-                    )?;
-                    push_command(
-                        commands,
-                        RuntimeCommand::DeviceCommand(DeviceTaskCommand::ActivateFallback {
-                            operation_id: self.bridge.state().output_target.transition_operation_id,
-                        }),
-                    )?;
+                    self.begin_presentation_transition(None, commands)?;
                 }
                 Ok(())
             }
@@ -745,6 +757,7 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                 commands.clear();
                 let available = state.healthy && state.attached && state.configured;
                 if !available {
+                    self.active_mirror_target = None;
                     return self.handle_bridge_event_append::<COMMANDS, ACTIONS>(
                         BridgeEvent::WiredAvailabilityChanged {
                             availability: if state.healthy && state.attached {
@@ -758,15 +771,25 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                 }
 
                 let selected = self.bridge.state().output_target.selected;
-                let expected_mirror = (selected == OutputTarget::Wired)
-                    .then(|| self.selected_mirror_profile_hash())
-                    .flatten();
-                let presentation_matches = match expected_mirror {
+                let expected_target = if self.presentation_transition_pending {
+                    self.transition_mirror_target
+                } else if selected == OutputTarget::Wired {
+                    self.selected_mirror_candidate()
+                } else {
+                    None
+                };
+                let expected_profile_hash =
+                    expected_target.and_then(|candidate| self.mirror_profile_hash(candidate));
+                let presentation_matches = match expected_profile_hash {
                     Some(hash) => !state.fallback_active && state.active_profile_hash == hash,
                     None => state.fallback_active,
                 };
                 if presentation_matches {
                     self.presentation_transition_pending = false;
+                    self.transition_mirror_target = None;
+                    self.active_mirror_target = (selected == OutputTarget::Wired)
+                        .then_some(expected_target)
+                        .flatten();
                     return self.handle_bridge_event_append::<COMMANDS, ACTIONS>(
                         BridgeEvent::WiredAvailabilityChanged {
                             availability: OutputTargetAvailability::Ready,
@@ -776,6 +799,8 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                 }
 
                 self.presentation_transition_pending = true;
+                self.transition_mirror_target = expected_target;
+                self.active_mirror_target = None;
                 self.handle_bridge_event_append::<COMMANDS, ACTIONS>(
                     BridgeEvent::WiredAvailabilityChanged {
                         availability: OutputTargetAvailability::ConnectedNotReady,
@@ -785,7 +810,7 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                 let operation_id = self.bridge.state().output_target.transition_operation_id;
                 push_command(
                     commands,
-                    RuntimeCommand::DeviceCommand(match expected_mirror {
+                    RuntimeCommand::DeviceCommand(match expected_profile_hash {
                         Some(profile_hash) => DeviceTaskCommand::ActivateMirror(ActivateProfile {
                             operation_id,
                             profile_hash,
@@ -842,20 +867,7 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                     if selected_candidate == Some(candidate)
                         && self.bridge.state().output_target.selected == OutputTarget::Wired
                     {
-                        push_command(
-                            commands,
-                            RuntimeCommand::DeviceCommand(DeviceTaskCommand::ReleaseAll),
-                        )?;
-                        push_command(
-                            commands,
-                            RuntimeCommand::DeviceCommand(DeviceTaskCommand::ActivateFallback {
-                                operation_id: self
-                                    .bridge
-                                    .state()
-                                    .output_target
-                                    .transition_operation_id,
-                            }),
-                        )?;
+                        self.begin_presentation_transition(None, commands)?;
                     }
                 }
                 if let Some(profile_hash) = accepted_profile_hash {
@@ -864,16 +876,7 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                 if selected_candidate_replaced
                     && self.bridge.state().output_target.selected == OutputTarget::Wired
                 {
-                    push_command(
-                        commands,
-                        RuntimeCommand::DeviceCommand(DeviceTaskCommand::ReleaseAll),
-                    )?;
-                    push_command(
-                        commands,
-                        RuntimeCommand::DeviceCommand(DeviceTaskCommand::ActivateFallback {
-                            operation_id: self.bridge.state().output_target.transition_operation_id,
-                        }),
-                    )?;
+                    self.begin_presentation_transition(None, commands)?;
                 }
                 Ok(())
             }
@@ -934,8 +937,10 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         ble: &mut heapless::Vec<BleTaskCommand, BLE>,
         device: &mut heapless::Vec<DeviceTaskCommand, DEVICE>,
     ) -> Result<(), RuntimeError> {
-        if self.bridge.state().output_target.active == Some(OutputTarget::Wired)
-            && self.selected_mirror_candidate().is_some()
+        if (self.presentation_transition_pending
+            && self.bridge.state().output_target.selected == OutputTarget::Wired)
+            || (self.bridge.state().output_target.active == Some(OutputTarget::Wired)
+                && self.active_mirror_target.is_some())
         {
             self.counters.mirror_non_target_input_dropped = self
                 .counters
@@ -1082,16 +1087,7 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                 if selected_was_removed
                     && self.bridge.state().output_target.selected == OutputTarget::Wired
                 {
-                    push_command(
-                        commands,
-                        RuntimeCommand::DeviceCommand(DeviceTaskCommand::ReleaseAll),
-                    )?;
-                    push_command(
-                        commands,
-                        RuntimeCommand::DeviceCommand(DeviceTaskCommand::ActivateFallback {
-                            operation_id: self.bridge.state().output_target.transition_operation_id,
-                        }),
-                    )?;
+                    self.begin_presentation_transition(None, commands)?;
                 }
             }
         }
@@ -1415,23 +1411,8 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                         .set_mirror_target(Some(StoredMirrorTarget(stable_id)));
                     self.push_storage_snapshot(commands, StoragePersistPriority::Critical)?;
                     if self.bridge.state().output_target.selected == OutputTarget::Wired {
-                        push_command(
-                            commands,
-                            RuntimeCommand::DeviceCommand(DeviceTaskCommand::ReleaseAll),
-                        )?;
-                        push_command(
-                            commands,
-                            RuntimeCommand::DeviceCommand(DeviceTaskCommand::ActivateMirror(
-                                ActivateProfile {
-                                    operation_id: self
-                                        .bridge
-                                        .state()
-                                        .output_target
-                                        .transition_operation_id,
-                                    profile_hash,
-                                },
-                            )),
-                        )?;
+                        debug_assert_eq!(self.mirror_profile_hash(candidate), Some(profile_hash));
+                        self.begin_presentation_transition(Some(candidate), commands)?;
                     }
                     ManagementResult::Ok
                 } else {
@@ -1443,16 +1424,7 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                 self.bridge.set_mirror_target(None);
                 self.push_storage_snapshot(commands, StoragePersistPriority::Critical)?;
                 if self.bridge.state().output_target.selected == OutputTarget::Wired {
-                    push_command(
-                        commands,
-                        RuntimeCommand::DeviceCommand(DeviceTaskCommand::ReleaseAll),
-                    )?;
-                    push_command(
-                        commands,
-                        RuntimeCommand::DeviceCommand(DeviceTaskCommand::ActivateFallback {
-                            operation_id: self.bridge.state().output_target.transition_operation_id,
-                        }),
-                    )?;
+                    self.begin_presentation_transition(None, commands)?;
                 }
                 ManagementResult::Ok
             }
@@ -1576,7 +1548,7 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
     ) -> Option<ManagementMirrorCandidate> {
         let metadata = self.mirror_candidates.get(candidate)?;
         let selected = self.selected_mirror_candidate() == Some(candidate);
-        let active = selected
+        let active = self.active_mirror_target == Some(candidate)
             && !self.presentation_transition_pending
             && self.bridge.state().output_target.active == Some(OutputTarget::Wired);
         Some(ManagementMirrorCandidate {
@@ -1619,7 +1591,7 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             ready_ble_mask,
             effective_presentation: if target.active == Some(OutputTarget::Wired)
                 && !self.presentation_transition_pending
-                && self.selected_mirror_candidate().is_some()
+                && self.active_mirror_target.is_some()
             {
                 ManagementUsbPresentationKind::Mirror
             } else {
@@ -2105,6 +2077,9 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                 OutputTarget::Wired => {
                     #[cfg(feature = "dual-s3-wired")]
                     {
+                        if self.presentation_transition_pending {
+                            return Ok(());
+                        }
                         push_command(
                             commands,
                             RuntimeCommand::DeviceCommand(DeviceTaskCommand::StandardReport {
@@ -2138,7 +2113,11 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             ),
             #[cfg(feature = "dual-s3-wired")]
             BridgeAction::ActivateWired { operation_id } => {
-                let mirror = self.selected_mirror_profile_hash();
+                let target = self.selected_mirror_candidate();
+                let mirror = target.and_then(|candidate| self.mirror_profile_hash(candidate));
+                self.presentation_transition_pending = true;
+                self.transition_mirror_target = target;
+                self.bridge.hold_wired_presentation_transition();
                 push_command(
                     commands,
                     RuntimeCommand::DeviceCommand(match mirror {
@@ -2151,10 +2130,17 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                 )
             }
             #[cfg(feature = "dual-s3-wired")]
-            BridgeAction::EnsureFallback { operation_id } => push_command(
-                commands,
-                RuntimeCommand::DeviceCommand(DeviceTaskCommand::ActivateFallback { operation_id }),
-            ),
+            BridgeAction::EnsureFallback { operation_id } => {
+                self.presentation_transition_pending = true;
+                self.transition_mirror_target = None;
+                self.active_mirror_target = None;
+                push_command(
+                    commands,
+                    RuntimeCommand::DeviceCommand(DeviceTaskCommand::ActivateFallback {
+                        operation_id,
+                    }),
+                )
+            }
             BridgeAction::UsbSetKeyboardLeds {
                 interface_id,
                 device_id,
@@ -2970,10 +2956,14 @@ pub enum RuntimeError {
     UsbLed(KeyboardLedOutputError),
     BleHostAdapter(BleHostAdapterError),
     UsbHidInterfaceCapacity,
-    UsbHidInterfaceNotRegistered { interface_id: InterfaceId },
+    UsbHidInterfaceNotRegistered {
+        interface_id: InterfaceId,
+    },
     CommandCapacity,
     UnexpectedRealtimeAction,
     WiredFeatureDisabled,
+    #[cfg(feature = "dual-s3-wired")]
+    MirrorCandidateUnavailable,
 }
 
 impl From<BridgeError> for RuntimeError {
@@ -3426,8 +3416,13 @@ mod tests {
 
         runtime
             .handle_input::<16, 16, 2>(
-                RuntimeInput::BridgeEvent(BridgeEvent::WiredAvailabilityChanged {
-                    availability: crate::output_target::OutputTargetAvailability::Ready,
+                RuntimeInput::DeviceUsbState(crate::interchip::UsbState {
+                    attached: true,
+                    configured: true,
+                    fallback_active: true,
+                    healthy: true,
+                    active_profile_hash: 0,
+                    error_code: 0,
                 }),
                 &mut commands,
             )
@@ -3500,7 +3495,7 @@ mod tests {
         )));
         assert!(commands.contains(&RuntimeCommand::DeviceCommand(
             DeviceTaskCommand::ActivateMirror(ActivateProfile {
-                operation_id: 0,
+                operation_id: 1,
                 profile_hash: 0x1122_3344,
             })
         )));
@@ -3608,11 +3603,12 @@ mod tests {
                 &mut commands,
             )
             .unwrap();
-        assert!(commands.contains(&RuntimeCommand::DeviceCommand(
-            DeviceTaskCommand::ActivateMirror(ActivateProfile {
-                operation_id: 0,
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            RuntimeCommand::DeviceCommand(DeviceTaskCommand::ActivateMirror(ActivateProfile {
                 profile_hash: 0x1111_1111,
-            })
+                ..
+            }))
         )));
     }
 
@@ -3654,11 +3650,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(management_response(&commands).result, ManagementResult::Ok);
-        assert!(commands.contains(&RuntimeCommand::DeviceCommand(
-            DeviceTaskCommand::ActivateMirror(ActivateProfile {
-                operation_id: 0,
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            RuntimeCommand::DeviceCommand(DeviceTaskCommand::ActivateMirror(ActivateProfile {
                 profile_hash: 0x3344_5566,
-            })
+                ..
+            }))
         )));
     }
 
@@ -3725,11 +3722,12 @@ mod tests {
             )
             .unwrap();
 
-        assert!(!commands.contains(&RuntimeCommand::DeviceCommand(
-            DeviceTaskCommand::ActivateMirror(ActivateProfile {
-                operation_id: 0,
+        assert!(!commands.iter().any(|command| matches!(
+            command,
+            RuntimeCommand::DeviceCommand(DeviceTaskCommand::ActivateMirror(ActivateProfile {
                 profile_hash: 0x2222_2222,
-            })
+                ..
+            }))
         )));
         runtime
             .handle_input::<16, 16, 2>(
@@ -3737,11 +3735,12 @@ mod tests {
                 &mut commands,
             )
             .unwrap();
-        assert!(commands.contains(&RuntimeCommand::DeviceCommand(
-            DeviceTaskCommand::ActivateMirror(ActivateProfile {
-                operation_id: 0,
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            RuntimeCommand::DeviceCommand(DeviceTaskCommand::ActivateMirror(ActivateProfile {
                 profile_hash: 0x2222_2222,
-            })
+                ..
+            }))
         )));
 
         runtime
@@ -3943,6 +3942,168 @@ mod tests {
 
     #[cfg(feature = "dual-s3-wired")]
     #[test]
+    fn mirror_target_change_routes_only_after_new_profile_is_configured() {
+        let mut runtime = BridgeRuntime::<4, 1>::new(0);
+        let mut commands = heapless::Vec::<RuntimeCommand, 16>::new();
+        let candidates = [
+            (MirrorCandidateId(0), 0x1111_1111, DeviceId(7), 1),
+            (MirrorCandidateId(1), 0x2222_2222, DeviceId(8), 2),
+        ];
+        for (candidate, profile_hash, source_device, port) in candidates {
+            runtime
+                .handle_input::<16, 16, 2>(
+                    RuntimeInput::MirrorCandidateRegistered {
+                        candidate,
+                        stable_id: MirrorStableId::new(0x046d, 0xc547, None, profile_hash, &[port])
+                            .unwrap(),
+                        profile_hash: Some(profile_hash),
+                        synthetic: false,
+                        source_device: Some(source_device),
+                    },
+                    &mut commands,
+                )
+                .unwrap();
+            runtime
+                .handle_input::<16, 16, 2>(
+                    RuntimeInput::DeviceProfileResult(ProfileResult {
+                        transfer_id: u32::from(port),
+                        profile_hash,
+                        status: ProfileResultStatus::Accepted,
+                        reject_reason: 0,
+                        detail: 0,
+                    }),
+                    &mut commands,
+                )
+                .unwrap();
+        }
+
+        runtime
+            .handle_input::<16, 16, 2>(
+                management_request(ManagementCommand::SetMirrorTarget(MirrorCandidateId(0)), 50),
+                &mut commands,
+            )
+            .unwrap();
+        runtime
+            .handle_input::<16, 16, 2>(
+                RuntimeInput::DeviceUsbState(crate::interchip::UsbState {
+                    attached: true,
+                    configured: true,
+                    fallback_active: false,
+                    healthy: true,
+                    active_profile_hash: 0x1111_1111,
+                    error_code: 0,
+                }),
+                &mut commands,
+            )
+            .unwrap();
+        assert_eq!(
+            runtime.bridge.state().output_target.active,
+            Some(OutputTarget::Wired)
+        );
+
+        runtime
+            .handle_input::<16, 16, 2>(
+                management_request(ManagementCommand::SetMirrorTarget(MirrorCandidateId(1)), 51),
+                &mut commands,
+            )
+            .unwrap();
+        assert_eq!(runtime.bridge.state().output_target.active, None);
+        assert!(runtime.presentation_transition_pending);
+        assert_eq!(runtime.transition_mirror_target, Some(MirrorCandidateId(1)));
+        assert_eq!(runtime.active_mirror_target, Some(MirrorCandidateId(0)));
+
+        let input = RawEndpointReport::new(0x81, 1, &[1, 2, 3]).unwrap();
+        for device_id in [DeviceId(7), DeviceId(8)] {
+            runtime
+                .handle_input::<16, 16, 2>(
+                    RuntimeInput::MirrorEndpointIn {
+                        device_id,
+                        report: input,
+                    },
+                    &mut commands,
+                )
+                .unwrap();
+            assert!(commands.is_empty());
+        }
+
+        let mut ble = heapless::Vec::<BleTaskCommand, 4>::new();
+        let mut device = heapless::Vec::<DeviceTaskCommand, 4>::new();
+        runtime
+            .handle_realtime_input_frame_in_place(
+                crate::input::InputFrame::Standard(keyboard_input(KeyUsage(4))),
+                &mut ble,
+                &mut device,
+            )
+            .unwrap();
+        assert!(ble.is_empty());
+        assert!(device.is_empty());
+
+        runtime
+            .handle_input::<16, 16, 2>(
+                RuntimeInput::DeviceUsbState(crate::interchip::UsbState {
+                    attached: true,
+                    configured: true,
+                    fallback_active: false,
+                    healthy: true,
+                    active_profile_hash: 0x1111_1111,
+                    error_code: 0,
+                }),
+                &mut commands,
+            )
+            .unwrap();
+        assert!(runtime.presentation_transition_pending);
+        assert_eq!(runtime.active_mirror_target, None);
+        assert_eq!(runtime.bridge.state().output_target.active, None);
+
+        runtime
+            .handle_input::<16, 16, 2>(
+                RuntimeInput::DeviceUsbState(crate::interchip::UsbState {
+                    attached: true,
+                    configured: true,
+                    fallback_active: false,
+                    healthy: true,
+                    active_profile_hash: 0x2222_2222,
+                    error_code: 0,
+                }),
+                &mut commands,
+            )
+            .unwrap();
+        assert!(!runtime.presentation_transition_pending);
+        assert_eq!(runtime.active_mirror_target, Some(MirrorCandidateId(1)));
+        assert_eq!(
+            runtime.bridge.state().output_target.active,
+            Some(OutputTarget::Wired)
+        );
+
+        runtime
+            .handle_input::<16, 16, 2>(
+                RuntimeInput::MirrorEndpointIn {
+                    device_id: DeviceId(7),
+                    report: input,
+                },
+                &mut commands,
+            )
+            .unwrap();
+        assert!(commands.is_empty());
+        runtime
+            .handle_input::<16, 16, 2>(
+                RuntimeInput::MirrorEndpointIn {
+                    device_id: DeviceId(8),
+                    report: input,
+                },
+                &mut commands,
+            )
+            .unwrap();
+        assert_eq!(
+            commands.as_slice(),
+            &[RuntimeCommand::DeviceCommand(
+                DeviceTaskCommand::RawEndpointIn(input)
+            )]
+        );
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    #[test]
     fn completed_physical_control_request_returns_to_device_s3() {
         let mut runtime = BridgeRuntime::<4, 1>::new(0);
         let mut commands = heapless::Vec::<RuntimeCommand, 4>::new();
@@ -4088,11 +4249,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(runtime.bridge.state().output_target.active, None);
-        assert!(commands.contains(&RuntimeCommand::DeviceCommand(
-            DeviceTaskCommand::ActivateMirror(ActivateProfile {
-                operation_id: 0,
-                profile_hash,
-            })
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            RuntimeCommand::DeviceCommand(DeviceTaskCommand::ActivateMirror(ActivateProfile {
+                profile_hash: value,
+                ..
+            })) if *value == profile_hash
         )));
 
         runtime
