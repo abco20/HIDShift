@@ -182,7 +182,11 @@ impl DeviceLink {
                         self.sender.reset_session(session);
                         self.host_compatible = false;
                         self.usb_state_dirty = true;
-                        self.queue_record(RECORD_LINK_RESET, &[], now_ms)
+                        // A new session is accepted only when its first record
+                        // proves the peer role and protocol version. Starting
+                        // it with LINK_RESET would leave a strict peer waiting
+                        // forever without acknowledging sequence 1.
+                        self.queue_hello(now_ms)
                     }
                     RetransmitAction::Idle => None,
                 }
@@ -661,6 +665,29 @@ mod tests {
 
         assert!(events.is_empty());
         assert_eq!(device.receiver.cumulative_ack(), ack_before);
+    }
+
+    #[test]
+    fn retransmit_exhaustion_starts_the_new_device_session_with_hello() {
+        let mut device = DeviceLink::new(2, fallback_state());
+
+        // Never acknowledge the boot HELLO. Exhausting its retransmit budget
+        // must still produce a peer-authenticating HELLO as sequence 1 of the
+        // replacement session, rather than an unacknowledgeable LINK_RESET.
+        let first = SpiCell::decode(&device.next_transaction(0)).unwrap();
+        let first_session = first.header.session_id;
+        for now_ms in (5..40).step_by(5) {
+            let retransmit = SpiCell::decode(&device.next_transaction(now_ms)).unwrap();
+            assert_eq!(retransmit.header.session_id, first_session);
+        }
+        let restarted = SpiCell::decode(&device.next_transaction(40)).unwrap();
+        assert_ne!(restarted.header.session_id, first_session);
+        assert_eq!(restarted.header.tx_sequence, 1);
+        let record = RecordIter::new(restarted.payload(), restarted.header.record_count)
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.record_type, RECORD_HELLO);
     }
 
     #[test]

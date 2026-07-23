@@ -220,7 +220,11 @@ async fn run_link(
                 hello_confirmed = false;
                 usb_state = None;
                 control_request_assembler.reset();
-                queue_record(&mut sender, RECORD_LINK_RESET, &[], now_ms).ok()
+                // DeviceLink deliberately ignores commands from a new Host
+                // session until it sees a compatible HELLO. Sending
+                // LINK_RESET as sequence 1 therefore deadlocks recovery:
+                // Device cannot ACK it and Host never reaches HELLO.
+                queue_hello(&mut sender, now_ms)
             }
             RetransmitAction::Idle if !hello_confirmed && sender.pending_len() == 0 => {
                 queue_hello(&mut sender, now_ms)

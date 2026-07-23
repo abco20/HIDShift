@@ -100,6 +100,36 @@ pub enum ProfileTransferError {
     ConflictingRetry,
 }
 
+/// Remembers the final (including storage) result of the most recent commit.
+///
+/// A flash write can keep Device S3 from servicing SPI long enough for Host S3
+/// to establish a fresh transport session. In that case the unacknowledged
+/// PROFILE_COMMIT is replayed without BEGIN/CHUNK records that were already
+/// acknowledged. Replaying the same result keeps the operation idempotent.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProfileCommitCache {
+    result: Option<ProfileResult>,
+}
+
+impl ProfileCommitCache {
+    pub const fn new() -> Self {
+        Self { result: None }
+    }
+
+    pub fn record(&mut self, result: ProfileResult) {
+        self.result = Some(result);
+    }
+
+    pub fn replay(&self, transfer_id: u32) -> Option<ProfileResult> {
+        self.result
+            .filter(|result| result.transfer_id == transfer_id)
+    }
+
+    pub fn clear(&mut self) {
+        self.result = None;
+    }
+}
+
 pub struct ProfileTransferReceiver<'a> {
     staging: &'a mut [u8],
     active: Option<TransferState>,
@@ -310,6 +340,24 @@ mod tests {
         let (metadata, committed) = receiver.committed().unwrap();
         assert_eq!(metadata.length, length);
         assert_eq!(committed, &image[..length]);
+    }
+
+    #[test]
+    fn final_profile_result_can_be_replayed_after_a_session_reset() {
+        let accepted = ProfileResult {
+            transfer_id: 7,
+            profile_hash: 0x1234_5678,
+            status: ProfileResultStatus::AlreadyStored,
+            reject_reason: MirrorRejectReason::None as u8,
+            detail: 0,
+        };
+        let mut cache = ProfileCommitCache::new();
+        cache.record(accepted);
+
+        assert_eq!(cache.replay(7), Some(accepted));
+        assert_eq!(cache.replay(8), None);
+        cache.clear();
+        assert_eq!(cache.replay(7), None);
     }
 
     #[test]

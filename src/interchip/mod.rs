@@ -29,8 +29,8 @@ pub use message::{
     StandardOutputReportError, UsbState,
 };
 pub use profile_transfer::{
-    CommittedProfile, ProfileChunkDisposition, ProfileTransferCommand, ProfileTransferEncoder,
-    ProfileTransferError, ProfileTransferReceiver,
+    CommittedProfile, ProfileChunkDisposition, ProfileCommitCache, ProfileTransferCommand,
+    ProfileTransferEncoder, ProfileTransferError, ProfileTransferReceiver,
 };
 pub use record::{Record, RecordCodecError, RecordIter, RecordRef, encode_records};
 pub use reliable::{

@@ -13,8 +13,8 @@ use esp_hal::spi::Mode;
 use esp_hal::spi::slave::Spi;
 use hidshift::fallback::build_fallback_mirror_image;
 use hidshift::interchip::{
-    DeviceLink, DeviceLinkEvent, ProfileResult, ProfileResultStatus, ProfileTransferError,
-    ProfileTransferReceiver, SPI_CELL_LEN, StandardOutputReport, UsbState,
+    DeviceLink, DeviceLinkEvent, ProfileCommitCache, ProfileResult, ProfileResultStatus,
+    ProfileTransferError, ProfileTransferReceiver, SPI_CELL_LEN, StandardOutputReport, UsbState,
 };
 use hidshift::mirror::{
     HSMI_MAX_SIZE, MirrorRejectReason, ProfileCommitOutcome, UsbDevicePlan, validate_mirror_image,
@@ -302,6 +302,7 @@ fn run<'a, B: UsbBus, P: PresentationRuntime<B>>(
         Err((error, _, _, _)) => fatal("initial slave DMA queue", error),
     };
     let mut pending_profile_result = None;
+    let mut profile_commit_cache = ProfileCommitCache::new();
     let mut raw_output_sequence = 1u16;
     let mut remote_wakeup = RemoteWakeupController::new();
 
@@ -342,6 +343,7 @@ fn run<'a, B: UsbBus, P: PresentationRuntime<B>>(
         for event in events {
             match event {
                 DeviceLinkEvent::ProfileBegin(begin) => {
+                    profile_commit_cache.clear();
                     if profile_store.is_none() {
                         pending_profile_result = Some(ProfileResult {
                             transfer_id: begin.transfer_id,
@@ -365,6 +367,16 @@ fn run<'a, B: UsbBus, P: PresentationRuntime<B>>(
                     }
                 }
                 DeviceLinkEvent::ProfileCommit { transfer_id } => {
+                    if let Some(result) = profile_commit_cache.replay(transfer_id) {
+                        pending_profile_result = Some(result);
+                        log::info!(
+                            "device-profile: replaying transfer={} status={} reason={}",
+                            result.transfer_id,
+                            result.status as u8,
+                            result.reject_reason
+                        );
+                        continue;
+                    }
                     let mut result = profile_receiver.commit(transfer_id);
                     if result.status == ProfileResultStatus::Accepted {
                         result = match (profile_store.as_mut(), profile_receiver.committed()) {
@@ -392,6 +404,7 @@ fn run<'a, B: UsbBus, P: PresentationRuntime<B>>(
                         };
                         profile_receiver.clear_committed();
                     }
+                    profile_commit_cache.record(result);
                     pending_profile_result = Some(result);
                     log::info!(
                         "device-profile: transfer={} status={} reason={}",
