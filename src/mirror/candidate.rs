@@ -1,3 +1,4 @@
+use crate::ids::DeviceId;
 use crate::interchip::{MirrorControlRequest, MirrorControlResponse};
 use crate::output_target::{MirrorCandidateId, MirrorStableId};
 
@@ -7,6 +8,7 @@ pub struct MirrorCandidateMetadata {
     pub stable_id: MirrorStableId,
     pub profile_hash: u32,
     pub synthetic: bool,
+    pub source_device: Option<DeviceId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,6 +69,14 @@ impl<const N: usize> MirrorCandidateRegistry<N> {
         Ok(())
     }
 
+    pub fn clear_source(&mut self, device_id: DeviceId) {
+        for entry in &mut self.entries {
+            if entry.is_some_and(|metadata| metadata.source_device == Some(device_id)) {
+                *entry = None;
+            }
+        }
+    }
+
     pub fn get(&self, candidate: MirrorCandidateId) -> Option<MirrorCandidateMetadata> {
         self.entries
             .get(usize::from(candidate.0))
@@ -109,6 +119,7 @@ mod tests {
             stable_id: MirrorStableId::synthetic(hash),
             profile_hash: hash,
             synthetic: true,
+            source_device: None,
         }
     }
 

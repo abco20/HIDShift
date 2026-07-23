@@ -50,6 +50,8 @@ pub enum RuntimeInputMessage {
     },
     DiagnosticsEvent(RuntimeDiagnosticsEvent),
     #[cfg(feature = "dual-s3-wired")]
+    DeviceCommandRequested(crate::runtime::DeviceTaskCommand),
+    #[cfg(feature = "dual-s3-wired")]
     DeviceProfileResult(crate::interchip::ProfileResult),
     #[cfg(feature = "dual-s3-wired")]
     MirrorEndpointOut(crate::interchip::RawEndpointReport),
@@ -63,6 +65,7 @@ pub enum RuntimeInputMessage {
         stable_id: crate::output_target::MirrorStableId,
         profile_hash: Option<u32>,
         synthetic: bool,
+        source_device: Option<DeviceId>,
     },
     RestoreStorage(StorageState),
 }
@@ -122,6 +125,8 @@ impl RuntimeInputMessage {
             },
             Self::DiagnosticsEvent(event) => RuntimeInput::DiagnosticsEvent(*event),
             #[cfg(feature = "dual-s3-wired")]
+            Self::DeviceCommandRequested(command) => RuntimeInput::DeviceCommandRequested(*command),
+            #[cfg(feature = "dual-s3-wired")]
             Self::DeviceProfileResult(result) => RuntimeInput::DeviceProfileResult(*result),
             #[cfg(feature = "dual-s3-wired")]
             Self::MirrorEndpointOut(report) => RuntimeInput::MirrorEndpointOut(*report),
@@ -135,11 +140,13 @@ impl RuntimeInputMessage {
                 stable_id,
                 profile_hash,
                 synthetic,
+                source_device,
             } => RuntimeInput::MirrorCandidateRegistered {
                 candidate: *candidate,
                 stable_id: *stable_id,
                 profile_hash: *profile_hash,
                 synthetic: *synthetic,
+                source_device: *source_device,
             },
             Self::RestoreStorage(storage) => RuntimeInput::RestoreStorage(storage),
         }
@@ -199,6 +206,10 @@ impl TryFrom<RuntimeInput<'_>> for RuntimeInputMessage {
             }
             RuntimeInput::DiagnosticsEvent(event) => Ok(Self::DiagnosticsEvent(event)),
             #[cfg(feature = "dual-s3-wired")]
+            RuntimeInput::DeviceCommandRequested(command) => {
+                Ok(Self::DeviceCommandRequested(command))
+            }
+            #[cfg(feature = "dual-s3-wired")]
             RuntimeInput::DeviceProfileResult(result) => Ok(Self::DeviceProfileResult(result)),
             #[cfg(feature = "dual-s3-wired")]
             RuntimeInput::MirrorEndpointOut(report) => Ok(Self::MirrorEndpointOut(report)),
@@ -212,11 +223,13 @@ impl TryFrom<RuntimeInput<'_>> for RuntimeInputMessage {
                 stable_id,
                 profile_hash,
                 synthetic,
+                source_device,
             } => Ok(Self::MirrorCandidateRegistered {
                 candidate,
                 stable_id,
                 profile_hash,
                 synthetic,
+                source_device,
             }),
             RuntimeInput::RestoreStorage(storage) => Ok(Self::RestoreStorage(storage.clone())),
         }
@@ -409,6 +422,19 @@ mod tests {
         assert_eq!(
             message.as_runtime_input(),
             RuntimeInput::DeviceProfileResult(result)
+        );
+
+        let command =
+            crate::runtime::DeviceTaskCommand::ProfileBegin(crate::interchip::ProfileBegin {
+                transfer_id: 1,
+                total_length: 32,
+                crc32: 2,
+                profile_hash: 3,
+            });
+        let message = RuntimeInputMessage::DeviceCommandRequested(command);
+        assert_eq!(
+            message.as_runtime_input(),
+            RuntimeInput::DeviceCommandRequested(command)
         );
     }
 

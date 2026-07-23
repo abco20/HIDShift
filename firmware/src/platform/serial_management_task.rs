@@ -221,6 +221,7 @@ pub async fn serial_management_task(
                                             ),
                                             profile_hash: Some(metadata.profile_hash),
                                             synthetic: true,
+                                            source_device: None,
                                         })
                                         .await;
                                     log::info!(
@@ -248,6 +249,7 @@ pub async fn serial_management_task(
                                     stable_id: hidshift::MirrorStableId::synthetic(0),
                                     profile_hash: None,
                                     synthetic: true,
+                                    source_device: None,
                                 })
                                 .await;
                             log::info!("@HIDSHIFT-MIRROR:CLEARED,{}", packet.sequence);

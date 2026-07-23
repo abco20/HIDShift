@@ -105,8 +105,9 @@ pub use management::{
 };
 #[cfg(feature = "dual-s3-wired")]
 pub use mirror::{
-    MirrorCandidateError, MirrorCandidateMetadata, MirrorCandidateRegistry,
-    MirrorCandidateRegistryError, MirrorCandidateSource,
+    CapturedMirrorProfile, MirrorCandidateError, MirrorCandidateMetadata, MirrorCandidateRegistry,
+    MirrorCandidateRegistryError, MirrorCandidateSource, MirrorCaptureError, MirrorCaptureSource,
+    capture_mirror_profile,
 };
 pub use output_target::{
     MIRROR_PORT_PATH_MAX_LEN, MirrorCandidateId, MirrorConfiguration, MirrorStableId,

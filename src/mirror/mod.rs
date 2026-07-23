@@ -1,4 +1,5 @@
 pub mod candidate;
+pub mod capture;
 pub mod control;
 pub mod image;
 pub mod parser;
@@ -9,6 +10,9 @@ pub mod validator;
 pub use candidate::{
     MirrorCandidateError, MirrorCandidateMetadata, MirrorCandidateRegistry,
     MirrorCandidateRegistryError, MirrorCandidateSource,
+};
+pub use capture::{
+    CapturedMirrorProfile, MirrorCaptureError, MirrorCaptureSource, capture_mirror_profile,
 };
 pub use control::{
     MIRROR_CONTROL_TIMEOUT_MS, MirrorControlForwarder, MirrorControlForwarderError,

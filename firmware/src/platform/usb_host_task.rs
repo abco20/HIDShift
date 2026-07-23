@@ -33,6 +33,13 @@ use hidshift::usb_hid::host_runtime::UsbHidInterfaceRuntimeSession;
 use hidshift::usb_hid::topology::{DefaultUsbTopologyManager, UsbDeviceRoute};
 use static_cell::ConstStaticCell;
 
+#[cfg(feature = "dual-s3-wired")]
+use hidshift::interchip::ProfileTransferEncoder;
+#[cfg(feature = "dual-s3-wired")]
+use hidshift::mirror::{HSMI_MAX_SIZE, HidReportRecord, MirrorCaptureSource, StringRecord};
+#[cfg(feature = "dual-s3-wired")]
+use hidshift::{MirrorCandidateId, capture_mirror_profile};
+
 use super::usb_output_transport::UsbKeyboardLedWriter;
 use super::usb_transport::{UsbHidControl, UsbHidReader};
 
@@ -85,6 +92,41 @@ static MOVEMENT_QUEUE_STORAGE: ConstStaticCell<
 static ACTIVE_SLOTS_STORAGE: ConstStaticCell<
     [Option<StaticActiveUsbInterfaceSlot>; MAX_ACTIVE_USB_INTERFACES],
 > = ConstStaticCell::new([const { None }; MAX_ACTIVE_USB_INTERFACES]);
+
+#[cfg(feature = "dual-s3-wired")]
+const MIRROR_BOS_MAX_LEN: usize = 256;
+#[cfg(feature = "dual-s3-wired")]
+const MIRROR_STRING_RECORDS_MAX: usize = 16;
+#[cfg(feature = "dual-s3-wired")]
+const MIRROR_STRING_DESCRIPTOR_MAX_LEN: usize = 256;
+
+#[cfg(feature = "dual-s3-wired")]
+struct MirrorCaptureScratch {
+    image: [u8; HSMI_MAX_SIZE],
+    bos: [u8; MIRROR_BOS_MAX_LEN],
+    strings: [[u8; MIRROR_STRING_DESCRIPTOR_MAX_LEN]; MIRROR_STRING_RECORDS_MAX],
+    string_indices: [u8; MIRROR_STRING_RECORDS_MAX],
+    string_lang_ids: [u16; MIRROR_STRING_RECORDS_MAX],
+    string_lengths: [usize; MIRROR_STRING_RECORDS_MAX],
+}
+
+#[cfg(feature = "dual-s3-wired")]
+impl MirrorCaptureScratch {
+    const fn new() -> Self {
+        Self {
+            image: [0; HSMI_MAX_SIZE],
+            bos: [0; MIRROR_BOS_MAX_LEN],
+            strings: [[0; MIRROR_STRING_DESCRIPTOR_MAX_LEN]; MIRROR_STRING_RECORDS_MAX],
+            string_indices: [0; MIRROR_STRING_RECORDS_MAX],
+            string_lang_ids: [0; MIRROR_STRING_RECORDS_MAX],
+            string_lengths: [0; MIRROR_STRING_RECORDS_MAX],
+        }
+    }
+}
+
+#[cfg(feature = "dual-s3-wired")]
+static MIRROR_CAPTURE_STORAGE: ConstStaticCell<MirrorCaptureScratch> =
+    ConstStaticCell::new(MirrorCaptureScratch::new());
 
 enum UsbSlotReadResult {
     Input {
@@ -229,6 +271,7 @@ async fn handle_hub_device_detected<'d>(
     hub_device_id: DeviceId,
     port: u8,
     speed: embassy_usb_driver::Speed,
+    #[cfg(feature = "dual-s3-wired")] mirror_capture: &mut MirrorCaptureScratch,
 ) {
     let Some(port_index) =
         hidshift::usb_hid::topology::tracked_hub_port_index::<MAX_HUB_PORTS>(port)
@@ -273,6 +316,12 @@ async fn handle_hub_device_detected<'d>(
                     child_device_id,
                     &child_info,
                     child_config_desc,
+                    #[cfg(feature = "dual-s3-wired")]
+                    MirrorCandidateId(port_index as u8),
+                    #[cfg(feature = "dual-s3-wired")]
+                    &[port + 1],
+                    #[cfg(feature = "dual-s3-wired")]
+                    mirror_capture,
                 )
                 .await
                 .is_ok()
@@ -460,6 +509,8 @@ pub async fn usb_input_task(
     let mut topology = TOPOLOGY_STORAGE.take();
     let mut movement_queue = MOVEMENT_QUEUE_STORAGE.take();
     let mut active_slots = ACTIVE_SLOTS_STORAGE.take();
+    #[cfg(feature = "dual-s3-wired")]
+    let mirror_capture = MIRROR_CAPTURE_STORAGE.take();
 
     loop {
         let speed = bus_controller.wait_for_connection().await;
@@ -549,6 +600,8 @@ pub async fn usb_input_task(
                                 device_id,
                                 port,
                                 speed,
+                                #[cfg(feature = "dual-s3-wired")]
+                                mirror_capture,
                             ),
                         )
                         .await
@@ -586,6 +639,8 @@ pub async fn usb_input_task(
                                             device_id,
                                             port,
                                             speed,
+                                            #[cfg(feature = "dual-s3-wired")]
+                                            mirror_capture,
                                         ),
                                     )
                                     .await
@@ -766,6 +821,12 @@ pub async fn usb_input_task(
             device_id,
             &enum_info,
             config_desc,
+            #[cfg(feature = "dual-s3-wired")]
+            MirrorCandidateId(0),
+            #[cfg(feature = "dual-s3-wired")]
+            &[0],
+            #[cfg(feature = "dual-s3-wired")]
+            mirror_capture,
         )
         .await
         .is_err()
@@ -950,6 +1011,9 @@ async fn attach_hid_interfaces_for_device<'d>(
     device_id: DeviceId,
     enum_info: &embassy_usb_host::handler::EnumerationInfo,
     config_desc: &[u8],
+    #[cfg(feature = "dual-s3-wired")] mirror_candidate: MirrorCandidateId,
+    #[cfg(feature = "dual-s3-wired")] mirror_port_path: &[u8],
+    #[cfg(feature = "dual-s3-wired")] mirror_capture: &mut MirrorCaptureScratch,
 ) -> Result<(), ()> {
     let product_name = read_usb_product_name(bus_handle, enum_info)
         .await
@@ -1177,7 +1241,293 @@ async fn attach_hid_interfaces_for_device<'d>(
         });
     }
 
+    #[cfg(feature = "dual-s3-wired")]
+    match capture_and_forward_mirror_profile(
+        sender,
+        bus_handle,
+        active_slots,
+        device_id,
+        enum_info,
+        config_desc,
+        mirror_candidate,
+        mirror_port_path,
+        mirror_capture,
+    )
+    .await
+    {
+        Ok(()) => {
+            sender
+                .send(RuntimeInputMessage::UsbDeviceMetadataUpdated {
+                    device_id,
+                    vendor_id: enum_info.device_desc.vendor_id,
+                    product_id: enum_info.device_desc.product_id,
+                    name: product_name,
+                    flags: 0x10,
+                })
+                .await;
+        }
+        Err(error) => {
+            log::debug!(
+                "firmware: usb device is not mirrorable device={} err={:?}",
+                device_id.0,
+                error
+            );
+        }
+    }
+
     Ok(())
+}
+
+#[cfg(feature = "dual-s3-wired")]
+#[allow(clippy::too_many_arguments)]
+async fn capture_and_forward_mirror_profile<'d>(
+    sender: &Sender<
+        'static,
+        CriticalSectionRawMutex,
+        RuntimeInputMessage,
+        RUNTIME_INPUT_QUEUE_CAPACITY,
+    >,
+    bus_handle: &FirmwareBusHandle<'d>,
+    active_slots: &[Option<ActiveUsbInterfaceSlot<'d>>; MAX_ACTIVE_USB_INTERFACES],
+    device_id: DeviceId,
+    enum_info: &embassy_usb_host::handler::EnumerationInfo,
+    config_desc: &[u8],
+    candidate: MirrorCandidateId,
+    port_path: &[u8],
+    scratch: &mut MirrorCaptureScratch,
+) -> Result<(), &'static str> {
+    if enum_info.speed() != embassy_usb_driver::Speed::Full {
+        return Err("unsupported USB speed");
+    }
+
+    let endpoint = EndpointInfo {
+        addr: EndpointAddress::from_parts(0, Direction::In),
+        ep_type: EndpointType::Control,
+        max_packet_size: enum_info.device_desc.max_packet_size0 as u16,
+        interval_ms: 0,
+    };
+    let mut control = bus_handle
+        .alloc_pipe::<pipe::Control, pipe::InOut>(
+            enum_info.device_address,
+            &endpoint,
+            enum_info.split(),
+        )
+        .map_err(|_| "no control pipe")?;
+
+    let mut bos_len = 0usize;
+    if enum_info.device_desc.bcd_usb >= 0x0201 {
+        let setup = get_descriptor_setup(15, 0, 0, 5);
+        if let Ok(length) = control
+            .control_in(&setup.to_bytes(), &mut scratch.bos[..5])
+            .await
+            && length >= 5
+            && scratch.bos[1] == 15
+        {
+            let total = usize::from(u16::from_le_bytes([scratch.bos[2], scratch.bos[3]]))
+                .min(scratch.bos.len());
+            let setup = get_descriptor_setup(15, 0, 0, total as u16);
+            if let Ok(length) = control
+                .control_in(&setup.to_bytes(), &mut scratch.bos[..total])
+                .await
+            {
+                bos_len = length.min(total);
+            }
+        }
+    }
+
+    scratch.string_lengths.fill(0);
+    let language_setup = get_descriptor_setup(3, 0, 0, MIRROR_STRING_DESCRIPTOR_MAX_LEN as u16);
+    let mut string_count = 0usize;
+    let language_id = match control
+        .control_in(&language_setup.to_bytes(), &mut scratch.strings[0])
+        .await
+    {
+        Ok(length) if length >= 4 && scratch.strings[0][1] == 3 => {
+            let length = usize::from(scratch.strings[0][0])
+                .min(length)
+                .min(MIRROR_STRING_DESCRIPTOR_MAX_LEN);
+            scratch.string_indices[0] = 0;
+            scratch.string_lang_ids[0] = 0;
+            scratch.string_lengths[0] = length;
+            string_count = 1;
+            u16::from_le_bytes([scratch.strings[0][2], scratch.strings[0][3]])
+        }
+        _ => 0x0409,
+    };
+
+    let mut indices = [0u8; MIRROR_STRING_RECORDS_MAX - 1];
+    let index_count = collect_string_indices(
+        enum_info.device_desc.manufacturer,
+        enum_info.device_desc.product,
+        enum_info.device_desc.serial_number,
+        config_desc,
+        &mut indices,
+    );
+    for index in indices[..index_count].iter().copied() {
+        if string_count == MIRROR_STRING_RECORDS_MAX {
+            break;
+        }
+        let setup = get_descriptor_setup(
+            3,
+            index,
+            language_id,
+            MIRROR_STRING_DESCRIPTOR_MAX_LEN as u16,
+        );
+        if let Ok(length) = control
+            .control_in(&setup.to_bytes(), &mut scratch.strings[string_count][..])
+            .await
+            && length >= 2
+            && scratch.strings[string_count][1] == 3
+        {
+            let length = usize::from(scratch.strings[string_count][0])
+                .min(length)
+                .min(MIRROR_STRING_DESCRIPTOR_MAX_LEN);
+            scratch.string_indices[string_count] = index;
+            scratch.string_lang_ids[string_count] = language_id;
+            scratch.string_lengths[string_count] = length;
+            string_count += 1;
+        }
+    }
+    drop(control);
+
+    let mut strings = heapless::Vec::<StringRecord<'_>, MIRROR_STRING_RECORDS_MAX>::new();
+    for index in 0..string_count {
+        strings
+            .push(StringRecord {
+                index: scratch.string_indices[index],
+                lang_id: scratch.string_lang_ids[index],
+                descriptor: &scratch.strings[index][..scratch.string_lengths[index]],
+            })
+            .map_err(|_| "too many strings")?;
+    }
+    let mut reports = heapless::Vec::<HidReportRecord<'_>, 4>::new();
+    for slot in active_slots
+        .iter()
+        .flatten()
+        .filter(|slot| slot.session.device_id() == device_id)
+    {
+        reports
+            .push(HidReportRecord {
+                interface_number: slot.hid_info.interface_number,
+                descriptor: slot.session.source_snapshot().report_descriptor(),
+            })
+            .map_err(|_| "too many HID interfaces")?;
+    }
+
+    let device_descriptor = raw_device_descriptor(enum_info.device_desc);
+    let captured = capture_mirror_profile(
+        MirrorCaptureSource {
+            flags: 0,
+            device_descriptor: &device_descriptor,
+            configuration_descriptor: config_desc,
+            bos_descriptor: &scratch.bos[..bos_len],
+            strings: strings.as_slice(),
+            hid_reports: reports.as_slice(),
+            port_path,
+        },
+        &mut scratch.image,
+    )
+    .map_err(|_| "MirrorImage rejected")?;
+
+    let transfer = ProfileTransferEncoder::new(
+        captured.profile_hash,
+        captured.profile_hash,
+        &scratch.image[..captured.image_length],
+    )
+    .map_err(|_| "profile transfer rejected")?;
+    for command in transfer {
+        sender
+            .send(RuntimeInputMessage::DeviceCommandRequested(command.into()))
+            .await;
+    }
+    sender
+        .send(RuntimeInputMessage::MirrorCandidateRegistered {
+            candidate,
+            stable_id: captured.stable_id,
+            profile_hash: Some(captured.profile_hash),
+            synthetic: false,
+            source_device: Some(device_id),
+        })
+        .await;
+    Ok(())
+}
+
+#[cfg(feature = "dual-s3-wired")]
+fn get_descriptor_setup(
+    descriptor_type: u8,
+    index: u8,
+    language_id: u16,
+    length: u16,
+) -> SetupPacket {
+    SetupPacket {
+        request_type: RequestType {
+            direction: Direction::In,
+            control_type: ControlType::Standard,
+            recipient: Recipient::Device,
+        },
+        request: 6,
+        value: u16::from(descriptor_type) << 8 | u16::from(index),
+        index: language_id,
+        length,
+    }
+}
+
+#[cfg(feature = "dual-s3-wired")]
+fn raw_device_descriptor(descriptor: embassy_usb_host::descriptor::DeviceDescriptor) -> [u8; 18] {
+    let mut raw = [0u8; 18];
+    raw[0] = descriptor.len;
+    raw[1] = descriptor.descriptor_type;
+    raw[2..4].copy_from_slice(&descriptor.bcd_usb.to_le_bytes());
+    raw[4] = descriptor.device_class;
+    raw[5] = descriptor.device_subclass;
+    raw[6] = descriptor.device_protocol;
+    raw[7] = descriptor.max_packet_size0;
+    raw[8..10].copy_from_slice(&descriptor.vendor_id.to_le_bytes());
+    raw[10..12].copy_from_slice(&descriptor.product_id.to_le_bytes());
+    raw[12..14].copy_from_slice(&descriptor.bcd_device.to_le_bytes());
+    raw[14] = descriptor.manufacturer;
+    raw[15] = descriptor.product;
+    raw[16] = descriptor.serial_number;
+    raw[17] = descriptor.num_configurations;
+    raw
+}
+
+#[cfg(feature = "dual-s3-wired")]
+fn collect_string_indices(
+    manufacturer: u8,
+    product: u8,
+    serial: u8,
+    config_desc: &[u8],
+    output: &mut [u8],
+) -> usize {
+    let mut count = 0usize;
+    for index in [manufacturer, product, serial] {
+        push_unique_string_index(index, output, &mut count);
+    }
+    let mut offset = 0usize;
+    while offset + 2 <= config_desc.len() {
+        let length = usize::from(config_desc[offset]);
+        if length < 2 || offset + length > config_desc.len() {
+            break;
+        }
+        let descriptor = &config_desc[offset..offset + length];
+        match descriptor[1] {
+            2 if length >= 7 => push_unique_string_index(descriptor[6], output, &mut count),
+            4 if length >= 9 => push_unique_string_index(descriptor[8], output, &mut count),
+            _ => {}
+        }
+        offset += length;
+    }
+    count
+}
+
+#[cfg(feature = "dual-s3-wired")]
+fn push_unique_string_index(index: u8, output: &mut [u8], count: &mut usize) {
+    if index == 0 || output[..*count].contains(&index) || *count == output.len() {
+        return;
+    }
+    output[*count] = index;
+    *count += 1;
 }
 
 fn to_core_descriptor<const SRC: usize, const DST: usize>(
