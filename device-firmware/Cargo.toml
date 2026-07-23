@@ -21,7 +21,10 @@ hidshift = { path = "..", features = ["dual-s3-wired"] }
 heapless = "0.9.2"
 log = "0.4.33"
 static_cell = "2.1.1"
-usb-device = "0.3.2"
+usb-device = { version = "0.3.2", features = ["control-buffer-256"] }
+
+[patch.crates-io]
+usb-device = { path = "../vendor/usb-device-0.3.2" }
 
 [profile.dev]
 debug = true

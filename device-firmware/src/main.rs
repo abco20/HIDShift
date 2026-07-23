@@ -202,6 +202,10 @@ trait PresentationRuntime<B: UsbBus> {
         None
     }
     fn restore_raw_output(&mut self, _packet: RawPacket) {}
+    fn take_control_request(&mut self) -> Option<hidshift::interchip::MirrorControlRequest> {
+        None
+    }
+    fn restore_control_request(&mut self, _request: hidshift::interchip::MirrorControlRequest) {}
     fn usb_state(&self, configured: bool, profile_hash: u32) -> UsbState;
     fn is_fallback(&self) -> bool;
 }
@@ -241,6 +245,7 @@ impl<B: UsbBus> PresentationRuntime<B> for DynamicUsb<'_, B> {
     fn poll(&mut self, usb_device: &mut UsbDevice<'_, B>) {
         usb_device.poll(&mut [self]);
         self.service();
+        self.service_control(usb_device);
     }
 
     fn enqueue_link_event(&mut self, event: DeviceLinkEvent) {
@@ -256,6 +261,9 @@ impl<B: UsbBus> PresentationRuntime<B> for DynamicUsb<'_, B> {
             DeviceLinkEvent::StandardInput(_) | DeviceLinkEvent::ReleaseAll => {
                 self.drop_standard_report();
             }
+            DeviceLinkEvent::ControlResponse(response) => {
+                self.enqueue_control_response(response);
+            }
             _ => {}
         }
     }
@@ -266,6 +274,14 @@ impl<B: UsbBus> PresentationRuntime<B> for DynamicUsb<'_, B> {
 
     fn restore_raw_output(&mut self, packet: RawPacket) {
         self.restore_output(packet);
+    }
+
+    fn take_control_request(&mut self) -> Option<hidshift::interchip::MirrorControlRequest> {
+        self.take_control_request()
+    }
+
+    fn restore_control_request(&mut self, request: hidshift::interchip::MirrorControlRequest) {
+        self.restore_control_request(request);
     }
 
     fn usb_state(&self, _configured: bool, profile_hash: u32) -> UsbState {
@@ -525,6 +541,11 @@ fn service_usb<B: UsbBus, P: PresentationRuntime<B>>(
         if !sent {
             presentation.restore_raw_output(packet);
         }
+    }
+    if let Some(request) = presentation.take_control_request()
+        && !link.queue_control_request(request, now_ms)
+    {
+        presentation.restore_control_request(request);
     }
 
     let next_usb_state = presentation.usb_state(

@@ -20,6 +20,7 @@ exclude = [
     "tools/hidshift-client",
     "tools/hidshiftctl",
     "vendor/trouble-host-0.6.0",
+    "vendor/usb-device-0.3.2",
     "web",
 ]
 resolver = "3"

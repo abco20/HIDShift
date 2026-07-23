@@ -1,5 +1,7 @@
 use heapless::{Deque, Vec};
-use hidshift::mirror::{MIRROR_ENDPOINTS_MAX, UsbDevicePlan};
+use hidshift::interchip::{ControlStatus, MirrorControlRequest, MirrorControlResponse};
+use hidshift::mirror::{MIRROR_ENDPOINTS_MAX, MirrorControlForwarder, UsbDevicePlan};
+use usb_device::UsbDirection;
 use usb_device::class_prelude::*;
 use usb_device::control::{Recipient, Request, RequestType};
 use usb_device::endpoint::{EndpointAddress, EndpointType};
@@ -68,6 +70,10 @@ pub struct DynamicUsb<'a, B: UsbBus> {
     pending_out: Deque<RawPacket, RAW_QUEUE_CAPACITY>,
     configuration_value: u8,
     configured: bool,
+    control_forwarder: MirrorControlForwarder,
+    pending_control_request: Option<MirrorControlRequest>,
+    pending_control_response: Option<MirrorControlResponse>,
+    pending_control_direction: Option<UsbDirection>,
     pub dropped_packets: u32,
 }
 
@@ -120,6 +126,10 @@ impl<'a, B: UsbBus> DynamicUsb<'a, B> {
             pending_in: Deque::new(),
             pending_out: Deque::new(),
             configured: false,
+            control_forwarder: MirrorControlForwarder::new(),
+            pending_control_request: None,
+            pending_control_response: None,
+            pending_control_direction: None,
             dropped_packets: 0,
         })
     }
@@ -139,6 +149,24 @@ impl<'a, B: UsbBus> DynamicUsb<'a, B> {
 
     pub fn take_output(&mut self) -> Option<RawPacket> {
         self.pending_out.pop_front()
+    }
+
+    pub fn take_control_request(&mut self) -> Option<MirrorControlRequest> {
+        self.pending_control_request.take()
+    }
+
+    pub fn restore_control_request(&mut self, request: MirrorControlRequest) {
+        if self.pending_control_request.is_none() {
+            self.pending_control_request = Some(request);
+        }
+    }
+
+    pub fn enqueue_control_response(&mut self, response: MirrorControlResponse) {
+        if self.pending_control_response.is_none() {
+            self.pending_control_response = Some(response);
+        } else {
+            self.dropped_packets = self.dropped_packets.saturating_add(1);
+        }
     }
 
     pub fn restore_output(&mut self, packet: RawPacket) {
@@ -198,6 +226,48 @@ impl<'a, B: UsbBus> DynamicUsb<'a, B> {
         }
     }
 
+    pub fn service_control(&mut self, usb_device: &mut usb_device::device::UsbDevice<'_, B>) {
+        let now_ms = now_ms();
+        if let Some(response) = self.pending_control_response.take() {
+            let completed = self.control_forwarder.complete(response, now_ms);
+            if let Ok(response) = completed {
+                let result = match response.status {
+                    ControlStatus::Success => match self.pending_control_direction.take() {
+                        Some(UsbDirection::In) => usb_device.complete_control_in(response.data()),
+                        Some(UsbDirection::Out) => usb_device.complete_control_out(),
+                        None => usb_device.reject_deferred_control(),
+                    },
+                    _ => {
+                        self.pending_control_direction = None;
+                        usb_device.reject_deferred_control()
+                    }
+                };
+                if result.is_err() {
+                    self.dropped_packets = self.dropped_packets.saturating_add(1);
+                }
+            }
+        }
+        if self.control_forwarder.expire(now_ms).is_some() {
+            self.pending_control_direction = None;
+            self.pending_control_request = None;
+            let _ = usb_device.reject_deferred_control();
+        }
+    }
+
+    fn defer_control(
+        &mut self,
+        request: Request,
+        data: &[u8],
+    ) -> Result<(), DynamicUsbError> {
+        let setup = setup_packet(request);
+        let forwarded = self
+            .control_forwarder
+            .begin(setup, data, now_ms())
+            .map_err(|_| DynamicUsbError::QueueFull)?;
+        self.pending_control_request = Some(forwarded);
+        self.pending_control_direction = Some(request.direction);
+        Ok(())
+    }
 }
 
 impl<B: UsbBus> UsbClass<B> for DynamicUsb<'_, B> {
@@ -223,42 +293,45 @@ impl<B: UsbBus> UsbClass<B> for DynamicUsb<'_, B> {
             let _ = transfer.accept_with(&[value]);
             return;
         }
-        if request.request_type != RequestType::Standard
-            || request.request != Request::GET_DESCRIPTOR
+        if request.request_type == RequestType::Standard
+            && request.request == Request::GET_DESCRIPTOR
         {
-            return;
-        }
-        let descriptor_type = (request.value >> 8) as u8;
-        let descriptor_index = request.value as u8;
-        if request.recipient == Recipient::Device && descriptor_type == 0x01 {
-            let _ = transfer.accept_with(&self.plan.device_descriptor);
-            return;
-        }
-        let descriptor = match request.recipient {
-            Recipient::Device => match (descriptor_type, descriptor_index) {
-                (0x02, 0) => Some(self.plan.configuration_descriptor),
-                (0x03, index) => self.plan.strings.get(index, request.index),
-                (0x0f, 0) if !self.plan.bos_descriptor.is_empty() => {
-                    Some(self.plan.bos_descriptor)
+            let descriptor_type = (request.value >> 8) as u8;
+            let descriptor_index = request.value as u8;
+            if request.recipient == Recipient::Device && descriptor_type == 0x01 {
+                let _ = transfer.accept_with(&self.plan.device_descriptor);
+                return;
+            }
+            let descriptor = match request.recipient {
+                Recipient::Device => match (descriptor_type, descriptor_index) {
+                    (0x02, 0) => Some(self.plan.configuration_descriptor),
+                    (0x03, index) => self.plan.strings.get(index, request.index),
+                    (0x0f, 0) if !self.plan.bos_descriptor.is_empty() => {
+                        Some(self.plan.bos_descriptor)
+                    }
+                    _ => None,
+                },
+                Recipient::Interface if descriptor_index == 0 => {
+                    self.plan.interfaces.iter().find_map(|interface| {
+                        if interface.interface_number != request.index as u8 {
+                            return None;
+                        }
+                        match descriptor_type {
+                            0x21 => Some(interface.hid_descriptor),
+                            0x22 => Some(interface.report_descriptor),
+                            _ => None,
+                        }
+                    })
                 }
                 _ => None,
-            },
-            Recipient::Interface if descriptor_index == 0 => self.plan.interfaces.iter().find_map(
-                |interface| {
-                    if interface.interface_number != request.index as u8 {
-                        return None;
-                    }
-                    match descriptor_type {
-                        0x21 => Some(interface.hid_descriptor),
-                        0x22 => Some(interface.report_descriptor),
-                        _ => None,
-                    }
-                },
-            ),
-            _ => None,
-        };
-        if let Some(descriptor) = descriptor {
-            let _ = transfer.accept_with_static(descriptor);
+            };
+            if let Some(descriptor) = descriptor {
+                let _ = transfer.accept_with_static(descriptor);
+            }
+            return;
+        }
+        if should_forward_control(request) && self.defer_control(request, &[]).is_ok() {
+            let _ = transfer.defer();
         }
     }
 
@@ -281,6 +354,15 @@ impl<B: UsbBus> UsbClass<B> for DynamicUsb<'_, B> {
                     let _ = transfer.reject();
                 }
             }
+            return;
+        }
+        if should_forward_control(request) {
+            let data = transfer.data();
+            if self.defer_control(request, data).is_ok() {
+                let _ = transfer.defer();
+            } else {
+                let _ = transfer.reject();
+            }
         }
     }
 
@@ -296,4 +378,42 @@ impl<B: UsbBus> UsbClass<B> for DynamicUsb<'_, B> {
     fn set_alt_setting(&mut self, interface: InterfaceNumber, alternative: u8) -> bool {
         alternative == 0 && self.get_alt_setting(interface).is_some()
     }
+
+    fn reset(&mut self) {
+        let _ = self.control_forwarder.cancel();
+        self.pending_control_request = None;
+        self.pending_control_response = None;
+        self.pending_control_direction = None;
+        self.configured = false;
+    }
+}
+
+fn should_forward_control(request: Request) -> bool {
+    request.request_type != RequestType::Standard
+}
+
+fn setup_packet(request: Request) -> [u8; 8] {
+    let direction = match request.direction {
+        UsbDirection::Out => 0,
+        UsbDirection::In => 0x80,
+    };
+    let value = request.value.to_le_bytes();
+    let index = request.index.to_le_bytes();
+    let length = request.length.to_le_bytes();
+    [
+        direction | ((request.request_type as u8) << 5) | request.recipient as u8,
+        request.request,
+        value[0],
+        value[1],
+        index[0],
+        index[1],
+        length[0],
+        length[1],
+    ]
+}
+
+fn now_ms() -> u64 {
+    esp_hal::time::Instant::now()
+        .duration_since_epoch()
+        .as_millis()
 }
