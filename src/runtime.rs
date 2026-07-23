@@ -2656,6 +2656,10 @@ impl BleTaskCommand {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+// Control requests intentionally remain owned, fixed-capacity values at the
+// no_std task boundary. Boxing would add a heap requirement, while a second
+// queue would weaken ordering with endpoint output for the same USB device.
+#[allow(clippy::large_enum_variant)]
 pub enum UsbHostTaskCommand {
     KeyboardLedWrite {
         interface_id: InterfaceId,

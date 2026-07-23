@@ -333,8 +333,8 @@ fn fragment_bounds(total_length: usize, offset: usize) -> Result<(), ControlFrag
 }
 
 fn fragment_flags(offset: usize, end: usize, total_length: usize) -> u8 {
-    u8::from(offset == 0) * CONTROL_FRAGMENT_FIRST
-        | u8::from(end == total_length) * CONTROL_FRAGMENT_LAST
+    (u8::from(offset == 0) * CONTROL_FRAGMENT_FIRST)
+        | (u8::from(end == total_length) * CONTROL_FRAGMENT_LAST)
 }
 
 fn validate_fragment(
