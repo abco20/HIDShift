@@ -54,6 +54,7 @@ pub struct DeviceLink {
     next_cell: Option<SpiCell>,
     host_compatible: bool,
     usb_state: UsbState,
+    usb_state_dirty: bool,
     diagnostics: DeviceLinkDiagnostics,
     capabilities: u32,
     active_profile_hash: u32,
@@ -96,6 +97,7 @@ impl DeviceLink {
             next_cell: None,
             host_compatible: false,
             usb_state,
+            usb_state_dirty: true,
             diagnostics: DeviceLinkDiagnostics::default(),
             capabilities,
             active_profile_hash,
@@ -116,8 +118,9 @@ impl DeviceLink {
 
     pub fn update_usb_state(&mut self, state: UsbState, now_ms: u64) {
         self.usb_state = state;
-        if self.host_compatible {
-            self.next_cell = self.queue_usb_state(now_ms);
+        self.usb_state_dirty = true;
+        if self.host_compatible && self.next_cell.is_none() {
+            self.next_cell = self.queue_dirty_usb_state(now_ms);
         }
     }
 
@@ -166,6 +169,7 @@ impl DeviceLink {
             .next_cell
             .take()
             .or_else(|| self.queue_next_control_request_fragment(now_ms))
+            .or_else(|| self.queue_dirty_usb_state(now_ms))
             .or_else(|| {
                 match self.sender.poll_retransmit(
                     now_ms,
@@ -177,6 +181,7 @@ impl DeviceLink {
                         let session = nonzero_session(self.sender.session_id().wrapping_add(1));
                         self.sender.reset_session(session);
                         self.host_compatible = false;
+                        self.usb_state_dirty = true;
                         self.queue_record(RECORD_LINK_RESET, &[], now_ms)
                     }
                     RetransmitAction::Idle => None,
@@ -251,6 +256,7 @@ impl DeviceLink {
                 RECORD_HEARTBEAT => {}
                 RECORD_LINK_RESET => {
                     self.host_compatible = false;
+                    self.usb_state_dirty = true;
                     self.control_request_tx = None;
                     self.control_response_assembler.reset();
                     self.next_cell = self.queue_hello(now_ms);
@@ -266,7 +272,10 @@ impl DeviceLink {
                             operation_id: u32::from_le_bytes(raw_operation_id),
                         },
                     );
-                    self.next_cell = self.queue_usb_state(now_ms);
+                    self.usb_state_dirty = true;
+                    if self.next_cell.is_none() {
+                        self.next_cell = self.queue_dirty_usb_state(now_ms);
+                    }
                 }
                 RECORD_ACTIVATE_PROFILE if self.host_compatible => {
                     match ActivateProfile::decode(record.data) {
@@ -373,7 +382,7 @@ impl DeviceLink {
     fn queue_hello_ack_and_usb_state(&mut self, now_ms: u64) -> Option<SpiCell> {
         let hello = self.device_hello().encode();
         let state = self.usb_state.encode();
-        self.queue_records(
+        let cell = self.queue_records(
             &[
                 Record {
                     record_type: RECORD_HELLO_ACK,
@@ -387,12 +396,23 @@ impl DeviceLink {
                 },
             ],
             now_ms,
-        )
+        );
+        if cell.is_some() {
+            self.usb_state_dirty = false;
+        }
+        cell
     }
 
-    fn queue_usb_state(&mut self, now_ms: u64) -> Option<SpiCell> {
+    fn queue_dirty_usb_state(&mut self, now_ms: u64) -> Option<SpiCell> {
+        if !self.host_compatible || !self.usb_state_dirty {
+            return None;
+        }
         let state = self.usb_state.encode();
-        self.queue_record(RECORD_USB_STATE, &state, now_ms)
+        let cell = self.queue_record(RECORD_USB_STATE, &state, now_ms);
+        if cell.is_some() {
+            self.usb_state_dirty = false;
+        }
+        cell
     }
 
     fn queue_next_control_request_fragment(&mut self, now_ms: u64) -> Option<SpiCell> {
@@ -462,6 +482,7 @@ const fn nonzero_session(value: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::interchip::SPI_TX_WINDOW;
     use crate::reports::{Keyboard6KroReport, StandardHidReport};
 
     fn fallback_state() -> UsbState {
@@ -670,6 +691,52 @@ mod tests {
             .unwrap();
         assert_eq!(record.record_type, RECORD_STANDARD_OUTPUT_REPORT);
         assert_eq!(StandardOutputReport::decode(record.data), Ok(output));
+    }
+
+    #[test]
+    fn latest_usb_state_is_retried_after_sender_window_reopens() {
+        let mut device = DeviceLink::new(2, fallback_state());
+        let mut host = ReliableSender::new(1);
+        let hello = Hello {
+            role: InterchipRole::Host,
+            protocol_version: SPI_PROTOCOL_VERSION,
+            firmware_major: 0,
+            firmware_minor: 2,
+            capabilities: DEVICE_CAPABILITIES,
+            active_profile_hash: 0,
+        }
+        .encode();
+        let mut events = Vec::<_, 1>::new();
+        device.handle_transaction(&host_cell(&mut host, RECORD_HELLO, &hello), 0, &mut events);
+        let _ = device.next_transaction(1);
+
+        let output = StandardOutputReport::new(1, &[0x02]).unwrap();
+        assert!(device.queue_standard_output(output, 2));
+        let _ = device.next_transaction(2);
+        assert!(device.queue_standard_output(output, 3));
+        let _ = device.next_transaction(3);
+        assert_eq!(device.sender.pending_len(), SPI_TX_WINDOW);
+
+        let configured = UsbState {
+            configured: true,
+            ..fallback_state()
+        };
+        device.update_usb_state(configured, 4);
+        assert!(device.next_cell.is_none());
+
+        host.set_cumulative_ack(4);
+        device.handle_transaction(
+            &host_cell(&mut host, RECORD_HEARTBEAT, &[]),
+            5,
+            &mut events,
+        );
+        let cell = SpiCell::decode(&device.next_transaction(5)).unwrap();
+        let record = RecordIter::new(cell.payload(), cell.header.record_count)
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.record_type, RECORD_USB_STATE);
+        assert_eq!(UsbState::decode(record.data), Ok(configured));
     }
 
     #[test]
