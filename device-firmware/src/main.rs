@@ -179,7 +179,8 @@ fn build_dynamic_device<'a, B: UsbBus>(
     .device_protocol(device[6])
     .device_release(u16::from_le_bytes([device[12], device[13]]))
     .usb_rev(usb_revision)
-    .self_powered(configuration[7] & 0x40 != 0);
+    .self_powered(configuration[7] & 0x40 != 0)
+    .supports_remote_wakeup(dynamic.plan().supports_remote_wakeup());
     let builder = match builder.max_packet_size_0(device[7]) {
         Ok(builder) => builder,
         Err(error) => fatal("dynamic EP0", error),

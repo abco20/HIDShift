@@ -41,6 +41,10 @@ pub struct UsbDevicePlan<'a> {
 }
 
 impl<'a> UsbDevicePlan<'a> {
+    pub const fn supports_remote_wakeup(&self) -> bool {
+        self.configuration_descriptor[7] & 0x20 != 0
+    }
+
     pub fn device_descriptor(&self, descriptor_type: u8, index: u8, lang_id: u16) -> Option<&[u8]> {
         match (descriptor_type, index) {
             (USB_DESCRIPTOR_DEVICE, 0) => Some(&self.device_descriptor),

@@ -40,7 +40,7 @@ use hidshift::interchip::{
 #[cfg(feature = "dual-s3-wired")]
 use hidshift::mirror::{HSMI_MAX_SIZE, HidReportRecord, MirrorCaptureSource, StringRecord};
 #[cfg(feature = "dual-s3-wired")]
-use hidshift::{MirrorCandidateId, capture_mirror_profile};
+use hidshift::{MirrorCandidateId, MirrorCaptureError, capture_mirror_profile};
 
 use super::usb_output_transport::UsbKeyboardLedWriter;
 #[cfg(feature = "dual-s3-wired")]
@@ -116,6 +116,17 @@ struct MirrorCaptureScratch {
     string_indices: [u8; MIRROR_STRING_RECORDS_MAX],
     string_lang_ids: [u16; MIRROR_STRING_RECORDS_MAX],
     string_lengths: [usize; MIRROR_STRING_RECORDS_MAX],
+}
+
+#[cfg(feature = "dual-s3-wired")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MirrorProfileCaptureError {
+    UnsupportedUsbSpeed,
+    ControlPipeUnavailable,
+    TooManyStrings,
+    TooManyHidInterfaces,
+    Capture(MirrorCaptureError),
+    ProfileTransferRejected,
 }
 
 #[cfg(feature = "dual-s3-wired")]
@@ -1434,7 +1445,7 @@ async fn attach_hid_interfaces_for_device<'d>(
                 .await;
         }
         Err(error) => {
-            log::debug!(
+            log::warn!(
                 "firmware: usb device is not mirrorable device={} err={:?}",
                 device_id.0,
                 error
@@ -1462,9 +1473,9 @@ async fn capture_and_forward_mirror_profile<'d>(
     candidate: MirrorCandidateId,
     port_path: &[u8],
     scratch: &mut MirrorCaptureScratch,
-) -> Result<(), &'static str> {
+) -> Result<(), MirrorProfileCaptureError> {
     if enum_info.speed() != embassy_usb_driver::Speed::Full {
-        return Err("unsupported USB speed");
+        return Err(MirrorProfileCaptureError::UnsupportedUsbSpeed);
     }
 
     let endpoint = EndpointInfo {
@@ -1479,7 +1490,7 @@ async fn capture_and_forward_mirror_profile<'d>(
             &endpoint,
             enum_info.split(),
         )
-        .map_err(|_| "no control pipe")?;
+        .map_err(|_| MirrorProfileCaptureError::ControlPipeUnavailable)?;
 
     let mut bos_len = 0usize;
     if enum_info.device_desc.bcd_usb >= 0x0201 {
@@ -1565,7 +1576,7 @@ async fn capture_and_forward_mirror_profile<'d>(
                 lang_id: scratch.string_lang_ids[index],
                 descriptor: &scratch.strings[index][..scratch.string_lengths[index]],
             })
-            .map_err(|_| "too many strings")?;
+            .map_err(|_| MirrorProfileCaptureError::TooManyStrings)?;
     }
     let mut reports = heapless::Vec::<HidReportRecord<'_>, 4>::new();
     for slot in active_slots
@@ -1578,7 +1589,7 @@ async fn capture_and_forward_mirror_profile<'d>(
                 interface_number: slot.hid_info.interface_number,
                 descriptor: slot.session.source_snapshot().report_descriptor(),
             })
-            .map_err(|_| "too many HID interfaces")?;
+            .map_err(|_| MirrorProfileCaptureError::TooManyHidInterfaces)?;
     }
 
     let device_descriptor = raw_device_descriptor(enum_info.device_desc);
@@ -1594,14 +1605,14 @@ async fn capture_and_forward_mirror_profile<'d>(
         },
         &mut scratch.image,
     )
-    .map_err(|_| "MirrorImage rejected")?;
+    .map_err(MirrorProfileCaptureError::Capture)?;
 
     let transfer = ProfileTransferEncoder::new(
         captured.profile_hash,
         captured.profile_hash,
         &scratch.image[..captured.image_length],
     )
-    .map_err(|_| "profile transfer rejected")?;
+    .map_err(|_| MirrorProfileCaptureError::ProfileTransferRejected)?;
     for command in transfer {
         sender
             .send(RuntimeInputMessage::DeviceCommandRequested(command.into()))

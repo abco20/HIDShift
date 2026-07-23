@@ -128,10 +128,6 @@ fn validate_configuration<'a>(
     if usize::from(u16::from_le_bytes([config[2], config[3]])) != config.len() {
         return Err(MirrorRejectReason::InvalidDescriptorLength);
     }
-    if config[7] & 0x20 != 0 {
-        return Err(MirrorRejectReason::RemoteWakeUnsupported);
-    }
-
     let mut interfaces = Vec::<HidInterfacePlan<'a>, MIRROR_HID_INTERFACES_MAX>::new();
     let mut endpoints = Vec::<EndpointPlan, MIRROR_ENDPOINTS_MAX>::new();
     let mut endpoint_addresses = Vec::<u8, MIRROR_ENDPOINTS_MAX>::new();
@@ -447,10 +443,8 @@ mod tests {
 
         let mut wake = CONFIG;
         wake[7] |= 0x20;
-        assert_eq!(
-            validate_mirror_image(encode(&wake, &reports, &mut out)),
-            Err(MirrorRejectReason::RemoteWakeUnsupported)
-        );
+        let plan = validate_mirror_image(encode(&wake, &reports, &mut out)).unwrap();
+        assert!(plan.supports_remote_wakeup());
     }
 
     #[test]

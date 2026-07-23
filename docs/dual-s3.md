@@ -40,8 +40,11 @@ Mirror selection is stored separately:
 Only one Full-Speed, HID-only, single-configuration device can be mirrored.
 Up to four HID interfaces, four IN endpoints, four OUT endpoints, 64-byte
 interrupt packets, and a 16 KiB MirrorImage are accepted. Bulk, isochronous,
-non-HID interfaces, alternate settings, remote wake, and multiple
-configurations are rejected before activation.
+non-HID interfaces, alternate settings, and multiple configurations are
+rejected before activation. A source device's Remote Wakeup capability is
+preserved in the Configuration Descriptor, including the standard
+SET/CLEAR_FEATURE and GET_STATUS state. Device S3 does not currently originate
+a resume signal while the Wired PC is suspended.
 
 ## Build and flash
 
