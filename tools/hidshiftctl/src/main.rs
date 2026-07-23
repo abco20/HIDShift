@@ -389,7 +389,7 @@ async fn ble_request(
         )
         .await?;
 
-    tokio::time::timeout(timeout_duration, async {
+    let response = tokio::time::timeout(timeout_duration, async {
         while let Some(notification) = notifications.next().await {
             if notification.uuid != response_uuid
                 || notification.value.len() != MANAGEMENT_RESPONSE_LEN
@@ -399,13 +399,24 @@ async fn ble_request(
             let mut response = [0u8; MANAGEMENT_RESPONSE_LEN];
             response.copy_from_slice(&notification.value);
             if response[1] == request.request().request_id {
-                return Ok(response);
+                return Ok::<[u8; MANAGEMENT_RESPONSE_LEN], Box<dyn Error>>(response);
             }
         }
-        Err("Bluetooth notification stream ended".into())
+        Err::<[u8; MANAGEMENT_RESPONSE_LEN], Box<dyn Error>>(
+            "Bluetooth notification stream ended".into(),
+        )
     })
     .await
-    .map_err(|_| "timed out waiting for the Bluetooth response")?
+    .map_err(|_| "timed out waiting for the Bluetooth response")??;
+
+    // bluez-async removes several D-Bus match rules asynchronously when its
+    // notification stream is dropped. Let those removals finish while the
+    // session connection is still alive; otherwise short-lived CLI commands
+    // can race session teardown and panic in bluez-async's Drop task.
+    let _ = peripheral.unsubscribe(response_characteristic).await;
+    drop(notifications);
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    Ok(response)
 }
 
 async fn find_peripheral(
