@@ -344,7 +344,8 @@ fn run<'a, B: UsbBus, P: PresentationRuntime<B>>(
             );
             if ever_linked && now_ms().saturating_sub(last_valid_spi_ms) >= SPI_LINK_LOSS_TIMEOUT_MS
             {
-                let _ = usb_device.force_reset();
+                log::warn!("device-spi: link lost; restarting in fallback");
+                soft_disconnect_usb();
                 esp_hal::system::software_reset();
             }
         }
@@ -353,9 +354,18 @@ fn run<'a, B: UsbBus, P: PresentationRuntime<B>>(
         let mut received = [0u8; SPI_CELL_LEN];
         received.copy_from_slice(dma_rx.as_slice());
         let mut events = heapless::Vec::<DeviceLinkEvent, 4>::new();
-        let valid_cells_before = link.diagnostics().valid_cells;
+        let diagnostics_before = link.diagnostics();
         link.handle_transaction(&received, transaction_ms, &mut events);
-        let received_valid_cell = link.diagnostics().valid_cells != valid_cells_before;
+        let diagnostics_after = link.diagnostics();
+        let received_valid_cell =
+            diagnostics_after.valid_cells != diagnostics_before.valid_cells;
+        if diagnostics_after.host_session_changes != diagnostics_before.host_session_changes {
+            // A Host firmware reset invalidates any partially received image.
+            // Keeping it would make the next PROFILE_BEGIN look Busy and can
+            // later commit a mixture of two Host sessions.
+            profile_receiver.cancel();
+            pending_profile_result = None;
+        }
         ever_linked |= link.host_compatible();
         for event in events {
             match event {

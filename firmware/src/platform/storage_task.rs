@@ -16,7 +16,10 @@ use hidshift::storage::{
 };
 use hidshift::target_control::ButtonIntent;
 
+#[cfg(not(all(feature = "hardware-e2e", feature = "dual-s3-wired")))]
 use super::flash_backend::new_storage_backend;
+#[cfg(all(feature = "hardware-e2e", feature = "dual-s3-wired"))]
+use super::flash_backend::{FirmwareStorageBackend, InMemoryStorageBackend};
 
 pub const STORAGE_PERSIST_DEBOUNCE_MS: u64 = 1_000;
 pub const STORAGE_PERSIST_LAZY_MS: u64 = 5_000;
@@ -44,6 +47,13 @@ pub async fn storage_command_task(
     active_ble_connections: fn() -> usize,
     flash: FLASH<'static>,
 ) {
+    #[cfg(all(feature = "hardware-e2e", feature = "dual-s3-wired"))]
+    let mut backend = {
+        let _ = flash;
+        log::info!("firmware: dual-S3 E2E uses volatile Host settings storage");
+        FirmwareStorageBackend::Memory(InMemoryStorageBackend::new())
+    };
+    #[cfg(not(all(feature = "hardware-e2e", feature = "dual-s3-wired")))]
     let mut backend = new_storage_backend(flash);
     let mut persistence =
         StoragePersistence::new(STORAGE_PERSIST_DEBOUNCE_MS, STORAGE_PERSIST_LAZY_MS);
@@ -192,8 +202,19 @@ struct UsbInterruptQuiesceGuard {
 
 impl UsbInterruptQuiesceGuard {
     fn new() -> Self {
-        log::info!("firmware: storage_command disabling USB interrupt for flash write");
+        log::info!("firmware: storage_command disabling cache-unsafe interrupts for flash write");
         esp_hal::interrupt::disable(Cpu::ProCpu, Interrupt::USB);
+        // The BLE task has already dropped its controller future. Ensure a
+        // pending radio interrupt cannot enter esp-radio while flash erase
+        // has the instruction cache disabled. Controller initialization
+        // re-enables both sources after `ble_quiesce_done`.
+        // SAFETY: BLE ownership is quiesced by the request/ready handshake
+        // immediately before constructing this guard.
+        unsafe {
+            let bt = esp_hal::peripherals::BT::steal();
+            bt.disable_rwble_interrupt_on_all_cores();
+            bt.disable_bb_interrupt_on_all_cores();
+        }
         Self { active: true }
     }
 }

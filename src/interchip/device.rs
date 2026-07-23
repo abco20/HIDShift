@@ -39,6 +39,7 @@ pub enum DeviceLinkEvent {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DeviceLinkDiagnostics {
     pub valid_cells: u32,
+    pub host_session_changes: u32,
     pub standard_reports_received: u32,
     pub releases_received: u32,
     pub malformed_cells: u32,
@@ -203,6 +204,8 @@ impl DeviceLink {
         self.diagnostics.valid_cells = self.diagnostics.valid_cells.saturating_add(1);
         self.sender.acknowledge(cell.header.cumulative_ack);
         if self.receiver.session_id() != Some(cell.header.session_id) {
+            self.diagnostics.host_session_changes =
+                self.diagnostics.host_session_changes.saturating_add(1);
             self.host_compatible = false;
             self.control_request_tx = None;
             self.control_response_assembler.reset();
@@ -706,6 +709,28 @@ mod tests {
             })
             .unwrap();
         assert_eq!(received, chunk);
+    }
+
+    #[test]
+    fn host_session_changes_are_observable_for_external_transfer_state() {
+        let mut device = DeviceLink::new_with_profile_storage(2, fallback_state(), 0);
+        let mut host = ReliableSender::new(1);
+        let hello = Hello {
+            role: InterchipRole::Host,
+            protocol_version: SPI_PROTOCOL_VERSION,
+            firmware_major: 0,
+            firmware_minor: 2,
+            capabilities: CAPABILITY_DYNAMIC_PROFILE,
+            active_profile_hash: 0,
+        }
+        .encode();
+        let mut events = Vec::<_, 1>::new();
+        device.handle_transaction(&host_cell(&mut host, RECORD_HELLO, &hello), 0, &mut events);
+        assert_eq!(device.diagnostics().host_session_changes, 1);
+
+        host.reset_session(2);
+        device.handle_transaction(&host_cell(&mut host, RECORD_HELLO, &hello), 1, &mut events);
+        assert_eq!(device.diagnostics().host_session_changes, 2);
     }
 
     #[test]

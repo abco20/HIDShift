@@ -13,12 +13,15 @@ use hidshift::checksum::{crc16_ccitt_false, crc32_ieee};
 use hidshift::e2e::{E2eCommand, E2ePacket};
 use hidshift::e2e_mirror::{
     MIRROR_E2E_PAYLOAD_MAX, MirrorE2ePacket, OPCODE_HELLO, OPCODE_INJECT_ENDPOINT_IN,
-    OPCODE_REGISTER_BEGIN, OPCODE_REGISTER_CHUNK, OPCODE_REGISTER_COMMIT,
+    OPCODE_INJECT_SPI_CRC_FAILURE, OPCODE_READ_MOCK_STATUS, OPCODE_REGISTER_BEGIN,
+    OPCODE_REGISTER_CHUNK, OPCODE_REGISTER_COMMIT, OPCODE_RESET_MOCK_STATUS,
     OPCODE_SET_CONTROL_RESPONSE, raw_injection_transfer_id,
 };
 use hidshift::fallback::{FALLBACK_USB_PRODUCT_ID, FALLBACK_USB_VENDOR_ID};
 use hidshift::ids::HostId;
-use hidshift::management::{ManagementCommand, ManagementOutputTarget, ManagementResult};
+use hidshift::management::{
+    ManagementCommand, ManagementOutputTarget, ManagementResponsePayload, ManagementResult,
+};
 use hidshift::mirror::validate_mirror_image;
 use hidshift::output_target::MirrorCandidateId;
 use hidshift_client::{ManagementClient, SerialResponseDecoder, encode_serial_request};
@@ -247,6 +250,12 @@ fn run() -> Result<(), Box<dyn Error>> {
         b"profile result transfer=1",
         Duration::from_secs(10),
     )?;
+    wait_for_mirror_candidate(
+        &mut *serial,
+        &mut client,
+        nonzero_hash(crc32_ieee(&profile_a)),
+        Duration::from_secs(5),
+    )?;
 
     activate_candidate_zero(&mut *serial, &mut client)?;
     wait_for_usb_identity(
@@ -268,6 +277,20 @@ fn run() -> Result<(), Box<dyn Error>> {
     inject_endpoint(&mut *serial, &mut sequence, 0x81, &[0; 8])?;
     wait_for_key_event(&mut keyboard_events, 30, 0, Duration::from_secs(3))?;
     println!("T13 passed: raw endpoint 0x81 produced KEY_A press/release in evdev");
+
+    reset_mock_status(&mut *serial, &mut sequence)?;
+    arm_spi_crc_failure(&mut *serial, &mut sequence)?;
+    inject_endpoint(
+        &mut *serial,
+        &mut sequence,
+        0x81,
+        &[0, 0, 0x05, 0, 0, 0, 0, 0],
+    )?;
+    wait_for_key_event(&mut keyboard_events, 48, 1, Duration::from_secs(3))?;
+    inject_endpoint(&mut *serial, &mut sequence, 0x81, &[0; 8])?;
+    wait_for_key_event(&mut keyboard_events, 48, 0, Duration::from_secs(3))?;
+    assert_spi_crc_retry(&mut *serial, &mut sequence)?;
+    println!("T25 passed: corrupted SPI cell was retried and delivered once");
 
     // Force an edge even when Caps Lock was already enabled by an earlier run.
     set_keyboard_led(&mut keyboard_events, 1, false)?;
@@ -382,6 +405,12 @@ fn run() -> Result<(), Box<dyn Error>> {
         b"profile result transfer=2",
         Duration::from_secs(10),
     )?;
+    wait_for_mirror_candidate(
+        &mut *serial,
+        &mut client,
+        nonzero_hash(crc32_ieee(&profile_b)),
+        Duration::from_secs(5),
+    )?;
     activate_candidate_zero(&mut *serial, &mut client)?;
     wait_for_usb_identity(
         &mut *serial,
@@ -444,6 +473,14 @@ fn flash_firmware(host_port: &Path, device_port: &Path) -> Result<(), Box<dyn Er
     )?;
     run_command(
         Command::new("espflash")
+            .args(["erase-region", "--chip", "esp32s3", "--port"])
+            .arg(device_port)
+            .args(["0x194000", "0x10000"])
+            .current_dir(root),
+        "erase Device S3 Mirror profile partition",
+    )?;
+    run_command(
+        Command::new("espflash")
             .args(["flash", "--chip", "esp32s3", "--port"])
             .arg(device_port)
             .args([
@@ -455,6 +492,14 @@ fn flash_firmware(host_port: &Path, device_port: &Path) -> Result<(), Box<dyn Er
             ])
             .current_dir(root),
         "flash Device S3",
+    )?;
+    run_command(
+        Command::new("espflash")
+            .args(["erase-region", "--chip", "esp32s3", "--port"])
+            .arg(host_port)
+            .args(["0x190000", "0x4000"])
+            .current_dir(root),
+        "erase Host S3 settings partition",
     )?;
     run_command(
         Command::new("espflash")
@@ -538,6 +583,51 @@ fn set_control_response(
     )?;
     *sequence = sequence.wrapping_add(1);
     let expected = format!("@HIDSHIFT-MIRROR:CONTROL_RESPONSE_SET,{sent_sequence}");
+    wait_for_text(serial, expected.as_bytes(), Duration::from_secs(3))
+}
+
+fn reset_mock_status(
+    serial: &mut dyn SerialPort,
+    sequence: &mut u32,
+) -> Result<(), Box<dyn Error>> {
+    let sent_sequence = *sequence;
+    send_mirror(
+        serial,
+        MirrorE2ePacket::new(OPCODE_RESET_MOCK_STATUS, sent_sequence, 0, 0, &[])
+            .map_err(|error| format!("RESET_MOCK_STATUS packet: {error:?}"))?,
+    )?;
+    *sequence = sequence.wrapping_add(1);
+    let expected = format!("@HIDSHIFT-MIRROR:MOCK_STATUS_RESET,{sent_sequence}");
+    wait_for_text(serial, expected.as_bytes(), Duration::from_secs(3))
+}
+
+fn arm_spi_crc_failure(
+    serial: &mut dyn SerialPort,
+    sequence: &mut u32,
+) -> Result<(), Box<dyn Error>> {
+    let sent_sequence = *sequence;
+    send_mirror(
+        serial,
+        MirrorE2ePacket::new(OPCODE_INJECT_SPI_CRC_FAILURE, sent_sequence, 1, 0, &[])
+            .map_err(|error| format!("INJECT_SPI_CRC_FAILURE packet: {error:?}"))?,
+    )?;
+    *sequence = sequence.wrapping_add(1);
+    let expected = format!("@HIDSHIFT-MIRROR:SPI_CRC_ARMED,{sent_sequence},1");
+    wait_for_text(serial, expected.as_bytes(), Duration::from_secs(3))
+}
+
+fn assert_spi_crc_retry(
+    serial: &mut dyn SerialPort,
+    sequence: &mut u32,
+) -> Result<(), Box<dyn Error>> {
+    let sent_sequence = *sequence;
+    send_mirror(
+        serial,
+        MirrorE2ePacket::new(OPCODE_READ_MOCK_STATUS, sent_sequence, 0, 0, &[])
+            .map_err(|error| format!("READ_MOCK_STATUS packet: {error:?}"))?,
+    )?;
+    *sequence = sequence.wrapping_add(1);
+    let expected = format!("@HIDSHIFT-MIRROR:MOCK_STATUS,{sent_sequence},0,1,1");
     wait_for_text(serial, expected.as_bytes(), Duration::from_secs(3))
 }
 
@@ -830,6 +920,36 @@ fn activate_candidate_zero(
         "SELECT_OUTPUT_TARGET(Wired)",
     )?;
     Ok(())
+}
+
+fn wait_for_mirror_candidate(
+    serial: &mut dyn SerialPort,
+    client: &mut ManagementClient,
+    expected_profile_hash: u32,
+    timeout: Duration,
+) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let pending = client
+            .begin(ManagementCommand::GetMirrorCandidate(MirrorCandidateId(0)))
+            .map_err(|error| format!("GET_MIRROR_CANDIDATE request: {error:?}"))?;
+        serial.write_all(&encode_serial_request(pending))?;
+        let response = wait_management_response(serial, client, Duration::from_secs(1))?;
+        if response.result == ManagementResult::Ok
+            && matches!(
+                response.payload,
+                ManagementResponsePayload::MirrorCandidate(candidate)
+                    if candidate.profile_hash == expected_profile_hash
+            )
+        {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Err(format!(
+        "Mirror candidate 0 did not publish profile {expected_profile_hash:08x}"
+    )
+    .into())
 }
 
 fn send_management_command(

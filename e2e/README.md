@@ -64,6 +64,12 @@ tests. It verifies Linux evdev, raw endpoint reports, profile switching,
 invalid-image rejection, BLE/Wired presentation switching, LED output, and
 Device S3 reboot recovery without a physical test keyboard.
 
+A normal flashing run erases the Host settings partition and Device Mirror
+profile partition first, so every run exercises fresh Profile A/B commits.
+The dual-S3 hardware-E2E Host uses volatile settings storage to keep its
+controller-less BLE test configuration from pausing the 500 µs SPI poll loop;
+Device S3 profile flash and reboot persistence are still exercised.
+
 ```sh
 cargo run --manifest-path e2e/mirror-runner/Cargo.toml -- \
   --host-port /dev/serial/by-id/<host-s3> \

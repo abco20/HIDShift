@@ -1,6 +1,7 @@
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::{Receiver, Sender};
 use embassy_time::{Duration, Instant, Ticker};
+use esp_hal::Blocking;
 use esp_hal::dma::{DmaRxBuf, DmaTxBuf};
 use esp_hal::spi::Mode;
 use esp_hal::spi::master::{Config, Spi};
@@ -120,14 +121,13 @@ pub async fn mirror_spi_master_task(
     .with_sck(sclk)
     .with_miso(miso)
     .with_dma(dma_channel)
-    .with_buffers(dma_rx, dma_tx)
-    .into_async();
+    .with_buffers(dma_rx, dma_tx);
 
     run_link(spi, command_receiver, runtime_sender, session_id).await;
 }
 
 async fn run_link(
-    mut spi: esp_hal::spi::master::SpiDmaBus<'static, esp_hal::Async>,
+    mut spi: esp_hal::spi::master::SpiDmaBus<'static, Blocking>,
     command_receiver: Receiver<
         'static,
         CriticalSectionRawMutex,
@@ -198,6 +198,13 @@ async fn run_link(
         let tx_cell = match retransmit {
             RetransmitAction::Send(cell) => {
                 diagnostics.retransmissions = diagnostics.retransmissions.saturating_add(1);
+                #[cfg(feature = "hardware-e2e")]
+                if super::mirror_e2e_fault::observe_retransmission(cell.header.tx_sequence) {
+                    log::info!(
+                        "@HIDSHIFT-MIRROR:SPI_CRC_RETRIED,{}",
+                        cell.header.tx_sequence
+                    );
+                }
                 Some(cell)
             }
             RetransmitAction::LinkResetRequired => {
@@ -296,8 +303,19 @@ async fn run_link(
                 continue;
             }
         };
+        #[cfg(feature = "hardware-e2e")]
+        let mut tx = tx;
+        #[cfg(feature = "hardware-e2e")]
+        if is_e2e_faultable_input_cell(&tx_cell)
+            && super::mirror_e2e_fault::corrupt_tx_if_requested(tx_cell.header.tx_sequence, &mut tx)
+        {
+            log::info!(
+                "@HIDSHIFT-MIRROR:SPI_CRC_INJECTED,{}",
+                tx_cell.header.tx_sequence
+            );
+        }
         let mut rx = [0u8; SPI_CELL_LEN];
-        if let Err(error) = spi.transfer_async(&mut rx, &tx).await {
+        if let Err(error) = spi.transfer(&mut rx, &tx) {
             log::warn!("mirror-spi: DMA transaction failed {:?}", error);
             continue;
         }
@@ -379,6 +397,19 @@ async fn run_link(
             diagnostics.resets = diagnostics.resets.saturating_add(1);
         }
     }
+}
+
+#[cfg(feature = "hardware-e2e")]
+fn is_e2e_faultable_input_cell(cell: &SpiCell) -> bool {
+    let mut records = RecordIter::new(cell.payload(), cell.header.record_count);
+    records.any(|record| {
+        record.is_ok_and(|record| {
+            matches!(
+                record.record_type,
+                RECORD_RAW_ENDPOINT_IN | RECORD_STANDARD_INPUT_REPORT
+            )
+        })
+    })
 }
 
 fn queue_hello(sender: &mut ReliableSender, now_ms: u64) -> Option<SpiCell> {

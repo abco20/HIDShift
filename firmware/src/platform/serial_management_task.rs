@@ -12,8 +12,9 @@ use hidshift::e2e::{E2eCommand, E2ePacket};
 #[cfg(all(feature = "hardware-e2e", feature = "dual-s3-wired"))]
 use hidshift::e2e_mirror::{
     MirrorE2ePacket, MirrorRawInjectionReceiver, OPCODE_CLEAR_CANDIDATES, OPCODE_HELLO,
-    OPCODE_INJECT_ENDPOINT_IN, OPCODE_REGISTER_BEGIN, OPCODE_REGISTER_CHUNK,
-    OPCODE_REGISTER_COMMIT, OPCODE_SET_CONTROL_RESPONSE,
+    OPCODE_INJECT_ENDPOINT_IN, OPCODE_INJECT_SPI_CRC_FAILURE, OPCODE_READ_MOCK_STATUS,
+    OPCODE_REGISTER_BEGIN, OPCODE_REGISTER_CHUNK, OPCODE_REGISTER_COMMIT, OPCODE_RESET_MOCK_STATUS,
+    OPCODE_SET_CONTROL_RESPONSE,
 };
 #[cfg(all(feature = "hardware-e2e", feature = "dual-s3-wired"))]
 use hidshift::interchip::{
@@ -315,6 +316,29 @@ pub async fn serial_management_task(
                                     packet.sequence
                                 ),
                             }
+                        }
+                        OPCODE_INJECT_SPI_CRC_FAILURE if packet.payload().is_empty() => {
+                            let count = packet.transfer_id.clamp(1, u32::from(u8::MAX));
+                            super::mirror_e2e_fault::request_tx_crc_failures(count);
+                            log::info!(
+                                "@HIDSHIFT-MIRROR:SPI_CRC_ARMED,{},{}",
+                                packet.sequence,
+                                count
+                            );
+                        }
+                        OPCODE_READ_MOCK_STATUS => {
+                            let status = super::mirror_e2e_fault::snapshot();
+                            log::info!(
+                                "@HIDSHIFT-MIRROR:MOCK_STATUS,{},{},{},{}",
+                                packet.sequence,
+                                status.crc_failures_remaining,
+                                status.crc_failures_injected,
+                                status.crc_retransmissions_observed
+                            );
+                        }
+                        OPCODE_RESET_MOCK_STATUS => {
+                            super::mirror_e2e_fault::reset();
+                            log::info!("@HIDSHIFT-MIRROR:MOCK_STATUS_RESET,{}", packet.sequence);
                         }
                         _ => log::warn!(
                             "@HIDSHIFT-MIRROR:ERROR,{},opcode,{}",
