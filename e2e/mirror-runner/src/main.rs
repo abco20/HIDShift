@@ -22,7 +22,7 @@ use hidshift::ids::HostId;
 use hidshift::management::{
     ManagementCommand, ManagementOutputTarget, ManagementResponsePayload, ManagementResult,
 };
-use hidshift::mirror::validate_mirror_image;
+use hidshift::mirror::{UsbDevicePlan, validate_mirror_image};
 use hidshift::output_target::{MirrorCandidateId, OutputTargetAvailability};
 use hidshift_client::{ManagementClient, SerialResponseDecoder, encode_serial_request};
 use serialport::SerialPort;
@@ -41,6 +41,13 @@ struct Arguments {
     /// Skip T15 when the Linux hidraw node is not accessible to this user.
     #[arg(long)]
     skip_hidraw: bool,
+    /// Run BLE Management and release/suppression E2E through this bonded peer.
+    #[arg(long)]
+    ble_address: Option<String>,
+    #[arg(long, default_value_t = 2)]
+    ble_host_slot: u8,
+    #[arg(long, default_value = "tools/hidshiftctl/target/release/hidshiftctl")]
+    hidshiftctl: PathBuf,
     #[arg(long, default_value = "e2e/fixtures/mirror/composite-a.hsmi")]
     profile_a: PathBuf,
     #[arg(long, default_value = "e2e/fixtures/mirror/mouse-b.hsmi")]
@@ -281,6 +288,19 @@ fn run() -> Result<(), Box<dyn Error>> {
     )?;
     println!("T23 passed: fallback Caps Lock output crossed SPI to Host S3");
 
+    if let Some(address) = arguments.ble_address.as_deref() {
+        verify_ble_management_switching(
+            &mut *serial,
+            &arguments.hidshiftctl,
+            address,
+            arguments.ble_host_slot,
+            &mut fallback_events,
+            arguments.usb_timeout_seconds,
+        )?;
+    } else {
+        println!("T06-T08 skipped: pass --ble-address for bonded BlueZ Management E2E");
+    }
+
     if let Some(device_port) = arguments.device_flash_port.as_deref() {
         verify_spi_loss(
             &mut *serial,
@@ -313,6 +333,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         pid_a,
         Duration::from_secs(arguments.usb_timeout_seconds),
     )?;
+    verify_usb_plan(&plan_a)?;
     println!("T10-T12 passed: registered and enumerated {vid_a:04x}:{pid_a:04x}");
 
     let mut keyboard_events = open_input_events(vid_a, pid_a, 1, Duration::from_secs(3))?;
@@ -351,12 +372,22 @@ fn run() -> Result<(), Box<dyn Error>> {
     )?;
     println!("T14 passed: Caps Lock LED reached raw endpoint 0x01 unchanged");
 
-    send_management_command(
-        &mut *serial,
-        &mut client,
-        ManagementCommand::SelectOutputTarget(ManagementOutputTarget::Ble(HostId(1))),
-        "SELECT_OUTPUT_TARGET(BLE 1)",
-    )?;
+    if let Some(address) = arguments.ble_address.as_deref() {
+        let host_slot = arguments.ble_host_slot.to_string();
+        run_ble_management(
+            &arguments.hidshiftctl,
+            address,
+            &["target", "ble", &host_slot],
+        )?;
+        run_ble_management(&arguments.hidshiftctl, address, &["mirror", "status"])?;
+    } else {
+        send_management_command(
+            &mut *serial,
+            &mut client,
+            ManagementCommand::SelectOutputTarget(ManagementOutputTarget::Ble(HostId(1))),
+            "SELECT_OUTPUT_TARGET(BLE 1)",
+        )?;
+    }
     wait_for_usb_identity(
         &mut *serial,
         FALLBACK_USB_VENDOR_ID,
@@ -364,12 +395,16 @@ fn run() -> Result<(), Box<dyn Error>> {
         Duration::from_secs(arguments.usb_timeout_seconds),
     )?;
     println!("T20/T22 passed: BLE selection forced fallback while retaining Mirror A");
-    send_management_command(
-        &mut *serial,
-        &mut client,
-        ManagementCommand::SelectOutputTarget(ManagementOutputTarget::Wired),
-        "SELECT_OUTPUT_TARGET(Wired)",
-    )?;
+    if let Some(address) = arguments.ble_address.as_deref() {
+        run_ble_management(&arguments.hidshiftctl, address, &["target", "usb"])?;
+    } else {
+        send_management_command(
+            &mut *serial,
+            &mut client,
+            ManagementCommand::SelectOutputTarget(ManagementOutputTarget::Wired),
+            "SELECT_OUTPUT_TARGET(Wired)",
+        )?;
+    }
     wait_for_usb_identity(
         &mut *serial,
         vid_a,
@@ -470,6 +505,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     if usb_identity_present(vid_a, pid_a)? {
         return Err("Profile A remained enumerated after activating Profile B".into());
     }
+    verify_usb_plan(&plan_b)?;
     println!("T18 passed: switched without reflashing to {vid_b:04x}:{pid_b:04x}");
 
     register_profile(&mut *serial, &invalid_profile, 3, &mut sequence, false)?;
@@ -802,6 +838,231 @@ fn open_input_events(
         std::thread::sleep(Duration::from_millis(25));
     }
     Err(format!("fewer than {minimum_nodes} evdev nodes found for {vid:04x}:{pid:04x}").into())
+}
+
+fn open_named_input_events(name: &str, timeout: Duration) -> Result<Vec<fs::File>, Box<dyn Error>> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let mut files = Vec::new();
+        for entry in fs::read_dir("/sys/class/input")? {
+            let path = entry?.path();
+            let Some(event_name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if !event_name.starts_with("event")
+                || fs::read_to_string(path.join("device/name"))
+                    .ok()
+                    .is_none_or(|value| value.trim() != name)
+            {
+                continue;
+            }
+            if let Ok(file) = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(Path::new("/dev/input").join(event_name))
+            {
+                files.push(file);
+            }
+        }
+        if !files.is_empty() {
+            return Ok(files);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Err(format!("no readable evdev node named {name:?}").into())
+}
+
+fn run_ble_management(
+    hidshiftctl: &Path,
+    address: &str,
+    arguments: &[&str],
+) -> Result<(), Box<dyn Error>> {
+    let output = Command::new(hidshiftctl)
+        .args(["--ble", "--address", address])
+        .args(arguments)
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "BLE Management command {:?} failed: {}{}",
+            arguments,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn verify_ble_management_switching(
+    serial: &mut dyn SerialPort,
+    hidshiftctl: &Path,
+    address: &str,
+    host_slot: u8,
+    fallback_events: &mut [fs::File],
+    usb_timeout_seconds: u64,
+) -> Result<(), Box<dyn Error>> {
+    if !(1..=4).contains(&host_slot) {
+        return Err(format!("--ble-host-slot must be 1..=4, got {host_slot}").into());
+    }
+    if !hidshiftctl.is_file() {
+        return Err(format!(
+            "{} does not exist; build hidshiftctl --release first",
+            hidshiftctl.display()
+        )
+        .into());
+    }
+    drain_input_events(fallback_events)?;
+    send_normalized(
+        serial,
+        E2ePacket {
+            sequence: 1_100,
+            command: E2eCommand::Keyboard {
+                modifiers: 0,
+                keys: [0x04, 0, 0, 0, 0, 0],
+            },
+        },
+    )?;
+    wait_for_key_event(fallback_events, 30, 1, Duration::from_secs(3))?;
+
+    let host_slot_text = host_slot.to_string();
+    run_ble_management(hidshiftctl, address, &["target", "ble", &host_slot_text])?;
+    wait_for_key_event(fallback_events, 30, 0, Duration::from_secs(3))?;
+    let mut ble_events = open_named_input_events("HIDShift Keyboard", Duration::from_secs(8))?;
+    drain_input_events(&mut ble_events)?;
+    send_normalized(
+        serial,
+        E2ePacket {
+            sequence: 1_101,
+            command: E2eCommand::Keyboard {
+                modifiers: 0,
+                keys: [0x04, 0, 0, 0, 0, 0],
+            },
+        },
+    )?;
+    assert_no_input_event(&mut ble_events, 1, 30, 1, Duration::from_millis(500))?;
+    send_normalized(
+        serial,
+        E2ePacket {
+            sequence: 1_102,
+            command: E2eCommand::ReleaseAll,
+        },
+    )?;
+    send_normalized(
+        serial,
+        E2ePacket {
+            sequence: 1_103,
+            command: E2eCommand::Keyboard {
+                modifiers: 0,
+                keys: [0x05, 0, 0, 0, 0, 0],
+            },
+        },
+    )?;
+    wait_for_key_event(&mut ble_events, 48, 1, Duration::from_secs(3))?;
+
+    run_ble_management(hidshiftctl, address, &["target", "usb"])?;
+    wait_for_key_event(&mut ble_events, 48, 0, Duration::from_secs(3))?;
+    wait_for_usb_identity(
+        serial,
+        FALLBACK_USB_VENDOR_ID,
+        FALLBACK_USB_PRODUCT_ID,
+        Duration::from_secs(usb_timeout_seconds),
+    )?;
+    drain_input_events(fallback_events)?;
+    send_normalized(
+        serial,
+        E2ePacket {
+            sequence: 1_104,
+            command: E2eCommand::Keyboard {
+                modifiers: 0,
+                keys: [0x05, 0, 0, 0, 0, 0],
+            },
+        },
+    )?;
+    assert_no_input_event(fallback_events, 1, 48, 1, Duration::from_millis(500))?;
+    send_normalized(
+        serial,
+        E2ePacket {
+            sequence: 1_105,
+            command: E2eCommand::ReleaseAll,
+        },
+    )?;
+    drain_input_events(&mut ble_events)?;
+    send_normalized(
+        serial,
+        E2ePacket {
+            sequence: 1_106,
+            command: E2eCommand::Keyboard {
+                modifiers: 0,
+                keys: [0x04, 0, 0, 0, 0, 0],
+            },
+        },
+    )?;
+    wait_for_key_event(fallback_events, 30, 1, Duration::from_secs(3))?;
+    assert_no_input_event(&mut ble_events, 1, 30, 1, Duration::from_millis(500))?;
+    send_normalized(
+        serial,
+        E2ePacket {
+            sequence: 1_107,
+            command: E2eCommand::ReleaseAll,
+        },
+    )?;
+    wait_for_key_event(fallback_events, 30, 0, Duration::from_secs(3))?;
+    run_ble_management(hidshiftctl, address, &["target", "status"])?;
+    println!(
+        "T06-T08 passed: BLE GATT Management switched both directions with release, suppression and no broadcast"
+    );
+    Ok(())
+}
+
+fn drain_input_events(files: &mut [fs::File]) -> Result<(), Box<dyn Error>> {
+    let mut buffer = [0; 24 * 16];
+    for file in files {
+        loop {
+            match file.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn assert_no_input_event(
+    files: &mut [fs::File],
+    event_type: u16,
+    event_code: u16,
+    value: i32,
+    timeout: Duration,
+) -> Result<(), Box<dyn Error>> {
+    const INPUT_EVENT_LEN: usize = 24;
+    let deadline = Instant::now() + timeout;
+    let mut bytes = [0; INPUT_EVENT_LEN * 8];
+    while Instant::now() < deadline {
+        for file in files.iter_mut() {
+            match file.read(&mut bytes) {
+                Ok(length) => {
+                    for event in bytes[..length].chunks_exact(INPUT_EVENT_LEN) {
+                        if u16::from_ne_bytes([event[16], event[17]]) == event_type
+                            && u16::from_ne_bytes([event[18], event[19]]) == event_code
+                            && i32::from_ne_bytes([event[20], event[21], event[22], event[23]])
+                                == value
+                        {
+                            return Err(format!(
+                                "unexpected evdev type {event_type} code {event_code} value {value}"
+                            )
+                            .into());
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    Ok(())
 }
 
 fn set_keyboard_led(
@@ -1257,6 +1518,133 @@ fn wait_for_usb_identity(
     Err(format!("USB identity {vid:04x}:{pid:04x} did not enumerate").into())
 }
 
+fn verify_usb_plan(plan: &UsbDevicePlan<'_>) -> Result<(), Box<dyn Error>> {
+    let (vid, pid) = plan_identity(&plan.device_descriptor);
+    let path = find_usb_device(vid, pid)?.ok_or_else(|| {
+        format!("USB identity {vid:04x}:{pid:04x} disappeared before descriptor verification")
+    })?;
+    let raw = fs::read(path.join("descriptors"))?;
+    verify_raw_descriptors(plan, &raw)?;
+    verify_usb_strings(plan, &path)?;
+    for interface in &plan.interfaces {
+        let interface_path = PathBuf::from(format!(
+            "{}:1.{}",
+            path.to_string_lossy(),
+            interface.interface_number
+        ));
+        let report_path =
+            find_named_file(&interface_path, "report_descriptor", 3)?.ok_or_else(|| {
+                format!(
+                    "no Linux HID report_descriptor for USB interface {}",
+                    interface.interface_number
+                )
+            })?;
+        let actual = fs::read(&report_path)?;
+        if actual != interface.report_descriptor {
+            return Err(format!(
+                "HID Report Descriptor mismatch for interface {} at {}",
+                interface.interface_number,
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn verify_raw_descriptors(plan: &UsbDevicePlan<'_>, raw: &[u8]) -> Result<(), Box<dyn Error>> {
+    if raw.get(..18) != Some(plan.device_descriptor.as_slice()) {
+        return Err("raw USB Device Descriptor does not match MirrorImage".into());
+    }
+    let configuration_length = plan.configuration_descriptor.len();
+    if raw.get(18..18 + configuration_length) != Some(plan.configuration_descriptor) {
+        return Err("raw USB Configuration Descriptor does not match MirrorImage".into());
+    }
+    if !plan.bos_descriptor.is_empty() {
+        return Err(
+            "fixture contains BOS data but Linux sysfs does not expose a byte-exact BOS source"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn verify_usb_strings(plan: &UsbDevicePlan<'_>, path: &Path) -> Result<(), Box<dyn Error>> {
+    for (descriptor_index, sysfs_name) in [
+        (plan.device_descriptor[14], "manufacturer"),
+        (plan.device_descriptor[15], "product"),
+        (plan.device_descriptor[16], "serial"),
+    ] {
+        if descriptor_index == 0 {
+            continue;
+        }
+        let expected = plan
+            .strings
+            .get(descriptor_index, 0x0409)
+            .and_then(decode_usb_string)
+            .ok_or_else(|| format!("missing String Descriptor index {descriptor_index}"))?;
+        let actual = fs::read_to_string(path.join(sysfs_name))?;
+        if actual.trim_end() != expected {
+            return Err(format!(
+                "USB {sysfs_name} mismatch: expected {expected:?}, got {:?}",
+                actual.trim_end()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn decode_usb_string(descriptor: &[u8]) -> Option<String> {
+    if descriptor.len() < 2
+        || !descriptor.len().is_multiple_of(2)
+        || usize::from(descriptor[0]) != descriptor.len()
+        || descriptor[1] != 0x03
+    {
+        return None;
+    }
+    let utf16 = descriptor[2..]
+        .chunks_exact(2)
+        .map(|unit| u16::from_le_bytes([unit[0], unit[1]]));
+    char::decode_utf16(utf16)
+        .collect::<Result<String, _>>()
+        .ok()
+}
+
+fn find_usb_device(vid: u16, pid: u16) -> Result<Option<PathBuf>, Box<dyn Error>> {
+    for entry in fs::read_dir("/sys/bus/usb/devices")? {
+        let path = entry?.path();
+        if read_hex(path.join("idVendor")) == Some(vid)
+            && read_hex(path.join("idProduct")) == Some(pid)
+        {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+fn find_named_file(
+    root: &Path,
+    name: &str,
+    remaining_depth: usize,
+) -> Result<Option<PathBuf>, Box<dyn Error>> {
+    if remaining_depth == 0 || !root.is_dir() {
+        return Ok(None);
+    }
+    for entry in fs::read_dir(root)? {
+        let path = entry?.path();
+        if path.file_name().and_then(|value| value.to_str()) == Some(name) && path.is_file() {
+            return Ok(Some(path));
+        }
+        if path.is_dir()
+            && let Some(found) = find_named_file(&path, name, remaining_depth - 1)?
+        {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
+}
+
 fn read_hex(path: impl AsRef<Path>) -> Option<u16> {
     u16::from_str_radix(fs::read_to_string(path).ok()?.trim(), 16).ok()
 }
@@ -1292,5 +1680,29 @@ mod tests {
     fn linux_hidraw_feature_requests_match_uapi_values() {
         assert_eq!(hidraw_feature_request(17, 0x07), 0xc011_4807);
         assert_eq!(hidraw_feature_request(17, 0x06), 0xc011_4806);
+    }
+
+    #[test]
+    fn descriptor_verifier_requires_exact_device_and_configuration_bytes() {
+        let image = include_bytes!("../../fixtures/mirror/composite-a.hsmi");
+        let plan = validate_mirror_image(image).unwrap();
+        let mut raw = Vec::from(plan.device_descriptor);
+        raw.extend_from_slice(plan.configuration_descriptor);
+        verify_raw_descriptors(&plan, &raw).unwrap();
+
+        raw[12] ^= 1;
+        assert!(verify_raw_descriptors(&plan, &raw).is_err());
+        raw[12] ^= 1;
+        raw[18 + 20] ^= 1;
+        assert!(verify_raw_descriptors(&plan, &raw).is_err());
+    }
+
+    #[test]
+    fn usb_string_decoder_preserves_utf16_content() {
+        assert_eq!(
+            decode_usb_string(&[8, 3, b'E', 0, b'2', 0, b'E', 0]),
+            Some("E2E".into())
+        );
+        assert_eq!(decode_usb_string(&[3, 3, b'E']), None);
     }
 }
