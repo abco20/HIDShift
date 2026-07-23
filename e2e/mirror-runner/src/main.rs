@@ -1702,6 +1702,18 @@ fn verify_usb_plan(plan: &UsbDevicePlan<'_>) -> Result<(), Box<dyn Error>> {
     })?;
     let raw = fs::read(path.join("descriptors"))?;
     verify_raw_descriptors(plan, &raw)?;
+    if !plan.bos_descriptor.is_empty() {
+        let actual_bos = read_usb_bos_descriptor(vid, pid)?;
+        match actual_bos {
+            Some(actual) if actual == plan.bos_descriptor => {}
+            None => {
+                return Err("USB device did not expose the MirrorImage BOS Descriptor".into());
+            }
+            Some(_) => {
+                return Err("raw USB BOS Descriptor does not match MirrorImage".into());
+            }
+        }
+    }
     verify_usb_strings(plan, &path)?;
     for interface in &plan.interfaces {
         let interface_path = PathBuf::from(format!(
@@ -1737,13 +1749,60 @@ fn verify_raw_descriptors(plan: &UsbDevicePlan<'_>, raw: &[u8]) -> Result<(), Bo
     if raw.get(18..18 + configuration_length) != Some(plan.configuration_descriptor) {
         return Err("raw USB Configuration Descriptor does not match MirrorImage".into());
     }
-    if !plan.bos_descriptor.is_empty() {
-        return Err(
-            "fixture contains BOS data but Linux sysfs does not expose a byte-exact BOS source"
-                .into(),
-        );
-    }
     Ok(())
+}
+
+fn read_usb_bos_descriptor(vid: u16, pid: u16) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
+    const GET_DESCRIPTOR: u8 = 0x06;
+    const BOS_DESCRIPTOR: u16 = 0x0f00;
+    const DEVICE_TO_HOST_STANDARD_DEVICE: u8 = 0x80;
+
+    let devices = rusb::devices()?;
+    let device = devices
+        .iter()
+        .find(|device| {
+            device.device_descriptor().is_ok_and(|descriptor| {
+                descriptor.vendor_id() == vid && descriptor.product_id() == pid
+            })
+        })
+        .ok_or_else(|| format!("libusb could not find {vid:04x}:{pid:04x}"))?;
+    let handle = device.open()?;
+    let mut header = [0u8; 5];
+    let header_length = match handle.read_control(
+        DEVICE_TO_HOST_STANDARD_DEVICE,
+        GET_DESCRIPTOR,
+        BOS_DESCRIPTOR,
+        0,
+        &mut header,
+        Duration::from_secs(1),
+    ) {
+        Ok(length) => length,
+        Err(rusb::Error::Pipe) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if header_length != header.len() || header[0] != 5 || header[1] != 0x0f {
+        return Err(format!("malformed USB BOS header: {header:02x?}").into());
+    }
+    let total_length = usize::from(u16::from_le_bytes([header[2], header[3]]));
+    if total_length < header.len() {
+        return Err(format!("invalid USB BOS total length {total_length}").into());
+    }
+    let mut descriptor = vec![0; total_length];
+    let actual_length = handle.read_control(
+        DEVICE_TO_HOST_STANDARD_DEVICE,
+        GET_DESCRIPTOR,
+        BOS_DESCRIPTOR,
+        0,
+        &mut descriptor,
+        Duration::from_secs(1),
+    )?;
+    if actual_length != total_length {
+        return Err(format!(
+            "short USB BOS Descriptor: expected {total_length}, received {actual_length}"
+        )
+        .into());
+    }
+    Ok(Some(descriptor))
 }
 
 fn verify_usb_strings(plan: &UsbDevicePlan<'_>, path: &Path) -> Result<(), Box<dyn Error>> {
