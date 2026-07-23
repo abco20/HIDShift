@@ -40,6 +40,7 @@ enum CliCommand {
     Devices,
     Diagnostics,
     History,
+    MirrorList,
     SettingsList,
     SettingDescribe {
         key: String,
@@ -150,6 +151,8 @@ enum TargetArgs {
 
 #[derive(Debug, Subcommand)]
 enum MirrorArgs {
+    /// 登録済みMirror candidateを一覧表示
+    List,
     /// 登録済みMirror candidateを選択
     Select { candidate: u8 },
     /// Mirror設定を解除
@@ -207,6 +210,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             ensure_ok(response)
         }
         CliCommand::History => print_history(&arguments.transport).await,
+        CliCommand::MirrorList => print_mirror_candidates(&arguments.transport).await,
         CliCommand::SettingsList => print_settings(&arguments.transport).await,
         CliCommand::SettingDescribe { key } => {
             print_setting_description(&key)?;
@@ -550,6 +554,31 @@ fn print_response(response: ManagementResponse) {
             println!("mirror configured: {}", status.mirror_configured);
             println!("operation: {}", status.operation_id);
         }
+        ManagementResponsePayload::MirrorCandidate(candidate) => {
+            println!(
+                "mirror[{}] {:04x}:{:04x} profile={:08x} descriptor={:08x} source={}{}{}{}",
+                candidate.candidate.0,
+                candidate.vendor_id,
+                candidate.product_id,
+                candidate.profile_hash,
+                candidate.descriptor_hash,
+                candidate
+                    .source_device
+                    .map(|device| device.to_string())
+                    .unwrap_or_else(|| "synthetic".to_owned()),
+                if candidate.selected() {
+                    " selected"
+                } else {
+                    ""
+                },
+                if candidate.active() { " active" } else { "" },
+                if candidate.synthetic() {
+                    " synthetic"
+                } else {
+                    ""
+                },
+            );
+        }
         ManagementResponsePayload::None => {}
     }
 }
@@ -622,6 +651,27 @@ async fn print_devices(transport: &Transport) -> Result<(), Box<dyn Error>> {
                 ""
             },
         );
+    }
+    Ok(())
+}
+
+async fn print_mirror_candidates(transport: &Transport) -> Result<(), Box<dyn Error>> {
+    let mut found = 0usize;
+    for candidate in 0..4 {
+        let response = request(
+            transport,
+            ManagementCommand::GetMirrorCandidate(MirrorCandidateId(candidate)),
+        )
+        .await?;
+        if response.result == ManagementResult::NotFound {
+            continue;
+        }
+        ensure_ok(response)?;
+        print_response(response);
+        found += 1;
+    }
+    if found == 0 {
+        println!("no mirror candidates");
     }
     Ok(())
 }
@@ -982,6 +1032,7 @@ where
             TargetArgs::Status => CliCommand::Request(ManagementCommand::GetOutputTargetStatus),
         },
         CommandArgs::Mirror { command } => match command {
+            MirrorArgs::List => CliCommand::MirrorList,
             MirrorArgs::Select { candidate } => CliCommand::Request(
                 ManagementCommand::SetMirrorTarget(MirrorCandidateId(candidate)),
             ),
@@ -1080,6 +1131,12 @@ mod tests {
                 .unwrap()
                 .command,
             CliCommand::Request(ManagementCommand::GetOutputTargetStatus)
+        );
+        assert_eq!(
+            parse_arguments(["--ble", "mirror", "list"].map(str::to_owned))
+                .unwrap()
+                .command,
+            CliCommand::MirrorList
         );
     }
 

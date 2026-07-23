@@ -90,6 +90,11 @@ pub use input::{
     MouseInputReport, MouseMovement, PhysicalInputState, PhysicalKeyboardState, PhysicalMouseState,
     StandardInputFrame, VisibleKeyboardState,
 };
+#[cfg(feature = "dual-s3-wired")]
+pub use management::{
+    MANAGEMENT_CAPABILITY_DUAL_S3_WIRED, ManagementMirrorCandidate, ManagementOutputTarget,
+    ManagementOutputTargetStatus, ManagementUsbPresentationKind,
+};
 pub use management::{
     MANAGEMENT_PROTOCOL_VERSION, MANAGEMENT_REQUEST_LEN, MANAGEMENT_REQUEST_UUID,
     MANAGEMENT_RESPONSE_LEN, MANAGEMENT_RESPONSE_UUID, MANAGEMENT_SERVICE_UUID, ManagementCommand,
@@ -98,10 +103,6 @@ pub use management::{
     ManagementRequest, ManagementResponse, ManagementResponsePayload, ManagementResult,
     ManagementSchema, ManagementSetting, ManagementStatus, ManagementUsbDevice,
     ManagementUsbStatus,
-};
-#[cfg(feature = "dual-s3-wired")]
-pub use management::{
-    ManagementOutputTarget, ManagementOutputTargetStatus, ManagementUsbPresentationKind,
 };
 #[cfg(feature = "dual-s3-wired")]
 pub use mirror::{

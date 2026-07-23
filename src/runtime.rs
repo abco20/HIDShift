@@ -15,7 +15,8 @@ use crate::management::{
 };
 #[cfg(feature = "dual-s3-wired")]
 use crate::management::{
-    ManagementOutputTarget, ManagementOutputTargetStatus, ManagementUsbPresentationKind,
+    ManagementMirrorCandidate, ManagementOutputTarget, ManagementOutputTargetStatus,
+    ManagementUsbPresentationKind,
 };
 #[cfg(feature = "dual-s3-wired")]
 use crate::mirror::{MirrorCandidateMetadata, MirrorCandidateRegistry};
@@ -186,6 +187,11 @@ pub enum RuntimeInput<'a> {
     DeviceProfileResult(ProfileResult),
     #[cfg(feature = "dual-s3-wired")]
     MirrorEndpointOut(RawEndpointReport),
+    #[cfg(feature = "dual-s3-wired")]
+    MirrorEndpointIn {
+        device_id: DeviceId,
+        report: RawEndpointReport,
+    },
     #[cfg(feature = "dual-s3-wired")]
     MirrorControlRequest(MirrorControlRequest),
     #[cfg(feature = "dual-s3-wired")]
@@ -665,6 +671,17 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                 Ok(())
             }
             #[cfg(feature = "dual-s3-wired")]
+            RuntimeInput::MirrorEndpointIn { device_id, report } => {
+                commands.clear();
+                if self.active_physical_mirror_source() == Some(device_id) {
+                    push_command(
+                        commands,
+                        RuntimeCommand::DeviceCommand(DeviceTaskCommand::RawEndpointIn(report)),
+                    )?;
+                }
+                Ok(())
+            }
+            #[cfg(feature = "dual-s3-wired")]
             RuntimeInput::MirrorControlRequest(request) => {
                 commands.clear();
                 self.last_mirror_control_request = Some(request);
@@ -879,6 +896,15 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         ble: &mut heapless::Vec<BleTaskCommand, BLE>,
         device: &mut heapless::Vec<DeviceTaskCommand, DEVICE>,
     ) -> Result<(), RuntimeError> {
+        if self.bridge.state().output_target.active == Some(OutputTarget::Wired)
+            && self.selected_mirror_candidate().is_some()
+        {
+            self.counters.mirror_non_target_input_dropped = self
+                .counters
+                .mirror_non_target_input_dropped
+                .saturating_add(1);
+            return Ok(());
+        }
         let maximum_reports = match &frame {
             crate::input::InputFrame::Standard(frame) => {
                 usize::from(frame.keyboard.is_some())
@@ -1334,6 +1360,14 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             #[cfg(feature = "dual-s3-wired")]
             ManagementCommand::GetOutputTargetStatus => ManagementResult::Ok,
             #[cfg(feature = "dual-s3-wired")]
+            ManagementCommand::GetMirrorCandidate(candidate) => {
+                if self.mirror_candidates.get(candidate).is_some() {
+                    ManagementResult::Ok
+                } else {
+                    ManagementResult::NotFound
+                }
+            }
+            #[cfg(feature = "dual-s3-wired")]
             ManagementCommand::SetMirrorTarget(candidate) => {
                 if let (Some(profile_hash), Some(stable_id)) = (
                     self.mirror_profile_hash(candidate),
@@ -1431,6 +1465,11 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                 firmware_major: crate::FIRMWARE_VERSION_MAJOR,
                 firmware_minor: crate::FIRMWARE_VERSION_MINOR,
                 firmware_patch: crate::FIRMWARE_VERSION_PATCH,
+                capabilities: if cfg!(feature = "dual-s3-wired") {
+                    crate::management::MANAGEMENT_CAPABILITY_DUAL_S3_WIRED
+                } else {
+                    0
+                },
             }),
             ManagementCommand::GetSetting { id, target }
             | ManagementCommand::SetSetting { id, target, .. }
@@ -1450,6 +1489,12 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                 ManagementResponsePayload::OutputTargetStatus(
                     self.management_output_target_status(),
                 )
+            }
+            #[cfg(feature = "dual-s3-wired")]
+            ManagementCommand::GetMirrorCandidate(candidate) if result == ManagementResult::Ok => {
+                self.management_mirror_candidate(candidate)
+                    .map(ManagementResponsePayload::MirrorCandidate)
+                    .unwrap_or(ManagementResponsePayload::None)
             }
             _ => ManagementResponsePayload::Status(self.management_status()),
         };
@@ -1484,6 +1529,30 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             }
         }
         status
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    fn management_mirror_candidate(
+        &self,
+        candidate: MirrorCandidateId,
+    ) -> Option<ManagementMirrorCandidate> {
+        let metadata = self.mirror_candidates.get(candidate)?;
+        let selected = self.selected_mirror_candidate() == Some(candidate);
+        let active = selected
+            && !self.presentation_transition_pending
+            && self.bridge.state().output_target.active == Some(OutputTarget::Wired);
+        Some(ManagementMirrorCandidate {
+            candidate,
+            flags: 1
+                | (u8::from(selected) << 1)
+                | (u8::from(active) << 2)
+                | (u8::from(metadata.synthetic) << 3),
+            source_device: metadata.source_device.map(|device| device.0),
+            vendor_id: metadata.stable_id.vendor_id,
+            product_id: metadata.stable_id.product_id,
+            profile_hash: metadata.profile_hash,
+            descriptor_hash: metadata.stable_id.descriptor_hash,
+        })
     }
 
     #[cfg(feature = "dual-s3-wired")]
@@ -2275,6 +2344,7 @@ pub struct RuntimeCounters {
     pub mouse_reports_coalesced: u32,
     pub mouse_movement_saturated: u32,
     pub runtime_input_dropped: u32,
+    pub mirror_non_target_input_dropped: u32,
     pub status_updates_dropped: u32,
     pub usb_led_write_timeouts: u32,
     pub runtime_processing_max_us: u32,
@@ -2297,6 +2367,7 @@ impl RuntimeCounters {
             mouse_reports_coalesced: 0,
             mouse_movement_saturated: 0,
             runtime_input_dropped: 0,
+            mirror_non_target_input_dropped: 0,
             status_updates_dropped: 0,
             usb_led_write_timeouts: 0,
             runtime_processing_max_us: 0,
@@ -3696,6 +3767,23 @@ mod tests {
                 &mut commands,
             )
             .unwrap();
+        runtime
+            .handle_input::<16, 16, 2>(
+                management_request(ManagementCommand::GetMirrorCandidate(candidate), 41),
+                &mut commands,
+            )
+            .unwrap();
+        let ManagementResponsePayload::MirrorCandidate(managed) =
+            management_response(&commands).payload
+        else {
+            panic!()
+        };
+        assert_eq!(managed.source_device, Some(7));
+        assert_eq!(managed.vendor_id, 0x046d);
+        assert_eq!(managed.product_id, 0xc547);
+        assert!(managed.selected());
+        assert!(managed.active());
+        assert!(!managed.synthetic());
 
         let report = RawEndpointReport::new(0x02, 17, &[0x10, 0xaa, 0xbb]).unwrap();
         runtime
@@ -3720,6 +3808,47 @@ mod tests {
                 request,
             }]
         );
+
+        let input = RawEndpointReport::new(0x81, 18, &[1, 2, 3, 4]).unwrap();
+        runtime
+            .handle_input::<16, 16, 2>(
+                RuntimeInput::MirrorEndpointIn {
+                    device_id: DeviceId(7),
+                    report: input,
+                },
+                &mut commands,
+            )
+            .unwrap();
+        assert_eq!(
+            commands.as_slice(),
+            &[RuntimeCommand::DeviceCommand(
+                DeviceTaskCommand::RawEndpointIn(input)
+            )]
+        );
+
+        runtime
+            .handle_input::<16, 16, 2>(
+                RuntimeInput::MirrorEndpointIn {
+                    device_id: DeviceId(8),
+                    report: input,
+                },
+                &mut commands,
+            )
+            .unwrap();
+        assert!(commands.is_empty());
+
+        let mut ble = heapless::Vec::<BleTaskCommand, 4>::new();
+        let mut device = heapless::Vec::<DeviceTaskCommand, 4>::new();
+        runtime
+            .handle_realtime_input_frame_in_place(
+                crate::input::InputFrame::Standard(keyboard_input(KeyUsage(4))),
+                &mut ble,
+                &mut device,
+            )
+            .unwrap();
+        assert!(ble.is_empty());
+        assert!(device.is_empty());
+        assert_eq!(runtime.counters().mirror_non_target_input_dropped, 1);
     }
 
     #[cfg(feature = "dual-s3-wired")]

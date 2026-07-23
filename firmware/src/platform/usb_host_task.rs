@@ -78,6 +78,8 @@ struct ActiveUsbInterfaceSlot<'d> {
     last_led_bytes: Option<hidshift::usb_hid::output::KeyboardLedOutputBytes>,
     #[cfg(feature = "dual-s3-wired")]
     raw_out: Option<UsbRawOutWriter<'d, FirmwareBusHandle<'d>>>,
+    #[cfg(feature = "dual-s3-wired")]
+    raw_in_sequence: u16,
 }
 
 // The USB task polls several nested futures while retaining up to eight HID
@@ -136,8 +138,12 @@ static MIRROR_CAPTURE_STORAGE: ConstStaticCell<MirrorCaptureScratch> =
 
 enum UsbSlotReadResult {
     Input {
-        message: RuntimeInputMessage,
+        message: Option<RuntimeInputMessage>,
         movement_only: bool,
+        #[cfg(feature = "dual-s3-wired")]
+        raw: hidshift::interchip::RawEndpointReport,
+        #[cfg(feature = "dual-s3-wired")]
+        device_id: DeviceId,
     },
     Fatal {
         device_id: DeviceId,
@@ -150,30 +156,66 @@ impl<'d> ActiveUsbInterfaceSlot<'d> {
     async fn next_result(&mut self) -> UsbSlotReadResult {
         loop {
             match self.reader.read(&mut self.report_buf).await {
-                Ok(n) => match self
-                    .session
-                    .capture_input_report(&self.report_buf[..n])
-                    .map_err(
-                        hidshift::usb_hid::host_runtime::UsbHidInterfaceRuntimeInputError::from,
-                    )
-                    .and_then(|report| self.session.input_message(report))
-                {
-                    Ok(message) => {
-                        let movement_only =
-                            movement_only_message(&message, &mut self.last_mouse_buttons);
+                Ok(n) => {
+                    #[cfg(feature = "dual-s3-wired")]
+                    let raw = {
+                        self.raw_in_sequence = self.raw_in_sequence.wrapping_add(1);
+                        if self.raw_in_sequence == 0 {
+                            self.raw_in_sequence = 1;
+                        }
+                        match hidshift::interchip::RawEndpointReport::new(
+                            self.hid_info.interrupt_in_ep,
+                            self.raw_in_sequence,
+                            &self.report_buf[..n],
+                        ) {
+                            Ok(report) => report,
+                            Err(error) => {
+                                log::warn!(
+                                    "firmware: raw mirror IN rejected interface={} err={:?}",
+                                    self.interface_id.0,
+                                    error
+                                );
+                                continue;
+                            }
+                        }
+                    };
+                    let decoded = self
+                        .session
+                        .capture_input_report(&self.report_buf[..n])
+                        .map_err(
+                            hidshift::usb_hid::host_runtime::UsbHidInterfaceRuntimeInputError::from,
+                        )
+                        .and_then(|report| self.session.input_message(report));
+                    let (message, movement_only) = match decoded {
+                        Ok(message) => {
+                            let movement_only =
+                                movement_only_message(&message, &mut self.last_mouse_buttons);
+                            (Some(message), movement_only)
+                        }
+                        Err(error) => {
+                            log::debug!(
+                                "firmware: usb input frame decode failed interface={} err={:?}",
+                                self.interface_id.0,
+                                error
+                            );
+                            (None, false)
+                        }
+                    };
+                    #[cfg(feature = "dual-s3-wired")]
+                    return UsbSlotReadResult::Input {
+                        message,
+                        movement_only,
+                        raw,
+                        device_id: self.session.device_id(),
+                    };
+                    #[cfg(not(feature = "dual-s3-wired"))]
+                    if let Some(message) = message {
                         return UsbSlotReadResult::Input {
-                            message,
+                            message: Some(message),
                             movement_only,
                         };
                     }
-                    Err(error) => {
-                        log::debug!(
-                            "firmware: usb input frame decode failed interface={} err={:?}",
-                            self.interface_id.0,
-                            error
-                        );
-                    }
-                },
+                }
                 Err(error) => {
                     return UsbSlotReadResult::Fatal {
                         device_id: self.session.device_id(),
@@ -215,9 +257,21 @@ async fn forward_usb_input(
         RUNTIME_INPUT_QUEUE_CAPACITY,
     >,
     movement_queue: &mut hidshift::input::UsbMovementCoalescer<MAX_ACTIVE_USB_INTERFACES>,
-    message: RuntimeInputMessage,
+    message: Option<RuntimeInputMessage>,
     movement_only: bool,
+    #[cfg(feature = "dual-s3-wired")] raw: hidshift::interchip::RawEndpointReport,
+    #[cfg(feature = "dual-s3-wired")] device_id: DeviceId,
 ) {
+    #[cfg(feature = "dual-s3-wired")]
+    sender
+        .send(RuntimeInputMessage::MirrorEndpointIn {
+            device_id,
+            report: raw,
+        })
+        .await;
+    let Some(message) = message else {
+        return;
+    };
     while sender.free_capacity() > 0 {
         let Some(frame) = movement_queue.take_next() else {
             break;
@@ -724,9 +778,22 @@ pub async fn usb_input_task(
                     Either3::Second(UsbSlotReadResult::Input {
                         message,
                         movement_only,
+                        #[cfg(feature = "dual-s3-wired")]
+                        raw,
+                        #[cfg(feature = "dual-s3-wired")]
+                        device_id,
                     }) => {
-                        forward_usb_input(&sender, &mut movement_queue, message, movement_only)
-                            .await;
+                        forward_usb_input(
+                            &sender,
+                            &mut movement_queue,
+                            message,
+                            movement_only,
+                            #[cfg(feature = "dual-s3-wired")]
+                            raw,
+                            #[cfg(feature = "dual-s3-wired")]
+                            device_id,
+                        )
+                        .await;
                     }
                     Either3::Second(UsbSlotReadResult::Fatal {
                         device_id: failed_device_id,
@@ -794,8 +861,22 @@ pub async fn usb_input_task(
                 Either::First(UsbSlotReadResult::Input {
                     message,
                     movement_only,
+                    #[cfg(feature = "dual-s3-wired")]
+                    raw,
+                    #[cfg(feature = "dual-s3-wired")]
+                    device_id,
                 }) => {
-                    forward_usb_input(&sender, &mut movement_queue, message, movement_only).await;
+                    forward_usb_input(
+                        &sender,
+                        &mut movement_queue,
+                        message,
+                        movement_only,
+                        #[cfg(feature = "dual-s3-wired")]
+                        raw,
+                        #[cfg(feature = "dual-s3-wired")]
+                        device_id,
+                    )
+                    .await;
                 }
                 Either::First(UsbSlotReadResult::Fatal {
                     device_id: failed_device_id,
@@ -1322,6 +1403,8 @@ async fn attach_hid_interfaces_for_device<'d>(
             last_led_bytes: None,
             #[cfg(feature = "dual-s3-wired")]
             raw_out,
+            #[cfg(feature = "dual-s3-wired")]
+            raw_in_sequence: 0,
         });
     }
 

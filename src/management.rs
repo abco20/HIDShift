@@ -7,6 +7,7 @@ pub const MANAGEMENT_PROTOCOL_VERSION: u8 = 1;
 pub const MANAGEMENT_REQUEST_LEN: usize = 20;
 pub const MANAGEMENT_RESPONSE_LEN: usize = 20;
 pub const MANAGEMENT_HOST_NAME_LEN: usize = 12;
+pub const MANAGEMENT_CAPABILITY_DUAL_S3_WIRED: u8 = 1 << 0;
 
 pub const MANAGEMENT_SERVICE_UUID: &str = "7f510000-1b15-4f0d-9f4b-5b6d4f3a0001";
 pub const MANAGEMENT_REQUEST_UUID: &str = "7f510001-1b15-4f0d-9f4b-5b6d4f3a0001";
@@ -31,6 +32,8 @@ const OP_SELECT_OUTPUT_TARGET: u8 = 0x0f;
 #[cfg(feature = "dual-s3-wired")]
 const OP_GET_OUTPUT_TARGET_STATUS: u8 = 0x10;
 #[cfg(feature = "dual-s3-wired")]
+const OP_GET_MIRROR_CANDIDATE: u8 = 0x11;
+#[cfg(feature = "dual-s3-wired")]
 const OP_SET_MIRROR_TARGET: u8 = 0x13;
 #[cfg(feature = "dual-s3-wired")]
 const OP_CLEAR_MIRROR_TARGET: u8 = 0x14;
@@ -46,6 +49,8 @@ const PAYLOAD_SETTING: u8 = 7;
 const PAYLOAD_HOST_TIMING: u8 = 8;
 #[cfg(feature = "dual-s3-wired")]
 const PAYLOAD_OUTPUT_TARGET_STATUS: u8 = 9;
+#[cfg(feature = "dual-s3-wired")]
+const PAYLOAD_MIRROR_CANDIDATE: u8 = 10;
 const STATUS_PAYLOAD_LEN: u8 = 10;
 const HOST_INFO_PAYLOAD_LEN: u8 = 15;
 const USB_DEVICE_PAYLOAD_LEN: u8 = 15;
@@ -56,6 +61,8 @@ const SETTING_PAYLOAD_LEN: u8 = 8;
 const HOST_TIMING_PAYLOAD_LEN: u8 = 10;
 #[cfg(feature = "dual-s3-wired")]
 const OUTPUT_TARGET_STATUS_PAYLOAD_LEN: u8 = 14;
+#[cfg(feature = "dual-s3-wired")]
+const MIRROR_CANDIDATE_PAYLOAD_LEN: u8 = 15;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ManagementRequest {
@@ -95,6 +102,10 @@ impl ManagementRequest {
             }
             #[cfg(feature = "dual-s3-wired")]
             (OP_GET_OUTPUT_TARGET_STATUS, []) => ManagementCommand::GetOutputTargetStatus,
+            #[cfg(feature = "dual-s3-wired")]
+            (OP_GET_MIRROR_CANDIDATE, [candidate]) => ManagementCommand::GetMirrorCandidate(
+                crate::output_target::MirrorCandidateId(*candidate),
+            ),
             #[cfg(feature = "dual-s3-wired")]
             (OP_SET_MIRROR_TARGET, [candidate]) => ManagementCommand::SetMirrorTarget(
                 crate::output_target::MirrorCandidateId(*candidate),
@@ -142,6 +153,7 @@ impl ManagementRequest {
             (
                 OP_SELECT_OUTPUT_TARGET
                 | OP_GET_OUTPUT_TARGET_STATUS
+                | OP_GET_MIRROR_CANDIDATE
                 | OP_SET_MIRROR_TARGET
                 | OP_CLEAR_MIRROR_TARGET,
                 _,
@@ -195,6 +207,12 @@ impl ManagementRequest {
             }
             #[cfg(feature = "dual-s3-wired")]
             ManagementCommand::GetOutputTargetStatus => bytes[2] = OP_GET_OUTPUT_TARGET_STATUS,
+            #[cfg(feature = "dual-s3-wired")]
+            ManagementCommand::GetMirrorCandidate(candidate) => {
+                bytes[2] = OP_GET_MIRROR_CANDIDATE;
+                bytes[3] = 1;
+                bytes[4] = candidate.0;
+            }
             #[cfg(feature = "dual-s3-wired")]
             ManagementCommand::SetMirrorTarget(candidate) => {
                 bytes[2] = OP_SET_MIRROR_TARGET;
@@ -275,6 +293,8 @@ pub enum ManagementCommand {
     SelectOutputTarget(ManagementOutputTarget),
     #[cfg(feature = "dual-s3-wired")]
     GetOutputTargetStatus,
+    #[cfg(feature = "dual-s3-wired")]
+    GetMirrorCandidate(crate::output_target::MirrorCandidateId),
     #[cfg(feature = "dual-s3-wired")]
     SetMirrorTarget(crate::output_target::MirrorCandidateId),
     #[cfg(feature = "dual-s3-wired")]
@@ -412,6 +432,7 @@ impl ManagementResponse {
                 bytes[14] = schema.firmware_major;
                 bytes[15] = schema.firmware_minor;
                 bytes[16] = schema.firmware_patch;
+                bytes[17] = schema.capabilities;
             }
             ManagementResponsePayload::Setting(setting) => {
                 bytes[3] = PAYLOAD_SETTING;
@@ -448,6 +469,18 @@ impl ManagementResponse {
                 bytes[12] = status.effective_presentation as u8;
                 bytes[13] = u8::from(status.mirror_configured);
                 bytes[14..18].copy_from_slice(&status.operation_id.to_le_bytes());
+            }
+            #[cfg(feature = "dual-s3-wired")]
+            ManagementResponsePayload::MirrorCandidate(candidate) => {
+                bytes[3] = PAYLOAD_MIRROR_CANDIDATE;
+                bytes[4] = MIRROR_CANDIDATE_PAYLOAD_LEN;
+                bytes[5] = candidate.candidate.0;
+                bytes[6] = candidate.flags;
+                bytes[7] = candidate.source_device.unwrap_or(0xff);
+                bytes[8..10].copy_from_slice(&candidate.vendor_id.to_le_bytes());
+                bytes[10..12].copy_from_slice(&candidate.product_id.to_le_bytes());
+                bytes[12..16].copy_from_slice(&candidate.profile_hash.to_le_bytes());
+                bytes[16..20].copy_from_slice(&candidate.descriptor_hash.to_le_bytes());
             }
         }
         bytes
@@ -547,6 +580,7 @@ impl ManagementResponse {
                     firmware_major: bytes[14],
                     firmware_minor: bytes[15],
                     firmware_patch: bytes[16],
+                    capabilities: bytes[17],
                 })
             }
             (PAYLOAD_SETTING, SETTING_PAYLOAD_LEN) => {
@@ -592,6 +626,20 @@ impl ManagementResponse {
                     operation_id: u32::from_le_bytes([bytes[14], bytes[15], bytes[16], bytes[17]]),
                 })
             }
+            #[cfg(feature = "dual-s3-wired")]
+            (PAYLOAD_MIRROR_CANDIDATE, MIRROR_CANDIDATE_PAYLOAD_LEN) => {
+                ManagementResponsePayload::MirrorCandidate(ManagementMirrorCandidate {
+                    candidate: crate::output_target::MirrorCandidateId(bytes[5]),
+                    flags: bytes[6],
+                    source_device: (bytes[7] != 0xff).then_some(bytes[7]),
+                    vendor_id: u16::from_le_bytes([bytes[8], bytes[9]]),
+                    product_id: u16::from_le_bytes([bytes[10], bytes[11]]),
+                    profile_hash: u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
+                    descriptor_hash: u32::from_le_bytes([
+                        bytes[16], bytes[17], bytes[18], bytes[19],
+                    ]),
+                })
+            }
             _ => return Err(ManagementProtocolError::InvalidArgument),
         };
         Ok(Self {
@@ -615,6 +663,8 @@ pub enum ManagementResponsePayload {
     HostTiming(ManagementHostTiming),
     #[cfg(feature = "dual-s3-wired")]
     OutputTargetStatus(ManagementOutputTargetStatus),
+    #[cfg(feature = "dual-s3-wired")]
+    MirrorCandidate(ManagementMirrorCandidate),
 }
 
 #[repr(u8)]
@@ -680,6 +730,34 @@ pub struct ManagementOutputTargetStatus {
     pub effective_presentation: ManagementUsbPresentationKind,
     pub mirror_configured: bool,
     pub operation_id: u32,
+}
+
+#[cfg(feature = "dual-s3-wired")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ManagementMirrorCandidate {
+    pub candidate: crate::output_target::MirrorCandidateId,
+    /// bit 0 registered, bit 1 selected, bit 2 active, bit 3 synthetic.
+    pub flags: u8,
+    pub source_device: Option<u8>,
+    pub vendor_id: u16,
+    pub product_id: u16,
+    pub profile_hash: u32,
+    pub descriptor_hash: u32,
+}
+
+#[cfg(feature = "dual-s3-wired")]
+impl ManagementMirrorCandidate {
+    pub const fn selected(self) -> bool {
+        self.flags & (1 << 1) != 0
+    }
+
+    pub const fn active(self) -> bool {
+        self.flags & (1 << 2) != 0
+    }
+
+    pub const fn synthetic(self) -> bool {
+        self.flags & (1 << 3) != 0
+    }
 }
 
 #[cfg(feature = "dual-s3-wired")]
@@ -773,6 +851,7 @@ pub struct ManagementSchema {
     pub firmware_major: u8,
     pub firmware_minor: u8,
     pub firmware_patch: u8,
+    pub capabilities: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1041,6 +1120,7 @@ mod tests {
             ManagementCommand::SelectOutputTarget(ManagementOutputTarget::Wired),
             ManagementCommand::SelectOutputTarget(ManagementOutputTarget::Ble(HostId(4))),
             ManagementCommand::GetOutputTargetStatus,
+            ManagementCommand::GetMirrorCandidate(crate::output_target::MirrorCandidateId(3)),
             ManagementCommand::SetMirrorTarget(crate::output_target::MirrorCandidateId(0)),
             ManagementCommand::ClearMirrorTarget,
         ] {
@@ -1067,6 +1147,25 @@ mod tests {
             payload: ManagementResponsePayload::OutputTargetStatus(status),
         };
         assert_eq!(ManagementResponse::decode(&response.encode()), Ok(response));
+
+        let candidate = ManagementMirrorCandidate {
+            candidate: crate::output_target::MirrorCandidateId(3),
+            flags: 0b1111,
+            source_device: Some(7),
+            vendor_id: 0x046d,
+            product_id: 0xc547,
+            profile_hash: 0x1234_5678,
+            descriptor_hash: 0x8765_4321,
+        };
+        let response = ManagementResponse {
+            request_id: 20,
+            result: ManagementResult::Ok,
+            payload: ManagementResponsePayload::MirrorCandidate(candidate),
+        };
+        assert_eq!(ManagementResponse::decode(&response.encode()), Ok(response));
+        assert!(candidate.selected());
+        assert!(candidate.active());
+        assert!(candidate.synthetic());
 
         let mut invalid = ManagementRequest {
             request_id: 1,
@@ -1157,6 +1256,7 @@ mod tests {
                 firmware_major: 0,
                 firmware_minor: 1,
                 firmware_patch: 0,
+                capabilities: MANAGEMENT_CAPABILITY_DUAL_S3_WIRED,
             }),
             ManagementResponsePayload::Setting(ManagementSetting {
                 id: SettingId::AutoReconnect,

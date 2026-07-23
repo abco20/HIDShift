@@ -56,6 +56,11 @@ pub enum RuntimeInputMessage {
     #[cfg(feature = "dual-s3-wired")]
     MirrorEndpointOut(crate::interchip::RawEndpointReport),
     #[cfg(feature = "dual-s3-wired")]
+    MirrorEndpointIn {
+        device_id: DeviceId,
+        report: crate::interchip::RawEndpointReport,
+    },
+    #[cfg(feature = "dual-s3-wired")]
     MirrorControlRequest(crate::interchip::MirrorControlRequest),
     #[cfg(feature = "dual-s3-wired")]
     MirrorControlCompleted(crate::interchip::MirrorControlResponse),
@@ -132,6 +137,11 @@ impl RuntimeInputMessage {
             Self::DeviceProfileResult(result) => RuntimeInput::DeviceProfileResult(*result),
             #[cfg(feature = "dual-s3-wired")]
             Self::MirrorEndpointOut(report) => RuntimeInput::MirrorEndpointOut(*report),
+            #[cfg(feature = "dual-s3-wired")]
+            Self::MirrorEndpointIn { device_id, report } => RuntimeInput::MirrorEndpointIn {
+                device_id: *device_id,
+                report: *report,
+            },
             #[cfg(feature = "dual-s3-wired")]
             Self::MirrorControlRequest(request) => RuntimeInput::MirrorControlRequest(*request),
             #[cfg(feature = "dual-s3-wired")]
@@ -219,6 +229,10 @@ impl TryFrom<RuntimeInput<'_>> for RuntimeInputMessage {
             RuntimeInput::DeviceProfileResult(result) => Ok(Self::DeviceProfileResult(result)),
             #[cfg(feature = "dual-s3-wired")]
             RuntimeInput::MirrorEndpointOut(report) => Ok(Self::MirrorEndpointOut(report)),
+            #[cfg(feature = "dual-s3-wired")]
+            RuntimeInput::MirrorEndpointIn { device_id, report } => {
+                Ok(Self::MirrorEndpointIn { device_id, report })
+            }
             #[cfg(feature = "dual-s3-wired")]
             RuntimeInput::MirrorControlRequest(request) => Ok(Self::MirrorControlRequest(request)),
             #[cfg(feature = "dual-s3-wired")]

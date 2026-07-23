@@ -150,11 +150,28 @@ button.text-button:hover:not(:disabled) { background: var(--brand-soft); box-sha
 .log-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 9px; color: var(--muted); font-size: 11px; }
 .logs { min-height: 100px; max-height: 340px; overflow: auto; margin: 0; padding: 16px; border-radius: 11px; background: #17202b; color: #dce7df; font-size: 11px; line-height: 1.65; white-space: pre-wrap; }
 .firmware-version { margin: 16px 2px 0; color: #8a949f; font-size: 10px; text-align: right; }
+.output-routing { display: grid; gap: 18px; }
+.target-picker { display: flex; flex-wrap: wrap; gap: 9px; }
+.target-picker button { min-width: 130px; }
+.mirror-panel { display: grid; gap: 14px; padding: 18px; border: 1px solid var(--line); border-radius: 14px; background: #f8fafc; }
+.mirror-heading { display: flex; align-items: start; justify-content: space-between; gap: 16px; }
+.mirror-heading h3 { margin: 0; font-size: 15px; }
+.mirror-heading p { margin: 5px 0 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.mirror-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.mirror-card { display: grid; gap: 12px; padding: 14px; border: 1px solid var(--line); border-radius: 11px; background: #fff; box-shadow: none; }
+.mirror-card.active { border-color: var(--brand); box-shadow: 0 0 0 2px rgba(49,92,219,.1); }
+.mirror-card > div:first-child { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.mirror-card code { color: var(--muted); font-size: 10px; }
+.mirror-card button { justify-self: start; }
+.management-note { margin: 0; padding: 11px 13px; border-left: 3px solid var(--brand); border-radius: 4px 9px 9px 4px; background: var(--brand-soft); color: var(--muted); font-size: 11px; line-height: 1.55; }
+.management-note strong { color: var(--brand-dark); }
+.presentation-state { margin: 0; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 10px; }
+.compact-empty { min-height: 0; padding: 20px; }
 
 @media (max-width: 850px) {
   .connection-panel { grid-template-columns: 1fr; }
   .connect-actions { justify-content: flex-start; }
-  .summary { grid-template-columns: repeat(2, 1fr); }
+  .summary, .mirror-grid { grid-template-columns: repeat(2, 1fr); }
 }
 
 @media (max-width: 620px) {
@@ -163,7 +180,8 @@ button.text-button:hover:not(:disabled) { background: var(--brand-soft); box-sha
   .connection-panel { padding: 20px; border-radius: 18px; }
   .connect-actions { display: grid; grid-template-columns: 1fr 1fr auto; width: 100%; }
   .connect-actions button { padding-inline: 10px; }
-  .summary, .slots, .device-grid, .settings-grid, .diagnostics-grid { grid-template-columns: 1fr; }
+  .summary, .slots, .device-grid, .settings-grid, .diagnostics-grid, .mirror-grid { grid-template-columns: 1fr; }
+  .mirror-heading { flex-direction: column; }
   .summary { margin-bottom: 42px; }
   .summary article { padding: 15px 17px; }
   .section-title { align-items: flex-start; flex-direction: column; }
