@@ -30,7 +30,7 @@ use hidshift::runtime::{
     RUNTIME_BLE_NOTIFY_COMMAND_QUEUE_CAPACITY, RUNTIME_INPUT_QUEUE_CAPACITY,
     RUNTIME_STATUS_COMMAND_QUEUE_CAPACITY, RUNTIME_STORAGE_COMMAND_QUEUE_CAPACITY,
     RUNTIME_USB_COMMAND_QUEUE_CAPACITY, RuntimeDiagnosticsEvent, StatusTaskCommand,
-    StorageTaskCommand, UsbTaskCommand,
+    StorageTaskCommand, UsbHostTaskCommand,
 };
 #[cfg(feature = "dual-s3-wired")]
 use hidshift::runtime::{DeviceTaskCommand, RUNTIME_DEVICE_COMMAND_QUEUE_CAPACITY};
@@ -59,7 +59,7 @@ static BLE_NOTIFY_COMMAND_CHANNEL: Channel<
 > = Channel::new();
 static USB_COMMAND_CHANNEL: Channel<
     CriticalSectionRawMutex,
-    UsbTaskCommand,
+    UsbHostTaskCommand,
     RUNTIME_USB_COMMAND_QUEUE_CAPACITY,
 > = Channel::new();
 #[cfg(feature = "dual-s3-wired")]
@@ -377,7 +377,7 @@ async fn usb_input_bootstrap(
     receiver: Receiver<
         'static,
         CriticalSectionRawMutex,
-        UsbTaskCommand,
+        UsbHostTaskCommand,
         RUNTIME_USB_COMMAND_QUEUE_CAPACITY,
     >,
     usb0: esp_hal::peripherals::USB0<'static>,
@@ -568,7 +568,7 @@ struct ChannelTaskSink {
     usb: Sender<
         'static,
         CriticalSectionRawMutex,
-        UsbTaskCommand,
+        UsbHostTaskCommand,
         RUNTIME_USB_COMMAND_QUEUE_CAPACITY,
     >,
     #[cfg(feature = "dual-s3-wired")]
@@ -591,7 +591,7 @@ struct ChannelTaskSink {
         RUNTIME_STATUS_COMMAND_QUEUE_CAPACITY,
     >,
     mouse: MouseReportAccumulator<4>,
-    pending_usb: [Option<UsbTaskCommand>; RUNTIME_USB_COMMAND_QUEUE_CAPACITY],
+    pending_usb: [Option<UsbHostTaskCommand>; RUNTIME_USB_COMMAND_QUEUE_CAPACITY],
     pending_status: Option<StatusTaskCommand>,
     status_updates_dropped: u32,
 }
@@ -626,7 +626,7 @@ impl ChannelTaskSink {
         for command in queues.device.iter().copied() {
             self.device.send(command).await;
         }
-        for command in queues.usb.iter().copied() {
+        for command in queues.usb_host.iter().copied() {
             self.send_usb_with_policy(command).await?;
         }
         for command in queues.storage.iter().cloned() {
@@ -694,14 +694,14 @@ impl ChannelTaskSink {
             RUNTIME_USB_COMMAND_QUEUE_CAPACITY,
         >::new();
         let critical_usb = queues
-            .usb
+            .usb_host
             .iter()
             .filter(|command| command.class() == hidshift::CommandClass::Critical)
             .count();
         if self.usb.free_capacity() < critical_usb {
             return Err(ChannelTaskSendError::UsbQueueFull);
         }
-        for command in queues.usb.iter().copied() {
+        for command in queues.usb_host.iter().copied() {
             let Some(key) = command.led_target() else {
                 continue;
             };
@@ -830,7 +830,7 @@ impl ChannelTaskSink {
 
     async fn send_usb_with_policy(
         &mut self,
-        command: UsbTaskCommand,
+        command: UsbHostTaskCommand,
     ) -> Result<(), ChannelTaskSendError> {
         if command.class() == hidshift::CommandClass::Critical {
             self.usb.send(command).await;
@@ -948,7 +948,7 @@ impl RuntimeTaskSink for ChannelTaskSink {
                     hidshift::runtime::driver::RuntimeTaskKind::Device
                 }
                 ChannelTaskSendError::UsbQueueFull => {
-                    hidshift::runtime::driver::RuntimeTaskKind::Usb
+                    hidshift::runtime::driver::RuntimeTaskKind::UsbHost
                 }
                 ChannelTaskSendError::StorageQueueFull => {
                     hidshift::runtime::driver::RuntimeTaskKind::Storage
@@ -981,7 +981,7 @@ impl RuntimeTaskSink for ChannelTaskSink {
             .map_err(ChannelTaskSendError::from)
     }
 
-    fn send_usb(&mut self, command: UsbTaskCommand) -> Result<(), Self::Error> {
+    fn send_usb_host(&mut self, command: UsbHostTaskCommand) -> Result<(), Self::Error> {
         self.usb
             .try_send(command)
             .map_err(ChannelTaskSendError::from)
@@ -1041,8 +1041,8 @@ impl From<TrySendError<BleTaskCommand>> for ChannelTaskSendError {
     }
 }
 
-impl From<TrySendError<UsbTaskCommand>> for ChannelTaskSendError {
-    fn from(_: TrySendError<UsbTaskCommand>) -> Self {
+impl From<TrySendError<UsbHostTaskCommand>> for ChannelTaskSendError {
+    fn from(_: TrySendError<UsbHostTaskCommand>) -> Self {
         Self::UsbQueueFull
     }
 }

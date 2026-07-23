@@ -151,7 +151,7 @@ impl<
         next_queues.dispatch_from(next_commands.as_slice())?;
         next_runtime.observe_outbox_usage(
             next_queues.ble.len(),
-            next_queues.usb.len(),
+            next_queues.usb_host.len(),
             next_queues.storage.len(),
             next_queues.status.len(),
         );
@@ -203,7 +203,7 @@ impl<
             )?;
             self.runtime.observe_outbox_usage(
                 self.queues.ble.len(),
-                self.queues.usb.len(),
+                self.queues.usb_host.len(),
                 self.queues.storage.len(),
                 self.queues.status.len(),
             );
@@ -217,7 +217,7 @@ impl<
         self.queues.dispatch_from(self.commands.as_slice())?;
         self.runtime.observe_outbox_usage(
             self.queues.ble.len(),
-            self.queues.usb.len(),
+            self.queues.usb_host.len(),
             self.queues.storage.len(),
             self.queues.status.len(),
         );
@@ -297,7 +297,7 @@ impl From<RuntimeDispatchError> for RuntimeOwnerError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::UsbTaskCommand;
+    use crate::UsbHostTaskCommand;
     use crate::ble::BleHidAttribute;
     use crate::bridge::{BridgeError, BridgeEvent, BridgeStatus};
     use crate::ids::{DeviceId, HostId, InterfaceId};
@@ -320,8 +320,8 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(queues.usb.len(), 1);
-        assert_eq!(queues.usb[0].device_id(), DeviceId(7));
+        assert_eq!(queues.usb_host.len(), 1);
+        assert_eq!(queues.usb_host[0].device_id(), DeviceId(7));
         assert_eq!(queues.ble.len(), 0);
         assert_eq!(queues.storage.len(), 0);
         assert_eq!(queues.status.len(), 0);
@@ -395,7 +395,7 @@ mod tests {
         assert_eq!(owner.runtime(), &before);
         assert!(owner.commands().is_empty());
         assert!(owner.queues().ble.is_empty());
-        assert!(owner.queues().usb.is_empty());
+        assert!(owner.queues().usb_host.is_empty());
         assert!(owner.queues().storage.is_empty());
         assert!(owner.queues().status.is_empty());
         assert!(owner.queues().effects.is_empty());
@@ -656,10 +656,10 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(queues.usb.len(), 1);
+        assert_eq!(queues.usb_host.len(), 1);
         assert!(matches!(
-            queues.usb[0],
-            UsbTaskCommand::KeyboardLedWrite { bytes, .. }
+            queues.usb_host[0],
+            UsbHostTaskCommand::KeyboardLedWrite { bytes, .. }
                 if bytes
                     == KeyboardLedOutputReport::boot_keyboard()
                         .build(KeyboardLedState::CAPS_LOCK)
@@ -680,7 +680,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(queues.ble.len(), 0);
-        assert_eq!(queues.usb.len(), 0);
+        assert_eq!(queues.usb_host.len(), 0);
         assert_eq!(queues.storage.len(), 0);
         assert_eq!(queues.status.len(), 0);
         assert_eq!(owner.runtime().storage_generation(), 22);

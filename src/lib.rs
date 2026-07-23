@@ -138,8 +138,8 @@ pub use runtime::{
     RUNTIME_USB_INTERFACES_MAX, RuntimeCapacities, RuntimeCommand, RuntimeCommandQueues,
     RuntimeCommandVec, RuntimeCounters, RuntimeDiagnosticsEvent, RuntimeDispatchError,
     RuntimeError, RuntimeInput, StatusSnapshot, StatusTaskCommand, StatusTaskCommandVec,
-    StorageTaskCommand, StorageTaskCommandVec, UsbHidInterfaceRuntimeState, UsbTaskCommand,
-    UsbTaskCommandVec,
+    StorageTaskCommand, StorageTaskCommandVec, UsbHidInterfaceRuntimeState, UsbHostTaskCommand,
+    UsbHostTaskCommandVec,
     bootstrap::prepare_ready_host,
     driver::{
         RuntimeDriverError, RuntimeTaskKind, RuntimeTaskSink, dispatch_runtime_queues,

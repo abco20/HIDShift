@@ -3,7 +3,7 @@ use super::DeviceTaskCommand;
 use super::message::RuntimeInputMessage;
 use super::owner::{RuntimeOwner, RuntimeOwnerError};
 use super::{
-    BleTaskCommand, RuntimeCommandQueues, StatusTaskCommand, StorageTaskCommand, UsbTaskCommand,
+    BleTaskCommand, RuntimeCommandQueues, StatusTaskCommand, StorageTaskCommand, UsbHostTaskCommand,
 };
 
 pub trait RuntimeTaskSink {
@@ -22,7 +22,7 @@ pub trait RuntimeTaskSink {
     fn send_ble(&mut self, command: BleTaskCommand) -> Result<(), Self::Error>;
     #[cfg(feature = "dual-s3-wired")]
     fn send_device(&mut self, command: DeviceTaskCommand) -> Result<(), Self::Error>;
-    fn send_usb(&mut self, command: UsbTaskCommand) -> Result<(), Self::Error>;
+    fn send_usb_host(&mut self, command: UsbHostTaskCommand) -> Result<(), Self::Error>;
     fn send_storage(&mut self, command: StorageTaskCommand) -> Result<(), Self::Error>;
     fn send_status(&mut self, command: StatusTaskCommand) -> Result<(), Self::Error>;
     fn apply_effect(&mut self, effect: super::RuntimeEffect);
@@ -33,7 +33,7 @@ pub enum RuntimeTaskKind {
     Ble,
     #[cfg(feature = "dual-s3-wired")]
     Device,
-    Usb,
+    UsbHost,
     Storage,
     Status,
 }
@@ -119,10 +119,10 @@ where
                 error,
             })?;
     }
-    for command in queues.usb.iter().copied() {
-        sink.send_usb(command)
+    for command in queues.usb_host.iter().copied() {
+        sink.send_usb_host(command)
             .map_err(|error| RuntimeDriverError::Sink {
-                task: RuntimeTaskKind::Usb,
+                task: RuntimeTaskKind::UsbHost,
                 error,
             })?;
     }
@@ -226,7 +226,7 @@ mod tests {
     fn drive_runtime_message_surfaces_sink_task_failures() {
         let mut owner = ready_owner();
         let mut sink = RecordingSink {
-            fail_task: Some(RuntimeTaskKind::Usb),
+            fail_task: Some(RuntimeTaskKind::UsbHost),
             ..RecordingSink::default()
         };
 
@@ -244,7 +244,7 @@ mod tests {
         assert_eq!(
             err,
             RuntimeDriverError::Sink {
-                task: RuntimeTaskKind::Usb,
+                task: RuntimeTaskKind::UsbHost,
                 error: SinkError::Rejected,
             }
         );
@@ -275,7 +275,7 @@ mod tests {
         }
         let before = owner.clone();
         let mut failing_sink = RecordingSink {
-            fail_task: Some(RuntimeTaskKind::Usb),
+            fail_task: Some(RuntimeTaskKind::UsbHost),
             ..RecordingSink::default()
         };
 
@@ -289,7 +289,7 @@ mod tests {
         assert_eq!(
             error,
             RuntimeDriverError::Sink {
-                task: RuntimeTaskKind::Usb,
+                task: RuntimeTaskKind::UsbHost,
                 error: SinkError::Rejected,
             }
         );
@@ -363,7 +363,7 @@ mod tests {
         ble: heapless::Vec<BleTaskCommand, 8>,
         #[cfg(feature = "dual-s3-wired")]
         device: heapless::Vec<DeviceTaskCommand, 8>,
-        usb: heapless::Vec<UsbTaskCommand, 8>,
+        usb: heapless::Vec<UsbHostTaskCommand, 8>,
         storage: heapless::Vec<StorageTaskCommand, 8>,
         status: heapless::Vec<StatusTaskCommand, 8>,
         fail_task: Option<RuntimeTaskKind>,
@@ -386,7 +386,7 @@ mod tests {
                 Some(RuntimeTaskKind::Ble) => !queues.ble.is_empty(),
                 #[cfg(feature = "dual-s3-wired")]
                 Some(RuntimeTaskKind::Device) => !queues.device.is_empty(),
-                Some(RuntimeTaskKind::Usb) => !queues.usb.is_empty(),
+                Some(RuntimeTaskKind::UsbHost) => !queues.usb_host.is_empty(),
                 Some(RuntimeTaskKind::Storage) => !queues.storage.is_empty(),
                 Some(RuntimeTaskKind::Status) => !queues.status.is_empty(),
                 None => false,
@@ -415,8 +415,8 @@ mod tests {
             Ok(())
         }
 
-        fn send_usb(&mut self, command: UsbTaskCommand) -> Result<(), Self::Error> {
-            if self.fail_task == Some(RuntimeTaskKind::Usb) {
+        fn send_usb_host(&mut self, command: UsbHostTaskCommand) -> Result<(), Self::Error> {
+            if self.fail_task == Some(RuntimeTaskKind::UsbHost) {
                 return Err(SinkError::Rejected);
             }
             self.usb.push(command).unwrap();

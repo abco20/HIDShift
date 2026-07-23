@@ -74,7 +74,8 @@ pub const RUNTIME_STATUS_COMMAND_QUEUE_CAPACITY: usize = RUNTIME_COMMAND_CAPACIT
 pub type DefaultBridgeRuntime = BridgeRuntime<RUNTIME_HOSTS_MAX, RUNTIME_USB_INTERFACES_MAX>;
 pub type RuntimeCommandVec = heapless::Vec<RuntimeCommand, RUNTIME_COMMAND_CAPACITY>;
 pub type BleTaskCommandVec = heapless::Vec<BleTaskCommand, RUNTIME_BLE_COMMAND_QUEUE_CAPACITY>;
-pub type UsbTaskCommandVec = heapless::Vec<UsbTaskCommand, RUNTIME_USB_COMMAND_QUEUE_CAPACITY>;
+pub type UsbHostTaskCommandVec =
+    heapless::Vec<UsbHostTaskCommand, RUNTIME_USB_COMMAND_QUEUE_CAPACITY>;
 pub type StorageTaskCommandVec =
     heapless::Vec<StorageTaskCommand, RUNTIME_STORAGE_COMMAND_QUEUE_CAPACITY>;
 pub type StatusTaskCommandVec =
@@ -2655,7 +2656,7 @@ impl BleTaskCommand {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum UsbTaskCommand {
+pub enum UsbHostTaskCommand {
     KeyboardLedWrite {
         interface_id: InterfaceId,
         device_id: DeviceId,
@@ -2673,7 +2674,7 @@ pub enum UsbTaskCommand {
     },
 }
 
-impl UsbTaskCommand {
+impl UsbHostTaskCommand {
     pub const fn class(self) -> CommandClass {
         match self {
             Self::KeyboardLedWrite { .. } => CommandClass::Realtime,
@@ -2755,28 +2756,28 @@ pub enum RuntimeDispatchError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeCommandQueues<
     const BLE: usize,
-    const USB: usize,
+    const USB_HOST: usize,
     const STORAGE: usize,
     const STATUS: usize,
 > {
     pub ble: heapless::Vec<BleTaskCommand, BLE>,
     #[cfg(feature = "dual-s3-wired")]
     pub device: heapless::Vec<DeviceTaskCommand, RUNTIME_DEVICE_COMMAND_QUEUE_CAPACITY>,
-    pub usb: heapless::Vec<UsbTaskCommand, USB>,
+    pub usb_host: heapless::Vec<UsbHostTaskCommand, USB_HOST>,
     pub storage: heapless::Vec<StorageTaskCommand, STORAGE>,
     pub status: heapless::Vec<StatusTaskCommand, STATUS>,
     pub effects: heapless::Vec<RuntimeEffect, STATUS>,
 }
 
-impl<const BLE: usize, const USB: usize, const STORAGE: usize, const STATUS: usize>
-    RuntimeCommandQueues<BLE, USB, STORAGE, STATUS>
+impl<const BLE: usize, const USB_HOST: usize, const STORAGE: usize, const STATUS: usize>
+    RuntimeCommandQueues<BLE, USB_HOST, STORAGE, STATUS>
 {
     pub const fn new() -> Self {
         Self {
             ble: heapless::Vec::new(),
             #[cfg(feature = "dual-s3-wired")]
             device: heapless::Vec::new(),
-            usb: heapless::Vec::new(),
+            usb_host: heapless::Vec::new(),
             storage: heapless::Vec::new(),
             status: heapless::Vec::new(),
             effects: heapless::Vec::new(),
@@ -2787,7 +2788,7 @@ impl<const BLE: usize, const USB: usize, const STORAGE: usize, const STATUS: usi
         self.ble.clear();
         #[cfg(feature = "dual-s3-wired")]
         self.device.clear();
-        self.usb.clear();
+        self.usb_host.clear();
         self.storage.clear();
         self.status.clear();
         self.effects.clear();
@@ -2839,7 +2840,7 @@ impl<const BLE: usize, const USB: usize, const STORAGE: usize, const STATUS: usi
         if device > RUNTIME_DEVICE_COMMAND_QUEUE_CAPACITY {
             return Err(RuntimeDispatchError::DeviceQueueCapacity);
         }
-        if usb > USB {
+        if usb > USB_HOST {
             return Err(RuntimeDispatchError::UsbQueueCapacity);
         }
         if storage > STORAGE {
@@ -2870,8 +2871,8 @@ impl<const BLE: usize, const USB: usize, const STORAGE: usize, const STATUS: usi
                 device_id,
                 bytes,
             } => self
-                .usb
-                .push(UsbTaskCommand::KeyboardLedWrite {
+                .usb_host
+                .push(UsbHostTaskCommand::KeyboardLedWrite {
                     interface_id: *interface_id,
                     device_id: *device_id,
                     bytes: *bytes,
@@ -2879,16 +2880,16 @@ impl<const BLE: usize, const USB: usize, const STORAGE: usize, const STATUS: usi
                 .map_err(|_| RuntimeDispatchError::UsbQueueCapacity),
             #[cfg(feature = "dual-s3-wired")]
             RuntimeCommand::UsbMirrorEndpointOut { device_id, report } => self
-                .usb
-                .push(UsbTaskCommand::MirrorEndpointOut {
+                .usb_host
+                .push(UsbHostTaskCommand::MirrorEndpointOut {
                     device_id: *device_id,
                     report: *report,
                 })
                 .map_err(|_| RuntimeDispatchError::UsbQueueCapacity),
             #[cfg(feature = "dual-s3-wired")]
             RuntimeCommand::UsbMirrorControlRequest { device_id, request } => self
-                .usb
-                .push(UsbTaskCommand::MirrorControlRequest {
+                .usb_host
+                .push(UsbHostTaskCommand::MirrorControlRequest {
                     device_id: *device_id,
                     request: *request,
                 })
@@ -2943,8 +2944,8 @@ const fn valid_management_host<const HOSTS: usize>(host_id: HostId) -> bool {
     host_id.0 != 0 && (host_id.0 as usize) <= HOSTS && (host_id.0 as usize) <= 4
 }
 
-impl<const BLE: usize, const USB: usize, const STORAGE: usize, const STATUS: usize> Default
-    for RuntimeCommandQueues<BLE, USB, STORAGE, STATUS>
+impl<const BLE: usize, const USB_HOST: usize, const STORAGE: usize, const STATUS: usize> Default
+    for RuntimeCommandQueues<BLE, USB_HOST, STORAGE, STATUS>
 {
     fn default() -> Self {
         Self::new()
@@ -5374,10 +5375,10 @@ mod tests {
 
         assert_eq!(queues.ble.len(), 4);
         assert_eq!(queues.device.len(), 1);
-        assert_eq!(queues.usb.len(), RUNTIME_USB_INTERFACES_MAX);
+        assert_eq!(queues.usb_host.len(), RUNTIME_USB_INTERFACES_MAX);
         assert_eq!(queues.storage.len(), 1);
         assert_eq!(queues.status.len(), 1);
-        assert_eq!(queues.usb[0].device_id(), DeviceId(1));
+        assert_eq!(queues.usb_host[0].device_id(), DeviceId(1));
 
         runtime
             .handle_default_input(
@@ -5401,7 +5402,7 @@ mod tests {
         let mut queues = DefaultRuntimeCommandQueues::new();
         queues.dispatch_from(commands.as_slice()).unwrap();
         assert_eq!(queues.ble.len(), 5);
-        assert_eq!(queues.usb.len(), RUNTIME_USB_INTERFACES_MAX);
+        assert_eq!(queues.usb_host.len(), RUNTIME_USB_INTERFACES_MAX);
         assert_eq!(queues.storage.len(), 1);
         assert_eq!(queues.status.len(), 1);
     }
@@ -5520,7 +5521,7 @@ mod tests {
 
     #[test]
     fn usb_led_command_rejects_reused_interface_for_a_different_device() {
-        let command = UsbTaskCommand::KeyboardLedWrite {
+        let command = UsbHostTaskCommand::KeyboardLedWrite {
             interface_id: InterfaceId(3),
             device_id: DeviceId(7),
             bytes: KeyboardLedOutputReport::boot_keyboard()

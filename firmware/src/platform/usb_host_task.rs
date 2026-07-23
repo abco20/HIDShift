@@ -23,7 +23,7 @@ use hidshift::input::KeyboardLedState;
 use hidshift::runtime::message::RuntimeInputMessage;
 use hidshift::runtime::{
     RUNTIME_INPUT_QUEUE_CAPACITY, RUNTIME_USB_COMMAND_QUEUE_CAPACITY, RuntimeDiagnosticsEvent,
-    UsbTaskCommand,
+    UsbHostTaskCommand,
 };
 use hidshift::storage::FixedName;
 use hidshift::usb_hid::host_interface::{
@@ -547,7 +547,7 @@ pub async fn usb_input_task(
     receiver: Receiver<
         'static,
         CriticalSectionRawMutex,
-        UsbTaskCommand,
+        UsbHostTaskCommand,
         RUNTIME_USB_COMMAND_QUEUE_CAPACITY,
     >,
     usb0: esp_hal::peripherals::USB0<'static>,
@@ -920,10 +920,10 @@ async fn handle_usb_command<'d>(
     >,
     bus_handle: &FirmwareBusHandle<'d>,
     active_slots: &mut [Option<ActiveUsbInterfaceSlot<'d>>; MAX_ACTIVE_USB_INTERFACES],
-    command: UsbTaskCommand,
+    command: UsbHostTaskCommand,
 ) {
     match command {
-        UsbTaskCommand::KeyboardLedWrite {
+        UsbHostTaskCommand::KeyboardLedWrite {
             interface_id,
             device_id,
             bytes,
@@ -985,7 +985,7 @@ async fn handle_usb_command<'d>(
             }
         }
         #[cfg(feature = "dual-s3-wired")]
-        UsbTaskCommand::MirrorEndpointOut { device_id, report } => {
+        UsbHostTaskCommand::MirrorEndpointOut { device_id, report } => {
             let Some(slot) = active_slots.iter_mut().find_map(|slot| {
                 slot.as_mut().filter(|slot| {
                     slot.session.device_id() == device_id
@@ -1020,7 +1020,7 @@ async fn handle_usb_command<'d>(
             }
         }
         #[cfg(feature = "dual-s3-wired")]
-        UsbTaskCommand::MirrorControlRequest { device_id, request } => {
+        UsbHostTaskCommand::MirrorControlRequest { device_id, request } => {
             let Some(slot) = active_slots
                 .iter()
                 .flatten()

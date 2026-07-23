@@ -9,10 +9,12 @@ pub struct UsbHidReader<'d, A: UsbHostAllocator<'d>> {
     in_ch: A::Pipe<pipe::Interrupt, pipe::In>,
 }
 
+#[cfg(feature = "dual-s3-wired")]
 pub struct UsbRawOutWriter<'d, A: UsbHostAllocator<'d>> {
     out_ch: A::Pipe<pipe::Interrupt, pipe::Out>,
 }
 
+#[cfg(feature = "dual-s3-wired")]
 impl<'d, A: UsbHostAllocator<'d>> UsbRawOutWriter<'d, A> {
     pub fn new(
         alloc: &A,
@@ -131,6 +133,7 @@ impl<'d, A: UsbHostAllocator<'d>> UsbHidControl<'d, A> {
         self.set_protocol(protocol).await
     }
 
+    #[cfg(feature = "dual-s3-wired")]
     pub async fn forward(
         &mut self,
         setup: [u8; 8],
@@ -170,6 +173,7 @@ fn interrupt_in_endpoint_info(interface: HidInterfaceInfo) -> EndpointInfo {
     }
 }
 
+#[cfg(feature = "dual-s3-wired")]
 fn interrupt_out_endpoint_info(interface: HidInterfaceInfo) -> EndpointInfo {
     EndpointInfo {
         addr: EndpointAddress::from_parts(
