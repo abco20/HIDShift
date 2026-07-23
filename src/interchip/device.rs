@@ -725,11 +725,7 @@ mod tests {
         assert!(device.next_cell.is_none());
 
         host.set_cumulative_ack(4);
-        device.handle_transaction(
-            &host_cell(&mut host, RECORD_HEARTBEAT, &[]),
-            5,
-            &mut events,
-        );
+        device.handle_transaction(&host_cell(&mut host, RECORD_HEARTBEAT, &[]), 5, &mut events);
         let cell = SpiCell::decode(&device.next_transaction(5)).unwrap();
         let record = RecordIter::new(cell.payload(), cell.header.record_count)
             .next()

@@ -9,7 +9,8 @@ use crate::input::{
 use crate::output_target::OutputTarget;
 #[cfg(feature = "dual-s3-wired")]
 use crate::output_target::{
-    OutputTargetAvailability, OutputTargetState, StoredOutputTarget, StoredPresentationConfig,
+    BLE_TARGET_READINESS_POLICY, OutputTargetAvailability, OutputTargetState, StoredOutputTarget,
+    StoredPresentationConfig,
 };
 use crate::reports::{
     BleKeyboardLedOutputReport, BleKeyboardOutputError, ConsumerReport, KEYBOARD_6KRO_KEY_CAPACITY,
@@ -779,14 +780,7 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
         let availability = match self.state.output_target.selected {
             OutputTarget::Wired => self.state.wired_availability,
             OutputTarget::Ble(host_id) => {
-                let any_ready = [
-                    ReportKind::Keyboard,
-                    ReportKind::Mouse,
-                    ReportKind::Consumer,
-                ]
-                .into_iter()
-                .any(|kind| self.can_send(host_id, kind));
-                if any_ready {
+                if self.ble_target_ready(host_id) {
                     OutputTargetAvailability::Ready
                 } else if self
                     .state
@@ -805,6 +799,15 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
 
     pub fn can_send(&self, host_id: HostId, kind: ReportKind) -> bool {
         self.state.hosts.can_send(host_id, kind)
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    pub fn ble_target_ready(&self, host_id: HostId) -> bool {
+        BLE_TARGET_READINESS_POLICY.is_ready(
+            self.can_send(host_id, ReportKind::Keyboard),
+            self.can_send(host_id, ReportKind::Mouse),
+            self.can_send(host_id, ReportKind::Consumer),
+        )
     }
 
     #[cfg(feature = "dual-s3-wired")]
@@ -1661,7 +1664,7 @@ mod tests {
 
     #[test]
     fn target_switch_releases_mouse_and_suppresses_held_buttons_for_new_host() {
-        let mut bridge = ready_bridge_with(&[ReportKind::Mouse]);
+        let mut bridge = ready_bridge_with(&[ReportKind::Keyboard, ReportKind::Mouse]);
         let mut actions = heapless::Vec::<BridgeAction, 8>::new();
 
         bridge
@@ -1675,19 +1678,20 @@ mod tests {
             .unwrap();
         actions.clear();
 
-        make_ready_with(&mut bridge, HOST_B, &[ReportKind::Mouse]);
+        make_ready_with(
+            &mut bridge,
+            HOST_B,
+            &[ReportKind::Keyboard, ReportKind::Mouse],
+        );
         bridge
             .handle_event(BridgeEvent::SwitchTarget { target: HOST_B }, &mut actions)
             .unwrap();
 
-        assert_eq!(
-            actions.as_slice()[0],
-            BridgeAction::Notify {
-                target: OutputTarget::Ble(HOST_A),
-                report: StandardHidReport::Mouse(MouseReport::release_buttons()),
-                reason: NotifyReason::TargetSwitchRelease,
-            }
-        );
+        assert!(actions.contains(&BridgeAction::Notify {
+            target: OutputTarget::Ble(HOST_A),
+            report: StandardHidReport::Mouse(MouseReport::release_buttons()),
+            reason: NotifyReason::TargetSwitchRelease,
+        }));
 
         actions.clear();
         bridge
@@ -1758,7 +1762,7 @@ mod tests {
 
     #[test]
     fn target_switch_releases_consumer_and_suppresses_held_usage_for_new_host() {
-        let mut bridge = ready_bridge_with(&[ReportKind::Consumer]);
+        let mut bridge = ready_bridge_with(&[ReportKind::Keyboard, ReportKind::Consumer]);
         let mut actions = heapless::Vec::<BridgeAction, 8>::new();
 
         bridge
@@ -1769,19 +1773,20 @@ mod tests {
             .unwrap();
         actions.clear();
 
-        make_ready_with(&mut bridge, HOST_B, &[ReportKind::Consumer]);
+        make_ready_with(
+            &mut bridge,
+            HOST_B,
+            &[ReportKind::Keyboard, ReportKind::Consumer],
+        );
         bridge
             .handle_event(BridgeEvent::SwitchTarget { target: HOST_B }, &mut actions)
             .unwrap();
 
-        assert_eq!(
-            actions.as_slice()[0],
-            BridgeAction::Notify {
-                target: OutputTarget::Ble(HOST_A),
-                report: StandardHidReport::Consumer(ConsumerReport::release()),
-                reason: NotifyReason::TargetSwitchRelease,
-            }
-        );
+        assert!(actions.contains(&BridgeAction::Notify {
+            target: OutputTarget::Ble(HOST_A),
+            report: StandardHidReport::Consumer(ConsumerReport::release()),
+            reason: NotifyReason::TargetSwitchRelease,
+        }));
 
         actions.clear();
         bridge

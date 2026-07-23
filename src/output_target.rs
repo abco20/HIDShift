@@ -31,6 +31,26 @@ pub enum OutputTargetAvailability {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BleTargetReadinessPolicy {
+    KeyboardRequired,
+    AllStandardReports,
+    AnyReport,
+}
+
+impl BleTargetReadinessPolicy {
+    pub const fn is_ready(self, keyboard: bool, mouse: bool, consumer: bool) -> bool {
+        match self {
+            Self::KeyboardRequired => keyboard,
+            Self::AllStandardReports => keyboard && mouse && consumer,
+            Self::AnyReport => keyboard || mouse || consumer,
+        }
+    }
+}
+
+pub const BLE_TARGET_READINESS_POLICY: BleTargetReadinessPolicy =
+    BleTargetReadinessPolicy::KeyboardRequired;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OutputTargetState {
     pub selected: OutputTarget,
     pub active: Option<OutputTarget>,
@@ -243,6 +263,17 @@ mod tests {
         state.set_availability(OutputTargetAvailability::Unavailable);
         assert_eq!(state.active, None);
         assert_eq!(state.selected, OutputTarget::Ble(HostId(2)));
+    }
+
+    #[test]
+    fn ble_readiness_policy_requires_keyboard_without_requiring_every_report() {
+        assert_eq!(
+            BLE_TARGET_READINESS_POLICY,
+            BleTargetReadinessPolicy::KeyboardRequired
+        );
+        assert!(!BLE_TARGET_READINESS_POLICY.is_ready(false, false, true));
+        assert!(!BLE_TARGET_READINESS_POLICY.is_ready(false, true, true));
+        assert!(BLE_TARGET_READINESS_POLICY.is_ready(true, false, false));
     }
 
     #[test]

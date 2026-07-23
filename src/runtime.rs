@@ -1219,13 +1219,7 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                     self.bridge.state().wired_availability
                         == crate::output_target::OutputTargetAvailability::Ready
                 }
-                OutputTarget::Ble(host_id) => [
-                    crate::reports::ReportKind::Keyboard,
-                    crate::reports::ReportKind::Mouse,
-                    crate::reports::ReportKind::Consumer,
-                ]
-                .into_iter()
-                .any(|kind| self.bridge.can_send(host_id, kind)),
+                OutputTarget::Ble(host_id) => self.bridge.ble_target_ready(host_id),
             };
             if ready {
                 return Some(target);
@@ -1571,14 +1565,7 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         let mut ready_ble_mask = 0u8;
         for index in 0..HOSTS.min(4) {
             let host_id = HostId((index + 1) as u8);
-            if [
-                crate::reports::ReportKind::Keyboard,
-                crate::reports::ReportKind::Mouse,
-                crate::reports::ReportKind::Consumer,
-            ]
-            .into_iter()
-            .any(|kind| self.bridge.can_send(host_id, kind))
-            {
+            if self.bridge.ble_target_ready(host_id) {
                 ready_ble_mask |= 1 << index;
             }
         }
@@ -5082,6 +5069,11 @@ mod tests {
             BridgeEvent::CccdChanged {
                 host_id: HostId(2),
                 report: ReportKind::Consumer,
+                enabled: true,
+            },
+            BridgeEvent::CccdChanged {
+                host_id: HostId(2),
+                report: ReportKind::Keyboard,
                 enabled: true,
             },
         ] {

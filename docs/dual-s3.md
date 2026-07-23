@@ -27,6 +27,10 @@ unready selection becomes inactive and never fails over. Target switching
 releases the old target, suppresses inputs already held, sends a neutral state
 to the new target, and only then activates it.
 
+A BLE target is Ready for selection and GPIO0 cycling only when its Keyboard
+notification path is ready. Mouse and Consumer reports still use their own
+CCCD readiness and are never broadcast to another target.
+
 Mirror selection is stored separately:
 
 - Wired without an available Mirror uses `HIDShift Wired`, a driverless
