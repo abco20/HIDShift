@@ -216,7 +216,11 @@ pub async fn serial_management_task(
                                     sender
                                         .send(RuntimeInputMessage::MirrorCandidateRegistered {
                                             candidate: MirrorCandidateId(0),
+                                            stable_id: hidshift::MirrorStableId::synthetic(
+                                                metadata.profile_hash,
+                                            ),
                                             profile_hash: Some(metadata.profile_hash),
+                                            synthetic: true,
                                         })
                                         .await;
                                     log::info!(
@@ -241,7 +245,9 @@ pub async fn serial_management_task(
                             sender
                                 .send(RuntimeInputMessage::MirrorCandidateRegistered {
                                     candidate: MirrorCandidateId(0),
+                                    stable_id: hidshift::MirrorStableId::synthetic(0),
                                     profile_hash: None,
+                                    synthetic: true,
                                 })
                                 .await;
                             log::info!("@HIDSHIFT-MIRROR:CLEARED,{}", packet.sequence);

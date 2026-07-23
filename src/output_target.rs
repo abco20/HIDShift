@@ -1,5 +1,7 @@
 use crate::ids::{HOST_SLOT_COUNT, HostId};
 
+pub const MIRROR_PORT_PATH_MAX_LEN: usize = 8;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OutputTarget {
     Wired,
@@ -116,7 +118,74 @@ impl StoredOutputTarget {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct StoredMirrorTarget(pub u8);
+pub struct MirrorStableId {
+    pub vendor_id: u16,
+    pub product_id: u16,
+    pub serial_hash: Option<u32>,
+    pub descriptor_hash: u32,
+    port_path_len: u8,
+    port_path: [u8; MIRROR_PORT_PATH_MAX_LEN],
+}
+
+impl MirrorStableId {
+    pub fn new(
+        vendor_id: u16,
+        product_id: u16,
+        serial_hash: Option<u32>,
+        descriptor_hash: u32,
+        port_path: &[u8],
+    ) -> Result<Self, MirrorStableIdError> {
+        if port_path.len() > MIRROR_PORT_PATH_MAX_LEN {
+            return Err(MirrorStableIdError::PortPathTooLong);
+        }
+        if serial_hash.is_none() && port_path.is_empty() {
+            return Err(MirrorStableIdError::MissingPhysicalLocation);
+        }
+
+        let mut stored_path = [0; MIRROR_PORT_PATH_MAX_LEN];
+        stored_path[..port_path.len()].copy_from_slice(port_path);
+        Ok(Self {
+            vendor_id,
+            product_id,
+            serial_hash,
+            descriptor_hash,
+            port_path_len: port_path.len() as u8,
+            port_path: stored_path,
+        })
+    }
+
+    pub const fn synthetic(descriptor_hash: u32) -> Self {
+        Self {
+            vendor_id: 0xcafe,
+            product_id: 0,
+            serial_hash: Some(descriptor_hash),
+            descriptor_hash,
+            port_path_len: 0,
+            port_path: [0; MIRROR_PORT_PATH_MAX_LEN],
+        }
+    }
+
+    pub fn port_path(&self) -> &[u8] {
+        &self.port_path[..usize::from(self.port_path_len)]
+    }
+
+    pub const fn port_path_len(&self) -> u8 {
+        self.port_path_len
+    }
+
+    pub const fn port_path_bytes(&self) -> &[u8; MIRROR_PORT_PATH_MAX_LEN] {
+        &self.port_path
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MirrorStableIdError {
+    MissingPhysicalLocation,
+    PortPathTooLong,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StoredMirrorTarget(pub MirrorStableId);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StoredPresentationConfig {
@@ -198,5 +267,20 @@ mod tests {
             StoredOutputTarget::Ble(slot).as_output_target(),
             OutputTarget::Ble(HostId(4))
         );
+    }
+
+    #[test]
+    fn stable_mirror_identity_requires_a_serial_or_physical_port_path() {
+        assert_eq!(
+            MirrorStableId::new(0x046d, 0xc547, None, 1, &[]),
+            Err(MirrorStableIdError::MissingPhysicalLocation)
+        );
+        let identity =
+            MirrorStableId::new(0x046d, 0xc547, None, 1, &[1, 3]).expect("valid port path");
+        assert_eq!(identity.port_path(), &[1, 3]);
+
+        let serial_identity =
+            MirrorStableId::new(0x046d, 0xc547, Some(7), 1, &[]).expect("serial is stable");
+        assert!(serial_identity.port_path().is_empty());
     }
 }

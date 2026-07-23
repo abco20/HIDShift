@@ -17,9 +17,13 @@ use crate::management::{
 use crate::management::{
     ManagementOutputTarget, ManagementOutputTargetStatus, ManagementUsbPresentationKind,
 };
+#[cfg(feature = "dual-s3-wired")]
+use crate::mirror::{MirrorCandidateMetadata, MirrorCandidateRegistry};
 use crate::output_target::OutputTarget;
 #[cfg(feature = "dual-s3-wired")]
-use crate::output_target::{MirrorCandidateId, OutputTargetAvailability, StoredMirrorTarget};
+use crate::output_target::{
+    MirrorCandidateId, MirrorStableId, OutputTargetAvailability, StoredMirrorTarget,
+};
 #[cfg(feature = "dual-s3-wired")]
 use crate::reports::StandardHidReport;
 use crate::reports::{BleConsumerReport, BleHidReport, BleKeyboard6KroReport, BleMouseReport};
@@ -187,7 +191,9 @@ pub enum RuntimeInput<'a> {
     #[cfg(feature = "dual-s3-wired")]
     MirrorCandidateRegistered {
         candidate: MirrorCandidateId,
+        stable_id: MirrorStableId,
         profile_hash: Option<u32>,
+        synthetic: bool,
     },
     RestoreStorage(&'a StorageState),
 }
@@ -214,9 +220,9 @@ pub struct BridgeRuntime<const HOSTS: usize, const USB_INTERFACES: usize> {
     #[cfg(feature = "dual-s3-wired")]
     last_profile_result: Option<ProfileResult>,
     #[cfg(feature = "dual-s3-wired")]
-    mirror_candidate_hashes: [Option<u32>; 4],
+    mirror_candidates: MirrorCandidateRegistry<4>,
     #[cfg(feature = "dual-s3-wired")]
-    pending_mirror_candidate: Option<(MirrorCandidateId, u32)>,
+    pending_mirror_candidate: Option<(MirrorCandidateId, MirrorStableId, u32, bool)>,
     #[cfg(feature = "dual-s3-wired")]
     last_mirror_endpoint_out: Option<RawEndpointReport>,
     #[cfg(feature = "dual-s3-wired")]
@@ -274,7 +280,7 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             #[cfg(feature = "dual-s3-wired")]
             last_profile_result: None,
             #[cfg(feature = "dual-s3-wired")]
-            mirror_candidate_hashes: [None; 4],
+            mirror_candidates: MirrorCandidateRegistry::new(),
             #[cfg(feature = "dual-s3-wired")]
             pending_mirror_candidate: None,
             #[cfg(feature = "dual-s3-wired")]
@@ -307,10 +313,28 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
 
     #[cfg(feature = "dual-s3-wired")]
     fn mirror_profile_hash(&self, candidate: MirrorCandidateId) -> Option<u32> {
-        self.mirror_candidate_hashes
-            .get(usize::from(candidate.0))
-            .copied()
-            .flatten()
+        self.mirror_candidates
+            .get(candidate)
+            .map(|metadata| metadata.profile_hash)
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    fn mirror_stable_id(&self, candidate: MirrorCandidateId) -> Option<MirrorStableId> {
+        self.mirror_candidates
+            .get(candidate)
+            .map(|metadata| metadata.stable_id)
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    fn selected_mirror_candidate(&self) -> Option<MirrorCandidateId> {
+        let selected = self.bridge.state().mirror_target?;
+        self.mirror_candidates.resolve(selected.0).ok().flatten()
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    fn selected_mirror_profile_hash(&self) -> Option<u32> {
+        self.selected_mirror_candidate()
+            .and_then(|candidate| self.mirror_profile_hash(candidate))
     }
 
     #[cfg(feature = "dual-s3-wired")]
@@ -320,7 +344,7 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         profile_hash: u32,
         commands: &mut heapless::Vec<RuntimeCommand, COMMANDS>,
     ) -> Result<(), RuntimeError> {
-        if self.bridge.state().mirror_target == Some(StoredMirrorTarget(candidate.0))
+        if self.selected_mirror_candidate() == Some(candidate)
             && self.bridge.state().output_target.selected == OutputTarget::Wired
         {
             push_command(
@@ -555,25 +579,46 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                 commands.clear();
                 self.last_profile_result = Some(result);
                 let mut accepted_candidate = None;
+                let mut selected_candidate_replaced = false;
                 if self
                     .pending_mirror_candidate
-                    .is_some_and(|(_, profile_hash)| profile_hash == result.profile_hash)
+                    .is_some_and(|(_, _, profile_hash, _)| profile_hash == result.profile_hash)
                 {
                     if matches!(
                         result.status,
                         ProfileResultStatus::Accepted | ProfileResultStatus::AlreadyStored
-                    ) && let Some((candidate, profile_hash)) = self.pending_mirror_candidate
-                        && let Some(slot) = self
-                            .mirror_candidate_hashes
-                            .get_mut(usize::from(candidate.0))
+                    ) && let Some((candidate, stable_id, profile_hash, synthetic)) =
+                        self.pending_mirror_candidate
                     {
-                        *slot = Some(profile_hash);
+                        selected_candidate_replaced = self.selected_mirror_candidate()
+                            == Some(candidate)
+                            && self.mirror_stable_id(candidate) != Some(stable_id);
+                        let _ = self.mirror_candidates.register(MirrorCandidateMetadata {
+                            candidate,
+                            stable_id,
+                            profile_hash,
+                            synthetic,
+                        });
                         accepted_candidate = Some((candidate, profile_hash));
                     }
                     self.pending_mirror_candidate = None;
                 }
                 if let Some((candidate, profile_hash)) = accepted_candidate {
                     self.activate_selected_mirror_candidate(candidate, profile_hash, commands)?;
+                }
+                if selected_candidate_replaced
+                    && self.bridge.state().output_target.selected == OutputTarget::Wired
+                {
+                    push_command(
+                        commands,
+                        RuntimeCommand::DeviceCommand(DeviceTaskCommand::ReleaseAll),
+                    )?;
+                    push_command(
+                        commands,
+                        RuntimeCommand::DeviceCommand(DeviceTaskCommand::ActivateFallback {
+                            operation_id: self.bridge.state().output_target.transition_operation_id,
+                        }),
+                    )?;
                 }
                 Ok(())
             }
@@ -608,9 +653,8 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
 
                 let selected = self.bridge.state().output_target.selected;
                 let expected_mirror = (selected == OutputTarget::Wired)
-                    .then(|| self.bridge.state().mirror_target)
-                    .flatten()
-                    .and_then(|target| self.mirror_profile_hash(MirrorCandidateId(target.0)));
+                    .then(|| self.selected_mirror_profile_hash())
+                    .flatten();
                 let presentation_matches = match expected_mirror {
                     Some(hash) => !state.fallback_active && state.active_profile_hash == hash,
                     None => state.fallback_active,
@@ -647,16 +691,13 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             #[cfg(feature = "dual-s3-wired")]
             RuntimeInput::MirrorCandidateRegistered {
                 candidate,
+                stable_id,
                 profile_hash,
+                synthetic,
             } => {
                 commands.clear();
-                let Some(slot) = self
-                    .mirror_candidate_hashes
-                    .get_mut(usize::from(candidate.0))
-                else {
-                    return Ok(());
-                };
                 let mut accepted_profile_hash = None;
+                let mut selected_candidate_replaced = false;
                 if let Some(profile_hash) = profile_hash {
                     if self.last_profile_result.is_some_and(|result| {
                         result.profile_hash == profile_hash
@@ -665,21 +706,54 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                                 ProfileResultStatus::Accepted | ProfileResultStatus::AlreadyStored
                             )
                     }) {
-                        *slot = Some(profile_hash);
+                        selected_candidate_replaced = self.selected_mirror_candidate()
+                            == Some(candidate)
+                            && self.mirror_stable_id(candidate) != Some(stable_id);
+                        if self
+                            .mirror_candidates
+                            .register(MirrorCandidateMetadata {
+                                candidate,
+                                stable_id,
+                                profile_hash,
+                                synthetic,
+                            })
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
                         self.pending_mirror_candidate = None;
                         accepted_profile_hash = Some(profile_hash);
                     } else {
-                        self.pending_mirror_candidate = Some((candidate, profile_hash));
+                        self.pending_mirror_candidate =
+                            Some((candidate, stable_id, profile_hash, synthetic));
                     }
                 } else {
-                    *slot = None;
+                    let selected_candidate = self.selected_mirror_candidate();
+                    let _ = self.mirror_candidates.clear(candidate);
                     self.pending_mirror_candidate = None;
+                    if selected_candidate == Some(candidate)
+                        && self.bridge.state().output_target.selected == OutputTarget::Wired
+                    {
+                        push_command(
+                            commands,
+                            RuntimeCommand::DeviceCommand(DeviceTaskCommand::ReleaseAll),
+                        )?;
+                        push_command(
+                            commands,
+                            RuntimeCommand::DeviceCommand(DeviceTaskCommand::ActivateFallback {
+                                operation_id: self
+                                    .bridge
+                                    .state()
+                                    .output_target
+                                    .transition_operation_id,
+                            }),
+                        )?;
+                    }
                 }
                 if let Some(profile_hash) = accepted_profile_hash {
                     self.activate_selected_mirror_candidate(candidate, profile_hash, commands)?;
                 }
-                if profile_hash.is_none()
-                    && self.bridge.state().mirror_target == Some(StoredMirrorTarget(candidate.0))
+                if selected_candidate_replaced
                     && self.bridge.state().output_target.selected == OutputTarget::Wired
                 {
                     push_command(
@@ -1186,9 +1260,12 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             ManagementCommand::GetOutputTargetStatus => ManagementResult::Ok,
             #[cfg(feature = "dual-s3-wired")]
             ManagementCommand::SetMirrorTarget(candidate) => {
-                if let Some(profile_hash) = self.mirror_profile_hash(candidate) {
+                if let (Some(profile_hash), Some(stable_id)) = (
+                    self.mirror_profile_hash(candidate),
+                    self.mirror_stable_id(candidate),
+                ) {
                     self.bridge
-                        .set_mirror_target(Some(StoredMirrorTarget(candidate.0)));
+                        .set_mirror_target(Some(StoredMirrorTarget(stable_id)));
                     self.push_storage_snapshot(commands, StoragePersistPriority::Critical)?;
                     if self.bridge.state().output_target.selected == OutputTarget::Wired {
                         push_command(
@@ -1874,11 +1951,7 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             ),
             #[cfg(feature = "dual-s3-wired")]
             BridgeAction::ActivateWired { operation_id } => {
-                let mirror = self
-                    .bridge
-                    .state()
-                    .mirror_target
-                    .and_then(|target| self.mirror_profile_hash(MirrorCandidateId(target.0)));
+                let mirror = self.selected_mirror_profile_hash();
                 push_command(
                     commands,
                     RuntimeCommand::DeviceCommand(match mirror {
@@ -3139,7 +3212,9 @@ mod tests {
             .handle_input::<16, 16, 2>(
                 RuntimeInput::MirrorCandidateRegistered {
                     candidate,
+                    stable_id: MirrorStableId::synthetic(0x1122_3344),
                     profile_hash: Some(0x1122_3344),
+                    synthetic: true,
                 },
                 &mut commands,
             )
@@ -3173,7 +3248,7 @@ mod tests {
         )));
         assert_eq!(
             runtime.bridge.state().mirror_target,
-            Some(StoredMirrorTarget(0))
+            Some(StoredMirrorTarget(MirrorStableId::synthetic(0x1122_3344)))
         );
 
         runtime
@@ -3204,7 +3279,9 @@ mod tests {
                 .handle_input::<16, 16, 2>(
                     RuntimeInput::MirrorCandidateRegistered {
                         candidate,
+                        stable_id: MirrorStableId::synthetic(profile_hash),
                         profile_hash: Some(profile_hash),
+                        synthetic: true,
                     },
                     &mut commands,
                 )
@@ -3259,7 +3336,9 @@ mod tests {
             .handle_input::<16, 16, 2>(
                 RuntimeInput::MirrorCandidateRegistered {
                     candidate,
+                    stable_id: MirrorStableId::synthetic(0x3344_5566),
                     profile_hash: Some(0x3344_5566),
+                    synthetic: true,
                 },
                 &mut commands,
             )
@@ -3282,7 +3361,7 @@ mod tests {
 
     #[cfg(feature = "dual-s3-wired")]
     #[test]
-    fn selected_candidate_activates_new_profile_when_result_arrives_after_management() {
+    fn changed_candidate_fingerprint_requires_explicit_reselection() {
         let mut runtime = BridgeRuntime::<4, 1>::new(0);
         let mut commands = heapless::Vec::<RuntimeCommand, 16>::new();
         let candidate = MirrorCandidateId(0);
@@ -3291,7 +3370,9 @@ mod tests {
             .handle_input::<16, 16, 2>(
                 RuntimeInput::MirrorCandidateRegistered {
                     candidate,
+                    stable_id: MirrorStableId::synthetic(0x1111_1111),
                     profile_hash: Some(0x1111_1111),
+                    synthetic: true,
                 },
                 &mut commands,
             )
@@ -3319,7 +3400,9 @@ mod tests {
             .handle_input::<16, 16, 2>(
                 RuntimeInput::MirrorCandidateRegistered {
                     candidate,
+                    stable_id: MirrorStableId::synthetic(0x2222_2222),
                     profile_hash: Some(0x2222_2222),
+                    synthetic: true,
                 },
                 &mut commands,
             )
@@ -3337,6 +3420,18 @@ mod tests {
             )
             .unwrap();
 
+        assert!(!commands.contains(&RuntimeCommand::DeviceCommand(
+            DeviceTaskCommand::ActivateMirror(ActivateProfile {
+                operation_id: 0,
+                profile_hash: 0x2222_2222,
+            })
+        )));
+        runtime
+            .handle_input::<16, 16, 2>(
+                management_request(ManagementCommand::SetMirrorTarget(candidate), 36),
+                &mut commands,
+            )
+            .unwrap();
         assert!(commands.contains(&RuntimeCommand::DeviceCommand(
             DeviceTaskCommand::ActivateMirror(ActivateProfile {
                 operation_id: 0,
@@ -3360,12 +3455,14 @@ mod tests {
             .handle_input::<16, 16, 2>(
                 RuntimeInput::MirrorCandidateRegistered {
                     candidate,
+                    stable_id: MirrorStableId::synthetic(0x3333_3333),
                     profile_hash: Some(0x3333_3333),
+                    synthetic: true,
                 },
                 &mut commands,
             )
             .unwrap();
-        assert!(commands.contains(&RuntimeCommand::DeviceCommand(
+        assert!(!commands.contains(&RuntimeCommand::DeviceCommand(
             DeviceTaskCommand::ActivateMirror(ActivateProfile {
                 operation_id: 0,
                 profile_hash: 0x3333_3333,
@@ -3414,7 +3511,9 @@ mod tests {
             .handle_input::<16, 16, 2>(
                 RuntimeInput::MirrorCandidateRegistered {
                     candidate,
+                    stable_id: MirrorStableId::synthetic(profile_hash),
                     profile_hash: Some(profile_hash),
+                    synthetic: true,
                 },
                 &mut commands,
             )

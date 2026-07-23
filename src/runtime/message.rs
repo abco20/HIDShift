@@ -60,7 +60,9 @@ pub enum RuntimeInputMessage {
     #[cfg(feature = "dual-s3-wired")]
     MirrorCandidateRegistered {
         candidate: crate::output_target::MirrorCandidateId,
+        stable_id: crate::output_target::MirrorStableId,
         profile_hash: Option<u32>,
+        synthetic: bool,
     },
     RestoreStorage(StorageState),
 }
@@ -130,10 +132,14 @@ impl RuntimeInputMessage {
             #[cfg(feature = "dual-s3-wired")]
             Self::MirrorCandidateRegistered {
                 candidate,
+                stable_id,
                 profile_hash,
+                synthetic,
             } => RuntimeInput::MirrorCandidateRegistered {
                 candidate: *candidate,
+                stable_id: *stable_id,
                 profile_hash: *profile_hash,
+                synthetic: *synthetic,
             },
             Self::RestoreStorage(storage) => RuntimeInput::RestoreStorage(storage),
         }
@@ -203,10 +209,14 @@ impl TryFrom<RuntimeInput<'_>> for RuntimeInputMessage {
             #[cfg(feature = "dual-s3-wired")]
             RuntimeInput::MirrorCandidateRegistered {
                 candidate,
+                stable_id,
                 profile_hash,
+                synthetic,
             } => Ok(Self::MirrorCandidateRegistered {
                 candidate,
+                stable_id,
                 profile_hash,
+                synthetic,
             }),
             RuntimeInput::RestoreStorage(storage) => Ok(Self::RestoreStorage(storage.clone())),
         }

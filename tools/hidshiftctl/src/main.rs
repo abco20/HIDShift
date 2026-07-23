@@ -10,8 +10,8 @@ use futures_util::StreamExt;
 use hidshift::{
     MANAGEMENT_REQUEST_UUID, MANAGEMENT_RESPONSE_LEN, MANAGEMENT_RESPONSE_UUID,
     MANAGEMENT_SERVICE_UUID, ManagementCommand, ManagementHostStatus, ManagementOutputTarget,
-    ManagementResponse, ManagementResponsePayload, ManagementResult, MirrorCandidateId, SETTING_DESCRIPTORS,
-    SettingScope, SettingTarget, setting_by_key,
+    ManagementResponse, ManagementResponsePayload, ManagementResult, MirrorCandidateId,
+    SETTING_DESCRIPTORS, SettingScope, SettingTarget, setting_by_key,
 };
 use hidshift_client::{
     ManagementClient, PendingRequest, SerialResponseDecoder, encode_serial_request,
@@ -537,7 +537,14 @@ fn print_response(response: ManagementResponse) {
                     .unwrap_or_else(|| "none".to_owned())
             );
             println!("state:    {:?}", status.availability);
-            println!("wired:   {}", if status.wired_ready { "ready" } else { "not ready" });
+            println!(
+                "wired:   {}",
+                if status.wired_ready {
+                    "ready"
+                } else {
+                    "not ready"
+                }
+            );
             println!("ble ready mask: 0x{:02x}", status.ready_ble_mask);
             println!("presentation: {:?}", status.effective_presentation);
             println!("mirror configured: {}", status.mirror_configured);
@@ -969,23 +976,17 @@ where
             TargetArgs::Usb => CliCommand::Request(ManagementCommand::SelectOutputTarget(
                 ManagementOutputTarget::Wired,
             )),
-            TargetArgs::Ble { slot } => CliCommand::Request(
-                ManagementCommand::SelectOutputTarget(ManagementOutputTarget::Ble(
-                    hidshift::HostId(slot),
-                )),
-            ),
-            TargetArgs::Status => {
-                CliCommand::Request(ManagementCommand::GetOutputTargetStatus)
-            }
+            TargetArgs::Ble { slot } => CliCommand::Request(ManagementCommand::SelectOutputTarget(
+                ManagementOutputTarget::Ble(hidshift::HostId(slot)),
+            )),
+            TargetArgs::Status => CliCommand::Request(ManagementCommand::GetOutputTargetStatus),
         },
         CommandArgs::Mirror { command } => match command {
             MirrorArgs::Select { candidate } => CliCommand::Request(
                 ManagementCommand::SetMirrorTarget(MirrorCandidateId(candidate)),
             ),
             MirrorArgs::Clear => CliCommand::Request(ManagementCommand::ClearMirrorTarget),
-            MirrorArgs::Status => {
-                CliCommand::Request(ManagementCommand::GetOutputTargetStatus)
-            }
+            MirrorArgs::Status => CliCommand::Request(ManagementCommand::GetOutputTargetStatus),
         },
         CommandArgs::Pair { slot } => {
             CliCommand::Request(ManagementCommand::StartPairing(hidshift::HostId(slot)))

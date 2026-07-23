@@ -1,3 +1,4 @@
+pub mod candidate;
 pub mod control;
 pub mod image;
 pub mod parser;
@@ -5,6 +6,10 @@ pub mod plan;
 pub mod store;
 pub mod validator;
 
+pub use candidate::{
+    MirrorCandidateError, MirrorCandidateMetadata, MirrorCandidateRegistry,
+    MirrorCandidateRegistryError, MirrorCandidateSource,
+};
 pub use control::{
     MIRROR_CONTROL_TIMEOUT_MS, MirrorControlForwarder, MirrorControlForwarderError,
     PendingMirrorControl,

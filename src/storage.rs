@@ -2,7 +2,10 @@
 use crate::ids::HostSlot;
 use crate::ids::{HOST_SLOT_COUNT, HostId};
 #[cfg(feature = "dual-s3-wired")]
-use crate::output_target::{StoredMirrorTarget, StoredOutputTarget, StoredPresentationConfig};
+use crate::output_target::{
+    MIRROR_PORT_PATH_MAX_LEN, MirrorStableId, StoredMirrorTarget, StoredOutputTarget,
+    StoredPresentationConfig,
+};
 use crate::settings::{GlobalSettings, HostSettings};
 
 pub const MAX_HOST_NAME_LEN: usize = 32;
@@ -11,7 +14,7 @@ pub const STORAGE_MAGIC: [u8; 4] = *b"E32B";
 pub const STORAGE_SCHEMA_VERSION: u16 = 1;
 pub const STORAGE_IMAGE_LEN: usize = 512;
 pub const STORAGE_HEADER_LEN: usize = 16;
-pub const STORAGE_BODY_PREFIX_LEN: usize = 64;
+pub const STORAGE_BODY_PREFIX_LEN: usize = 96;
 pub const STORED_HOST_RECORD_LEN: usize = 88;
 pub const STORED_BOND_LEN: usize = 48;
 pub const STORAGE_FLASH_SLOT_SIZE: usize = 4096;
@@ -495,7 +498,10 @@ pub fn encode_storage_image(state: &StorageState) -> Result<[u8; STORAGE_IMAGE_L
     image[17] = state.last_active_host.map_or(0xff, |host| host.0);
     encode_global_settings(state.global_settings, &mut image[18..30]);
     #[cfg(feature = "dual-s3-wired")]
-    encode_presentation_config(state.presentation, &mut image[30..32]);
+    {
+        encode_output_target(state.presentation.output_target, &mut image[30..31]);
+        encode_mirror_target(state.presentation.mirror_target, &mut image[80..104]);
+    }
     for (index, settings) in state.host_settings.iter().copied().enumerate() {
         let offset = 32 + index * 12;
         encode_host_settings(settings, &mut image[offset..offset + 12]);
@@ -552,7 +558,10 @@ pub fn decode_storage_image(image: &[u8]) -> Result<StorageState, StorageError> 
     state.global_settings = decode_global_settings(&image[18..30])?;
     #[cfg(feature = "dual-s3-wired")]
     {
-        state.presentation = decode_presentation_config(&image[30..32])?;
+        state.presentation = StoredPresentationConfig {
+            output_target: decode_output_target(&image[30..31])?,
+            mirror_target: decode_mirror_target(&image[80..104])?,
+        };
     }
     for index in 0..STORED_HOSTS_MAX {
         let offset = 32 + index * 12;
@@ -572,30 +581,58 @@ pub fn decode_storage_image(image: &[u8]) -> Result<StorageState, StorageError> 
 }
 
 #[cfg(feature = "dual-s3-wired")]
-fn encode_presentation_config(config: StoredPresentationConfig, out: &mut [u8]) {
-    out[0] = match config.output_target {
+fn encode_output_target(target: StoredOutputTarget, out: &mut [u8]) {
+    out[0] = match target {
         StoredOutputTarget::Wired => 0,
         StoredOutputTarget::Ble(slot) => slot.get(),
     };
-    out[1] = config
-        .mirror_target
-        .map_or(0, |target| 0x80 | (target.0 & 0x7f));
 }
 
 #[cfg(feature = "dual-s3-wired")]
-fn decode_presentation_config(bytes: &[u8]) -> Result<StoredPresentationConfig, StorageError> {
-    let output_target = match bytes[0] {
+fn decode_output_target(bytes: &[u8]) -> Result<StoredOutputTarget, StorageError> {
+    Ok(match bytes[0] {
         0 => StoredOutputTarget::Wired,
         slot @ 1..=4 => StoredOutputTarget::Ble(
             HostSlot::try_from(slot).map_err(|_| StorageError::InvalidOutputTarget)?,
         ),
         _ => return Err(StorageError::InvalidOutputTarget),
-    };
-    let mirror_target = (bytes[1] & 0x80 != 0).then_some(StoredMirrorTarget(bytes[1] & 0x7f));
-    Ok(StoredPresentationConfig {
-        output_target,
-        mirror_target,
     })
+}
+
+#[cfg(feature = "dual-s3-wired")]
+fn encode_mirror_target(target: Option<StoredMirrorTarget>, out: &mut [u8]) {
+    out.fill(0);
+    let Some(StoredMirrorTarget(identity)) = target else {
+        return;
+    };
+    out[0] = 1 | u8::from(identity.serial_hash.is_some()) << 1;
+    out[1] = identity.port_path_len();
+    write_u16(&mut out[2..4], identity.vendor_id);
+    write_u16(&mut out[4..6], identity.product_id);
+    write_u32(&mut out[6..10], identity.serial_hash.unwrap_or(0));
+    write_u32(&mut out[10..14], identity.descriptor_hash);
+    out[14..14 + MIRROR_PORT_PATH_MAX_LEN].copy_from_slice(identity.port_path_bytes());
+}
+
+#[cfg(feature = "dual-s3-wired")]
+fn decode_mirror_target(bytes: &[u8]) -> Result<Option<StoredMirrorTarget>, StorageError> {
+    if bytes[0] & 1 == 0 {
+        return Ok(None);
+    }
+    let path_len = usize::from(bytes[1]);
+    if path_len > MIRROR_PORT_PATH_MAX_LEN {
+        return Err(StorageError::InvalidOutputTarget);
+    }
+    let serial_hash = (bytes[0] & 2 != 0).then(|| read_u32(&bytes[6..10]));
+    let identity = MirrorStableId::new(
+        read_u16(&bytes[2..4]),
+        read_u16(&bytes[4..6]),
+        serial_hash,
+        read_u32(&bytes[10..14]),
+        &bytes[14..14 + path_len],
+    )
+    .map_err(|_| StorageError::InvalidOutputTarget)?;
+    Ok(Some(StoredMirrorTarget(identity)))
 }
 
 pub fn select_newest_valid_storage_image<'a>(
@@ -1187,7 +1224,16 @@ mod tests {
         let mut state = StorageState::new(43);
         state.presentation = StoredPresentationConfig {
             output_target: StoredOutputTarget::Ble(HostSlot::try_from(3).unwrap()),
-            mirror_target: Some(StoredMirrorTarget(17)),
+            mirror_target: Some(StoredMirrorTarget(
+                crate::output_target::MirrorStableId::new(
+                    0x046d,
+                    0xc547,
+                    Some(0x1122_3344),
+                    0x5566_7788,
+                    &[1, 3],
+                )
+                .unwrap(),
+            )),
         };
 
         let decoded = decode_storage_image(&encode_storage_image(&state).unwrap()).unwrap();

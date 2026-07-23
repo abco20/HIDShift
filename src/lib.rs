@@ -103,10 +103,16 @@ pub use management::{
 pub use management::{
     ManagementOutputTarget, ManagementOutputTargetStatus, ManagementUsbPresentationKind,
 };
+#[cfg(feature = "dual-s3-wired")]
+pub use mirror::{
+    MirrorCandidateError, MirrorCandidateMetadata, MirrorCandidateRegistry,
+    MirrorCandidateRegistryError, MirrorCandidateSource,
+};
 pub use output_target::{
-    MirrorCandidateId, MirrorConfiguration, OutputTarget, OutputTargetAvailability,
-    OutputTargetState, StoredMirrorTarget, StoredOutputTarget, StoredPresentationConfig,
-    UsbPresentation, effective_presentation,
+    MIRROR_PORT_PATH_MAX_LEN, MirrorCandidateId, MirrorConfiguration, MirrorStableId,
+    MirrorStableIdError, OutputTarget, OutputTargetAvailability, OutputTargetState,
+    StoredMirrorTarget, StoredOutputTarget, StoredPresentationConfig, UsbPresentation,
+    effective_presentation,
 };
 pub use reports::{
     BLE_HID_INPUT_REPORT_MAX_LEN, BLE_HID_NOTIFICATIONS_PER_REPORT_MAX, BLE_HID_NOTIFY_MAX_LEN,
