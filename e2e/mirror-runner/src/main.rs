@@ -44,6 +44,12 @@ struct Arguments {
     /// Run BLE Management and release/suppression E2E through this bonded peer.
     #[arg(long)]
     ble_address: Option<String>,
+    /// Re-pair the BLE peer even when reusing already flashed images.
+    #[arg(long)]
+    pair_ble: bool,
+    /// Linux Bluetooth controller accepted by hardware-E2E Host firmware.
+    #[arg(long)]
+    linux_controller_address: Option<String>,
     #[arg(long, default_value_t = 2)]
     ble_host_slot: u8,
     #[arg(long, default_value = "tools/hidshiftctl/target/release/hidshiftctl")]
@@ -75,7 +81,16 @@ fn run() -> Result<(), Box<dyn Error>> {
             .device_flash_port
             .as_deref()
             .ok_or("--device-flash-port is required unless --skip-flash is used")?;
-        flash_firmware(&arguments.host_port, device_port)?;
+        if arguments.ble_address.is_some() && arguments.linux_controller_address.is_none() {
+            return Err(
+                "--linux-controller-address is required when flashing for --ble-address E2E".into(),
+            );
+        }
+        flash_firmware(
+            &arguments.host_port,
+            device_port,
+            arguments.linux_controller_address.as_deref(),
+        )?;
     }
     let mut serial = serialport::new(arguments.host_port.to_string_lossy(), 115_200)
         .timeout(Duration::from_millis(100))
@@ -85,6 +100,11 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut sequence = 2;
     let mut client = ManagementClient::new(80);
     wait_for_management_ready(&mut *serial, &mut client, Duration::from_secs(30))?;
+    if (!arguments.skip_flash || arguments.pair_ble)
+        && let Some(address) = arguments.ble_address.as_deref()
+    {
+        pair_linux_ble_peer(&mut *serial, &mut client, address, arguments.ble_host_slot)?;
+    }
     if arguments.spi_loss_only {
         send_management_command(
             &mut *serial,
@@ -102,6 +122,11 @@ fn run() -> Result<(), Box<dyn Error>> {
             &mut *serial,
             FALLBACK_USB_VENDOR_ID,
             FALLBACK_USB_PRODUCT_ID,
+            Duration::from_secs(arguments.usb_timeout_seconds),
+        )?;
+        wait_for_wired_ready(
+            &mut *serial,
+            &mut client,
             Duration::from_secs(arguments.usb_timeout_seconds),
         )?;
         let device_port = arguments
@@ -146,6 +171,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         FALLBACK_USB_PRODUCT_ID,
         Duration::from_secs(arguments.usb_timeout_seconds),
     )?;
+    wait_for_wired_ready(
+        &mut *serial,
+        &mut client,
+        Duration::from_secs(arguments.usb_timeout_seconds),
+    )?;
     println!("T02 passed: HIDShift Wired fallback enumerated");
 
     let mut fallback_events = open_input_events(
@@ -154,6 +184,18 @@ fn run() -> Result<(), Box<dyn Error>> {
         3,
         Duration::from_secs(3),
     )?;
+    // A previous interrupted E2E run may leave the injected physical state
+    // pressed. Reset that source boundary before asserting a fresh edge so
+    // suppression state cannot make a rerun order-dependent.
+    send_normalized(
+        &mut *serial,
+        E2ePacket {
+            sequence: 999,
+            command: E2eCommand::ReleaseAll,
+        },
+    )?;
+    std::thread::sleep(Duration::from_millis(50));
+    drain_input_events(&mut fallback_events)?;
     send_normalized(
         &mut *serial,
         E2ePacket {
@@ -333,6 +375,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         pid_a,
         Duration::from_secs(arguments.usb_timeout_seconds),
     )?;
+    wait_for_wired_ready(
+        &mut *serial,
+        &mut client,
+        Duration::from_secs(arguments.usb_timeout_seconds),
+    )?;
     verify_usb_plan(&plan_a)?;
     println!("T10-T12 passed: registered and enumerated {vid_a:04x}:{pid_a:04x}");
 
@@ -409,6 +456,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         &mut *serial,
         vid_a,
         pid_a,
+        Duration::from_secs(arguments.usb_timeout_seconds),
+    )?;
+    wait_for_wired_ready(
+        &mut *serial,
+        &mut client,
         Duration::from_secs(arguments.usb_timeout_seconds),
     )?;
     println!("T21 passed: Wired selection restored saved Mirror A");
@@ -502,6 +554,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         pid_b,
         Duration::from_secs(arguments.usb_timeout_seconds),
     )?;
+    wait_for_wired_ready(
+        &mut *serial,
+        &mut client,
+        Duration::from_secs(arguments.usb_timeout_seconds),
+    )?;
     if usb_identity_present(vid_a, pid_a)? {
         return Err("Profile A remained enumerated after activating Profile B".into());
     }
@@ -522,6 +579,11 @@ fn run() -> Result<(), Box<dyn Error>> {
             pid_b,
             Duration::from_secs(arguments.usb_timeout_seconds),
         )?;
+        wait_for_wired_ready(
+            &mut *serial,
+            &mut client,
+            Duration::from_secs(arguments.usb_timeout_seconds),
+        )?;
         println!("T24 passed: Device S3 reboot restored saved Profile B");
     } else {
         println!("T24 skipped: --device-flash-port was not provided");
@@ -529,7 +591,14 @@ fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn flash_firmware(host_port: &Path, device_port: &Path) -> Result<(), Box<dyn Error>> {
+fn flash_firmware(
+    host_port: &Path,
+    device_port: &Path,
+    linux_controller_address: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    if linux_controller_address.is_some_and(|address| !valid_bluetooth_address(address)) {
+        return Err("invalid --linux-controller-address".into());
+    }
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
@@ -539,8 +608,10 @@ fn flash_firmware(host_port: &Path, device_port: &Path) -> Result<(), Box<dyn Er
         return Err("ESP toolchain is not installed; run `mise run esp:install`".into());
     }
 
+    let controller = linux_controller_address.unwrap_or("");
     let build_script = format!(
         "source '{}' && \
+         export HIDSHIFT_E2E_LINUX_ADDRESS='{}' && \
          cargo +esp build --locked -Zbuild-std=core,alloc --release \
            --manifest-path firmware/Cargo.toml --bin firmware \
            --features hardware-e2e,dual-s3-wired \
@@ -549,7 +620,8 @@ fn flash_firmware(host_port: &Path, device_port: &Path) -> Result<(), Box<dyn Er
            --manifest-path device-firmware/Cargo.toml --bin hidshift-device \
            --features hardware-e2e \
            --target xtensa-esp32s3-none-elf",
-        export_file.display()
+        export_file.display(),
+        controller
     );
     run_command(
         Command::new("bash")
@@ -602,6 +674,18 @@ fn flash_firmware(host_port: &Path, device_port: &Path) -> Result<(), Box<dyn Er
         "flash Host S3",
     )?;
     Ok(())
+}
+
+fn valid_bluetooth_address(address: &str) -> bool {
+    let bytes = address.as_bytes();
+    bytes.len() == 17
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            if matches!(index, 2 | 5 | 8 | 11 | 14) {
+                *byte == b':'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
 }
 
 fn run_command(command: &mut Command, description: &str) -> Result<(), Box<dyn Error>> {
@@ -877,20 +961,28 @@ fn run_ble_management(
     address: &str,
     arguments: &[&str],
 ) -> Result<(), Box<dyn Error>> {
-    let output = Command::new(hidshiftctl)
-        .args(["--ble", "--address", address])
-        .args(arguments)
-        .output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "BLE Management command {:?} failed: {}{}",
-            arguments,
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last_failure = String::new();
+    while Instant::now() < deadline {
+        let output = Command::new(hidshiftctl)
+            .args(["--ble", "--address", address])
+            .args(arguments)
+            .output()?;
+        if output.status.success() {
+            return Ok(());
+        }
+        last_failure = format!(
+            "{}{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
-        )
-        .into());
+        );
+        std::thread::sleep(Duration::from_millis(250));
     }
-    Ok(())
+    Err(format!(
+        "BLE Management command {:?} failed after reconnect retries: {last_failure}",
+        arguments
+    )
+    .into())
 }
 
 fn verify_ble_management_switching(
@@ -1327,6 +1419,91 @@ fn send_management_command(
     Ok(())
 }
 
+fn pair_linux_ble_peer(
+    serial: &mut dyn SerialPort,
+    client: &mut ManagementClient,
+    address: &str,
+    host_slot: u8,
+) -> Result<(), Box<dyn Error>> {
+    // hardware-e2e intentionally uses volatile Host state, so flashing always
+    // requires a fresh pairing. Remove a stale BlueZ bond before opening the
+    // firmware pairing window; otherwise each side can retain different keys.
+    let _ = Command::new("bluetoothctl")
+        .args(["remove", address])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    send_management_command(
+        serial,
+        client,
+        ManagementCommand::StartPairing(HostId(host_slot)),
+        "START_PAIRING",
+    )?;
+
+    let mut bluez = Command::new("bluetoothctl")
+        .args(["--agent", "NoInputNoOutput"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("start bluetoothctl: {error}"))?;
+    let mut bluez_stdin = bluez
+        .stdin
+        .take()
+        .ok_or("bluetoothctl stdin was not available")?;
+    std::thread::sleep(Duration::from_secs(1));
+    bluez_stdin.write_all(b"default-agent\nscan on\n")?;
+    bluez_stdin.flush()?;
+    let discovery_deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < discovery_deadline {
+        let devices = Command::new("bluetoothctl").arg("devices").output()?;
+        if String::from_utf8_lossy(&devices.stdout).contains(address) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let devices = Command::new("bluetoothctl").arg("devices").output()?;
+    if !String::from_utf8_lossy(&devices.stdout).contains(address) {
+        let _ = bluez.kill();
+        let _ = bluez.wait();
+        return Err(format!("BlueZ did not discover HIDShift peer {address}").into());
+    }
+    writeln!(bluez_stdin, "pair {address}")?;
+    bluez_stdin.flush()?;
+    std::thread::sleep(Duration::from_secs(12));
+    writeln!(bluez_stdin, "trust {address}\nscan off\nquit")?;
+    drop(bluez_stdin);
+    let bluez_output = bluez
+        .wait_with_output()
+        .map_err(|error| format!("wait for bluetoothctl pairing: {error}"))?;
+    if !bluez_output.status.success() {
+        return Err(format!(
+            "BlueZ pairing failed for {address}: {}{}",
+            String::from_utf8_lossy(&bluez_output.stdout),
+            String::from_utf8_lossy(&bluez_output.stderr)
+        )
+        .into());
+    }
+    let info = Command::new("bluetoothctl")
+        .args(["info", address])
+        .output()
+        .map_err(|error| format!("inspect BLE peer {address}: {error}"))?;
+    let info_text = String::from_utf8_lossy(&info.stdout);
+    if !info.status.success()
+        || !info_text.contains("Paired: yes")
+        || !info_text.contains("Bonded: yes")
+    {
+        return Err(format!(
+            "BlueZ did not retain a bond for {address}: {info_text}\npair session: {}{}",
+            String::from_utf8_lossy(&bluez_output.stdout),
+            String::from_utf8_lossy(&bluez_output.stderr)
+        )
+        .into());
+    }
+    println!("BLE setup: paired Linux with HIDShift Host slot {host_slot}");
+    Ok(())
+}
+
 fn wait_for_management_ready(
     serial: &mut dyn SerialPort,
     client: &mut ManagementClient,
@@ -1704,5 +1881,12 @@ mod tests {
             Some("E2E".into())
         );
         assert_eq!(decode_usb_string(&[3, 3, b'E']), None);
+    }
+
+    #[test]
+    fn bluetooth_build_address_accepts_only_canonical_mac_text() {
+        assert!(valid_bluetooth_address("4C:23:38:A6:20:44"));
+        assert!(!valid_bluetooth_address("4C:23:38:A6:20"));
+        assert!(!valid_bluetooth_address("4C:23:38:A6:20:'"));
     }
 }

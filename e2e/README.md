@@ -78,15 +78,20 @@ Device S3 profile flash and reboot persistence are still exercised.
 cargo run --manifest-path e2e/mirror-runner/Cargo.toml -- \
   --host-port /dev/serial/by-id/<host-s3> \
   --device-flash-port /dev/serial/by-id/<device-s3> \
-  --ble-address 6A:EE:8F:64:11:AD
+  --ble-address 6A:EE:8F:64:11:AD \
+  --linux-controller-address 4C:23:38:A6:20:44
 ```
 
 Use `--skip-flash` to reuse loaded images. Explicit ports avoid confusing the
 two ESP32-S3 roles after Device S3 changes its native USB identity.
 `--ble-address` enables the BlueZ BLE Management, HID release/suppression and
-no-broadcast cases and expects a bonded Linux peer in `--ble-host-slot`
-(default 2). Build `tools/hidshiftctl` in release mode first or override
-`--hidshiftctl`.
+no-broadcast cases in `--ble-host-slot` (default 2). Build `tools/hidshiftctl`
+in release mode first or override `--hidshiftctl`. A flashing BLE run also
+requires the local controller address so the hardware-E2E firmware can
+authorize that peer. Because hardware-E2E bond state is volatile, a flashing
+run removes the stale BlueZ bond and pairs the peer automatically.
+`--skip-flash` preserves and reuses the existing bond unless `--pair-ble` is
+also specified.
 `--skip-hidraw` omits Vendor and Feature Report cases when local udev policy
 does not grant read/write access to `/dev/hidraw*`; evdev cases still run.
 Use `--skip-flash --spi-loss-only --device-flash-port <device-s3>` for a short
