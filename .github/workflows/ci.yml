@@ -24,7 +24,7 @@ jobs:
       - name: Install host system dependencies
         run: >-
           sudo apt-get update && sudo apt-get install --yes
-          libdbus-1-dev libudev-dev pkg-config
+          libdbus-1-dev libudev-dev libusb-1.0-0-dev pkg-config
       - run: cargo test --locked --all-targets
       - run: cargo test --locked --all-targets --features dual-s3-wired
       - run: cargo fmt --check
