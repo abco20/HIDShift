@@ -14,16 +14,20 @@ rust = {
 description = "Run the host checks used by CI in order"
 run = [
   "cargo test --locked --all-targets",
+  "cargo test --locked --all-targets --features dual-s3-wired",
   "cargo fmt --check",
   "cargo check --locked --lib",
   "cargo clippy --locked --lib -- -D warnings",
+  "cargo clippy --locked --all-targets --features dual-s3-wired -- -D warnings",
   "cargo test --locked --manifest-path tools/hidshift-client/Cargo.toml",
   "cargo test --locked --manifest-path tools/hidshiftctl/Cargo.toml",
   "cargo test --locked --all-targets --manifest-path e2e/runner/Cargo.toml",
+  "cargo test --locked --all-targets --manifest-path e2e/mirror-runner/Cargo.toml",
   "cargo check --locked --manifest-path web/Cargo.toml --target wasm32-unknown-unknown",
   "cargo fmt --check --manifest-path tools/hidshift-client/Cargo.toml",
   "cargo fmt --check --manifest-path tools/hidshiftctl/Cargo.toml",
   "cargo fmt --check --manifest-path e2e/runner/Cargo.toml",
+  "cargo fmt --check --manifest-path e2e/mirror-runner/Cargo.toml",
   "cargo fmt --check --manifest-path web/Cargo.toml",
   "python3 -m unittest discover -s tools/release -p 'test_*.py'",
 ]
@@ -74,6 +78,110 @@ cargo +esp build \
   --manifest-path firmware/Cargo.toml \
   --bin firmware \
   --target xtensa-esp32s3-none-elf
+"""
+
+[tasks."firmware:build-dual"]
+description = "Build the optional dual-S3 Host firmware"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+export_file="$MISE_PROJECT_ROOT/.mise/esp/export-esp.sh"
+if [[ ! -f "$export_file" ]]; then
+  echo "ESP toolchain is not installed. Run: mise run esp:install" >&2
+  exit 1
+fi
+source "$export_file"
+
+cargo +esp build \
+  --locked \
+  -Zbuild-std=core,alloc \
+  --release \
+  --manifest-path firmware/Cargo.toml \
+  --bin firmware \
+  --features dual-s3-wired \
+  --target xtensa-esp32s3-none-elf
+"""
+
+[tasks."device-firmware:build"]
+description = "Build the dual-S3 native USB Device firmware"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+export_file="$MISE_PROJECT_ROOT/.mise/esp/export-esp.sh"
+if [[ ! -f "$export_file" ]]; then
+  echo "ESP toolchain is not installed. Run: mise run esp:install" >&2
+  exit 1
+fi
+source "$export_file"
+
+cargo +esp build \
+  --locked \
+  -Zbuild-std=core \
+  --release \
+  --manifest-path device-firmware/Cargo.toml \
+  --bin hidshift-device \
+  --target xtensa-esp32s3-none-elf
+"""
+
+[tasks."device-firmware:check"]
+description = "Check the dual-S3 native USB Device firmware"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+export_file="$MISE_PROJECT_ROOT/.mise/esp/export-esp.sh"
+if [[ ! -f "$export_file" ]]; then
+  echo "ESP toolchain is not installed. Run: mise run esp:install" >&2
+  exit 1
+fi
+source "$export_file"
+
+cargo +esp check \
+  --locked \
+  -Zbuild-std=core \
+  --manifest-path device-firmware/Cargo.toml \
+  --bin hidshift-device \
+  --target xtensa-esp32s3-none-elf
+"""
+
+[tasks."firmware:flash-dual"]
+description = "Flash the optional dual-S3 Host firmware using HIDSHIFT_HOST_PORT"
+depends = ["firmware:build-dual"]
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+: "${HIDSHIFT_HOST_PORT:?Set HIDSHIFT_HOST_PORT to the Host S3 UART path}"
+
+export_file="$MISE_PROJECT_ROOT/.mise/esp/export-esp.sh"
+source "$export_file"
+
+espflash flash \
+  --chip esp32s3 \
+  --port "$HIDSHIFT_HOST_PORT" \
+  --partition-table partitions/bridge.csv \
+  --target-app-partition factory \
+  target/xtensa-esp32s3-none-elf/release/firmware
+"""
+
+[tasks."device-firmware:flash"]
+description = "Flash the native USB Device firmware using HIDSHIFT_DEVICE_PORT"
+depends = ["device-firmware:build"]
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+: "${HIDSHIFT_DEVICE_PORT:?Set HIDSHIFT_DEVICE_PORT to the Device S3 UART path}"
+
+export_file="$MISE_PROJECT_ROOT/.mise/esp/export-esp.sh"
+source "$export_file"
+
+espflash flash \
+  --chip esp32s3 \
+  --port "$HIDSHIFT_DEVICE_PORT" \
+  --partition-table partitions/bridge.csv \
+  --target-app-partition factory \
+  device-firmware/target/xtensa-esp32s3-none-elf/release/hidshift-device
 """
 
 [tasks."firmware:check"]

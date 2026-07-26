@@ -9,18 +9,19 @@ pub const KEYBOARD_6KRO_KEY_CAPACITY: usize = 6;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KeyboardReportBuild {
-    pub report: BleKeyboard6KroReport,
+    pub report: Keyboard6KroReport,
     pub truncated: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BleKeyboard6KroReport {
+pub struct Keyboard6KroReport {
     bytes: [u8; KEYBOARD_REPORT_LEN],
 }
 
-pub type BleKeyboardReport = BleKeyboard6KroReport;
+pub type BleKeyboard6KroReport = Keyboard6KroReport;
+pub type BleKeyboardReport = Keyboard6KroReport;
 
-impl BleKeyboard6KroReport {
+impl Keyboard6KroReport {
     pub const fn from_bytes(bytes: [u8; KEYBOARD_REPORT_LEN]) -> Self {
         Self { bytes }
     }

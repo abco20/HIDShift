@@ -9,7 +9,7 @@ publish = false
 btleplug = "0.11"
 clap = { version = "4.5", features = ["derive"] }
 futures-util = "0.3"
-hidshift = { path = "../.." }
+hidshift = { path = "../..", features = ["dual-s3-wired"] }
 hidshift-client = { path = "../hidshift-client" }
 serialport = { version = "4.8", default-features = false }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

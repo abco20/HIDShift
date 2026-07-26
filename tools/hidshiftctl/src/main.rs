@@ -9,9 +9,9 @@ use clap::{ArgGroup, Parser, Subcommand};
 use futures_util::StreamExt;
 use hidshift::{
     MANAGEMENT_REQUEST_UUID, MANAGEMENT_RESPONSE_LEN, MANAGEMENT_RESPONSE_UUID,
-    MANAGEMENT_SERVICE_UUID, ManagementCommand, ManagementHostStatus, ManagementResponse,
-    ManagementResponsePayload, ManagementResult, SETTING_DESCRIPTORS, SettingScope, SettingTarget,
-    setting_by_key,
+    MANAGEMENT_SERVICE_UUID, ManagementCommand, ManagementHostStatus, ManagementOutputTarget,
+    ManagementResponse, ManagementResponsePayload, ManagementResult, MirrorCandidateId,
+    SETTING_DESCRIPTORS, SettingScope, SettingTarget, setting_by_key,
 };
 use hidshift_client::{
     ManagementClient, PendingRequest, SerialResponseDecoder, encode_serial_request,
@@ -40,6 +40,7 @@ enum CliCommand {
     Devices,
     Diagnostics,
     History,
+    MirrorList,
     SettingsList,
     SettingDescribe {
         key: String,
@@ -90,6 +91,16 @@ enum CommandArgs {
         #[arg(value_parser = clap::value_parser!(u8).range(1..=4))]
         slot: u8,
     },
+    /// USBまたはBLEの出力先を選択・確認
+    Target {
+        #[command(subcommand)]
+        command: TargetArgs,
+    },
+    /// Dynamic USB Mirrorの対象を選択・解除
+    Mirror {
+        #[command(subcommand)]
+        command: MirrorArgs,
+    },
     /// 新しいPCやスマートフォンのペアリングを開始
     Pair {
         #[arg(value_parser = clap::value_parser!(u8).range(1..=4))]
@@ -123,6 +134,31 @@ enum CommandArgs {
         #[command(subcommand)]
         command: SettingsArgs,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum TargetArgs {
+    /// Device S3経由のWired USBを選択
+    Usb,
+    /// BLE Host slotを選択
+    Ble {
+        #[arg(value_parser = clap::value_parser!(u8).range(1..=4))]
+        slot: u8,
+    },
+    /// 選択中・稼働中の出力先とReady状態を表示
+    Status,
+}
+
+#[derive(Debug, Subcommand)]
+enum MirrorArgs {
+    /// 登録済みMirror candidateを一覧表示
+    List,
+    /// 登録済みMirror candidateを選択
+    Select { candidate: u8 },
+    /// Mirror設定を解除
+    Clear,
+    /// Mirror設定と現在のUSB presentationを表示
+    Status,
 }
 
 #[derive(Debug, Subcommand)]
@@ -174,6 +210,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             ensure_ok(response)
         }
         CliCommand::History => print_history(&arguments.transport).await,
+        CliCommand::MirrorList => print_mirror_candidates(&arguments.transport).await,
         CliCommand::SettingsList => print_settings(&arguments.transport).await,
         CliCommand::SettingDescribe { key } => {
             print_setting_description(&key)?;
@@ -352,7 +389,7 @@ async fn ble_request(
         )
         .await?;
 
-    tokio::time::timeout(timeout_duration, async {
+    let response = tokio::time::timeout(timeout_duration, async {
         while let Some(notification) = notifications.next().await {
             if notification.uuid != response_uuid
                 || notification.value.len() != MANAGEMENT_RESPONSE_LEN
@@ -362,13 +399,24 @@ async fn ble_request(
             let mut response = [0u8; MANAGEMENT_RESPONSE_LEN];
             response.copy_from_slice(&notification.value);
             if response[1] == request.request().request_id {
-                return Ok(response);
+                return Ok::<[u8; MANAGEMENT_RESPONSE_LEN], Box<dyn Error>>(response);
             }
         }
-        Err("Bluetooth notification stream ended".into())
+        Err::<[u8; MANAGEMENT_RESPONSE_LEN], Box<dyn Error>>(
+            "Bluetooth notification stream ended".into(),
+        )
     })
     .await
-    .map_err(|_| "timed out waiting for the Bluetooth response")?
+    .map_err(|_| "timed out waiting for the Bluetooth response")??;
+
+    // bluez-async removes several D-Bus match rules asynchronously when its
+    // notification stream is dropped. Let those removals finish while the
+    // session connection is still alive; otherwise short-lived CLI commands
+    // can race session teardown and panic in bluez-async's Drop task.
+    let _ = peripheral.unsubscribe(response_characteristic).await;
+    drop(notifications);
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    Ok(response)
 }
 
 async fn find_peripheral(
@@ -494,7 +542,62 @@ fn print_response(response: ManagementResponse) {
             device.flags,
             String::from_utf8_lossy(device.name_chunk())
         ),
+        ManagementResponsePayload::OutputTargetStatus(status) => {
+            println!("selected: {}", display_output_target(status.selected));
+            println!(
+                "active:   {}",
+                status
+                    .active
+                    .map(display_output_target)
+                    .unwrap_or_else(|| "none".to_owned())
+            );
+            println!("state:    {:?}", status.availability);
+            println!(
+                "wired:   {}",
+                if status.wired_ready {
+                    "ready"
+                } else {
+                    "not ready"
+                }
+            );
+            println!("ble ready mask: 0x{:02x}", status.ready_ble_mask);
+            println!("presentation: {:?}", status.effective_presentation);
+            println!("mirror configured: {}", status.mirror_configured);
+            println!("operation: {}", status.operation_id);
+        }
+        ManagementResponsePayload::MirrorCandidate(candidate) => {
+            println!(
+                "mirror[{}] {:04x}:{:04x} profile={:08x} descriptor={:08x} source={}{}{}{}",
+                candidate.candidate.0,
+                candidate.vendor_id,
+                candidate.product_id,
+                candidate.profile_hash,
+                candidate.descriptor_hash,
+                candidate
+                    .source_device
+                    .map(|device| device.to_string())
+                    .unwrap_or_else(|| "synthetic".to_owned()),
+                if candidate.selected() {
+                    " selected"
+                } else {
+                    ""
+                },
+                if candidate.active() { " active" } else { "" },
+                if candidate.synthetic() {
+                    " synthetic"
+                } else {
+                    ""
+                },
+            );
+        }
         ManagementResponsePayload::None => {}
+    }
+}
+
+fn display_output_target(target: ManagementOutputTarget) -> String {
+    match target {
+        ManagementOutputTarget::Wired => "usb".to_owned(),
+        ManagementOutputTarget::Ble(host_id) => format!("ble {}", host_id.0),
     }
 }
 
@@ -559,6 +662,27 @@ async fn print_devices(transport: &Transport) -> Result<(), Box<dyn Error>> {
                 ""
             },
         );
+    }
+    Ok(())
+}
+
+async fn print_mirror_candidates(transport: &Transport) -> Result<(), Box<dyn Error>> {
+    let mut found = 0usize;
+    for candidate in 0..4 {
+        let response = request(
+            transport,
+            ManagementCommand::GetMirrorCandidate(MirrorCandidateId(candidate)),
+        )
+        .await?;
+        if response.result == ManagementResult::NotFound {
+            continue;
+        }
+        ensure_ok(response)?;
+        print_response(response);
+        found += 1;
+    }
+    if found == 0 {
+        println!("no mirror candidates");
     }
     Ok(())
 }
@@ -909,6 +1033,23 @@ where
         CommandArgs::Select { slot } => {
             CliCommand::Request(ManagementCommand::SelectHost(hidshift::HostId(slot)))
         }
+        CommandArgs::Target { command } => match command {
+            TargetArgs::Usb => CliCommand::Request(ManagementCommand::SelectOutputTarget(
+                ManagementOutputTarget::Wired,
+            )),
+            TargetArgs::Ble { slot } => CliCommand::Request(ManagementCommand::SelectOutputTarget(
+                ManagementOutputTarget::Ble(hidshift::HostId(slot)),
+            )),
+            TargetArgs::Status => CliCommand::Request(ManagementCommand::GetOutputTargetStatus),
+        },
+        CommandArgs::Mirror { command } => match command {
+            MirrorArgs::List => CliCommand::MirrorList,
+            MirrorArgs::Select { candidate } => CliCommand::Request(
+                ManagementCommand::SetMirrorTarget(MirrorCandidateId(candidate)),
+            ),
+            MirrorArgs::Clear => CliCommand::Request(ManagementCommand::ClearMirrorTarget),
+            MirrorArgs::Status => CliCommand::Request(ManagementCommand::GetOutputTargetStatus),
+        },
         CommandArgs::Pair { slot } => {
             CliCommand::Request(ManagementCommand::StartPairing(hidshift::HostId(slot)))
         }
@@ -975,6 +1116,38 @@ mod tests {
                     name: hidshift::ManagementHostName::from_ascii("Work PC").unwrap(),
                 }),
             }
+        );
+    }
+
+    #[test]
+    fn parses_wired_and_ble_output_target_commands() {
+        assert_eq!(
+            parse_arguments(["--serial", "/dev/ttyACM0", "target", "usb"].map(str::to_owned))
+                .unwrap()
+                .command,
+            CliCommand::Request(ManagementCommand::SelectOutputTarget(
+                ManagementOutputTarget::Wired
+            ))
+        );
+        assert_eq!(
+            parse_arguments(["--ble", "target", "ble", "4"].map(str::to_owned))
+                .unwrap()
+                .command,
+            CliCommand::Request(ManagementCommand::SelectOutputTarget(
+                ManagementOutputTarget::Ble(hidshift::HostId(4))
+            ))
+        );
+        assert_eq!(
+            parse_arguments(["--ble", "target", "status"].map(str::to_owned))
+                .unwrap()
+                .command,
+            CliCommand::Request(ManagementCommand::GetOutputTargetStatus)
+        );
+        assert_eq!(
+            parse_arguments(["--ble", "mirror", "list"].map(str::to_owned))
+                .unwrap()
+                .command,
+            CliCommand::MirrorList
         );
     }
 

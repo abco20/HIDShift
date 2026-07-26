@@ -278,18 +278,7 @@ const fn hex_digit(value: u8) -> u8 {
 }
 
 pub fn crc16_ccitt_false(bytes: &[u8]) -> u16 {
-    let mut crc = 0xffffu16;
-    for byte in bytes {
-        crc ^= (*byte as u16) << 8;
-        for _ in 0..8 {
-            crc = if crc & 0x8000 != 0 {
-                (crc << 1) ^ 0x1021
-            } else {
-                crc << 1
-            };
-        }
-    }
-    crc
+    crate::checksum::crc16_ccitt_false(bytes)
 }
 
 #[cfg(test)]

@@ -1,18 +1,18 @@
-use crate::input::{MouseButtons, MouseMovement, MouseReport};
+use crate::input::{MouseButtons, MouseInputReport, MouseMovement};
 
 pub const MOUSE_REPORT_ID: u8 = 2;
 pub const MOUSE_REPORT_LEN: usize = 5;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BleMouseReport {
+pub struct MouseReport {
     bytes: [u8; MOUSE_REPORT_LEN],
 }
 
-impl BleMouseReport {
+impl MouseReport {
     pub const fn from_bytes(bytes: [u8; MOUSE_REPORT_LEN]) -> Self {
         Self { bytes }
     }
-    pub const fn from_mouse(report: MouseReport) -> Self {
+    pub const fn from_mouse(report: MouseInputReport) -> Self {
         Self {
             bytes: [
                 report.buttons.bits(),
@@ -47,6 +47,8 @@ impl BleMouseReport {
     }
 }
 
+pub type BleMouseReport = MouseReport;
+
 const fn clamp_i16_to_i8(value: i16) -> i8 {
     if value > i8::MAX as i16 {
         i8::MAX
@@ -68,7 +70,7 @@ mod tests {
         buttons.set(MouseButton::Left, true);
         buttons.set(MouseButton::Forward, true);
 
-        let report = BleMouseReport::from_mouse(MouseReport {
+        let report = BleMouseReport::from_mouse(MouseInputReport {
             buttons,
             x: -3,
             y: 4,

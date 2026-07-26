@@ -49,6 +49,33 @@ pub enum RuntimeInputMessage {
         name: crate::storage::FixedName,
     },
     DiagnosticsEvent(RuntimeDiagnosticsEvent),
+    #[cfg(feature = "dual-s3-wired")]
+    DeviceCommandRequested(crate::runtime::DeviceTaskCommand),
+    #[cfg(feature = "dual-s3-wired")]
+    DeviceProfileResult(crate::interchip::ProfileResult),
+    #[cfg(feature = "dual-s3-wired")]
+    MirrorEndpointOut(crate::interchip::RawEndpointReport),
+    #[cfg(feature = "dual-s3-wired")]
+    MirrorEndpointIn {
+        device_id: DeviceId,
+        report: crate::interchip::RawEndpointReport,
+    },
+    #[cfg(feature = "dual-s3-wired")]
+    MirrorControlRequest(crate::interchip::MirrorControlRequest),
+    #[cfg(feature = "dual-s3-wired")]
+    MirrorControlCompleted(crate::interchip::MirrorControlResponse),
+    #[cfg(all(feature = "dual-s3-wired", feature = "hardware-e2e"))]
+    SyntheticMirrorControlResponse(crate::interchip::MirrorControlResponse),
+    #[cfg(feature = "dual-s3-wired")]
+    DeviceUsbState(crate::interchip::UsbState),
+    #[cfg(feature = "dual-s3-wired")]
+    MirrorCandidateRegistered {
+        candidate: crate::output_target::MirrorCandidateId,
+        stable_id: crate::output_target::MirrorStableId,
+        profile_hash: Option<u32>,
+        synthetic: bool,
+        source_device: Option<DeviceId>,
+    },
     RestoreStorage(StorageState),
 }
 
@@ -106,6 +133,43 @@ impl RuntimeInputMessage {
                 name: *name,
             },
             Self::DiagnosticsEvent(event) => RuntimeInput::DiagnosticsEvent(*event),
+            #[cfg(feature = "dual-s3-wired")]
+            Self::DeviceCommandRequested(command) => RuntimeInput::DeviceCommandRequested(*command),
+            #[cfg(feature = "dual-s3-wired")]
+            Self::DeviceProfileResult(result) => RuntimeInput::DeviceProfileResult(*result),
+            #[cfg(feature = "dual-s3-wired")]
+            Self::MirrorEndpointOut(report) => RuntimeInput::MirrorEndpointOut(*report),
+            #[cfg(feature = "dual-s3-wired")]
+            Self::MirrorEndpointIn { device_id, report } => RuntimeInput::MirrorEndpointIn {
+                device_id: *device_id,
+                report: *report,
+            },
+            #[cfg(feature = "dual-s3-wired")]
+            Self::MirrorControlRequest(request) => RuntimeInput::MirrorControlRequest(*request),
+            #[cfg(feature = "dual-s3-wired")]
+            Self::MirrorControlCompleted(response) => {
+                RuntimeInput::MirrorControlCompleted(*response)
+            }
+            #[cfg(all(feature = "dual-s3-wired", feature = "hardware-e2e"))]
+            Self::SyntheticMirrorControlResponse(response) => {
+                RuntimeInput::SyntheticMirrorControlResponse(*response)
+            }
+            #[cfg(feature = "dual-s3-wired")]
+            Self::DeviceUsbState(state) => RuntimeInput::DeviceUsbState(*state),
+            #[cfg(feature = "dual-s3-wired")]
+            Self::MirrorCandidateRegistered {
+                candidate,
+                stable_id,
+                profile_hash,
+                synthetic,
+                source_device,
+            } => RuntimeInput::MirrorCandidateRegistered {
+                candidate: *candidate,
+                stable_id: *stable_id,
+                profile_hash: *profile_hash,
+                synthetic: *synthetic,
+                source_device: *source_device,
+            },
             Self::RestoreStorage(storage) => RuntimeInput::RestoreStorage(storage),
         }
     }
@@ -163,6 +227,44 @@ impl TryFrom<RuntimeInput<'_>> for RuntimeInputMessage {
                 Ok(Self::HostNameDiscovered { host_id, name })
             }
             RuntimeInput::DiagnosticsEvent(event) => Ok(Self::DiagnosticsEvent(event)),
+            #[cfg(feature = "dual-s3-wired")]
+            RuntimeInput::DeviceCommandRequested(command) => {
+                Ok(Self::DeviceCommandRequested(command))
+            }
+            #[cfg(feature = "dual-s3-wired")]
+            RuntimeInput::DeviceProfileResult(result) => Ok(Self::DeviceProfileResult(result)),
+            #[cfg(feature = "dual-s3-wired")]
+            RuntimeInput::MirrorEndpointOut(report) => Ok(Self::MirrorEndpointOut(report)),
+            #[cfg(feature = "dual-s3-wired")]
+            RuntimeInput::MirrorEndpointIn { device_id, report } => {
+                Ok(Self::MirrorEndpointIn { device_id, report })
+            }
+            #[cfg(feature = "dual-s3-wired")]
+            RuntimeInput::MirrorControlRequest(request) => Ok(Self::MirrorControlRequest(request)),
+            #[cfg(feature = "dual-s3-wired")]
+            RuntimeInput::MirrorControlCompleted(response) => {
+                Ok(Self::MirrorControlCompleted(response))
+            }
+            #[cfg(all(feature = "dual-s3-wired", feature = "hardware-e2e"))]
+            RuntimeInput::SyntheticMirrorControlResponse(response) => {
+                Ok(Self::SyntheticMirrorControlResponse(response))
+            }
+            #[cfg(feature = "dual-s3-wired")]
+            RuntimeInput::DeviceUsbState(state) => Ok(Self::DeviceUsbState(state)),
+            #[cfg(feature = "dual-s3-wired")]
+            RuntimeInput::MirrorCandidateRegistered {
+                candidate,
+                stable_id,
+                profile_hash,
+                synthetic,
+                source_device,
+            } => Ok(Self::MirrorCandidateRegistered {
+                candidate,
+                stable_id,
+                profile_hash,
+                synthetic,
+                source_device,
+            }),
             RuntimeInput::RestoreStorage(storage) => Ok(Self::RestoreStorage(storage.clone())),
         }
     }
@@ -338,6 +440,36 @@ mod tests {
         assert_eq!(frame.report_id, Some(ReportId(1)));
         assert_eq!(frame.direction, HidDirection::Input);
         assert_eq!(frame.payload(), &[0xaa, 0xbb]);
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    #[test]
+    fn profile_result_message_reaches_runtime_without_transport_borrowing() {
+        let result = crate::interchip::ProfileResult {
+            transfer_id: 7,
+            profile_hash: 9,
+            status: crate::interchip::ProfileResultStatus::Accepted,
+            reject_reason: 0,
+            detail: 0,
+        };
+        let message = RuntimeInputMessage::DeviceProfileResult(result);
+        assert_eq!(
+            message.as_runtime_input(),
+            RuntimeInput::DeviceProfileResult(result)
+        );
+
+        let command =
+            crate::runtime::DeviceTaskCommand::ProfileBegin(crate::interchip::ProfileBegin {
+                transfer_id: 1,
+                total_length: 32,
+                crc32: 2,
+                profile_hash: 3,
+            });
+        let message = RuntimeInputMessage::DeviceCommandRequested(command);
+        assert_eq!(
+            message.as_runtime_input(),
+            RuntimeInput::DeviceCommandRequested(command)
+        );
     }
 
     #[test]

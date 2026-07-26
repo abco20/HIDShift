@@ -9,7 +9,7 @@ publish = false
 futures-channel = "0.3"
 futures-util = "0.3"
 gloo-timers = { version = "0.3", features = ["futures"] }
-hidshift = { path = ".." }
+hidshift = { path = "..", features = ["dual-s3-wired"] }
 hidshift-client = { path = "../tools/hidshift-client" }
 js-sys = "0.3"
 leptos = { version = "0.8.20", features = ["csr"] }

@@ -1,0 +1,108 @@
+# Optional dual-S3 Wired USB and HID Mirror
+
+The `dual-s3-wired` feature keeps Host S3 responsible for USB Host, BLE, input
+aggregation, routing, and management. Device S3 is a dedicated native USB HID
+Device. The default firmware does not include this path and runs on one
+ESP32-S3.
+
+## Wiring
+
+Connect a common ground and only these four SPI signals:
+
+| Signal | Host S3 | Device S3 |
+| --- | --- | --- |
+| CS | GPIO10 output | GPIO10 input |
+| MOSI | GPIO11 output | GPIO11 input |
+| SCLK | GPIO12 output | GPIO12 input |
+| MISO | GPIO13 input | GPIO13 output |
+
+The link uses SPI2, mode 0, MSB first, 10 MHz, DMA, and fixed 128-byte
+transactions. Host S3 is master and polls every 500 µs. No READY, IRQ, or reset
+wire is used. Device S3 native USB uses GPIO19 D- and GPIO20 D+.
+
+## Output and presentation
+
+Exactly one output is active: Wired USB or BLE host 1–4. A disconnected or
+unready selection becomes inactive and never fails over. Target switching
+releases the old target, suppresses inputs already held, sends a neutral state
+to the new target, and only then activates it.
+
+A BLE target is Ready for selection and GPIO0 cycling only when its Keyboard
+notification path is ready. Mouse and Consumer reports still use their own
+CCCD readiness and are never broadcast to another target.
+
+Mirror selection is stored separately:
+
+- Wired without an available Mirror uses `HIDShift Wired`, a driverless
+  Keyboard + Mouse + Consumer composite HID.
+- Wired with an available Mirror presents that device's validated descriptors
+  and forwards raw interrupt and HID control reports without Report ID
+  rewriting.
+- BLE always uses normalized aggregated input. Device S3 remains neutral
+  Fallback USB and the saved Mirror selection is retained.
+
+Fallback is a built-in MirrorImage and uses the same parser, validator,
+endpoint planner, descriptor path, and dynamic USB state machine as mirrored
+devices. Only its standard HID report adaptation and class semantics are
+profile-specific.
+
+Only one Full-Speed, HID-only, single-configuration device can be mirrored.
+Up to four HID interfaces, four IN endpoints, four OUT endpoints, 64-byte
+interrupt packets, and a 16 KiB MirrorImage are accepted. Bulk, isochronous,
+non-HID interfaces, alternate settings, and multiple configurations are
+rejected before activation. A source device's Remote Wakeup capability is
+preserved in the Configuration Descriptor, including the standard
+SET/CLEAR_FEATURE and GET_STATUS state. Fallback also advertises Remote
+Wakeup. While USB is suspended, Device S3 emits one 10 ms resume signal for
+the first standard or mirrored input only when the PC has enabled Remote
+Wakeup. The pulse is advanced by the normal main loop instead of a blocking
+delay, so the fixed 500 us SPI polling schedule remains serviced.
+
+## Build and flash
+
+```sh
+mise run esp:install
+mise run firmware:build-dual
+mise run device-firmware:build
+
+HIDSHIFT_HOST_PORT=/dev/serial/by-id/<host> mise run firmware:flash-dual
+HIDSHIFT_DEVICE_PORT=/dev/serial/by-id/<device> mise run device-firmware:flash
+```
+
+Host S3 connects to the USB Hub. Device S3 connects its native USB port to the
+Wired PC. Device USB contains HID only; use Host S3 BLE management during
+Mirror mode.
+
+For a non-suspend hardware check, build Device S3 with `--features
+hardware-e2e`. Its boot-only register self-test prints the following line on
+the Device S3 USB-UART and then continues normal enumeration:
+
+```text
+@HIDSHIFT-REMOTE-WAKE:clear-before=true,asserted=true,cleared=true
+```
+
+This verifies the PHY clock ungate and DCTL Remote Wakeup signal read-back.
+The production Device build omits the self-test.
+
+## Management
+
+```sh
+hidshiftctl --ble target status
+hidshiftctl --ble target usb
+hidshiftctl --ble target ble 1
+hidshiftctl --ble mirror list
+hidshiftctl --ble mirror select 0
+hidshiftctl --ble mirror clear
+```
+
+The Web UI shows routing and Mirror candidates only when firmware reports the
+dual-S3 capability. It stays connected over BLE during USB
+detach/re-enumeration.
+
+## Recovery
+
+Device S3 validates and stores profiles transactionally in two flash slots.
+Invalid images preserve the current presentation. A missing or incompatible
+SPI link falls back to `HIDShift Wired`; it never sends input to BLE
+automatically. Profile activation holds USB detached for 100 ms so the PC
+cannot retain stale descriptors across profile changes.

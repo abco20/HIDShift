@@ -156,7 +156,8 @@ mod tests {
         ConsumerFrame, ConsumerUsage, KeyUsage, ModifierState, MouseButton, MouseButtons,
         MouseFrame, MouseMovement,
     };
-    use crate::reports::{BleHidReport, BleKeyboard6KroReport, ReportKind};
+    use crate::output_target::OutputTarget;
+    use crate::reports::{Keyboard6KroReport, ReportKind, StandardHidReport};
     use crate::usb_hid::report::{
         FIELD_FLAG_VARIABLE, ReportField, USAGE_PAGE_BUTTON, USAGE_PAGE_GENERIC_DESKTOP,
         USAGE_PAGE_KEYBOARD, USAGE_X, USAGE_Y,
@@ -245,10 +246,10 @@ mod tests {
 
         assert_eq!(
             actions.as_slice(),
-            &[BridgeAction::BleNotify {
-                host_id: HOST,
-                report: BleHidReport::Keyboard(
-                    BleKeyboard6KroReport::from_visible_state(
+            &[BridgeAction::Notify {
+                target: OutputTarget::Ble(HOST),
+                report: StandardHidReport::Keyboard(
+                    Keyboard6KroReport::from_visible_state(
                         &bridge
                             .state()
                             .input
@@ -299,9 +300,9 @@ mod tests {
 
         assert_eq!(
             actions.as_slice(),
-            &[BridgeAction::BleNotify {
-                host_id: HOST,
-                report: BleHidReport::Keyboard(BleKeyboard6KroReport::release()),
+            &[BridgeAction::Notify {
+                target: OutputTarget::Ble(HOST),
+                report: StandardHidReport::Keyboard(Keyboard6KroReport::release()),
                 reason: NotifyReason::InputRelease,
             }]
         );

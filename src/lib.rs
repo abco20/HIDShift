@@ -32,11 +32,23 @@ pub mod ble_connection;
 pub mod ble_notify;
 pub mod ble_runtime;
 pub mod bridge;
+pub mod checksum;
 pub mod e2e;
+#[cfg(feature = "hardware-e2e")]
+pub mod e2e_mirror;
+#[cfg(feature = "dual-s3-wired")]
+pub mod fallback;
 pub mod ids;
 pub mod input;
+#[cfg(feature = "dual-s3-wired")]
+pub mod interchip;
 pub mod management;
+#[cfg(feature = "dual-s3-wired")]
+pub mod mirror;
 pub mod mouse_accumulator;
+pub mod output_target;
+#[cfg(feature = "dual-s3-wired")]
+pub mod remote_wakeup;
 pub mod reports;
 pub mod routing;
 pub mod runtime;
@@ -77,8 +89,13 @@ pub use ids::{
 pub use input::{
     ConsumerUsage, InputEvent, KeyCode, KeyUsage, KeyboardEvent, KeyboardFrame, KeyboardLedState,
     KeyboardSuppression, Modifier, ModifierState, MouseButton, MouseButtons, MouseFrame,
-    MouseMovement, MouseReport, PhysicalInputState, PhysicalKeyboardState, PhysicalMouseState,
+    MouseInputReport, MouseMovement, PhysicalInputState, PhysicalKeyboardState, PhysicalMouseState,
     StandardInputFrame, VisibleKeyboardState,
+};
+#[cfg(feature = "dual-s3-wired")]
+pub use management::{
+    MANAGEMENT_CAPABILITY_DUAL_S3_WIRED, ManagementMirrorCandidate, ManagementOutputTarget,
+    ManagementOutputTargetStatus, ManagementUsbPresentationKind,
 };
 pub use management::{
     MANAGEMENT_PROTOCOL_VERSION, MANAGEMENT_REQUEST_LEN, MANAGEMENT_REQUEST_UUID,
@@ -89,13 +106,26 @@ pub use management::{
     ManagementSchema, ManagementSetting, ManagementStatus, ManagementUsbDevice,
     ManagementUsbStatus,
 };
+#[cfg(feature = "dual-s3-wired")]
+pub use mirror::{
+    CapturedMirrorProfile, MirrorCandidateError, MirrorCandidateMetadata, MirrorCandidateRegistry,
+    MirrorCandidateRegistryError, MirrorCandidateSource, MirrorCaptureError, MirrorCaptureSource,
+    capture_mirror_profile,
+};
+pub use output_target::{
+    MIRROR_PORT_PATH_MAX_LEN, MirrorCandidateId, MirrorConfiguration, MirrorStableId,
+    MirrorStableIdError, OutputTarget, OutputTargetAvailability, OutputTargetState,
+    StoredMirrorTarget, StoredOutputTarget, StoredPresentationConfig, UsbPresentation,
+    effective_presentation,
+};
 pub use reports::{
     BLE_HID_INPUT_REPORT_MAX_LEN, BLE_HID_NOTIFICATIONS_PER_REPORT_MAX, BLE_HID_NOTIFY_MAX_LEN,
     BleConsumerReport, BleHidCharacteristic, BleHidInputReport, BleHidNotification,
     BleHidNotificationError, BleHidReport, BleKeyboard6KroReport, BleKeyboardLedOutputReport,
-    BleKeyboardOutputError, BleKeyboardReport, BleMouseReport, FEATURE_REPORT_TYPE,
-    HID_INFORMATION, INPUT_REPORT_TYPE, KeyboardReportBuild, OUTPUT_REPORT_TYPE, ReportKind,
-    V1_COMBINED_REPORT_MAP, notifications_for_input_report, report_id, report_type,
+    BleKeyboardOutputError, BleKeyboardReport, BleMouseReport, ConsumerReport, FEATURE_REPORT_TYPE,
+    HID_INFORMATION, INPUT_REPORT_TYPE, Keyboard6KroReport, KeyboardReportBuild, MouseReport,
+    OUTPUT_REPORT_TYPE, ReportKind, StandardHidReport, V1_COMBINED_REPORT_MAP,
+    notifications_for_input_report, report_id, report_type,
 };
 pub use routing::{ActiveTargetError, HostRouter};
 pub use runtime::{
@@ -110,8 +140,8 @@ pub use runtime::{
     RUNTIME_USB_INTERFACES_MAX, RuntimeCapacities, RuntimeCommand, RuntimeCommandQueues,
     RuntimeCommandVec, RuntimeCounters, RuntimeDiagnosticsEvent, RuntimeDispatchError,
     RuntimeError, RuntimeInput, StatusSnapshot, StatusTaskCommand, StatusTaskCommandVec,
-    StorageTaskCommand, StorageTaskCommandVec, UsbHidInterfaceRuntimeState, UsbTaskCommand,
-    UsbTaskCommandVec,
+    StorageTaskCommand, StorageTaskCommandVec, UsbHidInterfaceRuntimeState, UsbHostTaskCommand,
+    UsbHostTaskCommandVec,
     bootstrap::prepare_ready_host,
     driver::{
         RuntimeDriverError, RuntimeTaskKind, RuntimeTaskSink, dispatch_runtime_queues,
@@ -122,6 +152,8 @@ pub use runtime::{
     },
     owner::{DefaultRuntimeOwner, RuntimeOwner, RuntimeOwnerError},
 };
+#[cfg(feature = "dual-s3-wired")]
+pub use runtime::{DeviceTaskCommand, RUNTIME_DEVICE_COMMAND_QUEUE_CAPACITY};
 pub use settings::{
     GlobalSettings, HostSettings, SETTING_COUNT, SETTING_DESCRIPTORS, SETTINGS_SCHEMA_HASH,
     SETTINGS_SCHEMA_VERSION, SettingChoice, SettingDescriptor, SettingId, SettingScope,

@@ -41,7 +41,7 @@ impl MouseMovement {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MouseReport {
+pub struct MouseInputReport {
     pub buttons: MouseButtons,
     pub x: i8,
     pub y: i8,
@@ -49,7 +49,7 @@ pub struct MouseReport {
     pub pan: i8,
 }
 
-impl MouseReport {
+impl MouseInputReport {
     pub const fn neutral() -> Self {
         Self {
             buttons: MouseButtons::empty(),

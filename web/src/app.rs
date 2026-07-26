@@ -1,10 +1,12 @@
 use std::rc::Rc;
 
 use hidshift::{
-    HostId, ManagementCommand, ManagementDiagnostics, ManagementHistoryEvent, ManagementHostName,
-    ManagementHostStatus, ManagementHostTiming, ManagementResponse, ManagementResponsePayload,
-    ManagementResult, ManagementSchema, ManagementStatus, SETTING_DESCRIPTORS, SettingDescriptor,
-    SettingScope, SettingTarget,
+    HostId, MANAGEMENT_CAPABILITY_DUAL_S3_WIRED, ManagementCommand, ManagementDiagnostics,
+    ManagementHistoryEvent, ManagementHostName, ManagementHostStatus, ManagementHostTiming,
+    ManagementMirrorCandidate, ManagementOutputTarget, ManagementOutputTargetStatus,
+    ManagementResponse, ManagementResponsePayload, ManagementResult, ManagementSchema,
+    ManagementStatus, MirrorCandidateId, SETTING_DESCRIPTORS, SettingDescriptor, SettingScope,
+    SettingTarget,
 };
 use leptos::prelude::*;
 use send_wrapper::SendWrapper;
@@ -43,6 +45,8 @@ pub fn App() -> impl IntoView {
     let schema = RwSignal::new(None::<ManagementSchema>);
     let history = RwSignal::new(Vec::<ManagementHistoryEvent>::new());
     let settings = RwSignal::new(Vec::<SettingView>::new());
+    let output_status = RwSignal::new(None::<ManagementOutputTargetStatus>);
+    let mirror_candidates = RwSignal::new(Vec::<ManagementMirrorCandidate>::new());
     let connection = RwSignal::new("未接続".to_owned());
     let connected = RwSignal::new(false);
     let busy = RwSignal::new(false);
@@ -74,6 +78,8 @@ pub fn App() -> impl IntoView {
                         schema,
                         history,
                         settings,
+                        output_status,
+                        mirror_candidates,
                     )
                     .await
                 }
@@ -135,6 +141,8 @@ pub fn App() -> impl IntoView {
     };
     let slot_send = send.clone();
     let setting_send = send.clone();
+    let output_send = send.clone();
+    let mirror_send = send.clone();
 
     view! {
         <main>
@@ -166,11 +174,77 @@ pub fn App() -> impl IntoView {
             </p>
 
             <section class="summary" aria-label="現在の状態">
-                <article class="summary-primary"><span>"現在の接続先"</span><strong>{move || display_host(status.get().and_then(|s| s.active_host), &names.get())}</strong><small>{move || status.get().and_then(|s| s.active_host).map(|_| "キーボード・マウス入力の送信先").unwrap_or("接続後に選択できます")}</small></article>
+                <article class="summary-primary"><span>"現在の接続先"</span><strong>{move || display_output(output_status.get(), status.get(), &names.get())}</strong><small>{move || output_status.get().map(|value| if value.active.is_some() { "キーボード・マウス入力の送信先" } else { "選択先の準備待ち（自動切替なし）" }).unwrap_or("接続後に選択できます")}</small></article>
                 <article><span>"USB入力機器"</span><strong>{move || status.get().map(|s| format!("{} 台", s.usb.device_count)).unwrap_or_else(|| "—".into())}</strong><small>{move || status.get().map(|s| format!("HIDインターフェース {}個", s.usb.interface_count)).unwrap_or_else(|| "未取得".into())}</small></article>
                 <article><span>"ペアリング"</span><strong>{move || status.get().and_then(|s| s.pairing_host).map(|host| display_host(Some(host), &names.get())).unwrap_or_else(|| "待機中".into())}</strong><small>"新しいPCやスマートフォンを追加"</small></article>
                 <article><span>"システム"</span><strong>{move || if connected.get() { "正常稼働" } else { "未確認" }}</strong><small>{move || diagnostics.get().map(|d| format!("稼働 {} · BLE切断 {}回", format_duration(d.uptime_seconds), d.ble_disconnect_count)).unwrap_or_else(|| "接続すると状態を確認できます".into())}</small></article>
             </section>
+
+            {move || {
+                let output_send = output_send.clone();
+                let mirror_send = mirror_send.clone();
+                output_status.get().map(|output| view! {
+                <section class="content-section output-routing">
+                    <div class="section-title">
+                        <div><p class="section-kicker">"ROUTING"</p><h2>"入力の送信先"</h2><p>"USBまたはReadyなBluetooth Hostを1台だけ選びます。切断時に別のPCへ自動送信しません。"</p></div>
+                    </div>
+                    <div class="target-picker">
+                        <button
+                            class:secondary=output.selected != ManagementOutputTarget::Wired
+                            disabled=move || busy.get() || output.selected == ManagementOutputTarget::Wired
+                            on:click={
+                                let send = output_send.clone();
+                                move |_| send(ManagementCommand::SelectOutputTarget(ManagementOutputTarget::Wired))
+                            }
+                        >{if output.selected == ManagementOutputTarget::Wired { "✓ Wired USB" } else { "Wired USBへ切替" }}</button>
+                        {(1..=4).map(|slot| {
+                            let target = ManagementOutputTarget::Ble(HostId(slot));
+                            let ready = output.ready_ble_mask & (1 << (slot - 1)) != 0;
+                            let send = output_send.clone();
+                            view! {
+                                <button
+                                    class:secondary=output.selected != target
+                                    disabled=move || busy.get() || !ready || output.selected == target
+                                    on:click=move |_| send(ManagementCommand::SelectOutputTarget(target))
+                                >{if output.selected == target { format!("✓ BLE {}", slot) } else { format!("BLE {}", slot) }}</button>
+                            }
+                        }).collect_view()}
+                    </div>
+                    <div class="mirror-panel">
+                        <div class="mirror-heading">
+                            <div><h3>"USB Mirror Presentation"</h3><p>"Wired選択時だけ、物理USB機器のDescriptor・Raw Report・Feature ReportをPCへ転送します。"</p></div>
+                            <button class="quiet compact" disabled=move || busy.get() || !output.mirror_configured on:click={
+                                let send = mirror_send.clone();
+                                move |_| send(ManagementCommand::ClearMirrorTarget)
+                            }>"標準HIDへ戻す"</button>
+                        </div>
+                        <div class="mirror-grid">
+                            {move || if mirror_candidates.get().is_empty() {
+                                view! { <div class="empty compact-empty"><strong>"Mirror対応機器はありません"</strong><p>"Host S3のUSB HubへFull-Speed HID機器を接続してください。"</p></div> }.into_any()
+                            } else {
+                                mirror_candidates.get().into_iter().map(|candidate| {
+                                    let send = mirror_send.clone();
+                                    let source_name = mirror_source_name(candidate, &usb_devices.get());
+                                    view! {
+                                        <article class:active=candidate.active() class="mirror-card">
+                                            <div><strong>{source_name}</strong><code>{format!("{:04x}:{:04x}", candidate.vendor_id, candidate.product_id)}</code></div>
+                                            <div class="badges">
+                                                {candidate.selected().then(|| view! { <span class="badge selected">"保存中"</span> })}
+                                                {candidate.active().then(|| view! { <span class="badge live">"USBへ提示中"</span> })}
+                                                {candidate.synthetic().then(|| view! { <span class="badge">"Synthetic"</span> })}
+                                            </div>
+                                            <button disabled=move || busy.get() || candidate.selected() on:click=move |_| send(ManagementCommand::SetMirrorTarget(candidate.candidate))>{if candidate.selected() { "選択済み" } else { "Mirror対象に選択" }}</button>
+                                        </article>
+                                    }
+                                }).collect_view().into_any()
+                            }}
+                        </div>
+                        <p class="management-note"><strong>"Mirror中の管理:"</strong>" Device S3のUSBには管理用interfaceを追加しません。この画面はBluetooth経由で接続したまま利用できます。Wiredへ切替えて再列挙中でも、BLE Management接続は維持されます。"</p>
+                        <p class="presentation-state">{format!("USB presentation: {:?} · operation {}", output.effective_presentation, output.operation_id)}</p>
+                    </div>
+                </section>
+                })
+            }}
 
             <section class="content-section">
                 <div class="section-title">
@@ -229,6 +303,8 @@ async fn refresh_all(
     schema_signal: RwSignal<Option<ManagementSchema>>,
     history: RwSignal<Vec<ManagementHistoryEvent>>,
     settings: RwSignal<Vec<SettingView>>,
+    output_status: RwSignal<Option<ManagementOutputTargetStatus>>,
+    mirror_candidates: RwSignal<Vec<ManagementMirrorCandidate>>,
 ) -> Result<(), BrowserClientError> {
     let response = client.request(ManagementCommand::GetStatus).await?;
     ensure_ok(response)?;
@@ -328,6 +404,34 @@ async fn refresh_all(
             ));
         }
         schema_signal.set(Some(value));
+        if value.capabilities & MANAGEMENT_CAPABILITY_DUAL_S3_WIRED != 0 {
+            let response = client
+                .request(ManagementCommand::GetOutputTargetStatus)
+                .await?;
+            ensure_ok(response)?;
+            if let ManagementResponsePayload::OutputTargetStatus(value) = response.payload {
+                output_status.set(Some(value));
+            }
+            let mut candidates = Vec::new();
+            for candidate in 0..4 {
+                let response = client
+                    .request(ManagementCommand::GetMirrorCandidate(MirrorCandidateId(
+                        candidate,
+                    )))
+                    .await?;
+                if response.result == ManagementResult::NotFound {
+                    continue;
+                }
+                ensure_ok(response)?;
+                if let ManagementResponsePayload::MirrorCandidate(value) = response.payload {
+                    candidates.push(value);
+                }
+            }
+            mirror_candidates.set(candidates);
+        } else {
+            output_status.set(None);
+            mirror_candidates.set(Vec::new());
+        }
     }
     let mut values = Vec::new();
     for descriptor in SETTING_DESCRIPTORS {
@@ -575,6 +679,39 @@ fn display_host(host: Option<HostId>, names: &[String; 4]) -> String {
         }
     })
     .unwrap_or_else(|| "なし".into())
+}
+
+fn display_output(
+    output: Option<ManagementOutputTargetStatus>,
+    legacy: Option<ManagementStatus>,
+    names: &[String; 4],
+) -> String {
+    match output.and_then(|value| value.active) {
+        Some(ManagementOutputTarget::Wired) => "Wired USB".into(),
+        Some(ManagementOutputTarget::Ble(host)) => display_host(Some(host), names),
+        None if output.is_some() => "準備待ち".into(),
+        None => display_host(legacy.and_then(|value| value.active_host), names),
+    }
+}
+
+fn mirror_source_name(candidate: ManagementMirrorCandidate, devices: &[UsbDeviceView]) -> String {
+    candidate
+        .source_device
+        .and_then(|device_id| {
+            devices
+                .iter()
+                .find(|device| device.device_id == device_id)
+                .map(|device| device.name.as_str())
+        })
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            if candidate.synthetic() {
+                format!("Synthetic Candidate {}", candidate.candidate.0)
+            } else {
+                format!("USB Mirror Candidate {}", candidate.candidate.0)
+            }
+        })
 }
 
 fn format_duration(seconds: u32) -> String {
