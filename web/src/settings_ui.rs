@@ -7,7 +7,7 @@ use hidshift::{
 use leptos::prelude::*;
 use send_wrapper::SendWrapper;
 
-use crate::app::SettingView;
+use crate::state::SettingView;
 
 type CommandSender = SendWrapper<Rc<dyn Fn(ManagementCommand)>>;
 

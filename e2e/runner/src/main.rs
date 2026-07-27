@@ -31,6 +31,8 @@ use metrics::{
 const DUT_BAUD_RATE: u32 = 115_200;
 const PROBE_BAUD_RATE: u32 = 115_200;
 const DUT_CHIP: &str = "esp32s3";
+const DUT_MAC: &str = "68:ee:8f:64:11:ac";
+const S3_PROBE_MAC: &str = "68:ee:8f:63:94:a0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum ProbeChip {
@@ -76,10 +78,10 @@ struct Args {
     dut_port: Option<PathBuf>,
     #[arg(long)]
     probe_port: Option<PathBuf>,
-    /// Required with --skip-flash so discovery does not reset the loaded probe.
+    /// Required with --reuse-firmware so discovery does not reset the loaded probe.
     #[arg(long, value_enum)]
     probe_chip: Option<ProbeChip>,
-    #[arg(long)]
+    #[arg(long = "reuse-firmware", alias = "skip-flash")]
     skip_flash: bool,
     #[arg(long)]
     skip_linux: bool,
@@ -425,7 +427,7 @@ fn resolve_ports(args: &Args, repo: &Path) -> Result<(PathBuf, PathBuf, ProbeChi
         if args.skip_flash {
             let probe_chip = args
                 .probe_chip
-                .context("--skip-flash requires --probe-chip with explicit ports")?;
+                .context("--reuse-firmware requires --probe-chip with explicit ports")?;
             return Ok((dut.clone(), probe.clone(), probe_chip));
         }
         verify_chip(repo, dut, DUT_CHIP)?;
@@ -442,7 +444,7 @@ fn resolve_ports(args: &Args, repo: &Path) -> Result<(PathBuf, PathBuf, ProbeChi
     );
     ensure!(
         !args.skip_flash,
-        "--skip-flash requires --dut-port, --probe-port, and --probe-chip to avoid resetting boards during discovery"
+        "--reuse-firmware requires --dut-port, --probe-port, and --probe-chip to avoid resetting boards during discovery"
     );
 
     let candidates = serial_by_path_candidates(Path::new("/dev/serial/by-path"))?;
@@ -463,23 +465,37 @@ fn resolve_ports(args: &Args, repo: &Path) -> Result<(PathBuf, PathBuf, ProbeChi
     }
     let mut esp32 = Vec::new();
     let mut esp32s3 = Vec::new();
-    for ((chip, _), path) in boards {
+    for ((chip, mac), path) in boards {
         match ProbeChip::from_espflash(&chip) {
-            Some(ProbeChip::Esp32) => esp32.push(path),
-            Some(ProbeChip::Esp32S3) => esp32s3.push(path),
+            Some(ProbeChip::Esp32) => esp32.push((mac, path)),
+            Some(ProbeChip::Esp32S3) => esp32s3.push((mac, path)),
             None => {}
         }
     }
-    let dut = esp32s3.first().cloned().context("no ESP32-S3 DUT found")?;
-    if let Some(probe) = esp32.into_iter().next() {
+    let dut = esp32s3
+        .iter()
+        .find(|(mac, _)| mac.eq_ignore_ascii_case(DUT_MAC))
+        .map(|(_, path)| path.clone())
+        .context("the configured ESP32-S3 DUT MAC was not found")?;
+    if let Some((_, probe)) = esp32.into_iter().next() {
         return Ok((dut, probe, ProbeChip::Esp32));
     }
-    ensure!(
-        esp32s3.len() == 2,
-        "S3-only E2E discovery requires exactly two unique boards; found {} (use --dut-port and --probe-port)",
-        esp32s3.len()
-    );
-    Ok((dut, esp32s3[1].clone(), ProbeChip::Esp32S3))
+    let (_, s3_probe) = select_s3_roles(&esp32s3)?;
+    Ok((dut, s3_probe, ProbeChip::Esp32S3))
+}
+
+fn select_s3_roles(boards: &[(String, PathBuf)]) -> Result<(PathBuf, PathBuf)> {
+    let dut = boards
+        .iter()
+        .find(|(mac, _)| mac.eq_ignore_ascii_case(DUT_MAC))
+        .map(|(_, path)| path.clone())
+        .context("the configured ESP32-S3 DUT MAC was not found")?;
+    let probe = boards
+        .iter()
+        .find(|(mac, _)| mac.eq_ignore_ascii_case(S3_PROBE_MAC))
+        .map(|(_, path)| path.clone())
+        .context("the configured ESP32-S3 Probe MAC was not found")?;
+    Ok((dut, probe))
 }
 
 fn verify_chip(repo: &Path, port: &Path, expected: &str) -> Result<()> {
@@ -547,7 +563,7 @@ fn build_and_flash(repo: &Path, dut: &Path, probe: &Path, probe_chip: ProbeChip)
                 "--partition-table",
                 "partitions/bridge.csv",
                 "--target-app-partition",
-                "factory",
+                "ota_0",
                 "target/xtensa-esp32s3-none-elf/release/firmware",
             ]),
         repo,
@@ -2310,5 +2326,18 @@ mod tests {
                 .and_then(|rest| rest.split_whitespace().next())
         });
         assert_eq!(address, Some("02:00:00:00:00:02"));
+    }
+
+    #[test]
+    fn s3_roles_follow_hardware_identity_not_enumeration_order() {
+        let probe = (S3_PROBE_MAC.to_owned(), PathBuf::from("/dev/probe"));
+        let dut = (DUT_MAC.to_owned(), PathBuf::from("/dev/dut"));
+        let expected = (dut.1.clone(), probe.1.clone());
+
+        assert_eq!(
+            select_s3_roles(&[probe.clone(), dut.clone()]).unwrap(),
+            expected
+        );
+        assert_eq!(select_s3_roles(&[dut, probe]).unwrap(), expected);
     }
 }

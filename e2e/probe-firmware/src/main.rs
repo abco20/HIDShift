@@ -198,26 +198,30 @@ async fn probe_task(
             let _ = connection.set_bondable(true);
             let _ = connection.request_security();
 
-            let secured =
-                match with_timeout(Duration::from_secs(10), wait_for_security(&connection)).await {
-                    Ok(Some(bond)) => {
-                        if let Some(bond) = bond
-                            && let Err(error) = stack.add_bond_information(bond)
-                        {
-                            log::warn!("@HIDSHIFT-PROBE:BOND-ERROR,{:?}", error);
-                        }
-                        log::info!("@HIDSHIFT-PROBE:ENCRYPTED");
-                        true
+            let secured = match with_timeout(
+                Duration::from_secs(10),
+                wait_for_security(&stack, &connection),
+            )
+            .await
+            {
+                Ok(Some(bond)) => {
+                    if let Some(bond) = bond
+                        && let Err(error) = stack.add_bond_information(bond)
+                    {
+                        log::warn!("@HIDSHIFT-PROBE:BOND-ERROR,{:?}", error);
                     }
-                    Ok(None) => {
-                        log::warn!("@HIDSHIFT-PROBE:PAIRING-FAILED");
-                        false
-                    }
-                    Err(_) => {
-                        log::warn!("@HIDSHIFT-PROBE:PAIRING-TIMEOUT");
-                        false
-                    }
-                };
+                    log::info!("@HIDSHIFT-PROBE:ENCRYPTED");
+                    true
+                }
+                Ok(None) => {
+                    log::warn!("@HIDSHIFT-PROBE:PAIRING-FAILED");
+                    false
+                }
+                Err(_) => {
+                    log::warn!("@HIDSHIFT-PROBE:PAIRING-TIMEOUT");
+                    false
+                }
+            };
             if !secured {
                 connection.disconnect();
                 Timer::after_millis(250).await;
@@ -266,11 +270,18 @@ fn dut_address() -> Option<BdAddr> {
     Some(BdAddr::new(visible))
 }
 
-async fn wait_for_security<P: PacketPool>(
+async fn wait_for_security<C: Controller, P: PacketPool>(
+    stack: &Stack<'_, C, P>,
     connection: &Connection<'_, P>,
 ) -> Option<Option<BondInformation>> {
     loop {
         match connection.next().await {
+            ConnectionEvent::RequestConnectionParams(request) => {
+                if let Err(error) = request.accept(None, stack).await {
+                    log::warn!("@HIDSHIFT-PROBE:PARAMS-ERROR,{:?}", error);
+                    return None;
+                }
+            }
             ConnectionEvent::PairingComplete {
                 security_level,
                 bond,

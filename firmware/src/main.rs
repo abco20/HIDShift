@@ -14,6 +14,8 @@ mod platform;
 mod wired_management;
 use esp_hal::clock::CpuClock;
 use esp_hal::interrupt::software::SoftwareInterruptControl;
+#[cfg(not(feature = "dual-s3-wired"))]
+use esp_hal::system::Stack;
 use esp_hal::timer::timg::TimerGroup;
 use esp32s3_platform::ble_hid_task::BleRuntimeSnapshot;
 use esp32s3_platform::ble_hid_task::active_ble_connections;
@@ -93,9 +95,25 @@ static STATUS_COMMAND_CHANNEL: Channel<
     RUNTIME_STATUS_COMMAND_QUEUE_CAPACITY,
 > = Channel::new();
 static EXECUTOR: StaticCell<esp_rtos::embassy::Executor> = StaticCell::new();
+#[cfg(not(feature = "dual-s3-wired"))]
+const BLE_CORE_STACK_SIZE: usize = 48 * 1024;
+#[cfg(not(feature = "dual-s3-wired"))]
+static BLE_EXECUTOR: StaticCell<esp_rtos::embassy::Executor> = StaticCell::new();
+#[cfg(not(feature = "dual-s3-wired"))]
+static BLE_CORE_STACK: StaticCell<Stack<BLE_CORE_STACK_SIZE>> = StaticCell::new();
 static CHANNEL_TASK_SINK: StaticCell<ChannelTaskSink> = StaticCell::new();
+static PENDING_USB_COMMANDS: ConstStaticCell<
+    [Option<UsbHostTaskCommand>; RUNTIME_USB_COMMAND_QUEUE_CAPACITY],
+> = ConstStaticCell::new([None; RUNTIME_USB_COMMAND_QUEUE_CAPACITY]);
 static RUNTIME_OWNER_STORAGE: ConstStaticCell<DefaultRuntimeOwner> =
     ConstStaticCell::new(DefaultRuntimeOwner::new(0));
+
+#[cfg(feature = "dual-s3-wired")]
+struct BleTaskResources {
+    bt: esp_hal::peripherals::BT<'static>,
+    rng: esp_hal::peripherals::RNG<'static>,
+    adc1: esp_hal::peripherals::ADC1<'static>,
+}
 
 fn spawn_or_reset<S>(
     spawner: &Spawner,
@@ -155,6 +173,21 @@ fn run_firmware(
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let sw_ints = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     let scheduler_interrupt = sw_ints.software_interrupt0;
+    #[cfg(not(feature = "dual-s3-wired"))]
+    let ble_core_interrupt = sw_ints.software_interrupt1;
+    #[cfg(not(feature = "dual-s3-wired"))]
+    let cpu_control = peripherals.CPU_CTRL;
+    let (bt, rng, adc1) = (peripherals.BT, peripherals.RNG, peripherals.ADC1);
+    esp_rtos::start(timg0.timer0, scheduler_interrupt);
+    // The one-board image reserves the second core for the routing owner and
+    // BLE delivery. The dual-S3 image keeps USB Host, fixed-rate SPI, routing,
+    // and BLE on one explicit executor; both topologies spawn the same tasks
+    // through `spawn_runtime_and_ble`.
+    #[cfg(not(feature = "dual-s3-wired"))]
+    start_ble_core(cpu_control, ble_core_interrupt, bt, rng, adc1);
+    #[cfg(feature = "dual-s3-wired")]
+    let ble_resources = BleTaskResources { bt, rng, adc1 };
+
     let gpio0 = peripherals.GPIO0;
     let uart0 = peripherals.UART0;
     let gpio44 = peripherals.GPIO44;
@@ -171,8 +204,6 @@ fn run_firmware(
         peripherals.GPIO13,
     );
     let flash = peripherals.FLASH;
-    let (bt, rng, adc1) = (peripherals.BT, peripherals.RNG, peripherals.ADC1);
-    esp_rtos::start(timg0.timer0, scheduler_interrupt);
 
     let executor = EXECUTOR.init(esp_rtos::embassy::Executor::new());
     executor.run(|spawner| {
@@ -190,15 +221,93 @@ fn run_firmware(
                 gpio19,
                 boot_session_id,
                 flash,
-                bt,
-                rng,
-                adc1,
+                #[cfg(feature = "dual-s3-wired")]
+                ble_resources,
                 #[cfg(feature = "dual-s3-wired")]
                 mirror_spi,
             ),
             "startup",
         );
     })
+}
+
+fn init_channel_task_sink() -> &'static mut ChannelTaskSink {
+    let pending_usb = PENDING_USB_COMMANDS.take();
+    CHANNEL_TASK_SINK.init_with(|| ChannelTaskSink {
+        ble_control: BLE_CONTROL_COMMAND_CHANNEL.sender(),
+        ble_notify: BLE_NOTIFY_COMMAND_CHANNEL.sender(),
+        usb: USB_COMMAND_CHANNEL.sender(),
+        #[cfg(feature = "dual-s3-wired")]
+        device: DEVICE_COMMAND_CHANNEL.sender(),
+        storage: STORAGE_COMMAND_CHANNEL.sender(),
+        status: STATUS_COMMAND_CHANNEL.sender(),
+        mouse: MouseReportAccumulator::new(),
+        pending_usb,
+        pending_status: None,
+        status_updates_dropped: 0,
+    })
+}
+
+fn spawn_runtime_and_ble(
+    spawner: &Spawner,
+    sink: &'static mut ChannelTaskSink,
+    bt: esp_hal::peripherals::BT<'static>,
+    rng: esp_hal::peripherals::RNG<'static>,
+    adc1: esp_hal::peripherals::ADC1<'static>,
+) {
+    spawn_or_reset(
+        spawner,
+        runtime_owner_task(
+            RUNTIME_INPUT_CHANNEL.receiver(),
+            &RUNTIME_TICK_PENDING,
+            BLE_RUNTIME_BARRIER_REQUEST_CHANNEL.receiver(),
+            BLE_RUNTIME_BARRIER_DONE_CHANNEL.sender(),
+            BLE_RUNTIME_BARRIER_RESUME_CHANNEL.receiver(),
+            sink,
+        ),
+        "runtime-owner",
+    );
+    spawn_or_reset(
+        spawner,
+        esp32s3_platform::ble_hid_task::ble_host_event_task(
+            RUNTIME_INPUT_CHANNEL.sender(),
+            BLE_CONTROL_COMMAND_CHANNEL.receiver(),
+            BLE_NOTIFY_COMMAND_CHANNEL.receiver(),
+            BLE_RESTORE_CHANNEL.receiver(),
+            BLE_QUIESCE_REQUEST_CHANNEL.receiver(),
+            BLE_QUIESCE_READY_CHANNEL.sender(),
+            BLE_QUIESCE_DONE_CHANNEL.receiver(),
+            USB_BLE_QUIESCE_REQUEST_CHANNEL.receiver(),
+            USB_BLE_QUIESCE_READY_CHANNEL.sender(),
+            USB_BLE_QUIESCE_DONE_CHANNEL.receiver(),
+            BLE_RUNTIME_BARRIER_REQUEST_CHANNEL.sender(),
+            BLE_RUNTIME_BARRIER_DONE_CHANNEL.receiver(),
+            BLE_RUNTIME_BARRIER_RESUME_CHANNEL.sender(),
+            bt,
+            rng,
+            adc1,
+        ),
+        "ble-host-event",
+    );
+}
+
+#[cfg(not(feature = "dual-s3-wired"))]
+#[inline(never)]
+fn start_ble_core(
+    cpu_control: esp_hal::peripherals::CPU_CTRL<'static>,
+    ble_core_interrupt: esp_hal::interrupt::software::SoftwareInterrupt<'static, 1>,
+    bt: esp_hal::peripherals::BT<'static>,
+    rng: esp_hal::peripherals::RNG<'static>,
+    adc1: esp_hal::peripherals::ADC1<'static>,
+) {
+    let sink = init_channel_task_sink();
+    let ble_stack = BLE_CORE_STACK.init_with(Stack::new);
+    esp_rtos::start_second_core(cpu_control, ble_core_interrupt, ble_stack, move || {
+        let executor = BLE_EXECUTOR.init(esp_rtos::embassy::Executor::new());
+        executor.run(|spawner| {
+            spawn_runtime_and_ble(&spawner, sink, bt, rng, adc1);
+        })
+    });
 }
 
 #[embassy_executor::task]
@@ -214,9 +323,7 @@ async fn startup_task(
     gpio19: esp_hal::peripherals::GPIO19<'static>,
     boot_session_id: u32,
     flash: esp_hal::peripherals::FLASH<'static>,
-    bt: esp_hal::peripherals::BT<'static>,
-    rng: esp_hal::peripherals::RNG<'static>,
-    adc1: esp_hal::peripherals::ADC1<'static>,
+    #[cfg(feature = "dual-s3-wired")] ble_resources: BleTaskResources,
     #[cfg(feature = "dual-s3-wired")] mirror_spi: (
         esp_hal::peripherals::SPI2<'static>,
         esp_hal::peripherals::DMA_CH0<'static>,
@@ -226,42 +333,22 @@ async fn startup_task(
         esp_hal::peripherals::GPIO13<'static>,
     ),
 ) {
-    let runtime_owner_receiver = RUNTIME_INPUT_CHANNEL.receiver();
+    #[cfg(feature = "dual-s3-wired")]
+    {
+        let sink = init_channel_task_sink();
+        spawn_runtime_and_ble(
+            &spawner,
+            sink,
+            ble_resources.bt,
+            ble_resources.rng,
+            ble_resources.adc1,
+        );
+    }
     let storage_sender = RUNTIME_INPUT_CHANNEL.sender();
     let usb_input_sender = RUNTIME_INPUT_CHANNEL.sender();
     let usb_receiver = USB_COMMAND_CHANNEL.receiver();
     #[cfg(feature = "dual-s3-wired")]
     let device_receiver = DEVICE_COMMAND_CHANNEL.receiver();
-    let ble_control_receiver = BLE_CONTROL_COMMAND_CHANNEL.receiver();
-    let ble_notify_receiver = BLE_NOTIFY_COMMAND_CHANNEL.receiver();
-    let ble_input_sender = RUNTIME_INPUT_CHANNEL.sender();
-    let ble_restore_receiver = BLE_RESTORE_CHANNEL.receiver();
-    let sink = CHANNEL_TASK_SINK.init_with(|| ChannelTaskSink {
-        ble_control: BLE_CONTROL_COMMAND_CHANNEL.sender(),
-        ble_notify: BLE_NOTIFY_COMMAND_CHANNEL.sender(),
-        usb: USB_COMMAND_CHANNEL.sender(),
-        #[cfg(feature = "dual-s3-wired")]
-        device: DEVICE_COMMAND_CHANNEL.sender(),
-        storage: STORAGE_COMMAND_CHANNEL.sender(),
-        status: STATUS_COMMAND_CHANNEL.sender(),
-        mouse: MouseReportAccumulator::new(),
-        pending_usb: [None; RUNTIME_USB_COMMAND_QUEUE_CAPACITY],
-        pending_status: None,
-        status_updates_dropped: 0,
-    });
-
-    spawn_or_reset(
-        &spawner,
-        runtime_owner_task(
-            runtime_owner_receiver,
-            &RUNTIME_TICK_PENDING,
-            BLE_RUNTIME_BARRIER_REQUEST_CHANNEL.receiver(),
-            BLE_RUNTIME_BARRIER_DONE_CHANNEL.sender(),
-            BLE_RUNTIME_BARRIER_RESUME_CHANNEL.receiver(),
-            sink,
-        ),
-        "runtime-owner",
-    );
     let _ = RUNTIME_INPUT_CHANNEL.try_send(RuntimeInputMessage::DiagnosticsEvent(
         RuntimeDiagnosticsEvent::ResetReason(reset_reason_code),
     ));
@@ -301,28 +388,6 @@ async fn startup_task(
             USB_BLE_QUIESCE_DONE_CHANNEL.sender(),
         ),
         "usb-input-bootstrap",
-    );
-    spawn_or_reset(
-        &spawner,
-        esp32s3_platform::ble_hid_task::ble_host_event_task(
-            ble_input_sender,
-            ble_control_receiver,
-            ble_notify_receiver,
-            ble_restore_receiver,
-            BLE_QUIESCE_REQUEST_CHANNEL.receiver(),
-            BLE_QUIESCE_READY_CHANNEL.sender(),
-            BLE_QUIESCE_DONE_CHANNEL.receiver(),
-            USB_BLE_QUIESCE_REQUEST_CHANNEL.receiver(),
-            USB_BLE_QUIESCE_READY_CHANNEL.sender(),
-            USB_BLE_QUIESCE_DONE_CHANNEL.receiver(),
-            BLE_RUNTIME_BARRIER_REQUEST_CHANNEL.sender(),
-            BLE_RUNTIME_BARRIER_DONE_CHANNEL.receiver(),
-            BLE_RUNTIME_BARRIER_RESUME_CHANNEL.sender(),
-            bt,
-            rng,
-            adc1,
-        ),
-        "ble-host-event",
     );
     spawn_or_reset(
         &spawner,
@@ -591,7 +656,7 @@ struct ChannelTaskSink {
         RUNTIME_STATUS_COMMAND_QUEUE_CAPACITY,
     >,
     mouse: MouseReportAccumulator<4>,
-    pending_usb: [Option<UsbHostTaskCommand>; RUNTIME_USB_COMMAND_QUEUE_CAPACITY],
+    pending_usb: &'static mut [Option<UsbHostTaskCommand>; RUNTIME_USB_COMMAND_QUEUE_CAPACITY],
     pending_status: Option<StatusTaskCommand>,
     status_updates_dropped: u32,
 }
@@ -851,7 +916,7 @@ impl ChannelTaskSink {
     }
 
     fn flush_usb_commands(&mut self) {
-        for pending in &mut self.pending_usb {
+        for pending in self.pending_usb.iter_mut() {
             if self.usb.free_capacity() == 0 {
                 break;
             }
@@ -1010,9 +1075,7 @@ fn apply_runtime_effect(effect: hidshift::runtime::RuntimeEffect) {
             log::set_max_level(match level {
                 0 => log::LevelFilter::Error,
                 1 => log::LevelFilter::Warn,
-                2 => log::LevelFilter::Info,
-                3 => log::LevelFilter::Debug,
-                _ => log::LevelFilter::Trace,
+                _ => log::LevelFilter::Info,
             });
         }
     }

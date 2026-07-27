@@ -1,4 +1,5 @@
 [tools]
+node = "26.5.0"
 rust = {
   version = "1.95.0",
   profile = "minimal",
@@ -43,6 +44,16 @@ description = "Build the Web UI for local use"
 dir = "web"
 env = { NO_COLOR = "false" }
 run = "trunk build --release --locked"
+
+[tasks."web:test"]
+description = "Run Web UI interaction and screenshot tests"
+dir = "web"
+depends = ["web:build"]
+run = [
+  "npm install --ignore-scripts",
+  "npx playwright install chromium",
+  "npm test",
+]
 
 [tasks."esp:install"]
 description = "Install the ESP32-S3 Xtensa Rust toolchain"
@@ -161,7 +172,7 @@ espflash flash \
   --chip esp32s3 \
   --port "$HIDSHIFT_HOST_PORT" \
   --partition-table partitions/bridge.csv \
-  --target-app-partition factory \
+  --target-app-partition ota_0 \
   target/xtensa-esp32s3-none-elf/release/firmware
 """
 
@@ -180,7 +191,7 @@ espflash flash \
   --chip esp32s3 \
   --port "$HIDSHIFT_DEVICE_PORT" \
   --partition-table partitions/bridge.csv \
-  --target-app-partition factory \
+  --target-app-partition ota_0 \
   device-firmware/target/xtensa-esp32s3-none-elf/release/hidshift-device
 """
 
@@ -235,6 +246,31 @@ source "$export_file"
 espflash flash \
   --chip esp32s3 \
   --partition-table partitions/bridge.csv \
-  --target-app-partition factory \
-  target/xtensa-esp32s3-none-elf/release/firmware
+  --target-app-partition ota_0 \
+target/xtensa-esp32s3-none-elf/release/firmware
+"""
+
+[tasks."e2e:pc"]
+description = "Run the one-DUT plus Linux PC management smoke suite"
+run = "e2e/pc-smoke.sh"
+
+[tasks."e2e:radio"]
+description = "Run DUT plus Probe radio/latency suite with mandatory Linux retained connection"
+run = """
+mise exec -- cargo run --locked --manifest-path e2e/runner/Cargo.toml -- \
+  --dut-port /dev/serial/by-id/usb-1a86_USB_Single_Serial_5C84329179-if00 \
+  --probe-port /dev/serial/by-id/usb-1a86_USB_Single_Serial_5C84329358-if00 \
+  --latency-samples 200 \
+  --stability-seconds 120
+"""
+
+[tasks."e2e:dual"]
+description = "Run the dual-S3 exact USB presentation and SPI suite"
+run = """
+set -eu
+host_port="/dev/serial/by-id/usb-1a86_USB_Single_Serial_5C84329179-if00"
+device_port="/dev/serial/by-id/usb-1a86_USB_Single_Serial_5C84329358-if00"
+mise exec -- cargo run --locked --manifest-path e2e/mirror-runner/Cargo.toml -- \
+  --host-port "$host_port" \
+  --device-flash-port "$device_port"
 """

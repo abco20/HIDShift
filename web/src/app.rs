@@ -1,770 +1,655 @@
 use std::rc::Rc;
 
 use hidshift::{
-    HostId, MANAGEMENT_CAPABILITY_DUAL_S3_WIRED, ManagementCommand, ManagementDiagnostics,
-    ManagementHistoryEvent, ManagementHostName, ManagementHostStatus, ManagementHostTiming,
-    ManagementMirrorCandidate, ManagementOutputTarget, ManagementOutputTargetStatus,
-    ManagementResponse, ManagementResponsePayload, ManagementResult, ManagementSchema,
-    ManagementStatus, MirrorCandidateId, SETTING_DESCRIPTORS, SettingDescriptor, SettingScope,
-    SettingTarget,
+    HostId, ManagementCommand, ManagementDiagnostics, ManagementHistoryEvent, ManagementHostName,
+    ManagementHostStatus, ManagementOutputTarget, ManagementOutputTargetStatus, ManagementStatus,
 };
 use leptos::prelude::*;
 use send_wrapper::SendWrapper;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
-use crate::browser_client::{BrowserClient, BrowserClientError};
 use crate::settings_ui::SettingsPanel;
-use crate::transport::BrowserTransport;
+use crate::state::{AppState, Locale, Page, Theme, UsbDeviceView};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct UsbDeviceView {
-    index: u8,
-    device_id: u8,
-    vendor_id: u16,
-    product_id: u16,
-    flags: u8,
-    name: String,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct SettingView {
-    pub(crate) descriptor: &'static SettingDescriptor,
-    pub(crate) target: SettingTarget,
-    pub(crate) value: i32,
-}
+type CommandSender = SendWrapper<Rc<dyn Fn(ManagementCommand)>>;
 
 #[component]
 pub fn App() -> impl IntoView {
-    let client = BrowserClient::new();
-    let status = RwSignal::new(None::<ManagementStatus>);
-    let names = RwSignal::new(core::array::from_fn::<_, 4, _>(|_| String::new()));
-    let name_sources = RwSignal::new([0u8; 4]);
-    let timings = RwSignal::new([None::<ManagementHostTiming>; 4]);
-    let usb_devices = RwSignal::new(Vec::<UsbDeviceView>::new());
-    let diagnostics = RwSignal::new(None::<ManagementDiagnostics>);
-    let schema = RwSignal::new(None::<ManagementSchema>);
-    let history = RwSignal::new(Vec::<ManagementHistoryEvent>::new());
-    let settings = RwSignal::new(Vec::<SettingView>::new());
-    let output_status = RwSignal::new(None::<ManagementOutputTargetStatus>);
-    let mirror_candidates = RwSignal::new(Vec::<ManagementMirrorCandidate>::new());
-    let connection = RwSignal::new("未接続".to_owned());
-    let connected = RwSignal::new(false);
-    let busy = RwSignal::new(false);
-    let message = RwSignal::new(String::new());
-    let is_error = RwSignal::new(false);
-
-    let send: SendWrapper<Rc<dyn Fn(ManagementCommand)>> = {
-        let client = client.clone();
-        SendWrapper::new(Rc::new(move |command| {
-            if busy.get_untracked() {
-                return;
-            }
-            busy.set(true);
-            message.set("処理中…".into());
-            is_error.set(false);
-            let client = client.clone();
-            spawn_local(async move {
-                let result = async {
-                    let response = client.request(command).await?;
-                    ensure_ok(response)?;
-                    refresh_all(
-                        &client,
-                        status,
-                        names,
-                        name_sources,
-                        timings,
-                        usb_devices,
-                        diagnostics,
-                        schema,
-                        history,
-                        settings,
-                        output_status,
-                        mirror_candidates,
-                    )
-                    .await
-                }
-                .await;
-                match result {
-                    Ok(()) => message.set("状態を更新しました".into()),
-                    Err(error) => {
-                        message.set(client_error_message(error));
-                        is_error.set(true);
-                    }
-                }
-                busy.set(false);
-            });
-        }))
-    };
-
-    let connect_ble = connect_action(
-        client.clone(),
-        true,
-        status,
-        connection,
-        connected,
-        busy,
-        message,
-        is_error,
-        send.clone(),
-    );
-    let connect_serial = connect_action(
-        client.clone(),
-        false,
-        status,
-        connection,
-        connected,
-        busy,
-        message,
-        is_error,
-        send.clone(),
-    );
-    let refresh = {
-        let send = send.clone();
-        move |_| send(ManagementCommand::GetStatus)
-    };
-    let cancel_pairing = {
-        let send = send.clone();
-        move |_| send(ManagementCommand::CancelPairing)
-    };
-    let copy_logs = move |_| {
-        let text = history
-            .get_untracked()
-            .iter()
-            .map(format_history)
-            .collect::<Vec<_>>()
-            .join("\n");
-        spawn_local(async move {
-            if let Some(window) = web_sys::window() {
-                let _ = JsFuture::from(window.navigator().clipboard().write_text(&text)).await;
-            }
-        });
-    };
-    let slot_send = send.clone();
-    let setting_send = send.clone();
-    let output_send = send.clone();
-    let mirror_send = send.clone();
+    let state = AppState::new();
+    state.set_theme(state.theme.get_untracked());
+    let command_state = state.clone();
+    let send: CommandSender = SendWrapper::new(Rc::new(move |command| {
+        command_state.send(command);
+    }));
+    let connect_ble_state = state.clone();
+    let connect_ble: SendWrapper<Rc<dyn Fn()>> =
+        SendWrapper::new(Rc::new(move || connect_ble_state.connect(true)));
+    let connect_serial_state = state.clone();
+    let connect_serial: SendWrapper<Rc<dyn Fn()>> =
+        SendWrapper::new(Rc::new(move || connect_serial_state.connect(false)));
+    let notice_message = state.message;
+    let notice_error = state.is_error;
+    let notice_undo = state.undo;
+    let notice_locale = state.locale;
+    let undo_state = state.clone();
+    let connect_connected = state.connected;
+    let connect_busy = state.busy;
+    let connect_locale = state.locale;
+    let page_state = state.clone();
+    let page_send = send.clone();
 
     view! {
-        <main>
-            <header class="app-header">
-                <div class="brand-mark" aria-hidden="true">"H"</div>
-                <div class="brand-copy">
-                    <p class="eyebrow">"HIDShift"</p>
-                    <h1>"デバイスマネージャー"</h1>
-                    <p>"USB機器とBluetooth接続先を、ひとつの画面で管理します。"</p>
+        <div class="app-shell">
+            <aside class="sidebar">
+                <div class="brand">
+                    <span class="brand-mark" aria-hidden="true">"H"</span>
+                    <span><strong>"HIDShift"</strong><small>{move || text(state.locale.get(), "デバイス設定", "Device settings")}</small></span>
                 </div>
-            </header>
+                <nav class="nav-list" aria-label="Primary">
+                    <NavButton state=state.clone() page=Page::Home label_ja="ホーム" label_en="Home" icon="home"/>
+                    <NavButton state=state.clone() page=Page::Destinations label_ja="接続先" label_en="Destinations" icon="screen"/>
+                    <NavButton state=state.clone() page=Page::Inputs label_ja="入力機器" label_en="Inputs" icon="keyboard"/>
+                    <NavButton state=state.clone() page=Page::Settings label_ja="設定" label_en="Settings" icon="settings"/>
+                </nav>
+                <nav class="nav-support">
+                    <NavButton state=state.clone() page=Page::Support label_ja="サポート" label_en="Support" icon="support"/>
+                </nav>
+            </aside>
 
-            <section class:online=move || connected.get() class="connection-panel" aria-label="HIDShiftへの接続">
-                <div class="connection-copy">
-                    <div class="connection-label"><span class="status-dot"></span>{move || if connected.get() { "HIDShiftに接続済み" } else { "HIDShiftに接続してください" }}</div>
-                    <strong>{move || connection.get()}</strong>
-                    <p>{move || if connected.get() { "機器の状態は取得済みです。変更内容はHIDShift本体に保存されます。" } else { "普段はBluetooth、初期設定や復旧時はUSBケーブルでの接続がおすすめです。" }}</p>
-                </div>
-                <div class="connect-actions">
-                    <button class="primary" on:click=connect_ble disabled=move || busy.get()><span aria-hidden="true">"ᛒ"</span>"Bluetoothで接続"</button>
-                    <button class="secondary" on:click=connect_serial disabled=move || busy.get()><span aria-hidden="true">"⌁"</span>"USBケーブルで接続"</button>
-                    <button class="icon-button" title="状態を更新" aria-label="状態を更新" on:click=refresh disabled=move || !connected.get() || busy.get()>"↻"</button>
-                </div>
-                <p class="connection-help">"USB接続ではHIDShiftに接続したシリアルポートを選んでください。接続候補に出ない場合は、データ通信対応のUSBケーブルか確認してください。"</p>
-            </section>
-
-            <p class:error=move || is_error.get() class:visible=move || !message.get().is_empty() class="message" role="status">
-                <span aria-hidden="true">{move || if is_error.get() { "!" } else { "✓" }}</span>{move || message.get()}
-            </p>
-
-            <section class="summary" aria-label="現在の状態">
-                <article class="summary-primary"><span>"現在の接続先"</span><strong>{move || display_output(output_status.get(), status.get(), &names.get())}</strong><small>{move || output_status.get().map(|value| if value.active.is_some() { "キーボード・マウス入力の送信先" } else { "選択先の準備待ち（自動切替なし）" }).unwrap_or("接続後に選択できます")}</small></article>
-                <article><span>"USB入力機器"</span><strong>{move || status.get().map(|s| format!("{} 台", s.usb.device_count)).unwrap_or_else(|| "—".into())}</strong><small>{move || status.get().map(|s| format!("HIDインターフェース {}個", s.usb.interface_count)).unwrap_or_else(|| "未取得".into())}</small></article>
-                <article><span>"ペアリング"</span><strong>{move || status.get().and_then(|s| s.pairing_host).map(|host| display_host(Some(host), &names.get())).unwrap_or_else(|| "待機中".into())}</strong><small>"新しいPCやスマートフォンを追加"</small></article>
-                <article><span>"システム"</span><strong>{move || if connected.get() { "正常稼働" } else { "未確認" }}</strong><small>{move || diagnostics.get().map(|d| format!("稼働 {} · BLE切断 {}回", format_duration(d.uptime_seconds), d.ble_disconnect_count)).unwrap_or_else(|| "接続すると状態を確認できます".into())}</small></article>
-            </section>
-
-            {move || {
-                let output_send = output_send.clone();
-                let mirror_send = mirror_send.clone();
-                output_status.get().map(|output| view! {
-                <section class="content-section output-routing">
-                    <div class="section-title">
-                        <div><p class="section-kicker">"ROUTING"</p><h2>"入力の送信先"</h2><p>"USBまたはReadyなBluetooth Hostを1台だけ選びます。切断時に別のPCへ自動送信しません。"</p></div>
-                    </div>
-                    <div class="target-picker">
-                        <button
-                            class:secondary=output.selected != ManagementOutputTarget::Wired
-                            disabled=move || busy.get() || output.selected == ManagementOutputTarget::Wired
-                            on:click={
-                                let send = output_send.clone();
-                                move |_| send(ManagementCommand::SelectOutputTarget(ManagementOutputTarget::Wired))
-                            }
-                        >{if output.selected == ManagementOutputTarget::Wired { "✓ Wired USB" } else { "Wired USBへ切替" }}</button>
-                        {(1..=4).map(|slot| {
-                            let target = ManagementOutputTarget::Ble(HostId(slot));
-                            let ready = output.ready_ble_mask & (1 << (slot - 1)) != 0;
-                            let send = output_send.clone();
-                            view! {
-                                <button
-                                    class:secondary=output.selected != target
-                                    disabled=move || busy.get() || !ready || output.selected == target
-                                    on:click=move |_| send(ManagementCommand::SelectOutputTarget(target))
-                                >{if output.selected == target { format!("✓ BLE {}", slot) } else { format!("BLE {}", slot) }}</button>
-                            }
-                        }).collect_view()}
-                    </div>
-                    <div class="mirror-panel">
-                        <div class="mirror-heading">
-                            <div><h3>"USB Mirror Presentation"</h3><p>"Wired選択時だけ、物理USB機器のDescriptor・Raw Report・Feature ReportをPCへ転送します。"</p></div>
-                            <button class="quiet compact" disabled=move || busy.get() || !output.mirror_configured on:click={
-                                let send = mirror_send.clone();
-                                move |_| send(ManagementCommand::ClearMirrorTarget)
-                            }>"標準HIDへ戻す"</button>
-                        </div>
-                        <div class="mirror-grid">
-                            {move || if mirror_candidates.get().is_empty() {
-                                view! { <div class="empty compact-empty"><strong>"Mirror対応機器はありません"</strong><p>"Host S3のUSB HubへFull-Speed HID機器を接続してください。"</p></div> }.into_any()
+            <div class="workspace">
+                <header class="topbar">
+                    <div class="connection-state">
+                        <span class:online=move || state.connected.get() class="status-dot"></span>
+                        <span>
+                            <strong>{move || if state.connected.get() {
+                                let label = state.connection.get();
+                                if label.is_empty() { "HIDShift".into() } else { label }
                             } else {
-                                mirror_candidates.get().into_iter().map(|candidate| {
-                                    let send = mirror_send.clone();
-                                    let source_name = mirror_source_name(candidate, &usb_devices.get());
-                                    view! {
-                                        <article class:active=candidate.active() class="mirror-card">
-                                            <div><strong>{source_name}</strong><code>{format!("{:04x}:{:04x}", candidate.vendor_id, candidate.product_id)}</code></div>
-                                            <div class="badges">
-                                                {candidate.selected().then(|| view! { <span class="badge selected">"保存中"</span> })}
-                                                {candidate.active().then(|| view! { <span class="badge live">"USBへ提示中"</span> })}
-                                                {candidate.synthetic().then(|| view! { <span class="badge">"Synthetic"</span> })}
-                                            </div>
-                                            <button disabled=move || busy.get() || candidate.selected() on:click=move |_| send(ManagementCommand::SetMirrorTarget(candidate.candidate))>{if candidate.selected() { "選択済み" } else { "Mirror対象に選択" }}</button>
-                                        </article>
-                                    }
-                                }).collect_view().into_any()
-                            }}
+                                text(state.locale.get(), "未接続", "Not connected").into()
+                            }}</strong>
+                            <small>{move || current_target(state.status.get(), state.output_status.get(), &state.names.get(), state.locale.get())}</small>
+                        </span>
+                    </div>
+                    <div class="top-actions">
+                        <button class="quiet compact" on:click={
+                            let state = state.clone();
+                            move |_| state.navigate(Page::Support)
+                        }>{move || text(state.locale.get(), "ヘルプ", "Help")}</button>
+                        <button class="secondary icon-button" aria-label="Refresh" disabled=move || !state.connected.get() || state.busy.get() on:click={
+                            let state = state.clone();
+                            move |_| state.refresh()
+                        }><RefreshIcon/></button>
+                    </div>
+                </header>
+
+                <main class="content">
+                    {move || {
+                        let undo_state = undo_state.clone();
+                        (!notice_message.get().is_empty()).then(|| view! {
+                        <div class:error=move || notice_error.get() class="notice" role="status">
+                            <span>{move || notice_message.get()}</span>
+                            <span>
+                                {move || notice_undo.get().map(|_| view! {
+                                    <button class="quiet compact" on:click={
+                                        let state = undo_state.clone();
+                                        move |_| state.undo()
+                                    }>{move || text(notice_locale.get(), "元に戻す", "Undo")}</button>
+                                })}
+                                <button class="quiet compact" aria-label="Dismiss" on:click={
+                                    move |_| notice_message.set(String::new())
+                                }>"×"</button>
+                            </span>
                         </div>
-                        <p class="management-note"><strong>"Mirror中の管理:"</strong>" Device S3のUSBには管理用interfaceを追加しません。この画面はBluetooth経由で接続したまま利用できます。Wiredへ切替えて再列挙中でも、BLE Management接続は維持されます。"</p>
-                        <p class="presentation-state">{format!("USB presentation: {:?} · operation {}", output.effective_presentation, output.operation_id)}</p>
+                        })
+                    }}
+
+                    {move || (!connect_connected.get()).then(|| view! {
+                        <section class="connect-panel">
+                            <h2>{move || text(connect_locale.get(), "HIDShiftへ接続", "Connect to HIDShift")}</h2>
+                            <p>{move || text(connect_locale.get(), "普段はBluetooth、初期設定や復旧時はUSB Serialを利用できます。接続後は必要なページのデータだけを取得します。", "Use Bluetooth for everyday access or USB Serial for setup and recovery. Only the current page is loaded after connecting.")}</p>
+                            <div class="connect-actions">
+                                <button disabled=move || connect_busy.get() on:click={
+                                    let action = connect_ble.clone();
+                                    move |_| action()
+                                }>{move || text(connect_locale.get(), "Bluetoothで接続", "Connect with Bluetooth")}</button>
+                                <button class="secondary" disabled=move || connect_busy.get() on:click={
+                                    let action = connect_serial.clone();
+                                    move |_| action()
+                                }>{move || text(connect_locale.get(), "USB Serialで接続", "Connect with USB Serial")}</button>
+                            </div>
+                        </section>
+                    })}
+
+                    {move || match page_state.page.get() {
+                        Page::Home => home_page(page_state.clone(), page_send.clone()).into_any(),
+                        Page::Destinations => destinations_page(page_state.clone(), page_send.clone()).into_any(),
+                        Page::Inputs => inputs_page(page_state.clone(), page_send.clone()).into_any(),
+                        Page::Settings => settings_page(page_state.clone(), page_send.clone()).into_any(),
+                        Page::Support => support_page(page_state.clone()).into_any(),
+                    }}
+                </main>
+            </div>
+
+            <nav class="mobile-nav" aria-label="Primary">
+                <NavButton state=state.clone() page=Page::Home label_ja="ホーム" label_en="Home" icon="home"/>
+                <NavButton state=state.clone() page=Page::Destinations label_ja="接続先" label_en="Destinations" icon="screen"/>
+                <NavButton state=state.clone() page=Page::Inputs label_ja="入力" label_en="Inputs" icon="keyboard"/>
+                <NavButton state=state.clone() page=Page::Settings label_ja="設定" label_en="Settings" icon="settings"/>
+            </nav>
+        </div>
+    }
+}
+
+#[component]
+fn NavButton(
+    state: AppState,
+    page: Page,
+    label_ja: &'static str,
+    label_en: &'static str,
+    icon: &'static str,
+) -> impl IntoView {
+    let nav_state = state.clone();
+    view! {
+        <button class:active=move || state.page.get() == page class="nav-button" on:click=move |_| nav_state.navigate(page)>
+            <NavIcon name=icon/>
+            <span>{move || text(state.locale.get(), label_ja, label_en)}</span>
+        </button>
+    }
+}
+
+#[component]
+fn NavIcon(name: &'static str) -> impl IntoView {
+    let path = match name {
+        "home" => "M3 10.5 12 3l9 7.5M5 9.5V21h14V9.5M9 21v-7h6v7",
+        "screen" => "M4 5h16v11H4zM8 20h8M12 16v4",
+        "keyboard" => "M3 6h18v12H3zM6 10h.01M9 10h.01M12 10h.01M15 10h.01M18 10h.01M7 14h10",
+        "settings" => {
+            "M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7ZM19 12l2-1-2-3-2 .2-1.5-1.1-.3-2.1H9l-.4 2.1-1.5 1.1L5 8l-2 3 2 1-2 1 2 3 2.1-.2 1.5 1.1L9 19h6l.3-2.1 1.6-1.1 2.1.2 2-3-2-1Z"
+        }
+        _ => {
+            "M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20ZM9.5 9a2.5 2.5 0 1 1 4.2 1.8c-1.2 1-1.7 1.4-1.7 2.7M12 17h.01"
+        }
+    };
+    view! { <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d=path stroke-linecap="round" stroke-linejoin="round"/></svg> }
+}
+
+#[component]
+fn RefreshIcon() -> impl IntoView {
+    view! { <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M6.1 8a7 7 0 0 1 11.6-2.2L20 8M4 16l2.3 2.2A7 7 0 0 0 18 16" stroke-linecap="round" stroke-linejoin="round"/></svg> }
+}
+
+fn page_header(
+    locale: Locale,
+    title_ja: &'static str,
+    title_en: &'static str,
+    description_ja: &'static str,
+    description_en: &'static str,
+) -> impl IntoView {
+    view! {
+        <div class="page-header">
+            <div><h1>{text(locale, title_ja, title_en)}</h1><p>{text(locale, description_ja, description_en)}</p></div>
+        </div>
+    }
+}
+
+fn home_page(state: AppState, send: CommandSender) -> impl IntoView {
+    let locale = state.locale.get();
+    view! {
+        {page_header(locale, "ホーム", "Home", "現在の送信先と接続中の機器を確認します。", "See the current route and connected devices.")}
+        {move || if state.busy.get() && state.status.get().is_none() {
+            view! { <div class="row-list"><div class="skeleton"></div></div> }.into_any()
+        } else {
+            let status = state.status.get();
+            view! {
+                <section>
+                    <div class="hero-route">
+                        <span class="row-icon active"><RouteIcon/></span>
+                        <div class="row-copy">
+                            <small>{text(locale, "現在の送信先", "Current destination")}</small>
+                            <strong>{current_target(status, state.output_status.get(), &state.names.get(), locale)}</strong>
+                        </div>
+                        <div class="row-meta">{route_state(status, state.output_status.get(), locale)}</div>
                     </div>
                 </section>
-                })
-            }}
-
-            <section class="content-section">
-                <div class="section-title">
-                    <div><p class="section-kicker">"OUTPUTS"</p><h2>"接続先"</h2><p>"入力を送りたい機器を選ぶか、新しい機器を追加します。"</p></div>
-                    <button class="quiet" on:click=cancel_pairing disabled=move || busy.get() || status.get().and_then(|s| s.pairing_host).is_none()>"ペアリングを中止"</button>
-                </div>
-                <div class="slots">
-                    {move || status.get().map(|value| {
-                        (0..value.host_count as usize).map(|index| {
-                            slot_card(index, value, names.get()[index].clone(), name_sources.get()[index], timings.get()[index], busy, slot_send.clone())
-                        }).collect_view()
-                    })}
-                </div>
-            </section>
-
-            <section class="content-section">
-                <div class="section-title"><div><p class="section-kicker">"INPUTS"</p><h2>"接続中のUSB機器"</h2><p>"HIDShiftが認識しているキーボード、マウス、操作デバイスです。"</p></div></div>
-                <div class="device-grid">
-                    {move || if usb_devices.get().is_empty() {
-                        view! { <div class="empty"><span aria-hidden="true">"⌨"</span><strong>"USB機器が見つかりません"</strong><p>"HIDShiftのUSB Hostポートに機器を接続してください。"</p></div> }.into_any()
-                    } else {
-                        usb_devices.get().into_iter().map(usb_device_card).collect_view().into_any()
-                    }}
-                </div>
-            </section>
-
-            <section class="advanced-section">
-                <div class="section-title"><div><p class="section-kicker">"CUSTOMIZE & SUPPORT"</p><h2>"設定とサポート"</h2><p>"必要なときだけ開いて確認できます。"</p></div></div>
-                <details open>
-                    <summary><span><strong>"動作設定"</strong><small>"接続先ごとの感度や動作を変更"</small></span><span class="chevron">"⌄"</span></summary>
-                    <div class="detail-body"><SettingsPanel settings busy send=setting_send.clone()/></div>
-                </details>
-                <details>
-                    <summary><span><strong>"システム診断"</strong><small>"再起動・通信・保存状態を確認"</small></span><span class="chevron">"⌄"</span></summary>
-                    <div class="detail-body">{move || diagnostics.get().map(diagnostics_view)}</div>
-                </details>
-                <details>
-                    <summary><span><strong>"接続履歴とログ"</strong><small>"トラブル調査用のイベント記録"</small></span><span class="chevron">"⌄"</span></summary>
-                    <div class="detail-body"><div class="log-toolbar"><span>"新しいイベントが先頭です"</span><button class="quiet compact" on:click=copy_logs>"ログをコピー"</button></div><pre class="logs">{move || history.get().iter().map(format_history).collect::<Vec<_>>().join("\n")}</pre></div>
-                </details>
-                <p class="firmware-version">{move || schema.get().map(|s| format!("Firmware {}.{}.{} · Schema {}", s.firmware_major, s.firmware_minor, s.firmware_patch, s.version)).unwrap_or_else(|| "Firmware情報は未取得です".into())}</p>
-            </section>
-        </main>
+                <section class="section">
+                    <div class="section-heading"><div><h2>{text(locale, "接続中の接続先", "Connected destinations")}</h2></div><button class="quiet compact" on:click={
+                        let state = state.clone();
+                        move |_| state.navigate(Page::Destinations)
+                    }>{text(locale, "すべて表示", "View all")}</button></div>
+                    <div class="row-list">{connected_destination_rows(status, state.names.get(), state.busy, send.clone(), locale)}</div>
+                </section>
+                <section class="section">
+                    <div class="section-heading"><div><h2>{text(locale, "USB入力", "USB inputs")}</h2></div><button class="quiet compact" on:click={
+                        let state = state.clone();
+                        move |_| state.navigate(Page::Inputs)
+                    }>{text(locale, "詳細", "Details")}</button></div>
+                    <div class="row-list">
+                        <div class="row">
+                            <span class="row-icon"><InputIcon/></span>
+                            <div class="row-copy"><strong>{status.map(|value| format!("{} {}", value.usb.device_count, text(locale, "台", "devices"))).unwrap_or_else(|| "—".into())}</strong><small>{status.map(|value| format!("{} HID interfaces", value.usb.interface_count)).unwrap_or_default()}</small></div>
+                            <span class=move || if status.is_some_and(|value| value.usb.device_count > 0) { "state connected" } else { "state" }>{if status.is_some_and(|value| value.usb.device_count > 0) { text(locale, "接続中", "Connected") } else { text(locale, "未接続", "None") }}</span>
+                        </div>
+                    </div>
+                </section>
+            }.into_any()
+        }}
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn refresh_all(
-    client: &BrowserClient,
-    status_signal: RwSignal<Option<ManagementStatus>>,
-    names: RwSignal<[String; 4]>,
-    name_sources: RwSignal<[u8; 4]>,
-    timings: RwSignal<[Option<ManagementHostTiming>; 4]>,
-    usb_devices: RwSignal<Vec<UsbDeviceView>>,
-    diagnostics: RwSignal<Option<ManagementDiagnostics>>,
-    schema_signal: RwSignal<Option<ManagementSchema>>,
-    history: RwSignal<Vec<ManagementHistoryEvent>>,
-    settings: RwSignal<Vec<SettingView>>,
-    output_status: RwSignal<Option<ManagementOutputTargetStatus>>,
-    mirror_candidates: RwSignal<Vec<ManagementMirrorCandidate>>,
-) -> Result<(), BrowserClientError> {
-    let response = client.request(ManagementCommand::GetStatus).await?;
-    ensure_ok(response)?;
-    let ManagementResponsePayload::Status(status) = response.payload else {
-        return Err(BrowserClientError::Protocol(
-            "status payload missing".into(),
-        ));
-    };
-    status_signal.set(Some(status));
-    for index in 0..status.host_count as usize {
-        if !status.hosts[index].known {
-            continue;
-        }
-        let response = client
-            .request(ManagementCommand::GetHostInfo(HostId((index + 1) as u8)))
-            .await?;
-        ensure_ok(response)?;
-        if let ManagementResponsePayload::HostInfo(info) = response.payload {
-            names.update(|values| {
-                values[index] = String::from_utf8_lossy(info.name.as_bytes()).into_owned()
-            });
-            name_sources.update(|values| values[index] = info.name_source);
-        }
-        let response = client
-            .request(ManagementCommand::GetHostTiming(HostId((index + 1) as u8)))
-            .await?;
-        ensure_ok(response)?;
-        if let ManagementResponsePayload::HostTiming(value) = response.payload {
-            timings.update(|values| values[index] = Some(value));
-        }
-    }
-
-    let mut devices = Vec::new();
-    for index in 0..status.usb.device_count {
-        let mut offset = 0u8;
-        let mut name = Vec::new();
-        let mut metadata = None;
-        loop {
-            let response = client
-                .request(ManagementCommand::GetUsbDevice {
-                    index,
-                    name_offset: offset,
-                })
-                .await?;
-            ensure_ok(response)?;
-            let ManagementResponsePayload::UsbDevice(device) = response.payload else {
-                break;
-            };
-            metadata.get_or_insert(device);
-            name.extend_from_slice(device.name_chunk());
-            offset = offset.saturating_add(device.name_chunk_len);
-            if offset >= device.name_len || device.name_chunk_len == 0 {
-                break;
-            }
-        }
-        if let Some(device) = metadata {
-            devices.push(UsbDeviceView {
-                index,
-                device_id: device.device_id,
-                vendor_id: device.vendor_id,
-                product_id: device.product_id,
-                flags: device.flags,
-                name: String::from_utf8_lossy(&name).into_owned(),
-            });
-        }
-    }
-    usb_devices.set(devices);
-
-    let response = client.request(ManagementCommand::GetDiagnostics).await?;
-    ensure_ok(response)?;
-    if let ManagementResponsePayload::Diagnostics(value) = response.payload {
-        diagnostics.set(Some(value));
-    }
-
-    let mut events = Vec::new();
-    for index in 0..16 {
-        let response = client
-            .request(ManagementCommand::GetHistory { index })
-            .await?;
-        ensure_ok(response)?;
-        match response.payload {
-            ManagementResponsePayload::History(event) => events.push(event),
-            _ => break,
-        }
-    }
-    history.set(events);
-
-    let response = client.request(ManagementCommand::GetSchema).await?;
-    ensure_ok(response)?;
-    if let ManagementResponsePayload::Schema(value) = response.payload {
-        if value.version != hidshift::SETTINGS_SCHEMA_VERSION
-            || value.setting_count as usize != hidshift::SETTING_COUNT
-            || value.hash != hidshift::SETTINGS_SCHEMA_HASH
-        {
-            return Err(BrowserClientError::Protocol(
-                "firmwareとWeb UIの設定スキーマが一致しません".into(),
-            ));
-        }
-        schema_signal.set(Some(value));
-        if value.capabilities & MANAGEMENT_CAPABILITY_DUAL_S3_WIRED != 0 {
-            let response = client
-                .request(ManagementCommand::GetOutputTargetStatus)
-                .await?;
-            ensure_ok(response)?;
-            if let ManagementResponsePayload::OutputTargetStatus(value) = response.payload {
-                output_status.set(Some(value));
-            }
-            let mut candidates = Vec::new();
-            for candidate in 0..4 {
-                let response = client
-                    .request(ManagementCommand::GetMirrorCandidate(MirrorCandidateId(
-                        candidate,
-                    )))
-                    .await?;
-                if response.result == ManagementResult::NotFound {
-                    continue;
-                }
-                ensure_ok(response)?;
-                if let ManagementResponsePayload::MirrorCandidate(value) = response.payload {
-                    candidates.push(value);
-                }
-            }
-            mirror_candidates.set(candidates);
-        } else {
-            output_status.set(None);
-            mirror_candidates.set(Vec::new());
-        }
-    }
-    let mut values = Vec::new();
-    for descriptor in SETTING_DESCRIPTORS {
-        match descriptor.scope {
-            SettingScope::Global => {
-                if let Some(value) = get_setting(client, descriptor, SettingTarget::Global).await? {
-                    values.push(value);
-                }
-            }
-            SettingScope::Host => {
-                for slot in 1..=4 {
-                    if let Some(value) =
-                        get_setting(client, descriptor, SettingTarget::Host(HostId(slot))).await?
-                    {
-                        values.push(value);
+fn destinations_page(state: AppState, send: CommandSender) -> impl IntoView {
+    let locale = state.locale.get();
+    let cancel_send = send.clone();
+    view! {
+        <div class="page-header">
+            <div><h1>{text(locale, "接続先", "Destinations")}</h1><p>{text(locale, "入力を送るPCやスマートフォンを選択・登録します。切断しても登録は保持されます。", "Select and register computers or phones. Registration remains after disconnecting.")}</p></div>
+            <div class="page-actions">
+                <button disabled=move || state.busy.get() || state.status.get().and_then(|status| status.pairing_host).is_some() on:click={
+                    let send = send.clone();
+                    move |_| {
+                        let next = state.status.get_untracked().and_then(first_empty_host).unwrap_or(HostId(1));
+                        send(ManagementCommand::StartPairing(next));
                     }
-                }
-            }
-        }
+                }>{text(locale, "接続先を追加", "Add destination")}</button>
+                <button class="secondary" disabled=move || state.busy.get() || state.status.get().and_then(|status| status.pairing_host).is_none() on:click=move |_| cancel_send(ManagementCommand::CancelPairing)>{text(locale, "中止", "Cancel")}</button>
+            </div>
+        </div>
+        <section class="section">
+            <div class="section-heading"><h2>{text(locale, "接続中", "Connected")}</h2></div>
+            <div class="row-list">{connected_destination_rows(state.status.get(), state.names.get(), state.busy, send.clone(), locale)}</div>
+        </section>
+        <section class="section">
+            <div class="section-heading"><h2>{text(locale, "登録済み", "Registered")}</h2></div>
+            <div class="row-list">{registered_destination_rows(state.clone(), send, locale)}</div>
+        </section>
     }
-    settings.set(values);
-    Ok(())
 }
 
-async fn get_setting(
-    client: &BrowserClient,
-    descriptor: &'static SettingDescriptor,
-    target: SettingTarget,
-) -> Result<Option<SettingView>, BrowserClientError> {
-    let response = client
-        .request(ManagementCommand::GetSetting {
-            id: descriptor.id,
-            target,
+fn connected_destination_rows(
+    status: Option<ManagementStatus>,
+    names: [String; 4],
+    busy: RwSignal<bool>,
+    send: CommandSender,
+    locale: Locale,
+) -> impl IntoView {
+    let Some(status) = status else {
+        return view! { <div class="empty-row">{text(locale, "HIDShiftへ接続してください", "Connect to HIDShift")}</div> }.into_any();
+    };
+    let rows = status.hosts[..status.host_count.min(4) as usize]
+        .iter()
+        .enumerate()
+        .filter(|(_, host)| host.connected)
+        .map(|(index, host)| {
+            destination_row(
+                index,
+                *host,
+                status,
+                names[index].clone(),
+                None,
+                busy,
+                send.clone(),
+                locale,
+            )
         })
-        .await?;
-    ensure_ok(response)?;
-    Ok(match response.payload {
-        ManagementResponsePayload::Setting(setting) => Some(SettingView {
-            descriptor,
-            target,
-            value: setting.value,
-        }),
-        _ => None,
-    })
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        view! { <div class="empty-row">{text(locale, "接続中の接続先はありません", "No connected destinations")}</div> }.into_any()
+    } else {
+        rows.into_iter().collect_view().into_any()
+    }
 }
 
-fn ensure_ok(response: ManagementResponse) -> Result<(), BrowserClientError> {
-    if response.result == ManagementResult::Ok {
-        Ok(())
+fn registered_destination_rows(
+    state: AppState,
+    send: CommandSender,
+    locale: Locale,
+) -> impl IntoView {
+    let Some(status) = state.status.get() else {
+        return view! { <div class="empty-row">{text(locale, "HIDShiftへ接続してください", "Connect to HIDShift")}</div> }.into_any();
+    };
+    let names = state.names.get();
+    let timings = state.timings.get();
+    let rows = status.hosts[..status.host_count.min(4) as usize]
+        .iter()
+        .enumerate()
+        .filter(|(_, host)| host.known && !host.connected)
+        .map(|(index, host)| {
+            destination_row(
+                index,
+                *host,
+                status,
+                names[index].clone(),
+                timings[index],
+                state.busy,
+                send.clone(),
+                locale,
+            )
+        })
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        view! { <div class="empty-row">{text(locale, "切断中の登録済み接続先はありません", "No disconnected registered destinations")}</div> }.into_any()
     } else {
-        Err(BrowserClientError::Protocol(
-            result_message(response.result).into(),
-        ))
+        rows.into_iter().collect_view().into_any()
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn connect_action(
-    client: Rc<BrowserClient>,
-    bluetooth: bool,
-    status: RwSignal<Option<ManagementStatus>>,
-    connection: RwSignal<String>,
-    connected: RwSignal<bool>,
-    busy: RwSignal<bool>,
-    message: RwSignal<String>,
-    is_error: RwSignal<bool>,
-    send: SendWrapper<Rc<dyn Fn(ManagementCommand)>>,
-) -> impl Fn(web_sys::MouseEvent) + 'static {
-    move |_| {
-        busy.set(true);
-        message.set("接続しています…".into());
-        is_error.set(false);
-        let client_for_connect = client.clone();
-        let client_for_bytes = client.clone();
-        let client_for_disconnect = client.clone();
-        let send = send.clone();
-        spawn_local(async move {
-            let on_bytes = Rc::new(move |bytes: &[u8]| client_for_bytes.receive(bytes));
-            let on_disconnect = Rc::new(move |reason: String| {
-                client_for_disconnect.detach();
-                connected.set(false);
-                status.set(None);
-                connection.set("未接続".into());
-                message.set(reason);
-                is_error.set(true);
-                busy.set(false);
-            });
-            let result = if bluetooth {
-                BrowserTransport::connect_bluetooth(on_bytes, on_disconnect).await
-            } else {
-                BrowserTransport::connect_serial(on_bytes, on_disconnect).await
-            };
-            match result {
-                Ok(transport) => {
-                    connection.set(transport.label());
-                    client_for_connect.attach(transport);
-                    connected.set(true);
-                    busy.set(false);
-                    message.set("接続しました".into());
-                    send(ManagementCommand::GetStatus);
-                }
-                Err(error) => {
-                    busy.set(false);
-                    message.set(error);
-                    is_error.set(true);
-                }
-            }
-        });
-    }
-}
-
-fn slot_card(
+fn destination_row(
     index: usize,
+    flags: ManagementHostStatus,
     status: ManagementStatus,
     name: String,
-    name_source: u8,
-    timing: Option<ManagementHostTiming>,
+    timing: Option<hidshift::ManagementHostTiming>,
     busy: RwSignal<bool>,
-    send: SendWrapper<Rc<dyn Fn(ManagementCommand)>>,
+    send: CommandSender,
+    locale: Locale,
 ) -> impl IntoView {
     let host = HostId((index + 1) as u8);
-    let flags = status.hosts[index];
     let active = status.active_host == Some(host);
-    let pairing = status.pairing_host == Some(host);
-    let select = {
-        let send = send.clone();
-        move |_| send(ManagementCommand::SelectHost(host))
-    };
-    let pair = {
-        let send = send.clone();
-        move |_| send(ManagementCommand::StartPairing(host))
-    };
-    let forget = {
-        let send = send.clone();
-        move |_| {
-            if web_sys::window()
-                .and_then(|window| {
-                    window
-                        .confirm_with_message(&format!(
-                            "スロット {} のbondを削除しますか？",
-                            host.0
-                        ))
-                        .ok()
-                })
-                .unwrap_or(false)
-            {
-                send(ManagementCommand::ForgetHost(host));
-            }
-        }
-    };
-    let rename = {
-        let send = send.clone();
-        let current_name = name.clone();
-        move |_| {
-            let Some(window) = web_sys::window() else {
-                return;
-            };
-            let Ok(Some(value)) = window.prompt_with_message_and_default(
-                "表示名（空欄で自動名に戻す、半角12文字まで）",
-                &current_name,
-            ) else {
-                return;
-            };
-            match ManagementHostName::from_ascii(value.trim()) {
-                Ok(name) => send(ManagementCommand::SetHostName {
-                    host_id: host,
-                    name,
-                }),
-                Err(_) => {
-                    let _ = window.alert_with_message("名前は半角12文字以内で入力してください");
-                }
-            }
-        }
-    };
     let title = if name.is_empty() {
-        format!("スロット {}", host.0)
+        format!("{} {}", text(locale, "接続先", "Destination"), host.0)
     } else {
         name
     };
+    let select_send = send.clone();
+    let rename_send = send.clone();
+    let forget_send = send.clone();
     view! {
-        <article class:active=active class="slot">
-            <div class="slot-head"><div class="device-identity"><span class="device-icon" aria-hidden="true">{if flags.known { "◫" } else { "+" }}</span><div><h3>{title}</h3><small>{format!("スロット {} · {}", host.0, if name_source == 1 { "機器から名前を取得" } else if name_source == 2 { "カスタム名" } else { "未登録" })}</small></div></div>{active.then(|| view! { <span class="badge selected">"送信先"</span> })}</div>
-            <div class="badges">{status_badges(flags)}</div>
-            <p class="timing">{timing.map(|value| format!("最終接続 {}秒前 · 切断理由 0x{:02x}", value.last_connected_seconds, value.last_disconnect_reason)).unwrap_or_else(|| if flags.known { "接続履歴はありません".into() } else { "ここにPCやスマートフォンを追加できます".into() })}</p>
-            <div class="slot-actions">
-                <button on:click=select disabled=move || busy.get() || !flags.known || active>{if active { "選択中" } else { "この機器へ切り替え" }}</button>
-                <button class="secondary" on:click=pair disabled=move || busy.get() || flags.bonded || pairing>{if pairing { "ペアリング中…" } else if flags.known { "再ペアリング" } else { "新しい機器を追加" }}</button>
-                <button class="quiet compact" on:click=rename disabled=move || busy.get() || !flags.known>"名前を変更"</button>
-                <button class="danger compact" on:click=forget disabled=move || busy.get() || !flags.known>"登録解除"</button>
+        <div class="row has-actions">
+            <span class:active=active class="row-icon"><DestinationIcon/></span>
+            <div class="row-copy"><strong>{title.clone()}</strong><small>{timing.map(|value| format!("{}s · 0x{:02x}", value.last_connected_seconds, value.last_disconnect_reason)).unwrap_or_else(|| format!("ID {}", host.0))}</small></div>
+            <div class="row-meta"><span class=if flags.connected { "state connected" } else { "state" }>{if flags.connected { text(locale, "接続中", "Connected") } else { text(locale, "切断中", "Disconnected") }}</span>{active.then(|| view! { <span>{text(locale, "送信先", "Selected")}</span> })}</div>
+            <div class="row-actions">
+                <button class="secondary compact" disabled=move || busy.get() || !flags.connected || active on:click=move |_| select_send(ManagementCommand::SelectHost(host))>{if active { text(locale, "選択中", "Selected") } else { text(locale, "選択", "Select") }}</button>
+                <button class="quiet compact" disabled=move || busy.get() on:click=move |_| {
+                    let Some(window) = web_sys::window() else { return; };
+                    if let Ok(Some(value)) = window.prompt_with_message_and_default(text(locale, "表示名", "Display name"), &title)
+                        && let Ok(name) = ManagementHostName::from_ascii(value.trim())
+                    {
+                        rename_send(ManagementCommand::SetHostName { host_id: host, name });
+                    }
+                }>{text(locale, "名前", "Rename")}</button>
+                <button class="danger compact" disabled=move || busy.get() on:click=move |_| {
+                    let confirmed = web_sys::window().and_then(|window| window.confirm_with_message(text(locale, "この接続先の登録を解除しますか？", "Forget this destination?")).ok()).unwrap_or(false);
+                    if confirmed { forget_send(ManagementCommand::ForgetHost(host)); }
+                }>{text(locale, "登録解除", "Forget")}</button>
             </div>
-        </article>
+        </div>
     }
 }
 
-fn usb_device_card(device: UsbDeviceView) -> impl IntoView {
-    let name = if device.name.is_empty() {
-        "名前未取得".into()
-    } else {
-        device.name
+fn inputs_page(state: AppState, send: CommandSender) -> impl IntoView {
+    let locale = state.locale.get();
+    view! {
+        {page_header(locale, "入力機器", "Inputs", "USBキーボード、マウス、メディア操作機器を管理します。設定は入力機器に紐づきます。", "Manage USB keyboards, mice, and media controls. Settings belong to each input device.")}
+        <section class="section">
+            <div class="section-heading"><h2>{text(locale, "接続中", "Connected")}</h2><span class="count">{format!("{}", state.usb_devices.get().len())}</span></div>
+            <div class="row-list">{input_rows(state.usb_devices.get(), locale)}</div>
+        </section>
+        {move || (!state.mirror_candidates.get().is_empty()).then(|| view! {
+            <section class="section">
+                <div class="section-heading"><div><h2>{text(locale, "有線互換モード", "Wired compatibility mode")}</h2><p>{text(locale, "Standardまたは元のUSB機器として提示します。", "Present Standard HID or the original USB device.")}</p></div></div>
+                <div class="row-list">
+                    <div class="row has-actions">
+                        <span class="row-icon"><RouteIcon/></span>
+                        <div class="row-copy"><strong>"Standard"</strong><small>{text(locale, "Keyboard / Mouse / Consumer + 管理CDC", "Keyboard / Mouse / Consumer + management CDC")}</small></div>
+                        <div class="row-actions"><button class="secondary compact" disabled=move || state.busy.get() on:click={
+                            let send = send.clone();
+                            move |_| send(ManagementCommand::ClearMirrorTarget)
+                        }>{text(locale, "選択", "Select")}</button></div>
+                    </div>
+                    {state.mirror_candidates.get().into_iter().map(|candidate| {
+                        let candidate_send = send.clone();
+                        view! {
+                            <div class="row has-actions">
+                                <span class:active=candidate.active() class="row-icon"><InputIcon/></span>
+                                <div class="row-copy"><strong>{text(locale, "元のUSB機器", "Original USB device")}</strong><small>{format!("{:04x}:{:04x} · {:08x}", candidate.vendor_id, candidate.product_id, candidate.descriptor_hash)}</small></div>
+                                <div class="row-meta">{candidate.active().then(|| view! { <span class="state connected">{text(locale, "提示中", "Active")}</span> })}</div>
+                                <div class="row-actions"><button class="secondary compact" disabled=move || state.busy.get() || candidate.selected() on:click=move |_| candidate_send(ManagementCommand::SetMirrorTarget(candidate.candidate))>{if candidate.selected() { text(locale, "選択中", "Selected") } else { text(locale, "選択", "Select") }}</button></div>
+                            </div>
+                        }
+                    }).collect_view()}
+                </div>
+            </section>
+        })}
+    }
+}
+
+fn input_rows(devices: Vec<UsbDeviceView>, locale: Locale) -> impl IntoView {
+    if devices.is_empty() {
+        return view! { <div class="empty-row">{text(locale, "接続中のUSB入力機器はありません", "No connected USB input devices")}</div> }.into_any();
+    }
+    devices
+        .into_iter()
+        .map(|device| {
+            let name = if device.name.is_empty() {
+                format!("USB {}", device.index + 1)
+            } else {
+                device.name
+            };
+            let mut kinds = Vec::new();
+            if device.flags & 0x02 != 0 { kinds.push(text(locale, "キーボード", "Keyboard")); }
+            if device.flags & 0x04 != 0 { kinds.push(text(locale, "マウス", "Mouse")); }
+            if device.flags & 0x08 != 0 { kinds.push(text(locale, "メディア操作", "Media control")); }
+            view! {
+                <div class="row">
+                    <span class="row-icon active"><InputIcon/></span>
+                    <div class="row-copy"><strong>{name}</strong><small>{format!("{} · {:04x}:{:04x} · ID {}", kinds.join(" / "), device.vendor_id, device.product_id, device.device_id)}</small></div>
+                    <span class="state connected">{text(locale, "接続中", "Connected")}</span>
+                </div>
+            }
+        })
+        .collect_view()
+        .into_any()
+}
+
+fn settings_page(state: AppState, send: CommandSender) -> impl IntoView {
+    let locale = state.locale.get();
+    view! {
+        {page_header(locale, "設定", "Settings", "表示と本体の操作を調整します。入力固有の設定は入力機器ページから管理します。", "Adjust appearance and device controls. Input-specific settings belong on the Inputs page.")}
+        <section class="section">
+            <div class="section-heading"><h2>{text(locale, "表示", "Appearance")}</h2></div>
+            <div class="setting-list">
+                <div class="setting-row">
+                    <div class="setting-copy"><h4>{text(locale, "言語", "Language")}</h4><p>{text(locale, "ブラウザの言語を初期値として使用します。", "Browser language is used initially.")}</p></div>
+                    <div class="setting-control"><select on:change={
+                        let state = state.clone();
+                        move |event| state.set_locale(if event_target_value(&event) == "en" { Locale::En } else { Locale::Ja })
+                    }><option value="ja" selected=locale == Locale::Ja>"日本語"</option><option value="en" selected=locale == Locale::En>"English"</option></select></div>
+                </div>
+                <div class="setting-row">
+                    <div class="setting-copy"><h4>{text(locale, "外観", "Theme")}</h4><p>{text(locale, "OS設定に追従するか、明るさを固定します。", "Follow the operating system or choose a fixed appearance.")}</p></div>
+                    <div class="setting-control"><select on:change={
+                        let state = state.clone();
+                        move |event| state.set_theme(match event_target_value(&event).as_str() { "light" => Theme::Light, "dark" => Theme::Dark, _ => Theme::System })
+                    }><option value="system" selected=state.theme.get() == Theme::System>{text(locale, "システム", "System")}</option><option value="light" selected=state.theme.get() == Theme::Light>{text(locale, "ライト", "Light")}</option><option value="dark" selected=state.theme.get() == Theme::Dark>{text(locale, "ダーク", "Dark")}</option></select></div>
+                </div>
+            </div>
+        </section>
+        <section class="section">
+            <div class="section-heading"><div><h2>{text(locale, "詳細設定", "Advanced device settings")}</h2><p>{text(locale, "現在のfirmwareが提供する設定です。", "Settings exposed by the current firmware.")}</p></div></div>
+            {move || if state.settings.get().is_empty() {
+                view! { <div class="row-list"><div class="empty-row">{if state.connected.get() { text(locale, "読み込み中…", "Loading…") } else { text(locale, "HIDShiftへ接続してください", "Connect to HIDShift") }}</div></div> }.into_any()
+            } else {
+                view! { <SettingsPanel settings=state.settings busy=state.busy send=send.clone()/> }.into_any()
+            }}
+        </section>
+    }
+}
+
+fn support_page(state: AppState) -> impl IntoView {
+    let locale = state.locale.get();
+    let copy_history = {
+        let state = state.clone();
+        move |_| {
+            let text = state
+                .history
+                .get_untracked()
+                .iter()
+                .map(format_history)
+                .collect::<Vec<_>>()
+                .join("\n");
+            spawn_local(async move {
+                if let Some(window) = web_sys::window() {
+                    let _ = JsFuture::from(window.navigator().clipboard().write_text(&text)).await;
+                }
+            });
+        }
     };
-    view! { <article class="device-card"><div class="device-identity"><span class="device-icon usb" aria-hidden="true">"⌨"</span><div><h3>{name}</h3><p>"USBで接続中"</p></div><span class="live-indicator">"● 接続中"</span></div><div class="badges">{(device.flags & 0x02 != 0).then(|| view!{<span class="badge">"キーボード"</span>})}{(device.flags & 0x04 != 0).then(|| view!{<span class="badge">"マウス"</span>})}{(device.flags & 0x08 != 0).then(|| view!{<span class="badge">"メディア操作"</span>})}</div><div class="device-meta"><span>{format!("USB機器 {}", device.index + 1)}</span><code>{format!("{:04x}:{:04x}", device.vendor_id, device.product_id)}</code><span>{format!("ID {}", device.device_id)}</span></div></article> }
+    view! {
+        {page_header(locale, "サポート", "Support", "診断、イベント履歴、firmware情報をまとめて確認します。", "Review diagnostics, event history, and firmware details.")}
+        <section class="section">
+            <div class="section-heading"><h2>{text(locale, "システム状態", "System status")}</h2></div>
+            {move || state.diagnostics.get().map(diagnostics_view)}
+        </section>
+        <section class="section">
+            <div class="section-heading"><div><h2>{text(locale, "イベント履歴", "Event history")}</h2><p>{text(locale, "再起動で消去されるRAM内の履歴です。", "RAM-only history, cleared on reboot.")}</p></div><button class="secondary compact" on:click=copy_history>{text(locale, "コピー", "Copy")}</button></div>
+            <pre class="logs">{move || state.history.get().iter().map(format_history).collect::<Vec<_>>().join("\n")}</pre>
+        </section>
+        <section class="section">
+            <div class="section-heading"><h2>{text(locale, "バージョン", "Version")}</h2></div>
+            <div class="row-list"><div class="row"><span class="row-icon"><SupportIcon/></span><div class="row-copy"><strong>"HIDShift firmware"</strong><small>{move || state.schema.get().map(|schema| format!("{}.{}.{} · protocol v1 · schema {}", schema.firmware_major, schema.firmware_minor, schema.firmware_patch, schema.version)).unwrap_or_else(|| "—".into())}</small></div></div></div>
+        </section>
+        <section class="section danger-zone">
+            <h2>{text(locale, "復旧操作", "Recovery actions")}</h2>
+            <p>{text(locale, "再起動と工場出荷状態への初期化は、新しいmanagement protocolで提供予定です。GPIO0を押しながら起動するとStandard modeで復旧できます。", "Reboot and factory reset are provided by the new management protocol. Hold GPIO0 while booting to recover in Standard mode.")}</p>
+            <div class="support-actions"><button class="danger" disabled=true>{text(locale, "工場出荷状態に戻す", "Factory reset")}</button></div>
+        </section>
+    }
 }
 
 fn diagnostics_view(value: ManagementDiagnostics) -> impl IntoView {
-    view! { <div class="diagnostics-grid">
-        <article><span>"再起動理由"</span><strong>{format!("0x{:02x}", value.reset_reason)}</strong></article>
-        <article><span>"brownout"</span><strong>{value.brownout_count}</strong></article>
-        <article><span>"BLE notify失敗"</span><strong>{value.ble_notify_failure_count}</strong></article>
-        <article><span>"USBエラー"</span><strong>{value.usb_error_count}</strong></article>
-        <article><span>"Flash保存"</span><strong>{value.flash_write_count}</strong></article>
-        <article><span>"Flash失敗"</span><strong>{value.flash_failure_count}</strong></article>
-    </div> }
+    view! {
+        <div class="diagnostics-grid">
+            <article><span>"Uptime"</span><strong>{format_duration(value.uptime_seconds)}</strong></article>
+            <article><span>"Reset reason"</span><strong>{format!("0x{:02x}", value.reset_reason)}</strong></article>
+            <article><span>"Brownout"</span><strong>{value.brownout_count}</strong></article>
+            <article><span>"BLE disconnect"</span><strong>{value.ble_disconnect_count}</strong></article>
+            <article><span>"Notify failure"</span><strong>{value.ble_notify_failure_count}</strong></article>
+            <article><span>"USB / Flash error"</span><strong>{format!("{} / {}", value.usb_error_count, value.flash_failure_count)}</strong></article>
+        </div>
+    }
 }
 
-fn status_badges(status: ManagementHostStatus) -> impl IntoView {
-    let mut badges = Vec::new();
-    if status.known {
-        badges.push(("登録済み", "good"));
-    }
-    if status.connected {
-        badges.push(("接続中", "live"));
-    }
-    if status.encrypted {
-        badges.push(("暗号化済み", "good"));
-    }
-    if status.bonded {
-        badges.push(("bond済み", "good"));
-    }
-    if badges.is_empty() {
-        badges.push(("空き", ""));
-    }
-    badges
-        .into_iter()
-        .map(|(label, class)| view! { <span class=format!("badge {class}")>{label}</span> })
-        .collect_view()
+fn first_empty_host(status: ManagementStatus) -> Option<HostId> {
+    status.hosts[..status.host_count.min(4) as usize]
+        .iter()
+        .position(|host| !host.known)
+        .map(|index| HostId((index + 1) as u8))
 }
 
-fn display_host(host: Option<HostId>, names: &[String; 4]) -> String {
-    host.map(|host| {
-        let index = host.0.saturating_sub(1) as usize;
-        if index < names.len() && !names[index].is_empty() {
-            names[index].clone()
-        } else {
-            format!("スロット {}", host.0)
-        }
-    })
-    .unwrap_or_else(|| "なし".into())
-}
-
-fn display_output(
+fn current_target(
+    status: Option<ManagementStatus>,
     output: Option<ManagementOutputTargetStatus>,
-    legacy: Option<ManagementStatus>,
     names: &[String; 4],
+    locale: Locale,
 ) -> String {
-    match output.and_then(|value| value.active) {
-        Some(ManagementOutputTarget::Wired) => "Wired USB".into(),
-        Some(ManagementOutputTarget::Ble(host)) => display_host(Some(host), names),
-        None if output.is_some() => "準備待ち".into(),
-        None => display_host(legacy.and_then(|value| value.active_host), names),
+    match output.and_then(|output| output.active) {
+        Some(ManagementOutputTarget::Wired) => text(locale, "有線USB", "Wired USB").into(),
+        Some(ManagementOutputTarget::Ble(host)) => host_name(host, names, locale),
+        None if output.is_some() => text(locale, "準備待ち", "Waiting").into(),
+        None => status
+            .and_then(|status| status.active_host)
+            .map(|host| host_name(host, names, locale))
+            .unwrap_or_else(|| text(locale, "送信先なし", "No destination").into()),
     }
 }
 
-fn mirror_source_name(candidate: ManagementMirrorCandidate, devices: &[UsbDeviceView]) -> String {
-    candidate
-        .source_device
-        .and_then(|device_id| {
-            devices
-                .iter()
-                .find(|device| device.device_id == device_id)
-                .map(|device| device.name.as_str())
-        })
+fn route_state(
+    status: Option<ManagementStatus>,
+    output: Option<ManagementOutputTargetStatus>,
+    locale: Locale,
+) -> &'static str {
+    if output.is_some_and(|output| output.active.is_some())
+        || output.is_none() && status.and_then(|status| status.active_host).is_some()
+    {
+        text(locale, "送信可能", "Ready")
+    } else {
+        text(locale, "接続待ち", "Waiting")
+    }
+}
+
+fn host_name(host: HostId, names: &[String; 4], locale: Locale) -> String {
+    let index = host.0.saturating_sub(1) as usize;
+    names
+        .get(index)
         .filter(|name| !name.is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(|| {
-            if candidate.synthetic() {
-                format!("Synthetic Candidate {}", candidate.candidate.0)
-            } else {
-                format!("USB Mirror Candidate {}", candidate.candidate.0)
-            }
-        })
+        .cloned()
+        .unwrap_or_else(|| format!("{} {}", text(locale, "接続先", "Destination"), host.0))
+}
+
+fn text(locale: Locale, ja: &'static str, en: &'static str) -> &'static str {
+    match locale {
+        Locale::Ja => ja,
+        Locale::En => en,
+    }
 }
 
 fn format_duration(seconds: u32) -> String {
     format!(
-        "{}日 {:02}:{:02}:{:02}",
-        seconds / 86400,
-        seconds / 3600 % 24,
+        "{}d {:02}:{:02}:{:02}",
+        seconds / 86_400,
+        seconds / 3_600 % 24,
         seconds / 60 % 60,
         seconds % 60
     )
 }
+
 fn format_history(event: &ManagementHistoryEvent) -> String {
     format!(
-        "#{:04} +{}s {} subject={} detail=0x{:02x} {:04x}:{:04x}",
+        "#{:04} +{}s kind={} subject={} detail=0x{:02x} {:04x}:{:04x}",
         event.sequence,
         event.timestamp_seconds,
-        history_kind(event.kind),
+        event.kind,
         event.subject,
         event.detail,
         event.vendor_id,
         event.product_id
     )
 }
-fn history_kind(kind: u8) -> &'static str {
-    match kind {
-        1 => "BLE接続",
-        2 => "BLE切断",
-        3 => "USB接続",
-        4 => "USB切断",
-        5 => "接続先変更",
-        6 => "ペアリング開始",
-        _ => "イベント",
-    }
+
+#[component]
+fn RouteIcon() -> impl IntoView {
+    view! { <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h8a4 4 0 0 1 4 4v10M13 15l4 4 4-4M3 5h2" stroke-linecap="round" stroke-linejoin="round"/></svg> }
 }
-fn result_message(result: ManagementResult) -> &'static str {
-    match result {
-        ManagementResult::Ok => "ok",
-        ManagementResult::InvalidHost => "スロット番号が不正です",
-        ManagementResult::HostNotFound => "未登録のスロットです",
-        ManagementResult::HostAlreadyBonded => "bond済みです",
-        ManagementResult::InternalError => "firmware内部エラーです",
-        ManagementResult::InvalidName => "名前が不正です",
-        ManagementResult::InvalidSetting => "設定値または対象が不正です",
-        ManagementResult::NotFound => "対象が見つかりません",
-        ManagementResult::Unavailable => "このfirmwareでは利用できません",
-    }
+
+#[component]
+fn DestinationIcon() -> impl IntoView {
+    view! { <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v11H4zM8 20h8M12 16v4" stroke-linecap="round" stroke-linejoin="round"/></svg> }
 }
-fn client_error_message(error: BrowserClientError) -> String {
-    match error {
-        BrowserClientError::Busy => "別の処理が完了するまで待ってください".into(),
-        BrowserClientError::Disconnected => "接続が切れました".into(),
-        BrowserClientError::Transport(error) => error,
-        BrowserClientError::Protocol(error) => format!("応答を解釈できません: {error}"),
-        BrowserClientError::Timeout => "firmwareからの応答がタイムアウトしました".into(),
+
+#[component]
+fn InputIcon() -> impl IntoView {
+    view! { <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18v12H3zM6 10h.01M9 10h.01M12 10h.01M15 10h.01M18 10h.01M7 14h10" stroke-linecap="round" stroke-linejoin="round"/></svg> }
+}
+
+#[component]
+fn SupportIcon() -> impl IntoView {
+    view! { <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20ZM9.5 9a2.5 2.5 0 1 1 4.2 1.8c-1.2 1-1.7 1.4-1.7 2.7M12 17h.01" stroke-linecap="round" stroke-linejoin="round"/></svg> }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn navigation_and_core_labels_are_available_in_both_languages() {
+        for (ja, en) in [
+            ("ホーム", "Home"),
+            ("接続先", "Destinations"),
+            ("入力機器", "Inputs"),
+            ("設定", "Settings"),
+            ("サポート", "Support"),
+        ] {
+            assert_eq!(text(Locale::Ja, ja, en), ja);
+            assert_eq!(text(Locale::En, ja, en), en);
+        }
+    }
+
+    #[test]
+    fn empty_slot_selection_uses_first_available_slot() {
+        let mut status = ManagementStatus::empty(4);
+        status.hosts[0].known = true;
+        status.hosts[1].known = true;
+        assert_eq!(first_empty_host(status), Some(HostId(3)));
     }
 }

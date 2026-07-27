@@ -1381,42 +1381,57 @@ async fn configure_ble_connection<C, P>(
     P: PacketPool,
     C: Controller + ControllerCmdAsync<LeSetPhy>,
 {
+    let current_params = conn.raw().params();
     #[cfg(feature = "hardware-e2e")]
     {
-        let params = conn.raw().params();
         crate::e2e_telemetry::record_ble_connected(
-            params.conn_interval.as_micros() as u32,
-            params.peripheral_latency,
-            params.supervision_timeout.as_millis() as u32,
+            current_params.conn_interval.as_micros() as u32,
+            current_params.peripheral_latency,
+            current_params.supervision_timeout.as_millis() as u32,
         );
     }
     let timing = hidshift::low_latency_ble_connection_timing();
-    let requested = RequestedConnParams {
-        min_connection_interval: Duration::from_micros(u64::from(timing.interval_min_us)),
-        max_connection_interval: Duration::from_micros(u64::from(timing.interval_max_us)),
-        max_latency: timing.peripheral_latency,
-        min_event_length: Duration::from_micros(0),
-        max_event_length: Duration::from_micros(0),
-        supervision_timeout: Duration::from_millis(u64::from(timing.supervision_timeout_ms)),
+    let current = hidshift::BleConnectionParameters {
+        interval_us: current_params.conn_interval.as_micros() as u32,
+        peripheral_latency: current_params.peripheral_latency,
+        supervision_timeout_ms: current_params.supervision_timeout.as_millis() as u32,
     };
-    match conn
-        .raw()
-        .update_connection_params_l2cap(stack, &requested)
-        .await
-    {
-        Ok(()) => log::info!(
-            "firmware: ble slot {} requested interval={}..{}us latency={} timeout={}ms",
+    if hidshift::connection_timing_update_required(current, timing) {
+        let requested = RequestedConnParams {
+            min_connection_interval: Duration::from_micros(u64::from(timing.interval_min_us)),
+            max_connection_interval: Duration::from_micros(u64::from(timing.interval_max_us)),
+            max_latency: timing.peripheral_latency,
+            min_event_length: Duration::from_micros(0),
+            max_event_length: Duration::from_micros(0),
+            supervision_timeout: Duration::from_millis(u64::from(timing.supervision_timeout_ms)),
+        };
+        match conn
+            .raw()
+            .update_connection_params_l2cap(stack, &requested)
+            .await
+        {
+            Ok(()) => log::info!(
+                "firmware: ble slot {} requested interval={}..{}us latency={} timeout={}ms",
+                slot,
+                timing.interval_min_us,
+                timing.interval_max_us,
+                timing.peripheral_latency,
+                timing.supervision_timeout_ms
+            ),
+            Err(err) => log::warn!(
+                "firmware: ble slot {} connection parameter request failed: {:?}",
+                slot,
+                err
+            ),
+        }
+    } else {
+        log::info!(
+            "firmware: ble slot {} keeping responsive interval={}us latency={} timeout={}ms",
             slot,
-            timing.interval_min_us,
-            timing.interval_max_us,
-            timing.peripheral_latency,
-            timing.supervision_timeout_ms
-        ),
-        Err(err) => log::warn!(
-            "firmware: ble slot {} connection parameter request failed: {:?}",
-            slot,
-            err
-        ),
+            current.interval_us,
+            current.peripheral_latency,
+            current.supervision_timeout_ms
+        );
     }
     let preferred_phy = match timing.preferred_phy {
         hidshift::BlePhyPreference::Le1M => PhyKind::Le1M,

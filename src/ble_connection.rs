@@ -64,6 +64,13 @@ pub struct BleConnectionTiming {
     pub preferred_phy: BlePhyPreference,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BleConnectionParameters {
+    pub interval_us: u32,
+    pub peripheral_latency: u16,
+    pub supervision_timeout_ms: u32,
+}
+
 pub const fn low_latency_ble_connection_timing() -> BleConnectionTiming {
     BleConnectionTiming {
         // Peripheral latency permits skipping idle events only. As soon as an
@@ -75,6 +82,26 @@ pub const fn low_latency_ble_connection_timing() -> BleConnectionTiming {
         supervision_timeout_ms: 4_000,
         preferred_phy: BlePhyPreference::Le2M,
     }
+}
+
+/// Returns whether an established link needs a connection-parameter update.
+///
+/// The policy values are upper bounds, not exact values. A central that
+/// already selected the desired interval with a lower peripheral latency or a
+/// shorter but protocol-safe supervision timeout has a more responsive link;
+/// renegotiating it only adds control traffic and can disturb the active HID
+/// connection.
+pub const fn connection_timing_update_required(
+    current: BleConnectionParameters,
+    desired: BleConnectionTiming,
+) -> bool {
+    let timeout_us = current.supervision_timeout_ms as u64 * 1_000;
+    let minimum_timeout_us =
+        2 * (current.peripheral_latency as u64 + 1) * current.interval_us as u64;
+    current.interval_us < desired.interval_min_us
+        || current.interval_us > desired.interval_max_us
+        || current.peripheral_latency > desired.peripheral_latency
+        || timeout_us <= minimum_timeout_us
 }
 
 fn host_index<const HOSTS: usize>(host_id: HostId) -> Option<usize> {
@@ -436,6 +463,32 @@ mod tests {
             timing.supervision_timeout_ms * 1_000
                 > 2 * u32::from(timing.peripheral_latency + 1) * timing.interval_max_us
         );
+    }
+
+    #[test]
+    fn lower_latency_current_link_does_not_need_a_parameter_update() {
+        let desired = low_latency_ble_connection_timing();
+        let current = BleConnectionParameters {
+            interval_us: 7_500,
+            peripheral_latency: 0,
+            supervision_timeout_ms: 2_000,
+        };
+
+        assert!(!connection_timing_update_required(current, desired));
+        assert!(connection_timing_update_required(
+            BleConnectionParameters {
+                interval_us: 15_000,
+                ..current
+            },
+            desired
+        ));
+        assert!(connection_timing_update_required(
+            BleConnectionParameters {
+                peripheral_latency: 20,
+                ..current
+            },
+            desired
+        ));
     }
     use crate::storage::{FixedName, StoredHostProfile, StoredSecurityLevel};
 

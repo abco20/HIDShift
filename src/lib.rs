@@ -33,6 +33,7 @@ pub mod ble_notify;
 pub mod ble_runtime;
 pub mod bridge;
 pub mod checksum;
+pub mod domain;
 pub mod e2e;
 #[cfg(feature = "hardware-e2e")]
 pub mod e2e_mirror;
@@ -54,6 +55,7 @@ pub mod routing;
 pub mod runtime;
 pub mod settings;
 pub mod storage;
+pub mod support;
 pub mod target_control;
 pub mod usb_hid;
 
@@ -62,9 +64,10 @@ pub use ble::{
     cccd_notify_enabled,
 };
 pub use ble_connection::{
-    BLE_PAIRING_BACKOFF_STEPS_MS, BleConnectionEntry, BleConnectionSlot, BleConnectionSlotError,
-    BleConnectionSlots, BleConnectionTiming, BleInputGate, BlePairingBackoff,
-    BlePairingBackoffEntry, BlePeerIdentity, BlePhyPreference, low_latency_ble_connection_timing,
+    BLE_PAIRING_BACKOFF_STEPS_MS, BleConnectionEntry, BleConnectionParameters, BleConnectionSlot,
+    BleConnectionSlotError, BleConnectionSlots, BleConnectionTiming, BleInputGate,
+    BlePairingBackoff, BlePairingBackoffEntry, BlePeerIdentity, BlePhyPreference,
+    connection_timing_update_required, low_latency_ble_connection_timing,
     resolve_host_id as resolve_ble_host_id, restrict_advertising_to_bonded_peers,
 };
 pub use ble_notify::{
@@ -82,6 +85,13 @@ pub use bridge::{
     HostRuntimeState, HostStateError, NotifyReason, PairingMode, PairingSession, ReportReady,
     keyboard_led_event_from_ble_output,
 };
+pub use domain::{
+    ChangeSet, DESTINATION_CAPACITY, Destination, DestinationError, DestinationId,
+    DestinationRegistry, DomainRevision, FirmwareNode, FirmwareUpdate, FirmwareUpdateError,
+    FirmwareUpdatePhase, INPUT_PROFILE_CAPACITY, ImageMetadata, InputIdentity, InputProfile,
+    InputProfileError, InputProfileId, InputProfileRegistry, KeyboardLayout, REMAP_RULE_CAPACITY,
+    RemapRule, Revisions, SESSION_CAPACITY, SessionId, UpdateTarget, Usage,
+};
 pub use ids::{
     DeviceId, HOST_SLOT_COUNT, HOST_SLOT_MAX, HOST_SLOT_MIN, HostId, HostSlot, InterfaceId,
     InvalidHostSlot, ReportId, SlotId,
@@ -91,6 +101,11 @@ pub use input::{
     KeyboardSuppression, Modifier, ModifierState, MouseButton, MouseButtons, MouseFrame,
     MouseInputReport, MouseMovement, PhysicalInputState, PhysicalKeyboardState, PhysicalMouseState,
     StandardInputFrame, VisibleKeyboardState,
+};
+pub use management::frame::{
+    FRAME_CAPACITY, FRAME_CRC_LEN, FRAME_HEADER_LEN, FRAME_PAYLOAD_CAPACITY, FRAME_VERSION, Frame,
+    FrameError, FrameKind, NodeId as ManagementNodeId, STREAM_FRAME_CAPACITY, decode_stream,
+    encode_stream,
 };
 #[cfg(feature = "dual-s3-wired")]
 pub use management::{
@@ -168,6 +183,10 @@ pub use storage::{
     StoredAddressKind, StoredBond, StoredHostProfile, StoredSecurityLevel, decode_storage_image,
     encode_storage_image, persist_storage_state, restore_latest_storage_state,
     select_newest_valid_storage_image,
+};
+pub use support::{
+    LOG_MESSAGE_CAPACITY, LOG_RING_BYTE_BUDGET, LOG_RING_CAPACITY, LogEntry, LogLevel, LogRing,
+    LogWrite,
 };
 pub use target_control::{
     ButtonIntent, DebouncedButton, DebouncedButtonEvent, TargetSwitchControl,
