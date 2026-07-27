@@ -97,14 +97,6 @@ const LOG_LEVEL_CHOICES: &[SettingChoice] = &[
         value: 2,
         label: "通常（推奨）",
     },
-    SettingChoice {
-        value: 3,
-        label: "デバッグ",
-    },
-    SettingChoice {
-        value: 4,
-        label: "すべて記録",
-    },
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -222,8 +214,8 @@ settings_schema! {
         kind: HidUsage, scope: Host, default: 0, min: 0, max: 1023, step: 1, unit: "", choices: NO_CHOICES, restart: false
     },
     LogLevel = 15 => {
-        key: "log_level", label: "ログレベル", description: "0:error 1:warn 2:info 3:debug 4:trace",
-        kind: Choice, scope: Global, default: 2, min: 0, max: 4, step: 1, unit: "", choices: LOG_LEVEL_CHOICES, restart: false
+        key: "log_level", label: "ログレベル", description: "0:error 1:warn 2:info",
+        kind: Choice, scope: Global, default: 2, min: 0, max: 2, step: 1, unit: "", choices: LOG_LEVEL_CHOICES, restart: false
     },
 }
 

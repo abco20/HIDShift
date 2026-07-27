@@ -1,3 +1,5 @@
+pub mod frame;
+
 use crate::ids::HostId;
 #[cfg(feature = "dual-s3-wired")]
 use crate::output_target::{OutputTarget, OutputTargetAvailability, UsbPresentation};

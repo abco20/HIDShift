@@ -33,7 +33,7 @@ struct Arguments {
     host_port: PathBuf,
     #[arg(long)]
     device_flash_port: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(long = "reuse-firmware", alias = "skip-flash")]
     skip_flash: bool,
     /// Run only the SPI link-loss/no-failover scenario against existing images.
     #[arg(long)]
@@ -80,7 +80,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         let device_port = arguments
             .device_flash_port
             .as_deref()
-            .ok_or("--device-flash-port is required unless --skip-flash is used")?;
+            .ok_or("--device-flash-port is required unless --reuse-firmware is used")?;
         if arguments.ble_address.is_some() && arguments.linux_controller_address.is_none() {
             return Err(
                 "--linux-controller-address is required when flashing for --ble-address E2E".into(),
@@ -633,7 +633,7 @@ fn flash_firmware(
         Command::new("espflash")
             .args(["erase-region", "--chip", "esp32s3", "--port"])
             .arg(device_port)
-            .args(["0x194000", "0x10000"])
+            .args(["0x324000", "0x10000"])
             .current_dir(root),
         "erase Device S3 Mirror profile partition",
     )?;
@@ -645,7 +645,7 @@ fn flash_firmware(
                 "--partition-table",
                 "partitions/bridge.csv",
                 "--target-app-partition",
-                "factory",
+                "ota_0",
                 "device-firmware/target/xtensa-esp32s3-none-elf/release/hidshift-device",
             ])
             .current_dir(root),
@@ -655,7 +655,7 @@ fn flash_firmware(
         Command::new("espflash")
             .args(["erase-region", "--chip", "esp32s3", "--port"])
             .arg(host_port)
-            .args(["0x190000", "0x4000"])
+            .args(["0x320000", "0x4000"])
             .current_dir(root),
         "erase Host S3 settings partition",
     )?;
@@ -667,7 +667,7 @@ fn flash_firmware(
                 "--partition-table",
                 "partitions/bridge.csv",
                 "--target-app-partition",
-                "factory",
+                "ota_0",
                 "target/xtensa-esp32s3-none-elf/release/firmware",
             ])
             .current_dir(root),

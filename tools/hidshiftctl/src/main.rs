@@ -8,7 +8,7 @@ use btleplug::platform::{Adapter, Manager, Peripheral};
 use clap::{ArgGroup, Parser, Subcommand};
 use futures_util::StreamExt;
 use hidshift::{
-    MANAGEMENT_REQUEST_UUID, MANAGEMENT_RESPONSE_LEN, MANAGEMENT_RESPONSE_UUID,
+    HostId, MANAGEMENT_REQUEST_UUID, MANAGEMENT_RESPONSE_LEN, MANAGEMENT_RESPONSE_UUID,
     MANAGEMENT_SERVICE_UUID, ManagementCommand, ManagementHostStatus, ManagementOutputTarget,
     ManagementResponse, ManagementResponsePayload, ManagementResult, MirrorCandidateId,
     SETTING_DESCRIPTORS, SettingScope, SettingTarget, setting_by_key,
@@ -23,15 +23,16 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Transport {
+    Auto,
     Serial(String),
     Ble(Option<String>),
-    None,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Arguments {
     transport: Transport,
     command: CliCommand,
+    json: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -55,6 +56,7 @@ enum CliCommand {
         value: i32,
     },
     Overview,
+    Destinations,
 }
 
 #[derive(Debug, Parser)]
@@ -70,70 +72,174 @@ struct CliArgs {
     /// 接続するBluetoothアドレス（省略時はHIDShiftを自動検出）
     #[arg(long, requires = "ble", value_name = "ADDRESS")]
     address: Option<String>,
+    /// 安定したversion付きJSONとして出力
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: CommandArgs,
 }
 
 #[derive(Debug, Subcommand)]
 enum CommandArgs {
-    /// 接続先・USB入力・診断・履歴をまとめて表示
-    Overview,
-    /// 現在の接続状態を表示
+    /// 日常利用に必要な現在状態を表示
     Status,
+    /// Bluetooth接続先を一覧・選択・登録
+    Destination {
+        #[command(subcommand)]
+        command: DestinationArgs,
+    },
+    /// USB入力機器を一覧
+    Input {
+        #[command(subcommand)]
+        command: InputArgs,
+    },
+    /// 本体設定を確認・変更
+    System {
+        #[command(subcommand)]
+        command: SystemArgs,
+    },
+    /// 診断とイベント履歴
+    Support {
+        #[command(subcommand)]
+        command: SupportArgs,
+    },
+    /// 有線出力の互換モード
+    Wired {
+        #[command(subcommand)]
+        command: WiredArgs,
+    },
+    #[command(hide = true)]
+    Overview,
+    #[command(hide = true)]
     /// 接続中のUSB入力機器を表示
     Devices,
+    #[command(hide = true)]
     /// 再起動や通信エラーの診断情報を表示
     Diagnostics,
+    #[command(hide = true)]
     /// 接続イベントの履歴を表示
     History,
+    #[command(hide = true)]
     /// 入力の送信先を切り替え
     Select {
         #[arg(value_parser = clap::value_parser!(u8).range(1..=4))]
         slot: u8,
     },
+    #[command(hide = true)]
     /// USBまたはBLEの出力先を選択・確認
     Target {
         #[command(subcommand)]
         command: TargetArgs,
     },
+    #[command(hide = true)]
     /// Dynamic USB Mirrorの対象を選択・解除
     Mirror {
         #[command(subcommand)]
         command: MirrorArgs,
     },
+    #[command(hide = true)]
     /// 新しいPCやスマートフォンのペアリングを開始
     Pair {
         #[arg(value_parser = clap::value_parser!(u8).range(1..=4))]
         slot: u8,
     },
+    #[command(hide = true)]
     /// 実行中のペアリングを中止
     PairCancel,
+    #[command(hide = true)]
     /// スロットに登録された機器を削除
     Forget {
         #[arg(value_parser = clap::value_parser!(u8).range(1..=4))]
         slot: u8,
     },
+    #[command(hide = true)]
     /// スロットの機器名と状態を表示
     Info {
         #[arg(value_parser = clap::value_parser!(u8).range(1..=4))]
         slot: u8,
     },
+    #[command(hide = true)]
     /// スロットの最終接続情報を表示
     Timing {
         #[arg(value_parser = clap::value_parser!(u8).range(1..=4))]
         slot: u8,
     },
+    #[command(hide = true)]
     /// スロットの表示名を変更（空文字列で自動名に戻す）
     Name {
         #[arg(value_parser = clap::value_parser!(u8).range(1..=4))]
         slot: u8,
         name: String,
     },
+    #[command(hide = true)]
     /// 動作設定を確認・変更
     Settings {
         #[command(subcommand)]
         command: SettingsArgs,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum DestinationArgs {
+    /// 登録済み・接続中の接続先を一覧
+    List,
+    /// 入力の送信先を選択
+    Select {
+        #[arg(value_parser = clap::value_parser!(u8).range(1..=4))]
+        id: u8,
+    },
+    /// 新しい接続先のペアリングを開始
+    Add {
+        #[arg(value_parser = clap::value_parser!(u8).range(1..=4))]
+        id: u8,
+    },
+    /// ペアリングを中止
+    Cancel,
+    /// 登録を解除
+    Forget {
+        #[arg(value_parser = clap::value_parser!(u8).range(1..=4))]
+        id: u8,
+    },
+    /// 表示名を変更
+    Rename {
+        #[arg(value_parser = clap::value_parser!(u8).range(1..=4))]
+        id: u8,
+        name: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum InputArgs {
+    /// 接続中のUSB入力機器を一覧
+    List,
+}
+
+#[derive(Debug, Subcommand)]
+enum SystemArgs {
+    /// firmwareと現在状態を表示
+    Status,
+    /// 本体設定を一覧
+    Settings,
+}
+
+#[derive(Debug, Subcommand)]
+enum SupportArgs {
+    /// 診断情報を表示
+    Status,
+    /// RAM内イベント履歴を表示
+    Events,
+}
+
+#[derive(Debug, Subcommand)]
+enum WiredArgs {
+    /// 有線出力状態を表示
+    Status,
+    /// Standard HID modeへ戻す
+    Standard,
+    /// 元のUSB機器候補を一覧
+    OriginalList,
+    /// 元のUSB機器として提示
+    Original { id: u8 },
 }
 
 #[derive(Debug, Subcommand)]
@@ -197,6 +303,9 @@ async fn main() {
 
 async fn run() -> Result<(), Box<dyn Error>> {
     let arguments = parse_arguments(env::args().skip(1))?;
+    if arguments.json {
+        return run_json(arguments).await;
+    }
     match arguments.command {
         CliCommand::Request(command) => {
             let response = request(&arguments.transport, command).await?;
@@ -238,7 +347,320 @@ async fn run() -> Result<(), Box<dyn Error>> {
             print_devices(&arguments.transport).await?;
             print_history(&arguments.transport).await
         }
+        CliCommand::Destinations => print_destinations(&arguments.transport).await,
     }
+}
+
+async fn run_json(arguments: Arguments) -> Result<(), Box<dyn Error>> {
+    let data = match arguments.command {
+        CliCommand::Request(command) => {
+            let response = request(&arguments.transport, command).await?;
+            ensure_ok(response)?;
+            response_json(response)
+        }
+        CliCommand::Diagnostics => {
+            let response = request(&arguments.transport, ManagementCommand::GetDiagnostics).await?;
+            ensure_ok(response)?;
+            response_json(response)
+        }
+        CliCommand::Devices => devices_json(&arguments.transport).await?,
+        CliCommand::History => history_json(&arguments.transport).await?,
+        CliCommand::MirrorList => mirror_json(&arguments.transport).await?,
+        CliCommand::SettingsList => settings_json(&arguments.transport).await?,
+        CliCommand::SettingDescribe { key } => {
+            let descriptor = setting_by_key(&key).ok_or_else(|| unknown_setting_message(&key))?;
+            serde_json::json!({
+                "key": descriptor.key,
+                "id": descriptor.id as u16,
+                "scope": format!("{:?}", descriptor.scope).to_lowercase(),
+                "kind": format!("{:?}", descriptor.kind).to_lowercase(),
+                "default": descriptor.default,
+                "min": descriptor.min,
+                "max": descriptor.max,
+                "step": descriptor.step,
+                "restart_required": descriptor.restart_required,
+            })
+        }
+        CliCommand::SettingGet { key, slot } => {
+            let response =
+                request(&arguments.transport, setting_command(&key, slot, None)?).await?;
+            ensure_ok(response)?;
+            response_json(response)
+        }
+        CliCommand::SettingSet { key, slot, value } => {
+            let response = request(
+                &arguments.transport,
+                setting_command(&key, slot, Some(value))?,
+            )
+            .await?;
+            ensure_ok(response)?;
+            response_json(response)
+        }
+        CliCommand::Destinations => destinations_json(&arguments.transport).await?,
+        CliCommand::Overview => serde_json::json!({
+            "status": response_json(request(&arguments.transport, ManagementCommand::GetStatus).await?),
+            "inputs": devices_json(&arguments.transport).await?,
+            "diagnostics": response_json(request(&arguments.transport, ManagementCommand::GetDiagnostics).await?),
+            "events": history_json(&arguments.transport).await?,
+        }),
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "data": data,
+        }))?
+    );
+    Ok(())
+}
+
+async fn destinations_json(transport: &Transport) -> Result<serde_json::Value, Box<dyn Error>> {
+    let response = request(transport, ManagementCommand::GetStatus).await?;
+    ensure_ok(response)?;
+    let ManagementResponsePayload::Status(status) = response.payload else {
+        return Err("status payload missing".into());
+    };
+    let mut destinations = Vec::new();
+    for index in 0..status.host_count.min(4) as usize {
+        if !status.hosts[index].known {
+            continue;
+        }
+        let response = request(
+            transport,
+            ManagementCommand::GetHostInfo(HostId((index + 1) as u8)),
+        )
+        .await?;
+        ensure_ok(response)?;
+        destinations.push(response_json(response));
+    }
+    Ok(serde_json::json!({
+        "selected_id": status.active_host.map(|host| host.0),
+        "pairing_id": status.pairing_host.map(|host| host.0),
+        "destinations": destinations,
+    }))
+}
+
+async fn devices_json(transport: &Transport) -> Result<serde_json::Value, Box<dyn Error>> {
+    let response = request(transport, ManagementCommand::GetStatus).await?;
+    ensure_ok(response)?;
+    let ManagementResponsePayload::Status(status) = response.payload else {
+        return Err("status payload missing".into());
+    };
+    let mut devices = Vec::new();
+    for index in 0..status.usb.device_count {
+        let response = request(
+            transport,
+            ManagementCommand::GetUsbDevice {
+                index,
+                name_offset: 0,
+            },
+        )
+        .await?;
+        ensure_ok(response)?;
+        devices.push(response_json(response));
+    }
+    Ok(serde_json::Value::Array(devices))
+}
+
+async fn history_json(transport: &Transport) -> Result<serde_json::Value, Box<dyn Error>> {
+    let mut events = Vec::new();
+    for index in 0..16 {
+        let response = request(transport, ManagementCommand::GetHistory { index }).await?;
+        if response.result == ManagementResult::NotFound {
+            break;
+        }
+        ensure_ok(response)?;
+        events.push(response_json(response));
+    }
+    Ok(serde_json::Value::Array(events))
+}
+
+async fn mirror_json(transport: &Transport) -> Result<serde_json::Value, Box<dyn Error>> {
+    let mut candidates = Vec::new();
+    for id in 0..4 {
+        let response = request(
+            transport,
+            ManagementCommand::GetMirrorCandidate(MirrorCandidateId(id)),
+        )
+        .await?;
+        if response.result == ManagementResult::NotFound {
+            continue;
+        }
+        ensure_ok(response)?;
+        candidates.push(response_json(response));
+    }
+    Ok(serde_json::Value::Array(candidates))
+}
+
+async fn settings_json(transport: &Transport) -> Result<serde_json::Value, Box<dyn Error>> {
+    let mut settings = Vec::new();
+    for descriptor in SETTING_DESCRIPTORS {
+        let targets: Vec<_> = match descriptor.scope {
+            SettingScope::Global => vec![SettingTarget::Global],
+            SettingScope::Host => (1..=4).map(|id| SettingTarget::Host(HostId(id))).collect(),
+        };
+        for target in targets {
+            let response = request(
+                transport,
+                ManagementCommand::GetSetting {
+                    id: descriptor.id,
+                    target,
+                },
+            )
+            .await?;
+            ensure_ok(response)?;
+            settings.push(response_json(response));
+        }
+    }
+    Ok(serde_json::Value::Array(settings))
+}
+
+fn response_json(response: ManagementResponse) -> serde_json::Value {
+    match response.payload {
+        ManagementResponsePayload::None => serde_json::json!({ "ok": true }),
+        ManagementResponsePayload::Status(status) => serde_json::json!({
+            "selected_id": status.active_host.map(|host| host.0),
+            "pairing_id": status.pairing_host.map(|host| host.0),
+            "usb": {
+                "devices": status.usb.device_count,
+                "interfaces": status.usb.interface_count,
+                "keyboards": status.usb.keyboard_count,
+            },
+            "destinations": status.hosts[..status.host_count.min(4) as usize]
+                .iter()
+                .enumerate()
+                .map(|(index, host)| serde_json::json!({
+                    "id": index + 1,
+                    "known": host.known,
+                    "connected": host.connected,
+                    "encrypted": host.encrypted,
+                    "bonded": host.bonded,
+                }))
+                .collect::<Vec<_>>(),
+        }),
+        ManagementResponsePayload::HostInfo(info) => serde_json::json!({
+            "id": info.host_id.0,
+            "name": String::from_utf8_lossy(info.name.as_bytes()),
+            "name_source": info.name_source,
+            "connected": info.status.connected,
+            "encrypted": info.status.encrypted,
+            "bonded": info.status.bonded,
+        }),
+        ManagementResponsePayload::UsbDevice(device) => serde_json::json!({
+            "index": device.index,
+            "id": device.device_id,
+            "vendor_id": device.vendor_id,
+            "product_id": device.product_id,
+            "connected": device.flags & 1 != 0,
+            "keyboard": device.flags & 2 != 0,
+            "mouse": device.flags & 4 != 0,
+            "consumer": device.flags & 8 != 0,
+            "name_chunk": String::from_utf8_lossy(device.name_chunk()),
+        }),
+        ManagementResponsePayload::Diagnostics(value) => serde_json::json!({
+            "uptime_seconds": value.uptime_seconds,
+            "reset_reason": value.reset_reason,
+            "brownouts": value.brownout_count,
+            "ble_disconnects": value.ble_disconnect_count,
+            "ble_notify_failures": value.ble_notify_failure_count,
+            "usb_errors": value.usb_error_count,
+            "flash_writes": value.flash_write_count,
+            "flash_failures": value.flash_failure_count,
+        }),
+        ManagementResponsePayload::History(event) => serde_json::json!({
+            "sequence": event.sequence,
+            "timestamp_seconds": event.timestamp_seconds,
+            "kind": event.kind,
+            "subject": event.subject,
+            "detail": event.detail,
+            "vendor_id": event.vendor_id,
+            "product_id": event.product_id,
+        }),
+        ManagementResponsePayload::Schema(schema) => serde_json::json!({
+            "firmware": [schema.firmware_major, schema.firmware_minor, schema.firmware_patch],
+            "protocol_version": 1,
+            "settings_schema_version": schema.version,
+            "settings_schema_hash": schema.hash,
+            "capabilities": schema.capabilities,
+        }),
+        ManagementResponsePayload::Setting(setting) => serde_json::json!({
+            "id": setting.id as u16,
+            "key": hidshift::setting_descriptor(setting.id).key,
+            "target": match setting.target {
+                SettingTarget::Global => serde_json::json!({"kind": "system"}),
+                SettingTarget::Host(host) => serde_json::json!({"kind": "destination", "id": host.0}),
+            },
+            "value": setting.value,
+        }),
+        ManagementResponsePayload::HostTiming(value) => serde_json::json!({
+            "id": value.host_id.0,
+            "last_connected_seconds": value.last_connected_seconds,
+            "last_disconnected_seconds": value.last_disconnected_seconds,
+            "last_disconnect_reason": value.last_disconnect_reason,
+        }),
+        ManagementResponsePayload::OutputTargetStatus(value) => serde_json::json!({
+            "selected": output_target_json(value.selected),
+            "active": value.active.map(output_target_json),
+            "wired_ready": value.wired_ready,
+            "ready_ble_mask": value.ready_ble_mask,
+            "compatibility_mode": if value.mirror_configured { "original" } else { "standard" },
+            "operation_id": value.operation_id,
+        }),
+        ManagementResponsePayload::MirrorCandidate(value) => serde_json::json!({
+            "id": value.candidate.0,
+            "source_device_id": value.source_device,
+            "vendor_id": value.vendor_id,
+            "product_id": value.product_id,
+            "profile_hash": value.profile_hash,
+            "descriptor_hash": value.descriptor_hash,
+            "selected": value.selected(),
+            "active": value.active(),
+        }),
+    }
+}
+
+fn output_target_json(target: ManagementOutputTarget) -> serde_json::Value {
+    match target {
+        ManagementOutputTarget::Wired => serde_json::json!({ "kind": "wired" }),
+        ManagementOutputTarget::Ble(host) => {
+            serde_json::json!({ "kind": "destination", "id": host.0 })
+        }
+    }
+}
+
+async fn print_destinations(transport: &Transport) -> Result<(), Box<dyn Error>> {
+    let response = request(transport, ManagementCommand::GetStatus).await?;
+    ensure_ok(response)?;
+    let ManagementResponsePayload::Status(status) = response.payload else {
+        return Err("status payload missing".into());
+    };
+    println!(
+        "selected: {}",
+        display_host(status.active_host.map(|host| host.0))
+    );
+    println!("connected:");
+    for index in 0..status.host_count.min(4) as usize {
+        let flags = status.hosts[index];
+        if !flags.known {
+            continue;
+        }
+        let response = request(
+            transport,
+            ManagementCommand::GetHostInfo(HostId((index + 1) as u8)),
+        )
+        .await?;
+        ensure_ok(response)?;
+        if let ManagementResponsePayload::HostInfo(info) = response.payload {
+            let name = std::str::from_utf8(info.name.as_bytes()).unwrap_or("?");
+            println!(
+                "  {}: {} [{}]",
+                info.host_id.0,
+                if name.is_empty() { "(unnamed)" } else { name },
+                display_slot(flags)
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn request(
@@ -251,19 +673,67 @@ async fn request(
         .begin(command)
         .map_err(|error| format!("could not start request: {error:?}"))?;
 
+    let resolved;
+    let transport = if *transport == Transport::Auto {
+        resolved = resolve_auto_transport()?;
+        &resolved
+    } else {
+        transport
+    };
     let bytes = match transport {
+        Transport::Auto => unreachable!("automatic transport is resolved above"),
         Transport::Serial(port) => serial_request(port, request, DEFAULT_TIMEOUT)?,
         Transport::Ble(address) => {
             ble_request(address.as_deref(), request, DEFAULT_TIMEOUT).await?
-        }
-        Transport::None => {
-            return Err("接続方法を指定してください（--serial PORT または --ble）".into());
         }
     };
     let response = client
         .accept(&bytes)
         .map_err(|error| format!("invalid firmware response: {error:?}"))?;
     Ok(response)
+}
+
+fn resolve_auto_transport() -> Result<Transport, Box<dyn Error>> {
+    let mut candidates = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/dev/serial/by-id") {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.contains("HIDShift") || name.contains("1a86_USB_Single_Serial") {
+                candidates.push(entry.path().display().to_string());
+            }
+        }
+    }
+    if candidates.is_empty() {
+        for port in serialport::available_ports().unwrap_or_default() {
+            if let serialport::SerialPortType::UsbPort(info) = &port.port_type
+                && (info
+                    .product
+                    .as_deref()
+                    .is_some_and(|name| name.contains("HIDShift"))
+                    || info
+                        .manufacturer
+                        .as_deref()
+                        .is_some_and(|name| name.contains("HIDShift")))
+            {
+                candidates.push(port.port_name);
+            }
+        }
+    }
+    choose_auto_transport(candidates)
+}
+
+fn choose_auto_transport(mut candidates: Vec<String>) -> Result<Transport, Box<dyn Error>> {
+    candidates.sort();
+    candidates.dedup();
+    match candidates.as_slice() {
+        [] => Ok(Transport::Ble(None)),
+        [port] => Ok(Transport::Serial(port.clone())),
+        _ => Err(format!(
+            "multiple HIDShift USB devices found: {}; specify --serial PORT or --ble",
+            candidates.join(", ")
+        )
+        .into()),
+    }
 }
 
 fn ensure_ok(response: ManagementResponse) -> Result<(), Box<dyn Error>> {
@@ -278,7 +748,6 @@ fn serial_request(
     timeout: Duration,
 ) -> Result<[u8; MANAGEMENT_RESPONSE_LEN], Box<dyn Error>> {
     let mut port = open_management_serial(port_name)?;
-    std::thread::sleep(Duration::from_secs(2));
     port.write_all(&encode_serial_request(request))?;
     port.flush()?;
 
@@ -634,7 +1103,7 @@ async fn print_devices(transport: &Transport) -> Result<(), Box<dyn Error>> {
                 break;
             }
         }
-        let device = first.unwrap();
+        let device = first.ok_or("USB device response did not include metadata")?;
         println!(
             "usb[{}]: {} ({:04x}:{:04x}) device={}{}{}{}",
             index,
@@ -934,7 +1403,7 @@ fn setting_command(
     let descriptor = setting_by_key(key).ok_or("unknown setting key")?;
     let target = match (descriptor.scope, slot) {
         (SettingScope::Global, None) => SettingTarget::Global,
-        (SettingScope::Host, Some(1..=4)) => SettingTarget::Host(hidshift::HostId(slot.unwrap())),
+        (SettingScope::Host, Some(slot @ 1..=4)) => SettingTarget::Host(hidshift::HostId(slot)),
         (SettingScope::Global, Some(_)) => return Err("global setting does not take SLOT".into()),
         (SettingScope::Host, None) => return Err("host setting requires SLOT".into()),
         _ => return Err("slot must be between 1 and 4".into()),
@@ -1022,9 +1491,48 @@ where
     } else if parsed.ble {
         Transport::Ble(parsed.address)
     } else {
-        Transport::None
+        Transport::Auto
     };
     let command = match parsed.command {
+        CommandArgs::Destination { command } => match command {
+            DestinationArgs::List => CliCommand::Destinations,
+            DestinationArgs::Select { id } => {
+                CliCommand::Request(ManagementCommand::SelectHost(HostId(id)))
+            }
+            DestinationArgs::Add { id } => {
+                CliCommand::Request(ManagementCommand::StartPairing(HostId(id)))
+            }
+            DestinationArgs::Cancel => CliCommand::Request(ManagementCommand::CancelPairing),
+            DestinationArgs::Forget { id } => {
+                CliCommand::Request(ManagementCommand::ForgetHost(HostId(id)))
+            }
+            DestinationArgs::Rename { id, name } => {
+                CliCommand::Request(ManagementCommand::SetHostName {
+                    host_id: HostId(id),
+                    name: hidshift::ManagementHostName::from_ascii(&name)
+                        .map_err(|_| "name must be at most 12 printable ASCII characters")?,
+                })
+            }
+        },
+        CommandArgs::Input {
+            command: InputArgs::List,
+        } => CliCommand::Devices,
+        CommandArgs::System { command } => match command {
+            SystemArgs::Status => CliCommand::Request(ManagementCommand::GetSchema),
+            SystemArgs::Settings => CliCommand::SettingsList,
+        },
+        CommandArgs::Support { command } => match command {
+            SupportArgs::Status => CliCommand::Diagnostics,
+            SupportArgs::Events => CliCommand::History,
+        },
+        CommandArgs::Wired { command } => match command {
+            WiredArgs::Status => CliCommand::Request(ManagementCommand::GetOutputTargetStatus),
+            WiredArgs::Standard => CliCommand::Request(ManagementCommand::ClearMirrorTarget),
+            WiredArgs::OriginalList => CliCommand::MirrorList,
+            WiredArgs::Original { id } => {
+                CliCommand::Request(ManagementCommand::SetMirrorTarget(MirrorCandidateId(id)))
+            }
+        },
         CommandArgs::Overview => CliCommand::Overview,
         CommandArgs::Status => CliCommand::Request(ManagementCommand::GetStatus),
         CommandArgs::Devices => CliCommand::Devices,
@@ -1083,7 +1591,11 @@ where
             }
         },
     };
-    Ok(Arguments { transport, command })
+    Ok(Arguments {
+        transport,
+        command,
+        json: parsed.json,
+    })
 }
 
 #[cfg(test)]
@@ -1098,6 +1610,7 @@ mod tests {
             Arguments {
                 transport: Transport::Serial("/dev/ttyUSB0".to_owned()),
                 command: CliCommand::Request(ManagementCommand::SelectHost(hidshift::HostId(3))),
+                json: false,
             }
         );
         assert_eq!(
@@ -1105,6 +1618,7 @@ mod tests {
             Arguments {
                 transport: Transport::Ble(None),
                 command: CliCommand::Request(ManagementCommand::GetStatus),
+                json: false,
             }
         );
         assert_eq!(
@@ -1115,8 +1629,52 @@ mod tests {
                     host_id: hidshift::HostId(2),
                     name: hidshift::ManagementHostName::from_ascii("Work PC").unwrap(),
                 }),
+                json: false,
             }
         );
+    }
+
+    #[test]
+    fn new_command_families_default_to_auto_transport_and_versioned_json() {
+        assert_eq!(
+            parse_arguments(["destination", "list", "--json"].map(str::to_owned)).unwrap(),
+            Arguments {
+                transport: Transport::Auto,
+                command: CliCommand::Destinations,
+                json: true,
+            }
+        );
+        assert_eq!(
+            parse_arguments(["input", "list"].map(str::to_owned))
+                .unwrap()
+                .command,
+            CliCommand::Devices
+        );
+        assert_eq!(
+            parse_arguments(["support", "events"].map(str::to_owned))
+                .unwrap()
+                .command,
+            CliCommand::History
+        );
+        assert_eq!(
+            parse_arguments(["wired", "standard"].map(str::to_owned))
+                .unwrap()
+                .command,
+            CliCommand::Request(ManagementCommand::ClearMirrorTarget)
+        );
+    }
+
+    #[test]
+    fn auto_transport_never_guesses_between_multiple_usb_devices() {
+        assert_eq!(
+            choose_auto_transport(vec!["/dev/one".into()]).unwrap(),
+            Transport::Serial("/dev/one".into())
+        );
+        assert_eq!(
+            choose_auto_transport(Vec::new()).unwrap(),
+            Transport::Ble(None)
+        );
+        assert!(choose_auto_transport(vec!["/dev/one".into(), "/dev/two".into()]).is_err());
     }
 
     #[test]
@@ -1211,10 +1769,11 @@ mod tests {
             parse_arguments(["settings", "describe", "keyboard_layout"].map(str::to_owned))
                 .unwrap(),
             Arguments {
-                transport: Transport::None,
+                transport: Transport::Auto,
                 command: CliCommand::SettingDescribe {
                     key: "keyboard_layout".into(),
                 },
+                json: false,
             }
         );
     }

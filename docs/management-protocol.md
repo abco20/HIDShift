@@ -3,10 +3,16 @@
 This protocol is under development. Compatibility is not guaranteed until the
 format is declared stable.
 
-BLE carries binary request and response values. UART carries exactly the same
-values as hexadecimal, prefixed with `@HIDSHIFT:` and terminated by a newline.
-Both envelopes are fixed at 20 bytes so one message fits the default 23-byte
-BLE ATT MTU. Longer names and lists use indexed/chunked requests.
+The product-level v1 envelope is variable length and transport neutral. Its
+header contains magic `HS`, protocol version, frame kind, 16-bit request ID,
+node ID, flags, and payload length; CRC-16/CCITT-FALSE follows the payload.
+`src/management/frame.rs` is the host-tested envelope codec. UART and USB CDC
+can use COBS plus a zero delimiter. The envelope is designed for a BLE adapter
+to fragment the same logical frame at the ATT boundary.
+
+The shipping request/response adapter still accepts the original fixed
+20-byte v1 messages during the firmware transition. UART represents these as
+hexadecimal `@HIDSHIFT:` lines.
 
 ## GATT service
 
@@ -44,3 +50,16 @@ vendor interface on its native USB connection.
 compiled descriptors and verify the firmware schema version/count/hash before
 showing values. Wire IDs are stable numeric values; display labels and command
 keys are not used as persistent identifiers.
+
+## Product domains and synchronization
+
+The host-tested domain model supports node (Host or Device), up to eight
+remembered destinations, four transient sessions, up to eight remembered input
+profiles, and a Wired compatibility mode of Standard or Original USB device.
+The shipping fixed-message adapter has not yet migrated its four host slots to
+this model.
+
+The revision codec represents changes with a domain mask and wrapping revisions
+for summary, sessions, destinations, inputs, system, wired, and support. The Web
+client already loads a summary first and fetches details lazily; firmware event
+delivery and revision-driven refetch remain adapter work.

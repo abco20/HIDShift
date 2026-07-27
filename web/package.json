@@ -1,0 +1,11 @@
+{
+  "name": "hidshift-web-tests",
+  "private": true,
+  "scripts": {
+    "test": "playwright test",
+    "test:update": "playwright test --update-snapshots"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.0"
+  }
+}

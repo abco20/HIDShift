@@ -311,7 +311,7 @@ mod tests {
                 command: crate::management::ManagementCommand::SetSetting {
                     id: crate::settings::SettingId::LogLevel,
                     target: crate::settings::SettingTarget::Global,
-                    value: 3,
+                    value: 1,
                 },
             },
             now_ms: 0,
@@ -328,7 +328,7 @@ mod tests {
 
         let mut success = RecordingSink::default();
         drive_runtime_message(&mut owner, &message, &mut success).unwrap();
-        assert_eq!(success.effects.as_slice(), &[RuntimeEffect::SetLogLevel(3)]);
+        assert_eq!(success.effects.as_slice(), &[RuntimeEffect::SetLogLevel(1)]);
 
         let mut same_value = RecordingSink::default();
         drive_runtime_message(&mut owner, &message, &mut same_value).unwrap();

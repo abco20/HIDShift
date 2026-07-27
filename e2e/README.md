@@ -1,4 +1,15 @@
-# Direct BLE hardware E2E
+# Hardware E2E suites
+
+| Task | Hardware | Purpose |
+| --- | --- | --- |
+| `mise run e2e:pc` | one DUT + Linux PC | cable management, CLI JSON, input/status/diagnostics smoke |
+| `mise run e2e:radio` | DUT + Probe + Linux PC | mandatory retained Linux session, synchronized BLE latency and stability |
+| `mise run e2e:dual` | Host S3 + Device S3 + Linux PC | Wired presentation, exact descriptors, SPI loss and recovery |
+
+Roles are resolved by stable USB serial and MAC identity, never by `ttyACM`
+numbering.
+
+## Direct BLE radio suite
 
 The hardware suite measures the path from the DUT's normalized input boundary
 through the real BLE stack to an ESP BLE Central probe. It does not replace
@@ -18,16 +29,13 @@ ambiguous.
 ## Run
 
 ```sh
-source ~/export-esp.sh
-cargo run --manifest-path e2e/runner/Cargo.toml -- \
-  --latency-samples 500 \
-  --stability-seconds 120
+mise run e2e:radio
 ```
 
 Useful options are:
 
 - `--dut-port` and `--probe-port` to override port discovery
-- `--skip-flash` with explicit `--dut-port`, `--probe-port`, and `--probe-chip`
+- `--reuse-firmware` with explicit `--dut-port`, `--probe-port`, and `--probe-chip`
   to reuse loaded images without resetting boards during chip discovery
 - `--skip-linux` to omit Linux-side integration checks
 - `--write-baseline` to replace the checked-in baseline after a representative run
@@ -82,7 +90,7 @@ cargo run --manifest-path e2e/mirror-runner/Cargo.toml -- \
   --linux-controller-address 4C:23:38:A6:20:44
 ```
 
-Use `--skip-flash` to reuse loaded images. Explicit ports avoid confusing the
+Use `--reuse-firmware` to reuse loaded images. Explicit ports avoid confusing the
 two ESP32-S3 roles after Device S3 changes its native USB identity.
 `--ble-address` enables the BlueZ BLE Management, HID release/suppression and
 no-broadcast cases in `--ble-host-slot` (default 2). Build `tools/hidshiftctl`
@@ -90,11 +98,11 @@ in release mode first or override `--hidshiftctl`. A flashing BLE run also
 requires the local controller address so the hardware-E2E firmware can
 authorize that peer. Because hardware-E2E bond state is volatile, a flashing
 run removes the stale BlueZ bond and pairs the peer automatically.
-`--skip-flash` preserves and reuses the existing bond unless `--pair-ble` is
+`--reuse-firmware` preserves and reuses the existing bond unless `--pair-ble` is
 also specified.
 `--skip-hidraw` omits Vendor and Feature Report cases when local udev policy
 does not grant read/write access to `/dev/hidraw*`; evdev cases still run.
-Use `--skip-flash --spi-loss-only --device-flash-port <device-s3>` for a short
+Use `--reuse-firmware --spi-loss-only --device-flash-port <device-s3>` for a short
 T26 run against already loaded hardware. This mode does not read or register
 Mirror fixture files; the Device port is used only to reset the intentionally
 offline SPI slave after the no-failover assertion.
