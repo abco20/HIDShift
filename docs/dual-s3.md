@@ -66,6 +66,11 @@ delay, so the fixed 500 us SPI polling schedule remains serviced.
 
 ## Build and flash
 
+The optional dual-S3 images are currently source-built and are not included in
+the standard single-S3 release archive. Their package version is nevertheless
+validated against release tags so locally built Host and Device images cannot
+silently drift.
+
 ```sh
 mise run esp:install
 mise run firmware:build-dual

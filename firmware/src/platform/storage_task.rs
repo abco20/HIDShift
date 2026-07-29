@@ -1,30 +1,31 @@
 use embassy_futures::select::{Either, select};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::{Receiver, Sender};
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::{Duration, Instant, Timer, with_timeout};
 use esp_hal::peripherals::FLASH;
 use esp_hal::{peripherals::Interrupt, system::Cpu};
 use hidshift::ids::HostId;
-use hidshift::runtime::bootstrap::{initial_pairing_host, storage_with_default_target};
+use hidshift::runtime::bootstrap::storage_with_default_target;
 use hidshift::runtime::message::RuntimeInputMessage;
 use hidshift::runtime::{
     RUNTIME_INPUT_QUEUE_CAPACITY, RUNTIME_STORAGE_COMMAND_QUEUE_CAPACITY, StorageTaskCommand,
 };
 use hidshift::storage::{
-    StoragePersistPriority, StoragePersistence, StorageSlotBackend, StorageState,
-    StorageTaskAction, StorageTaskPolicy, restore_latest_storage_state,
+    StorageError, StorageHealth, StoragePersistPriority, StoragePersistence, StorageSlotBackend,
+    StorageState, StorageTaskAction, StorageTaskPolicy, restore_latest_storage_state,
 };
-use hidshift::target_control::ButtonIntent;
 
+use super::flash_backend::FirmwareStorageBackend;
+#[cfg(all(feature = "hardware-e2e", feature = "dual-s3-wired"))]
+use super::flash_backend::InMemoryStorageBackend;
 #[cfg(not(all(feature = "hardware-e2e", feature = "dual-s3-wired")))]
 use super::flash_backend::new_storage_backend;
-#[cfg(all(feature = "hardware-e2e", feature = "dual-s3-wired"))]
-use super::flash_backend::{FirmwareStorageBackend, InMemoryStorageBackend};
 
 pub const STORAGE_PERSIST_DEBOUNCE_MS: u64 = 1_000;
 pub const STORAGE_PERSIST_LAZY_MS: u64 = 5_000;
 pub const STORAGE_ACTIVE_BLE_RETRY_MS: u64 = 1_000;
 pub const STORAGE_CRITICAL_FORCE_QUIESCE_MS: u64 = 5_000;
+const STORAGE_QUIESCE_HANDSHAKE_TIMEOUT_MS: u64 = 2_000;
 
 #[embassy_executor::task]
 pub async fn storage_command_task(
@@ -51,7 +52,7 @@ pub async fn storage_command_task(
     let mut backend = {
         let _ = flash;
         log::info!("firmware: dual-S3 E2E uses volatile Host settings storage");
-        FirmwareStorageBackend::Memory(InMemoryStorageBackend::new())
+        FirmwareStorageBackend::Volatile(InMemoryStorageBackend::new())
     };
     #[cfg(not(all(feature = "hardware-e2e", feature = "dual-s3-wired")))]
     let mut backend = new_storage_backend(flash);
@@ -63,10 +64,14 @@ pub async fn storage_command_task(
     };
     log::info!("firmware: storage command task boot");
 
+    let backend_health = backend.health();
+    let mut reported_storage_health = backend_health;
+    runtime_input
+        .send(RuntimeInputMessage::StorageHealthChanged(backend_health))
+        .await;
     let restored_state = restore_latest_storage_state(&backend);
     ble_restore.send(restored_state.clone()).await;
     if let Some(state) = restored_state {
-        let initial_pairing_host = initial_pairing_host(&state, HostId(1));
         let had_active_target = state.last_active_host.is_some();
         let state = storage_with_default_target(&state, HostId(1));
         if !had_active_target {
@@ -75,18 +80,8 @@ pub async fn storage_command_task(
         runtime_input
             .send(RuntimeInputMessage::RestoreStorage(state))
             .await;
-        if initial_pairing_host.is_some() {
-            log::info!("firmware: storage empty; opening initial pairing host=1");
-            runtime_input
-                .send(RuntimeInputMessage::ButtonIntent {
-                    intent: ButtonIntent::EnterPairingMode,
-                    now_ms: Instant::now().as_millis(),
-                })
-                .await;
-        }
     } else {
         let state = StorageState::new(0);
-        let initial_pairing_host = initial_pairing_host(&state, HostId(1));
         let state = storage_with_default_target(&state, HostId(1));
         #[cfg(not(feature = "dual-s3-wired"))]
         log::info!("firmware: storage empty; restoring default active target host=1");
@@ -95,22 +90,35 @@ pub async fn storage_command_task(
         runtime_input
             .send(RuntimeInputMessage::RestoreStorage(state))
             .await;
-        if initial_pairing_host.is_some() {
-            log::info!("firmware: storage empty; opening initial pairing host=1");
-            runtime_input
-                .send(RuntimeInputMessage::ButtonIntent {
-                    intent: ButtonIntent::EnterPairingMode,
-                    now_ms: Instant::now().as_millis(),
-                })
-                .await;
-        }
     }
     loop {
+        if backend_health == StorageHealth::Unavailable {
+            let command = receiver.receive().await;
+            log::error!(
+                "firmware: rejected storage command {:?} because flash is unavailable",
+                command
+            );
+            runtime_input
+                .send(RuntimeInputMessage::DiagnosticsEvent(
+                    hidshift::runtime::RuntimeDiagnosticsEvent::FlashWrite { success: false },
+                ))
+                .await;
+            continue;
+        }
         let now_ms = Instant::now().as_millis();
         match storage_policy.evaluate(&persistence, now_ms, active_ble_connections()) {
             StorageTaskAction::AwaitCommand => {
                 let command = receiver.receive().await;
-                stage_storage_snapshot(&mut persistence, command.state, command.priority);
+                handle_storage_command(
+                    command,
+                    &mut persistence,
+                    &mut backend,
+                    runtime_input,
+                    ble_quiesce_request,
+                    ble_quiesce_ready,
+                    ble_quiesce_done,
+                )
+                .await;
             }
             StorageTaskAction::WaitForDeadline { delay_ms }
             | StorageTaskAction::DeferForActiveBle { delay_ms } => {
@@ -131,7 +139,16 @@ pub async fn storage_command_task(
                 .await
                 {
                     Either::First(command) => {
-                        stage_storage_snapshot(&mut persistence, command.state, command.priority)
+                        handle_storage_command(
+                            command,
+                            &mut persistence,
+                            &mut backend,
+                            runtime_input,
+                            ble_quiesce_request,
+                            ble_quiesce_ready,
+                            ble_quiesce_done,
+                        )
+                        .await
                     }
                     Either::Second(()) => {}
                 }
@@ -155,7 +172,14 @@ pub async fn storage_command_task(
                 let usb_interrupt_guard = UsbInterruptQuiesceGuard::new();
                 let persisted = persist_due_storage_snapshot(&mut persistence, &mut backend);
                 drop(usb_interrupt_guard);
-                if persisted {
+                let next_health = persistence.effective_health(backend_health);
+                if next_health != reported_storage_health {
+                    reported_storage_health = next_health;
+                    runtime_input
+                        .send(RuntimeInputMessage::StorageHealthChanged(next_health))
+                        .await;
+                }
+                if persisted.is_ok_and(|persisted| persisted) {
                     runtime_input
                         .send(RuntimeInputMessage::DiagnosticsEvent(
                             hidshift::runtime::RuntimeDiagnosticsEvent::FlashWrite {
@@ -165,6 +189,55 @@ pub async fn storage_command_task(
                         .await;
                     resume_ble_after_flash_write(ble_quiesce_done).await;
                 } else {
+                    if let Err(error) = persisted {
+                        log::error!("firmware: storage_command error {:?}", error);
+                    }
+                    runtime_input
+                        .send(RuntimeInputMessage::DiagnosticsEvent(
+                            hidshift::runtime::RuntimeDiagnosticsEvent::FlashWrite {
+                                success: false,
+                            },
+                        ))
+                        .await;
+                    resume_ble_after_flash_write(ble_quiesce_done).await;
+                }
+            }
+        }
+    }
+}
+
+async fn handle_storage_command(
+    command: StorageTaskCommand,
+    persistence: &mut StoragePersistence,
+    backend: &mut FirmwareStorageBackend,
+    runtime_input: Sender<
+        'static,
+        CriticalSectionRawMutex,
+        RuntimeInputMessage,
+        RUNTIME_INPUT_QUEUE_CAPACITY,
+    >,
+    ble_quiesce_request: Sender<'static, CriticalSectionRawMutex, (), 1>,
+    ble_quiesce_ready: Receiver<'static, CriticalSectionRawMutex, Option<StorageState>, 1>,
+    ble_quiesce_done: Sender<'static, CriticalSectionRawMutex, (), 1>,
+) {
+    match command {
+        StorageTaskCommand::Persist { state, priority } => {
+            stage_storage_snapshot(persistence, state, priority)
+        }
+        StorageTaskCommand::FactoryReset => {
+            log::warn!("firmware: factory reset requested; quiescing BLE");
+            let _ = quiesce_ble_for_flash_write(ble_quiesce_request, ble_quiesce_ready).await;
+            let usb_interrupt_guard = UsbInterruptQuiesceGuard::new();
+            let result = backend.factory_reset();
+            drop(usb_interrupt_guard);
+            match result {
+                Ok(()) => {
+                    log::warn!("firmware: factory reset complete; rebooting");
+                    Timer::after(Duration::from_millis(100)).await;
+                    esp_hal::system::software_reset();
+                }
+                Err(error) => {
+                    log::error!("firmware: factory reset failed {:?}", error);
                     runtime_input
                         .send(RuntimeInputMessage::DiagnosticsEvent(
                             hidshift::runtime::RuntimeDiagnosticsEvent::FlashWrite {
@@ -184,8 +257,21 @@ async fn quiesce_ble_for_flash_write(
     ble_quiesce_ready: Receiver<'static, CriticalSectionRawMutex, Option<StorageState>, 1>,
 ) -> Option<StorageState> {
     log::info!("firmware: storage_command requesting ble quiesce");
-    ble_quiesce_request.send(()).await;
-    let snapshot = ble_quiesce_ready.receive().await;
+    let result = with_timeout(
+        Duration::from_millis(STORAGE_QUIESCE_HANDSHAKE_TIMEOUT_MS),
+        async {
+            ble_quiesce_request.send(()).await;
+            ble_quiesce_ready.receive().await
+        },
+    )
+    .await;
+    let snapshot = match result {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            log::error!("firmware: storage BLE quiesce handshake timed out; rebooting");
+            esp_hal::system::software_reset();
+        }
+    };
     log::info!("firmware: storage_command ble quiesce ready");
     snapshot
 }
@@ -193,7 +279,16 @@ async fn quiesce_ble_for_flash_write(
 async fn resume_ble_after_flash_write(
     ble_quiesce_done: Sender<'static, CriticalSectionRawMutex, (), 1>,
 ) {
-    ble_quiesce_done.send(()).await;
+    if with_timeout(
+        Duration::from_millis(STORAGE_QUIESCE_HANDSHAKE_TIMEOUT_MS),
+        ble_quiesce_done.send(()),
+    )
+    .await
+    .is_err()
+    {
+        log::error!("firmware: storage BLE resume handshake timed out; rebooting");
+        esp_hal::system::software_reset();
+    }
 }
 
 struct UsbInterruptQuiesceGuard {
@@ -245,7 +340,7 @@ fn stage_storage_snapshot(
 fn persist_due_storage_snapshot<B: StorageSlotBackend>(
     persistence: &mut StoragePersistence,
     backend: &mut B,
-) -> bool {
+) -> Result<bool, StorageError> {
     match persistence.persist_due(backend, Instant::now().as_millis()) {
         Ok(Some(result)) => {
             log::info!(
@@ -253,12 +348,9 @@ fn persist_due_storage_snapshot<B: StorageSlotBackend>(
                 result.index,
                 result.state.generation
             );
-            true
+            Ok(true)
         }
-        Ok(None) => false,
-        Err(error) => {
-            log::error!("firmware: storage_command error {:?}", error);
-            false
-        }
+        Ok(None) => Ok(false),
+        Err(error) => Err(error),
     }
 }

@@ -263,12 +263,12 @@ fn main() -> Result<()> {
     }
 
     let mut harness = open_harness(&dut, &probe)?;
-    // The DUT can finish booting while the probe image is still being built,
-    // so its one-shot READY log is not a reliable synchronization point. The
-    // sequence-tagged Hello acknowledgement below proves the live UART path.
-    let (hello_sequence, _) = harness.send(E2eCommand::Hello)?;
-    harness.wait_dut_sequence("QUEUED", hello_sequence, Duration::from_secs(3))?;
+    // Opening a CH340 serial port can reset the DUT. A sequence-tagged,
+    // idempotent Hello retry proves that the current boot is accepting UART
+    // commands without replaying any input or management mutation.
+    wait_for_dut_readiness(&mut harness, Duration::from_secs(12))?;
     if !args.skip_flash {
+        start_pairing(&mut harness, HostId(1))?;
         harness.wait_marker(
             Source::Probe,
             "@HIDSHIFT-PROBE:SUBSCRIBED",
@@ -298,13 +298,7 @@ fn main() -> Result<()> {
     // exercise the retained multi-host session rather than a single link.
     let clock_sync = synchronize_probe_clock(&mut harness, 20)?;
     let dut_clock_sync = synchronize_dut_clock(&mut harness, 20)?;
-    let measurement = run_latency_test(
-        &mut harness,
-        args.latency_samples,
-        clock_sync,
-        dut_clock_sync,
-    )?;
-    let mouse_measurement = run_mouse_latency_test(
+    let (measurement, mouse_measurement) = run_latency_tests(
         &mut harness,
         args.latency_samples,
         clock_sync,
@@ -453,14 +447,13 @@ fn resolve_ports(args: &Args, repo: &Path) -> Result<(PathBuf, PathBuf, ProbeChi
         if let Ok(info) = board_info(repo, &path)
             && let Some(chip) = parse_chip_type(&info)
             && let Some(mac) = parse_mac_address(&info)
+            && ProbeChip::from_espflash(&chip).is_some()
         {
-            if ProbeChip::from_espflash(&chip).is_some() {
-                // One ESP32-S3 may be visible through both an external UART
-                // bridge and native USB-JTAG. Keep the first stable by-path
-                // candidate for each hardware MAC instead of flashing it as
-                // two different boards.
-                boards.entry((chip, mac)).or_insert(path);
-            }
+            // One ESP32-S3 may be visible through both an external UART
+            // bridge and native USB-JTAG. Keep the first stable by-path
+            // candidate for each hardware MAC instead of flashing it as
+            // two different boards.
+            boards.entry((chip, mac)).or_insert(path);
         }
     }
     let mut esp32 = Vec::new();
@@ -535,9 +528,9 @@ fn build_and_flash(repo: &Path, dut: &Path, probe: &Path, probe_chip: ProbeChip)
         linux_address
     );
     run(Command::new("sh").arg("-c").arg(build_dut), repo)?;
-    // Stop any probe firmware from a previous run before the freshly erased
-    // DUT opens its initial pairing window. Otherwise the old probe can create
-    // and persist a bond while the replacement probe image is still building.
+    // Stop any probe firmware from a previous run before erasing the DUT.
+    // Pairing is opened explicitly through the wired management channel after
+    // both fresh images are running.
     run(
         Command::new("espflash")
             .args([
@@ -568,15 +561,12 @@ fn build_and_flash(repo: &Path, dut: &Path, probe: &Path, probe_chip: ProbeChip)
             ]),
         repo,
     )?;
-    run(
-        Command::new("espflash")
-            .args(["erase-parts", "--chip", DUT_CHIP, "--port"])
-            .arg(dut)
-            .args(["--partition-table", "partitions/bridge.csv", "bridge"]),
-        repo,
-    )?;
-
     let address = read_dut_ble_address(dut, Duration::from_secs(15))?;
+    // Remove the exact controller-visible identity even when BlueZ cached it
+    // without the HIDShift name (for example after an interrupted prior run).
+    // Name-only cleanup above is insufficient in that state and leaves Linux
+    // attempting to reuse a bond that the freshly erased DUT no longer has.
+    let _ = bluetoothctl(&["remove", &address], 10);
     let build_probe = format!(
         ". '{}' && HIDSHIFT_DUT_ADDRESS='{}' cargo +esp build -Zbuild-std=core,alloc --release --manifest-path e2e/probe-firmware/Cargo.toml --no-default-features --features {} --target {}",
         export.display(),
@@ -585,6 +575,15 @@ fn build_and_flash(repo: &Path, dut: &Path, probe: &Path, probe_chip: ProbeChip)
         probe_chip.cargo_target()
     );
     run(Command::new("sh").arg("-c").arg(build_probe), repo)?;
+    // Clear the DUT storage only after both images are ready. The runner opens
+    // the host-1 pairing window explicitly once both serial paths are live.
+    run(
+        Command::new("espflash")
+            .args(["erase-parts", "--chip", DUT_CHIP, "--port"])
+            .arg(dut)
+            .args(["--partition-table", "partitions/bridge.csv", "bridge"]),
+        repo,
+    )?;
     run(
         Command::new("espflash")
             .args(["flash", "--chip", probe_chip.espflash_name(), "--port"])
@@ -618,11 +617,11 @@ fn read_dut_ble_address(port: &Path, timeout: Duration) -> Result<String> {
     let mut reader = BufReader::new(port);
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
+        let mut line = Vec::new();
+        match reader.read_until(b'\n', &mut line) {
             Ok(0) => {}
             Ok(_) => {
-                if let Some(address) = device_address_from_log(&line) {
+                if let Some(address) = device_address_from_log(&serial_line_text(&line)) {
                     return Ok(address);
                 }
             }
@@ -644,6 +643,10 @@ fn device_address_from_log(line: &str) -> Option<String> {
             }
         }))
     .then(|| address.to_owned())
+}
+
+fn serial_line_text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).trim().to_owned()
 }
 
 fn esp_export_path() -> Result<PathBuf> {
@@ -713,14 +716,14 @@ fn spawn_line_reader(source: Source, port: Box<dyn SerialPort>, sender: mpsc::Se
     thread::spawn(move || {
         let mut reader = BufReader::new(port);
         loop {
-            let mut line = String::new();
-            match reader.read_line(&mut line) {
+            let mut line = Vec::new();
+            match reader.read_until(b'\n', &mut line) {
                 Ok(0) => thread::sleep(Duration::from_millis(5)),
                 Ok(_) => {
                     let _ = sender.send(SerialLine {
                         source,
                         received: Instant::now(),
-                        text: line.trim().to_owned(),
+                        text: serial_line_text(&line),
                     });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {}
@@ -1053,7 +1056,7 @@ fn parse_probe_clock_response(line: &str) -> Option<(u32, u64)> {
 }
 
 fn decode_hex(encoded: &str) -> Option<Vec<u8>> {
-    if encoded.len() % 2 != 0 {
+    if !encoded.len().is_multiple_of(2) {
         return None;
     }
     (0..encoded.len())
@@ -1124,30 +1127,77 @@ fn run_functional_raw_tests(harness: &mut Harness) -> Result<Vec<TestResult>> {
     Ok(results)
 }
 
-fn run_latency_test(
+struct LatencySamples {
+    synchronized: Vec<f64>,
+    observed: Vec<f64>,
+    ingress_to_runtime: Vec<f64>,
+    runtime_processing: Vec<f64>,
+    runtime_queueing: Vec<f64>,
+    runtime_to_ble: Vec<f64>,
+    ble_dispatch: Vec<f64>,
+    notify_call: Vec<f64>,
+    notify_done_to_hci_dequeue: Vec<f64>,
+    hci_dequeue_to_credit: Vec<f64>,
+    hci_credit_to_submit: Vec<f64>,
+    notify_done_to_hci_submit: Vec<f64>,
+    hci_submit_to_probe: Vec<f64>,
+    notify_to_probe: Vec<f64>,
+}
+
+impl LatencySamples {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            synchronized: Vec::with_capacity(capacity),
+            observed: Vec::with_capacity(capacity),
+            ingress_to_runtime: Vec::with_capacity(capacity),
+            runtime_processing: Vec::with_capacity(capacity),
+            runtime_queueing: Vec::with_capacity(capacity),
+            runtime_to_ble: Vec::with_capacity(capacity),
+            ble_dispatch: Vec::with_capacity(capacity),
+            notify_call: Vec::with_capacity(capacity),
+            notify_done_to_hci_dequeue: Vec::with_capacity(capacity),
+            hci_dequeue_to_credit: Vec::with_capacity(capacity),
+            hci_credit_to_submit: Vec::with_capacity(capacity),
+            notify_done_to_hci_submit: Vec::with_capacity(capacity),
+            hci_submit_to_probe: Vec::with_capacity(capacity),
+            notify_to_probe: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn finish(self) -> LatencyMeasurement {
+        LatencyMeasurement {
+            end_to_end: latency_stats(self.synchronized),
+            host_observed: latency_stats(self.observed),
+            pipeline: PipelineLatencyStats {
+                ingress_to_runtime: latency_stats(self.ingress_to_runtime),
+                runtime_processing: latency_stats(self.runtime_processing),
+                runtime_queueing: latency_stats(self.runtime_queueing),
+                ble_queue_to_receive: latency_stats(self.runtime_to_ble),
+                ble_dispatch: latency_stats(self.ble_dispatch),
+                notify_call: latency_stats(self.notify_call),
+                notify_done_to_hci_dequeue: latency_stats(self.notify_done_to_hci_dequeue),
+                hci_dequeue_to_credit: latency_stats(self.hci_dequeue_to_credit),
+                hci_credit_to_submit: latency_stats(self.hci_credit_to_submit),
+                notify_done_to_hci_submit: latency_stats(self.notify_done_to_hci_submit),
+                hci_submit_to_probe: latency_stats(self.hci_submit_to_probe),
+                notify_done_to_probe: latency_stats(self.notify_to_probe),
+            },
+        }
+    }
+}
+
+fn run_latency_tests(
     harness: &mut Harness,
     samples: usize,
     probe_clock_sync: DeviceClockSync,
     dut_clock_sync: DeviceClockSync,
-) -> Result<LatencyMeasurement> {
+) -> Result<(LatencyMeasurement, LatencyMeasurement)> {
     ensure!(samples > 0, "--latency-samples must be positive");
-    let mut synchronized_values = Vec::with_capacity(samples * 2);
-    let mut observed_values = Vec::with_capacity(samples * 2);
-    let mut ingress_to_runtime_values = Vec::with_capacity(samples * 2);
-    let mut runtime_processing_values = Vec::with_capacity(samples * 2);
-    let mut runtime_queueing_values = Vec::with_capacity(samples * 2);
-    let mut runtime_to_ble_values = Vec::with_capacity(samples * 2);
-    let mut ble_dispatch_values = Vec::with_capacity(samples * 2);
-    let mut notify_call_values = Vec::with_capacity(samples * 2);
-    let mut notify_done_to_hci_dequeue_values = Vec::with_capacity(samples * 2);
-    let mut hci_dequeue_to_credit_values = Vec::with_capacity(samples * 2);
-    let mut hci_credit_to_submit_values = Vec::with_capacity(samples * 2);
-    let mut notify_done_to_hci_submit_values = Vec::with_capacity(samples * 2);
-    let mut hci_submit_to_probe_values = Vec::with_capacity(samples * 2);
-    let mut notify_to_probe_values = Vec::with_capacity(samples * 2);
+    let mut keyboard_values = LatencySamples::with_capacity(samples * 2);
+    let mut mouse_values = LatencySamples::with_capacity(samples);
     for index in 0..samples {
         let key = 4 + (index % 100) as u8;
-        thread::sleep(sample_phase_delay(index * 2));
+        thread::sleep(sample_phase_delay(index * 3));
         let (input_sequence, started) = harness.send(E2eCommand::Keyboard {
             modifiers: 0,
             keys: [key, 0, 0, 0, 0, 0],
@@ -1164,23 +1214,10 @@ fn run_latency_test(
             probe_clock_sync,
             dut_clock_sync,
             dut_timestamps,
-            &mut synchronized_values,
-            &mut observed_values,
-            &mut ingress_to_runtime_values,
-            &mut runtime_processing_values,
-            &mut runtime_queueing_values,
-            &mut runtime_to_ble_values,
-            &mut ble_dispatch_values,
-            &mut notify_call_values,
-            &mut notify_done_to_hci_dequeue_values,
-            &mut hci_dequeue_to_credit_values,
-            &mut hci_credit_to_submit_values,
-            &mut notify_done_to_hci_submit_values,
-            &mut hci_submit_to_probe_values,
-            &mut notify_to_probe_values,
+            &mut keyboard_values,
         )?;
 
-        thread::sleep(sample_phase_delay(index * 2 + 1));
+        thread::sleep(sample_phase_delay(index * 3 + 1));
         let (input_sequence, started) = harness.send(E2eCommand::Keyboard {
             modifiers: 0,
             keys: [0; 6],
@@ -1193,64 +1230,11 @@ fn run_latency_test(
             probe_clock_sync,
             dut_clock_sync,
             dut_timestamps,
-            &mut synchronized_values,
-            &mut observed_values,
-            &mut ingress_to_runtime_values,
-            &mut runtime_processing_values,
-            &mut runtime_queueing_values,
-            &mut runtime_to_ble_values,
-            &mut ble_dispatch_values,
-            &mut notify_call_values,
-            &mut notify_done_to_hci_dequeue_values,
-            &mut hci_dequeue_to_credit_values,
-            &mut hci_credit_to_submit_values,
-            &mut notify_done_to_hci_submit_values,
-            &mut hci_submit_to_probe_values,
-            &mut notify_to_probe_values,
+            &mut keyboard_values,
         )?;
-    }
-    Ok(finish_latency_measurement(
-        synchronized_values,
-        observed_values,
-        ingress_to_runtime_values,
-        runtime_processing_values,
-        runtime_queueing_values,
-        runtime_to_ble_values,
-        ble_dispatch_values,
-        notify_call_values,
-        notify_done_to_hci_dequeue_values,
-        hci_dequeue_to_credit_values,
-        hci_credit_to_submit_values,
-        notify_done_to_hci_submit_values,
-        hci_submit_to_probe_values,
-        notify_to_probe_values,
-    ))
-}
 
-fn run_mouse_latency_test(
-    harness: &mut Harness,
-    samples: usize,
-    probe_clock_sync: DeviceClockSync,
-    dut_clock_sync: DeviceClockSync,
-) -> Result<LatencyMeasurement> {
-    ensure!(samples > 0, "--latency-samples must be positive");
-    let mut synchronized_values = Vec::with_capacity(samples);
-    let mut observed_values = Vec::with_capacity(samples);
-    let mut ingress_to_runtime_values = Vec::with_capacity(samples);
-    let mut runtime_processing_values = Vec::with_capacity(samples);
-    let mut runtime_queueing_values = Vec::with_capacity(samples);
-    let mut runtime_to_ble_values = Vec::with_capacity(samples);
-    let mut ble_dispatch_values = Vec::with_capacity(samples);
-    let mut notify_call_values = Vec::with_capacity(samples);
-    let mut notify_done_to_hci_dequeue_values = Vec::with_capacity(samples);
-    let mut hci_dequeue_to_credit_values = Vec::with_capacity(samples);
-    let mut hci_credit_to_submit_values = Vec::with_capacity(samples);
-    let mut notify_done_to_hci_submit_values = Vec::with_capacity(samples);
-    let mut hci_submit_to_probe_values = Vec::with_capacity(samples);
-    let mut notify_to_probe_values = Vec::with_capacity(samples);
-    for index in 0..samples {
         let x = if index % 2 == 0 { 1 } else { -1 };
-        thread::sleep(sample_phase_delay(index + samples * 2));
+        thread::sleep(sample_phase_delay(index * 3 + 2));
         let (input_sequence, started) = harness.send(E2eCommand::Mouse {
             buttons: 0,
             x,
@@ -1277,74 +1261,10 @@ fn run_mouse_latency_test(
             probe_clock_sync,
             dut_clock_sync,
             dut_timestamps,
-            &mut synchronized_values,
-            &mut observed_values,
-            &mut ingress_to_runtime_values,
-            &mut runtime_processing_values,
-            &mut runtime_queueing_values,
-            &mut runtime_to_ble_values,
-            &mut ble_dispatch_values,
-            &mut notify_call_values,
-            &mut notify_done_to_hci_dequeue_values,
-            &mut hci_dequeue_to_credit_values,
-            &mut hci_credit_to_submit_values,
-            &mut notify_done_to_hci_submit_values,
-            &mut hci_submit_to_probe_values,
-            &mut notify_to_probe_values,
+            &mut mouse_values,
         )?;
     }
-    Ok(finish_latency_measurement(
-        synchronized_values,
-        observed_values,
-        ingress_to_runtime_values,
-        runtime_processing_values,
-        runtime_queueing_values,
-        runtime_to_ble_values,
-        ble_dispatch_values,
-        notify_call_values,
-        notify_done_to_hci_dequeue_values,
-        hci_dequeue_to_credit_values,
-        hci_credit_to_submit_values,
-        notify_done_to_hci_submit_values,
-        hci_submit_to_probe_values,
-        notify_to_probe_values,
-    ))
-}
-
-fn finish_latency_measurement(
-    synchronized_values: Vec<f64>,
-    observed_values: Vec<f64>,
-    ingress_to_runtime_values: Vec<f64>,
-    runtime_processing_values: Vec<f64>,
-    runtime_queueing_values: Vec<f64>,
-    runtime_to_ble_values: Vec<f64>,
-    ble_dispatch_values: Vec<f64>,
-    notify_call_values: Vec<f64>,
-    notify_done_to_hci_dequeue_values: Vec<f64>,
-    hci_dequeue_to_credit_values: Vec<f64>,
-    hci_credit_to_submit_values: Vec<f64>,
-    notify_done_to_hci_submit_values: Vec<f64>,
-    hci_submit_to_probe_values: Vec<f64>,
-    notify_to_probe_values: Vec<f64>,
-) -> LatencyMeasurement {
-    LatencyMeasurement {
-        end_to_end: latency_stats(synchronized_values),
-        host_observed: latency_stats(observed_values),
-        pipeline: PipelineLatencyStats {
-            ingress_to_runtime: latency_stats(ingress_to_runtime_values),
-            runtime_processing: latency_stats(runtime_processing_values),
-            runtime_queueing: latency_stats(runtime_queueing_values),
-            ble_queue_to_receive: latency_stats(runtime_to_ble_values),
-            ble_dispatch: latency_stats(ble_dispatch_values),
-            notify_call: latency_stats(notify_call_values),
-            notify_done_to_hci_dequeue: latency_stats(notify_done_to_hci_dequeue_values),
-            hci_dequeue_to_credit: latency_stats(hci_dequeue_to_credit_values),
-            hci_credit_to_submit: latency_stats(hci_credit_to_submit_values),
-            notify_done_to_hci_submit: latency_stats(notify_done_to_hci_submit_values),
-            hci_submit_to_probe: latency_stats(hci_submit_to_probe_values),
-            notify_done_to_probe: latency_stats(notify_to_probe_values),
-        },
-    }
+    Ok((keyboard_values.finish(), mouse_values.finish()))
 }
 
 /// Prevent the lockstep harness from repeatedly injecting at the same point
@@ -1361,20 +1281,7 @@ fn record_latency_sample(
     probe_clock_sync: DeviceClockSync,
     dut_clock_sync: DeviceClockSync,
     dut: DutInputTimestamps,
-    synchronized_values: &mut Vec<f64>,
-    observed_values: &mut Vec<f64>,
-    ingress_to_runtime_values: &mut Vec<f64>,
-    runtime_processing_values: &mut Vec<f64>,
-    runtime_queueing_values: &mut Vec<f64>,
-    runtime_to_ble_values: &mut Vec<f64>,
-    ble_dispatch_values: &mut Vec<f64>,
-    notify_call_values: &mut Vec<f64>,
-    notify_done_to_hci_dequeue_values: &mut Vec<f64>,
-    hci_dequeue_to_credit_values: &mut Vec<f64>,
-    hci_credit_to_submit_values: &mut Vec<f64>,
-    notify_done_to_hci_submit_values: &mut Vec<f64>,
-    hci_submit_to_probe_values: &mut Vec<f64>,
-    notify_to_probe_values: &mut Vec<f64>,
+    samples: &mut LatencySamples,
 ) -> Result<()> {
     ensure!(
         dut.ingress_us <= dut.runtime_us
@@ -1410,21 +1317,43 @@ fn record_latency_sample(
     let synchronized = probe_received
         .checked_duration_since(dut_ingress)
         .context("cross-device clock synchronization produced a negative latency")?;
-    synchronized_values.push(synchronized.as_secs_f64() * 1_000.0);
-    observed_values.push(line.received.duration_since(started).as_secs_f64() * 1_000.0);
-    ingress_to_runtime_values.push((dut.runtime_us - dut.ingress_us) as f64 / 1_000.0);
-    runtime_processing_values.push((dut.runtime_dispatch_us - dut.runtime_us) as f64 / 1_000.0);
-    runtime_queueing_values.push((dut.ble_queued_us - dut.runtime_dispatch_us) as f64 / 1_000.0);
-    runtime_to_ble_values.push((dut.ble_receive_us - dut.ble_queued_us) as f64 / 1_000.0);
-    ble_dispatch_values.push((dut.notify_start_us - dut.ble_receive_us) as f64 / 1_000.0);
-    notify_call_values.push((dut.notify_done_us - dut.notify_start_us) as f64 / 1_000.0);
-    notify_done_to_hci_dequeue_values
+    samples
+        .synchronized
+        .push(synchronized.as_secs_f64() * 1_000.0);
+    samples
+        .observed
+        .push(line.received.duration_since(started).as_secs_f64() * 1_000.0);
+    samples
+        .ingress_to_runtime
+        .push((dut.runtime_us - dut.ingress_us) as f64 / 1_000.0);
+    samples
+        .runtime_processing
+        .push((dut.runtime_dispatch_us - dut.runtime_us) as f64 / 1_000.0);
+    samples
+        .runtime_queueing
+        .push((dut.ble_queued_us - dut.runtime_dispatch_us) as f64 / 1_000.0);
+    samples
+        .runtime_to_ble
+        .push((dut.ble_receive_us - dut.ble_queued_us) as f64 / 1_000.0);
+    samples
+        .ble_dispatch
+        .push((dut.notify_start_us - dut.ble_receive_us) as f64 / 1_000.0);
+    samples
+        .notify_call
+        .push((dut.notify_done_us - dut.notify_start_us) as f64 / 1_000.0);
+    samples
+        .notify_done_to_hci_dequeue
         .push((dut.hci_dequeue_us - dut.notify_done_us) as f64 / 1_000.0);
-    hci_dequeue_to_credit_values.push((dut.hci_credit_us - dut.hci_dequeue_us) as f64 / 1_000.0);
-    hci_credit_to_submit_values.push((dut.hci_submit_us - dut.hci_credit_us) as f64 / 1_000.0);
-    notify_done_to_hci_submit_values
+    samples
+        .hci_dequeue_to_credit
+        .push((dut.hci_credit_us - dut.hci_dequeue_us) as f64 / 1_000.0);
+    samples
+        .hci_credit_to_submit
+        .push((dut.hci_submit_us - dut.hci_credit_us) as f64 / 1_000.0);
+    samples
+        .notify_done_to_hci_submit
         .push((dut.hci_submit_us - dut.notify_done_us) as f64 / 1_000.0);
-    hci_submit_to_probe_values.push(
+    samples.hci_submit_to_probe.push(
         duration_between_synchronized_devices(
             probe_received,
             dut_hci_submit,
@@ -1434,7 +1363,7 @@ fn record_latency_sample(
         .as_secs_f64()
             * 1_000.0,
     );
-    notify_to_probe_values.push(
+    samples.notify_to_probe.push(
         duration_between_synchronized_devices(
             probe_received,
             dut_notify_done,
@@ -1711,6 +1640,44 @@ trait ManagementHarness {
     ) -> Result<ManagementResponse>;
 }
 
+trait DutReadinessHarness {
+    fn send_hello(&mut self) -> Result<u32>;
+    fn wait_hello_ack(&self, sequence: u32, timeout: Duration) -> Result<()>;
+}
+
+impl DutReadinessHarness for Harness {
+    fn send_hello(&mut self) -> Result<u32> {
+        self.send(E2eCommand::Hello).map(|(sequence, _)| sequence)
+    }
+
+    fn wait_hello_ack(&self, sequence: u32, timeout: Duration) -> Result<()> {
+        self.wait_dut_sequence("QUEUED", sequence, timeout)
+            .map(|_| ())
+    }
+}
+
+fn wait_for_dut_readiness<H: DutReadinessHarness>(
+    harness: &mut H,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut last_error = None;
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        let sequence = harness.send_hello()?;
+        match harness.wait_hello_ack(sequence, remaining.min(Duration::from_secs(1))) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error.to_string()),
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    bail!(
+        "DUT serial management did not become ready: {}",
+        last_error
+            .as_deref()
+            .unwrap_or("no Hello attempt completed")
+    )
+}
+
 impl ManagementHarness for Harness {
     fn send_management(&mut self, command: ManagementCommand) -> Result<u8> {
         Harness::send_management(self, command)
@@ -1725,12 +1692,12 @@ impl ManagementHarness for Harness {
     }
 }
 
-fn start_linux_pairing<H: ManagementHarness>(harness: &mut H, host_id: HostId) -> Result<()> {
+fn start_pairing<H: ManagementHarness>(harness: &mut H, host_id: HostId) -> Result<()> {
     let request_id = harness.send_management(ManagementCommand::StartPairing(host_id))?;
     let response = harness.wait_management_response(request_id, Duration::from_secs(3))?;
     ensure!(
         response.result == ManagementResult::Ok,
-        "DUT rejected Linux pairing request for host {host_id:?}: {:?}",
+        "DUT rejected pairing request for host {host_id:?}: {:?}",
         response.result
     );
     ensure!(
@@ -1793,7 +1760,7 @@ where
 }
 
 fn run_linux_evdev_test(harness: &mut Harness) -> Result<Vec<TestResult>> {
-    bluetoothctl(&["power", "on"], 10)?;
+    power_on_linux_bluetooth()?;
     // A fresh Probe bond is persisted through a planned BLE-stack restart.
     // trouble-host 0.6 releases its single global pairing state on that
     // disconnect, so wait for the bonded Probe transport before pairing the
@@ -1803,13 +1770,13 @@ fn run_linux_evdev_test(harness: &mut Harness) -> Result<Vec<TestResult>> {
     let status = read_management_status(harness)?;
     let linux_bonded = status.hosts[1].bonded;
     if !linux_bonded {
-        start_linux_pairing(harness, HostId(2))?;
+        start_pairing(harness, HostId(2))?;
     }
     println!("provisioning: LinuxAdvertising");
     let address = discover_hidshift_address()?;
     if !linux_bonded {
         println!("provisioning: LinuxPair");
-        pair_linux_host(&address, || start_linux_pairing(harness, HostId(2)))?;
+        pair_linux_host(&address, || start_pairing(harness, HostId(2)))?;
     } else {
         println!("provisioning: LinuxPair reused bonded host 2 ({address})");
     }
@@ -1940,6 +1907,27 @@ fn wait_linux_link(address: &str, timeout: Duration) -> Result<()> {
         thread::sleep(Duration::from_millis(500));
     }
     bail!("BlueZ did not restore the encrypted HIDShift link")
+}
+
+fn power_on_linux_bluetooth() -> Result<()> {
+    // Some BlueZ/kernel combinations expose `bluetoothctl power off` as an
+    // rfkill soft block. Clear it before asking BlueZ to power the controller
+    // again, then tolerate the short org.bluez.Error.Busy transition.
+    let _ = Command::new("rfkill")
+        .args(["unblock", "bluetooth"])
+        .status();
+    let mut last_error = None;
+    for _ in 0..3 {
+        match bluetoothctl(&["power", "on"], 10) {
+            Ok(_) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    match last_error {
+        Some(error) => Err(error.context("could not power on the Linux Bluetooth controller")),
+        None => bail!("could not power on the Linux Bluetooth controller"),
+    }
 }
 
 fn hidshift_address_from_bluetoothctl(output: &str) -> Option<String> {
@@ -2111,6 +2099,37 @@ fn drain_for(receiver: &Receiver<SerialLine>, duration: Duration) {
 mod tests {
     use super::*;
 
+    struct ResettingDut {
+        attempts: usize,
+        failures_remaining: usize,
+    }
+
+    impl DutReadinessHarness for ResettingDut {
+        fn send_hello(&mut self) -> Result<u32> {
+            self.attempts += 1;
+            Ok(self.attempts as u32)
+        }
+
+        fn wait_hello_ack(&self, _sequence: u32, _timeout: Duration) -> Result<()> {
+            if self.attempts <= self.failures_remaining {
+                bail!("DUT is still rebooting")
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn dut_readiness_retries_only_idempotent_hello_after_serial_reset() {
+        let mut dut = ResettingDut {
+            attempts: 0,
+            failures_remaining: 2,
+        };
+
+        wait_for_dut_readiness(&mut dut, Duration::from_secs(1)).unwrap();
+
+        assert_eq!(dut.attempts, 3);
+    }
+
     #[test]
     fn probe_notification_parser_ignores_logger_prefix() {
         assert_eq!(
@@ -2245,6 +2264,17 @@ mod tests {
     }
 
     #[test]
+    fn interleaved_keyboard_and_mouse_each_span_the_connection_interval() {
+        for offset in 0..3 {
+            let delays = (0..200)
+                .map(|index| sample_phase_delay(index * 3 + offset).as_micros())
+                .collect::<Vec<_>>();
+            assert!(delays.iter().copied().min().unwrap() < 1_000);
+            assert!(delays.iter().copied().max().unwrap() > 7_000);
+        }
+    }
+
+    #[test]
     fn dut_timestamp_parsers_accept_logger_prefixes() {
         assert_eq!(
             parse_dut_queued_timestamp("INFO - @HIDSHIFT-E2E:QUEUED,42,123456"),
@@ -2315,6 +2345,14 @@ mod tests {
         assert_eq!(
             device_address_from_log("INFO - [host] Device Address 02:00:00:00:00:01\r\n"),
             Some("02:00:00:00:00:01".into())
+        );
+    }
+
+    #[test]
+    fn serial_log_boundary_tolerates_boot_noise_that_is_not_utf8() {
+        assert_eq!(
+            serial_line_text(b"\xffINFO - @HIDSHIFT-PROBE:READY,1\r\n"),
+            "\u{fffd}INFO - @HIDSHIFT-PROBE:READY,1"
         );
     }
 

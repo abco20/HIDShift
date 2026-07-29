@@ -149,12 +149,6 @@ impl<
         next_runtime
             .handle_input_in_place::<COMMANDS, ACTIONS, EVENTS>(input, &mut next_commands)?;
         next_queues.dispatch_from(next_commands.as_slice())?;
-        next_runtime.observe_outbox_usage(
-            next_queues.ble.len(),
-            next_queues.usb_host.len(),
-            next_queues.storage.len(),
-            next_queues.status.len(),
-        );
         self.runtime = next_runtime;
         self.commands = next_commands;
         self.queues = next_queues;
@@ -201,12 +195,6 @@ impl<
                 &mut self.queues.ble,
                 &mut self.queues.device,
             )?;
-            self.runtime.observe_outbox_usage(
-                self.queues.ble.len(),
-                self.queues.usb_host.len(),
-                self.queues.storage.len(),
-                self.queues.status.len(),
-            );
             return Ok(());
         }
         self.runtime
@@ -215,12 +203,6 @@ impl<
                 &mut self.commands,
             )?;
         self.queues.dispatch_from(self.commands.as_slice())?;
-        self.runtime.observe_outbox_usage(
-            self.queues.ble.len(),
-            self.queues.usb_host.len(),
-            self.queues.storage.len(),
-            self.queues.status.len(),
-        );
         Ok(())
     }
 
@@ -233,14 +215,8 @@ impl<
         Ok(())
     }
 
-    pub fn observe_transport_metrics(
-        &mut self,
-        runtime_input_depth: usize,
-        mouse: crate::mouse_accumulator::MouseAccumulatorStats,
-        status_updates_dropped: u32,
-    ) {
-        self.runtime
-            .observe_transport_metrics(runtime_input_depth, mouse, status_updates_dropped);
+    pub fn observe_transport_metrics(&mut self, metrics: super::RuntimeTransportMetrics) {
+        self.runtime.observe_transport_metrics(metrics);
     }
 
     pub fn into_inner(self) -> BridgeRuntime<HOSTS, USB_KEYBOARDS> {
@@ -649,6 +625,7 @@ mod tests {
             .process_message(&RuntimeInputMessage::BleHostEvent {
                 host_id: HostId(1),
                 event: crate::runtime::message::RuntimeBleHostEvent::GattWrite {
+                    encrypted: true,
                     attribute: BleHidAttribute::BootKeyboardOutputReport,
                     data: crate::runtime::message::RuntimeBleGattWrite::from_slice(&[0b0000_0010])
                         .unwrap(),

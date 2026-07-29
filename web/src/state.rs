@@ -205,10 +205,22 @@ impl AppState {
             };
             match transport {
                 Ok(transport) => {
+                    let requires_readiness_probe = transport.requires_readiness_probe();
                     state.connection.set(transport.label());
                     state.client.attach(transport);
-                    state.connected.set(true);
-                    let result = state.load_page(Page::Home).await;
+                    let result = async {
+                        if requires_readiness_probe {
+                            state.client.wait_for_serial_readiness().await?;
+                        }
+                        state.connected.set(true);
+                        state.load_page(Page::Home).await
+                    }
+                    .await;
+                    if result.is_err() {
+                        state.client.detach();
+                        state.connected.set(false);
+                        state.connection.set(String::new());
+                    }
                     state.finish(result, Some(("接続しました", "Connected")));
                 }
                 Err(error) => state.finish(

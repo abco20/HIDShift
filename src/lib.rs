@@ -33,6 +33,7 @@ pub mod ble_notify;
 pub mod ble_runtime;
 pub mod bridge;
 pub mod checksum;
+#[cfg(feature = "experimental-domain")]
 pub mod domain;
 pub mod e2e;
 #[cfg(feature = "hardware-e2e")]
@@ -85,6 +86,7 @@ pub use bridge::{
     HostRuntimeState, HostStateError, NotifyReason, PairingMode, PairingSession, ReportReady,
     keyboard_led_event_from_ble_output,
 };
+#[cfg(feature = "experimental-domain")]
 pub use domain::{
     ChangeSet, DESTINATION_CAPACITY, Destination, DestinationError, DestinationId,
     DestinationRegistry, DomainRevision, FirmwareNode, FirmwareUpdate, FirmwareUpdateError,
@@ -154,9 +156,9 @@ pub use runtime::{
     RUNTIME_STORAGE_COMMAND_QUEUE_CAPACITY, RUNTIME_USB_COMMAND_QUEUE_CAPACITY,
     RUNTIME_USB_INTERFACES_MAX, RuntimeCapacities, RuntimeCommand, RuntimeCommandQueues,
     RuntimeCommandVec, RuntimeCounters, RuntimeDiagnosticsEvent, RuntimeDispatchError,
-    RuntimeError, RuntimeInput, StatusSnapshot, StatusTaskCommand, StatusTaskCommandVec,
-    StorageTaskCommand, StorageTaskCommandVec, UsbHidInterfaceRuntimeState, UsbHostTaskCommand,
-    UsbHostTaskCommandVec,
+    RuntimeError, RuntimeInput, RuntimeTransportMetrics, StatusSnapshot, StatusTaskCommand,
+    StatusTaskCommandVec, StorageTaskCommand, StorageTaskCommandVec, UsbHidInterfaceRuntimeState,
+    UsbHostTaskCommand, UsbHostTaskCommandVec,
     bootstrap::prepare_ready_host,
     driver::{
         RuntimeDriverError, RuntimeTaskKind, RuntimeTaskSink, dispatch_runtime_queues,
@@ -178,11 +180,11 @@ pub use storage::{
     FixedName, NorFlashStorageBackend, STORAGE_FLASH_LEN, STORAGE_FLASH_SLOT_COUNT,
     STORAGE_FLASH_SLOT_SIZE, STORAGE_IMAGE_LEN, STORAGE_MAGIC, STORAGE_SCHEMA_VERSION,
     STORED_BOND_LEN, STORED_HOSTS_MAX, StorageDebouncer, StorageError, StorageFlashLayout,
-    StorageHeader, StoragePersistPriority, StoragePersistence, StorageSlot, StorageSlotBackend,
-    StorageSlotIndex, StorageState, StorageTaskAction, StorageTaskPolicy, StorageWriteResult,
-    StoredAddressKind, StoredBond, StoredHostProfile, StoredSecurityLevel, decode_storage_image,
-    encode_storage_image, persist_storage_state, restore_latest_storage_state,
-    select_newest_valid_storage_image,
+    StorageHeader, StorageHealth, StoragePersistPriority, StoragePersistence, StorageSlot,
+    StorageSlotBackend, StorageSlotIndex, StorageState, StorageTaskAction, StorageTaskPolicy,
+    StorageWriteResult, StoredAddressKind, StoredBond, StoredHostProfile, StoredSecurityLevel,
+    decode_storage_image, encode_storage_image, persist_storage_state,
+    restore_latest_storage_state, select_newest_valid_storage_image,
 };
 pub use support::{
     LOG_MESSAGE_CAPACITY, LOG_RING_BYTE_BUDGET, LOG_RING_CAPACITY, LogEntry, LogLevel, LogRing,

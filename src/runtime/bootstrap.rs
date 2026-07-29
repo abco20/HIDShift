@@ -64,18 +64,6 @@ pub fn storage_with_default_target(storage: &StorageState, default_host: HostId)
     restored
 }
 
-pub fn initial_pairing_host(storage: &StorageState, default_host: HostId) -> Option<HostId> {
-    #[cfg(feature = "dual-s3-wired")]
-    if storage.presentation.output_target == crate::output_target::StoredOutputTarget::Wired {
-        return None;
-    }
-    if storage.hosts().is_empty() {
-        Some(default_host)
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,17 +121,9 @@ mod tests {
         assert_eq!(restored.generation, 10);
     }
 
-    #[cfg(not(feature = "dual-s3-wired"))]
-    #[test]
-    fn empty_storage_opens_initial_pairing_for_default_host() {
-        let storage = StorageState::new(10);
-
-        assert_eq!(initial_pairing_host(&storage, HostId(1)), Some(HostId(1)));
-    }
-
     #[cfg(feature = "dual-s3-wired")]
     #[test]
-    fn empty_dual_s3_storage_keeps_wired_default_without_automatic_pairing() {
+    fn empty_dual_s3_storage_keeps_wired_default() {
         let storage = StorageState::new(10);
 
         let restored = storage_with_default_target(&storage, HostId(1));
@@ -153,16 +133,5 @@ mod tests {
             restored.presentation.output_target,
             crate::output_target::StoredOutputTarget::Wired
         );
-        assert_eq!(initial_pairing_host(&storage, HostId(1)), None);
-    }
-
-    #[test]
-    fn stored_host_profiles_disable_automatic_initial_pairing() {
-        let mut storage = StorageState::new(10);
-        storage
-            .push_host(crate::storage::StoredHostProfile::empty())
-            .unwrap();
-
-        assert_eq!(initial_pairing_host(&storage, HostId(1)), None);
     }
 }

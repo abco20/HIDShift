@@ -49,6 +49,9 @@ const BLE_L2CAP_CHANNELS_MAX: usize = BLE_CONNECTIONS_MAX * 2;
 const BLE_ATTRIBUTE_TABLE_SIZE: usize = 72;
 const BLE_NOTIFY_TIMEOUT_MS: u64 = 30;
 const MANAGEMENT_NOTIFY_TIMEOUT_MS: u64 = 1_000;
+const RUNTIME_BARRIER_TIMEOUT_MS: u64 = 2_000;
+const STORAGE_QUIESCE_OPERATION_TIMEOUT_MS: u64 = 10_000;
+const USB_QUIESCE_OPERATION_TIMEOUT_MS: u64 = 30_000;
 const MANAGEMENT_SERVICE_UUID_LE: [u8; 16] = [
     0x01, 0x00, 0x3a, 0x4f, 0x6d, 0x5b, 0x4b, 0x9f, 0x0d, 0x4f, 0x15, 0x1b, 0x00, 0x00, 0x51, 0x7f,
 ];
@@ -108,23 +111,35 @@ struct ManagementService {
 
 #[gatt_service(uuid = "1812")]
 struct HidService {
-    #[characteristic(uuid = "2a4a", read, value = HID_INFORMATION)]
+    #[characteristic(uuid = "2a4a", read, permissions(encrypted), value = HID_INFORMATION)]
     hid_information: [u8; 4],
-    #[characteristic(uuid = "2a4b", read, value = V1_COMBINED_REPORT_MAP)]
+    #[characteristic(uuid = "2a4b", read, permissions(encrypted), value = V1_COMBINED_REPORT_MAP)]
     report_map: &'static [u8],
-    #[characteristic(uuid = "2a4c", write_without_response, value = 0)]
+    #[characteristic(
+        uuid = "2a4c",
+        write_without_response,
+        permissions(encrypted),
+        value = 0
+    )]
     control_point: u8,
     #[descriptor(uuid = "2908", read, value = [KEYBOARD_REPORT_ID, INPUT_REPORT_TYPE])]
-    #[characteristic(uuid = "2a4d", read, notify, value = [0; 8])]
+    #[characteristic(uuid = "2a4d", read, notify, permissions(encrypted), value = [0; 8])]
     keyboard_input_report: [u8; 8],
     #[descriptor(uuid = "2908", read, value = [KEYBOARD_REPORT_ID, OUTPUT_REPORT_TYPE])]
-    #[characteristic(uuid = "2a4d", read, write, write_without_response, value = [0])]
+    #[characteristic(
+        uuid = "2a4d",
+        read,
+        write,
+        write_without_response,
+        permissions(encrypted),
+        value = [0]
+    )]
     keyboard_output_report: [u8; 1],
     #[descriptor(uuid = "2908", read, value = [MOUSE_REPORT_ID, INPUT_REPORT_TYPE])]
-    #[characteristic(uuid = "2a4d", read, notify, value = [0; 5])]
+    #[characteristic(uuid = "2a4d", read, notify, permissions(encrypted), value = [0; 5])]
     mouse_input_report: [u8; 5],
     #[descriptor(uuid = "2908", read, value = [CONSUMER_REPORT_ID, INPUT_REPORT_TYPE])]
-    #[characteristic(uuid = "2a4d", read, notify, value = [0; 2])]
+    #[characteristic(uuid = "2a4d", read, notify, permissions(encrypted), value = [0; 2])]
     consumer_input_report: [u8; 2],
 }
 
@@ -259,9 +274,20 @@ pub async fn ble_host_event_task(
                 }
                 pairable_host = snapshot.pairable_host;
                 log::info!("firmware: ble quiesced for flash write");
-                quiesce_ready.send(snapshot.storage).await;
-                quiesce_done.receive().await;
-                runtime_barrier_resume.send(()).await;
+                if with_timeout(
+                    Duration::from_millis(STORAGE_QUIESCE_OPERATION_TIMEOUT_MS),
+                    async {
+                        quiesce_ready.send(snapshot.storage).await;
+                        quiesce_done.receive().await;
+                    },
+                )
+                .await
+                .is_err()
+                {
+                    log::error!("firmware: storage quiesce operation timed out; rebooting");
+                    esp_hal::system::software_reset();
+                }
+                resume_runtime_or_reset(runtime_barrier_resume).await;
             }
             Either3::Third(()) => {
                 while notify_receiver.try_receive().is_ok() {}
@@ -275,9 +301,20 @@ pub async fn ble_host_event_task(
                 }
                 pairable_host = snapshot.pairable_host;
                 log::info!("firmware: ble quiesced for usb enumeration");
-                usb_quiesce_ready.send(()).await;
-                usb_quiesce_done.receive().await;
-                runtime_barrier_resume.send(()).await;
+                if with_timeout(
+                    Duration::from_millis(USB_QUIESCE_OPERATION_TIMEOUT_MS),
+                    async {
+                        usb_quiesce_ready.send(()).await;
+                        usb_quiesce_done.receive().await;
+                    },
+                )
+                .await
+                .is_err()
+                {
+                    log::error!("firmware: USB quiesce operation timed out; rebooting");
+                    esp_hal::system::software_reset();
+                }
+                resume_runtime_or_reset(runtime_barrier_resume).await;
             }
         }
     }
@@ -289,8 +326,31 @@ async fn disconnect_runtime_hosts_before_quiesce(
 ) -> BleRuntimeSnapshot {
     let host_mask = BLE_ACTIVE_HOST_MASK.swap(0, Ordering::AcqRel);
     BLE_ACTIVE_CONNECTIONS.store(0, Ordering::Release);
-    barrier_request.send(host_mask).await;
-    barrier_done.receive().await
+    match with_timeout(Duration::from_millis(RUNTIME_BARRIER_TIMEOUT_MS), async {
+        barrier_request.send(host_mask).await;
+        barrier_done.receive().await
+    })
+    .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            log::error!("firmware: runtime quiesce barrier timed out; rebooting");
+            esp_hal::system::software_reset();
+        }
+    }
+}
+
+async fn resume_runtime_or_reset(barrier_resume: Sender<'static, CriticalSectionRawMutex, (), 1>) {
+    if with_timeout(
+        Duration::from_millis(RUNTIME_BARRIER_TIMEOUT_MS),
+        barrier_resume.send(()),
+    )
+    .await
+    .is_err()
+    {
+        log::error!("firmware: runtime quiesce resume timed out; rebooting");
+        esp_hal::system::software_reset();
+    }
 }
 
 async fn run_ble_host_events<'server, C>(
@@ -1690,41 +1750,63 @@ where
                     None
                 }
                 GattEvent::Write(event) => {
-                    let message = if event.handle() == server.management.request.handle {
-                        match ManagementRequest::decode(event.data()) {
-                            Ok(request) => Some(RuntimeInputMessage::ManagementRequest {
-                                destination: ManagementDestination::Ble(host_id),
-                                request,
-                                now_ms: Instant::now().as_millis(),
-                            }),
-                            Err(err) => {
-                                log::warn!(
-                                    "firmware: invalid management request slot={} err={:?}",
-                                    slot,
-                                    err
-                                );
-                                None
-                            }
+                    let encrypted = conn
+                        .raw()
+                        .security_level()
+                        .is_ok_and(|level| level.encrypted());
+                    if !encrypted {
+                        log::warn!(
+                            "firmware: rejected unencrypted gatt write slot={} handle={}",
+                            slot,
+                            event.handle()
+                        );
+                        if let Ok(reply) = event.reject(AttErrorCode::INSUFFICIENT_ENCRYPTION) {
+                            reply.send().await;
                         }
+                        None
                     } else {
-                        let handles = ble_hid_attribute_handles(server);
-                        match gatt_write_message(host_id, handles, event.handle(), event.data()) {
-                            Ok(message) => Some(message),
-                            Err(err) => {
-                                log::warn!(
-                                    "firmware: ble gatt write adapter failed slot={} handle={} err={:?}",
-                                    slot,
-                                    event.handle(),
-                                    err
-                                );
-                                None
+                        let message = if event.handle() == server.management.request.handle {
+                            match ManagementRequest::decode(event.data()) {
+                                Ok(request) => Some(RuntimeInputMessage::ManagementRequest {
+                                    destination: ManagementDestination::Ble(host_id),
+                                    request,
+                                    now_ms: Instant::now().as_millis(),
+                                }),
+                                Err(err) => {
+                                    log::warn!(
+                                        "firmware: invalid management request slot={} err={:?}",
+                                        slot,
+                                        err
+                                    );
+                                    None
+                                }
                             }
+                        } else {
+                            let handles = ble_hid_attribute_handles(server);
+                            match gatt_write_message(
+                                host_id,
+                                true,
+                                handles,
+                                event.handle(),
+                                event.data(),
+                            ) {
+                                Ok(message) => Some(message),
+                                Err(err) => {
+                                    log::warn!(
+                                        "firmware: ble gatt write adapter failed slot={} handle={} err={:?}",
+                                        slot,
+                                        event.handle(),
+                                        err
+                                    );
+                                    None
+                                }
+                            }
+                        };
+                        if let Ok(reply) = event.accept() {
+                            reply.send().await;
                         }
-                    };
-                    if let Ok(reply) = event.accept() {
-                        reply.send().await;
+                        message
                     }
-                    message
                 }
                 _ => {
                     if let Ok(reply) = event.accept() {

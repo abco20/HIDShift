@@ -60,6 +60,7 @@ const HUB_ENUMERATION_TOTAL_TIMEOUT_MS: u64 = 8_000;
 const HUB_QUIESCED_EVENT_DRAIN_MS: u64 = 750;
 const HID_REPORT_DESCRIPTOR_TIMEOUT_MS: u64 = 2_000;
 const USB_LED_WRITE_TIMEOUT_MS: u64 = 20;
+const BLE_QUIESCE_HANDSHAKE_TIMEOUT_MS: u64 = 2_000;
 
 static HOST_STATE: HostStateStorage<HOST_CHANNELS> = HostStateStorage::new();
 static BUS_STATE: BusState = BusState::new();
@@ -1112,15 +1113,35 @@ async fn quiesce_ble_for_usb_enumeration(
     ble_quiesce_ready: Receiver<'static, CriticalSectionRawMutex, (), 1>,
 ) {
     log::debug!("firmware: usb requesting ble quiesce for hub enumeration");
-    ble_quiesce_request.send(()).await;
-    ble_quiesce_ready.receive().await;
+    if with_timeout(
+        Duration::from_millis(BLE_QUIESCE_HANDSHAKE_TIMEOUT_MS),
+        async {
+            ble_quiesce_request.send(()).await;
+            ble_quiesce_ready.receive().await;
+        },
+    )
+    .await
+    .is_err()
+    {
+        log::error!("firmware: USB BLE quiesce handshake timed out; rebooting");
+        esp_hal::system::software_reset();
+    }
     log::debug!("firmware: usb ble quiesce ready for hub enumeration");
 }
 
 async fn resume_ble_after_usb_enumeration(
     ble_quiesce_done: Sender<'static, CriticalSectionRawMutex, (), 1>,
 ) {
-    ble_quiesce_done.send(()).await;
+    if with_timeout(
+        Duration::from_millis(BLE_QUIESCE_HANDSHAKE_TIMEOUT_MS),
+        ble_quiesce_done.send(()),
+    )
+    .await
+    .is_err()
+    {
+        log::error!("firmware: USB BLE resume handshake timed out; rebooting");
+        esp_hal::system::software_reset();
+    }
 }
 
 async fn enumerate_hub_port_with_retries<'d, A: embassy_usb_driver::host::UsbHostAllocator<'d>>(

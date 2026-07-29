@@ -1,3 +1,9 @@
+//! Synchronous adapter driver for host integrations and deterministic tests.
+//!
+//! Firmware transports that must await critical channel capacity consume the
+//! same [`RuntimeCommandQueues`] through their async scheduler instead of
+//! implementing this non-blocking sink.
+
 #[cfg(feature = "dual-s3-wired")]
 use super::DeviceTaskCommand;
 use super::message::RuntimeInputMessage;
@@ -345,6 +351,7 @@ mod tests {
             &RuntimeInputMessage::BleHostEvent {
                 host_id: HostId(1),
                 event: RuntimeBleHostEvent::GattWrite {
+                    encrypted: true,
                     attribute: crate::ble::BleHidAttribute::BootKeyboardOutputReport,
                     data: RuntimeBleGattWrite::from_slice(&[0b0000_0010]).unwrap(),
                 },

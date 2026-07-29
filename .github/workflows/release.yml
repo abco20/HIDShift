@@ -69,7 +69,7 @@ jobs:
           cp licenses/THIRD_PARTY_LICENSES_FIRMWARE.html "dist/${package}/THIRD_PARTY_LICENSES.html"
           espflash save-image --chip esp32s3 --merge --skip-padding \
             --flash-size 4mb --partition-table partitions/bridge.csv \
-            --target-app-partition factory \
+            --target-app-partition ota_0 \
             "dist/${package}/hidshift.elf" "dist/${package}/hidshift-factory.bin"
           tar -C dist -czf "dist/${package}.tar.gz" "${package}"
       - uses: actions/upload-artifact@v4

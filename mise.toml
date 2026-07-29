@@ -15,7 +15,7 @@ rust = {
 description = "Run the host checks used by CI in order"
 run = [
   "cargo test --locked --all-targets",
-  "cargo test --locked --all-targets --features dual-s3-wired",
+  "cargo test --locked --all-targets --features dual-s3-wired,experimental-domain",
   "cargo fmt --check",
   "cargo check --locked --lib",
   "cargo clippy --locked --lib -- -D warnings",

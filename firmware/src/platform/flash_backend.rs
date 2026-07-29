@@ -3,7 +3,7 @@ use esp_bootloader_esp_idf::partitions::{
 };
 use esp_storage::FlashStorage;
 use hidshift::storage::{
-    NorFlashStorageBackend, STORAGE_PARTITION_REQUIRED_LEN, StorageFlashLayout,
+    NorFlashStorageBackend, STORAGE_PARTITION_REQUIRED_LEN, StorageFlashLayout, StorageHealth,
 };
 use hidshift::storage::{STORAGE_IMAGE_LEN, StorageError, StorageSlotBackend, StorageSlotIndex};
 
@@ -11,14 +11,42 @@ pub const STORAGE_PARTITION_LABEL: &str = "bridge";
 
 pub enum FirmwareStorageBackend {
     Flash(NorFlashStorageBackend<FlashStorage<'static>>),
-    Memory(InMemoryStorageBackend),
+    #[cfg(all(feature = "hardware-e2e", feature = "dual-s3-wired"))]
+    Volatile(InMemoryStorageBackend),
+    Unavailable(InMemoryStorageBackend),
+}
+
+impl FirmwareStorageBackend {
+    pub const fn health(&self) -> StorageHealth {
+        match self {
+            Self::Flash(_) => StorageHealth::Persistent,
+            #[cfg(all(feature = "hardware-e2e", feature = "dual-s3-wired"))]
+            Self::Volatile(_) => StorageHealth::VolatileTest,
+            Self::Unavailable(_) => StorageHealth::Unavailable,
+        }
+    }
+
+    pub fn factory_reset(&mut self) -> Result<(), StorageError> {
+        match self {
+            Self::Flash(backend) => backend.erase_all(),
+            #[cfg(all(feature = "hardware-e2e", feature = "dual-s3-wired"))]
+            Self::Volatile(backend) => {
+                backend.clear();
+                Ok(())
+            }
+            Self::Unavailable(_) => Err(StorageError::Unavailable),
+        }
+    }
 }
 
 impl StorageSlotBackend for FirmwareStorageBackend {
     fn slot(&self, index: StorageSlotIndex) -> &[u8; STORAGE_IMAGE_LEN] {
         match self {
             Self::Flash(backend) => backend.slot(index),
-            Self::Memory(backend) => backend.slot(index),
+            #[cfg(all(feature = "hardware-e2e", feature = "dual-s3-wired"))]
+            Self::Volatile(backend) | Self::Unavailable(backend) => backend.slot(index),
+            #[cfg(not(all(feature = "hardware-e2e", feature = "dual-s3-wired")))]
+            Self::Unavailable(backend) => backend.slot(index),
         }
     }
 
@@ -29,7 +57,9 @@ impl StorageSlotBackend for FirmwareStorageBackend {
     ) -> Result<(), StorageError> {
         match self {
             Self::Flash(backend) => backend.write_slot(index, image),
-            Self::Memory(backend) => backend.write_slot(index, image),
+            #[cfg(all(feature = "hardware-e2e", feature = "dual-s3-wired"))]
+            Self::Volatile(backend) => backend.write_slot(index, image),
+            Self::Unavailable(_) => Err(StorageError::Unavailable),
         }
     }
 }
@@ -45,10 +75,10 @@ pub fn new_storage_backend(flash: esp_hal::peripherals::FLASH<'static>) -> Firmw
         }
         Err(error) => {
             log::error!(
-                "firmware: storage backend flash unavailable {:?}; using in-memory",
+                "firmware: storage backend flash unavailable {:?}; persistent mutations disabled",
                 error
             );
-            FirmwareStorageBackend::Memory(InMemoryStorageBackend::new())
+            FirmwareStorageBackend::Unavailable(InMemoryStorageBackend::new())
         }
     }
 }
@@ -96,6 +126,11 @@ impl InMemoryStorageBackend {
         Self {
             slots: [[0; STORAGE_IMAGE_LEN]; 2],
         }
+    }
+
+    #[cfg(all(feature = "hardware-e2e", feature = "dual-s3-wired"))]
+    fn clear(&mut self) {
+        self.slots = [[0; STORAGE_IMAGE_LEN]; 2];
     }
 }
 

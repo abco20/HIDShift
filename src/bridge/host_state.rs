@@ -135,7 +135,6 @@ impl<const HOSTS: usize> BleHostStateMachine<HOSTS> {
 
     pub fn storage_state(&self, generation: u32) -> Result<StorageState, StorageError> {
         let mut state = StorageState::new(generation);
-        state.last_active_host = self.active_target;
 
         for host in self.hosts.iter().flatten().copied() {
             state.push_host(StoredHostProfile {
@@ -149,6 +148,9 @@ impl<const HOSTS: usize> BleHostStateMachine<HOSTS> {
                 bond: host.bond,
             })?;
         }
+        state.last_active_host = self
+            .active_target
+            .filter(|active| state.hosts().iter().any(|host| host.host_id == *active));
 
         Ok(state)
     }

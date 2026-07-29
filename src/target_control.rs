@@ -5,6 +5,51 @@ pub enum ButtonIntent {
     ClearActiveHostBond,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BootRecoveryAction {
+    Normal,
+    Suppress,
+    FactoryReset,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BootRecoveryControl {
+    arm_until_ms: u64,
+    pressed_since_ms: Option<u64>,
+    hold_ms: u64,
+}
+
+impl BootRecoveryControl {
+    pub const fn new(now_ms: u64, arm_window_ms: u64, hold_ms: u64) -> Self {
+        Self {
+            arm_until_ms: now_ms.saturating_add(arm_window_ms),
+            pressed_since_ms: None,
+            hold_ms,
+        }
+    }
+
+    pub fn sample(&mut self, pressed: bool, now_ms: u64) -> BootRecoveryAction {
+        if let Some(pressed_since_ms) = self.pressed_since_ms {
+            if pressed {
+                return BootRecoveryAction::Suppress;
+            }
+            self.pressed_since_ms = None;
+            return if now_ms.saturating_sub(pressed_since_ms) >= self.hold_ms {
+                BootRecoveryAction::FactoryReset
+            } else {
+                BootRecoveryAction::Suppress
+            };
+        }
+
+        if pressed && now_ms <= self.arm_until_ms {
+            self.pressed_since_ms = Some(now_ms);
+            return BootRecoveryAction::Suppress;
+        }
+
+        BootRecoveryAction::Normal
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TargetSwitchControl {
     button: DebouncedButton,
@@ -195,5 +240,36 @@ mod tests {
             control.target_button_sample(false, 160),
             Some(ButtonIntent::NextConnectedTarget)
         );
+    }
+
+    #[test]
+    fn boot_recovery_arms_when_pressed_during_the_startup_window() {
+        let mut recovery = BootRecoveryControl::new(0, 3_000, 5_000);
+
+        assert_eq!(recovery.sample(false, 2_000), BootRecoveryAction::Normal);
+        assert_eq!(recovery.sample(true, 2_500), BootRecoveryAction::Suppress);
+        assert_eq!(recovery.sample(true, 7_499), BootRecoveryAction::Suppress);
+        assert_eq!(
+            recovery.sample(false, 7_500),
+            BootRecoveryAction::FactoryReset
+        );
+        assert_eq!(recovery.sample(false, 7_510), BootRecoveryAction::Normal);
+    }
+
+    #[test]
+    fn short_startup_press_is_consumed_without_triggering_a_runtime_button_action() {
+        let mut recovery = BootRecoveryControl::new(0, 3_000, 5_000);
+
+        assert_eq!(recovery.sample(true, 1_000), BootRecoveryAction::Suppress);
+        assert_eq!(recovery.sample(false, 2_000), BootRecoveryAction::Suppress);
+        assert_eq!(recovery.sample(false, 2_010), BootRecoveryAction::Normal);
+    }
+
+    #[test]
+    fn boot_recovery_is_inactive_after_the_startup_window() {
+        let mut recovery = BootRecoveryControl::new(0, 3_000, 5_000);
+
+        assert_eq!(recovery.sample(false, 3_001), BootRecoveryAction::Normal);
+        assert_eq!(recovery.sample(true, 3_010), BootRecoveryAction::Normal);
     }
 }

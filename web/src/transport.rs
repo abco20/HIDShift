@@ -54,6 +54,10 @@ impl BrowserTransport {
             Self::Serial(_) => "有線 · Serial".into(),
         }
     }
+
+    pub fn requires_readiness_probe(&self) -> bool {
+        matches!(self, Self::Serial(_))
+    }
 }
 
 pub struct BluetoothTransport {
@@ -208,6 +212,13 @@ impl SerialTransport {
         Reflect::set(&options, &"baudRate".into(), &JsValue::from_f64(115_200.0))
             .map_err(js_error)?;
         await_method(&port, "open", &[options.into()]).await?;
+        let signals = Object::new();
+        Reflect::set(&signals, &"dataTerminalReady".into(), &JsValue::FALSE).map_err(js_error)?;
+        Reflect::set(&signals, &"requestToSend".into(), &JsValue::FALSE).map_err(js_error)?;
+        // CH340 adapters may reset the DUT when the browser opens the port.
+        // Deassert both modem-control signals when supported; readiness probes
+        // below still cover adapters or browsers that ignore this request.
+        let _ = await_method(&port, "setSignals", &[signals.into()]).await;
         let writable = Reflect::get(&port, &"writable".into()).map_err(js_error)?;
         let writer = call_method(&writable, "getWriter", &[])?;
         let readable = Reflect::get(&port, &"readable".into()).map_err(js_error)?;
@@ -260,9 +271,9 @@ fn bluetooth_event_bytes(event: &Event) -> Option<Vec<u8>> {
 }
 
 fn bluetooth_value_bytes(value: &JsValue) -> Option<Vec<u8>> {
-    let buffer = Reflect::get(&value, &"buffer".into()).ok()?;
-    let offset = Reflect::get(&value, &"byteOffset".into()).ok()?.as_f64()? as u32;
-    let length = Reflect::get(&value, &"byteLength".into()).ok()?.as_f64()? as u32;
+    let buffer = Reflect::get(value, &"buffer".into()).ok()?;
+    let offset = Reflect::get(value, &"byteOffset".into()).ok()?.as_f64()? as u32;
+    let length = Reflect::get(value, &"byteLength".into()).ok()?.as_f64()? as u32;
     if length as usize != MANAGEMENT_RESPONSE_LEN {
         return None;
     }

@@ -33,7 +33,8 @@ use crate::settings::{
     SettingId, SettingScope, SettingTarget, setting_descriptor, validate_setting_value,
 };
 use crate::storage::{
-    FixedName, STORED_HOSTS_MAX, StorageError, StoragePersistPriority, StorageState, StoredBond,
+    FixedName, STORED_HOSTS_MAX, StorageError, StorageHealth, StoragePersistPriority, StorageState,
+    StoredBond,
 };
 use crate::target_control::ButtonIntent;
 use crate::usb_hid::output::{
@@ -43,12 +44,17 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 #[path = "runtime/bootstrap.rs"]
 pub mod bootstrap;
+#[path = "runtime/diagnostics.rs"]
+pub mod diagnostics;
 #[path = "runtime/driver.rs"]
 pub mod driver;
 #[path = "runtime/message.rs"]
 pub mod message;
 #[path = "runtime/owner.rs"]
 pub mod owner;
+
+use diagnostics::saturating_depth;
+pub use diagnostics::{RuntimeCounters, RuntimeDiagnosticsEvent, RuntimeTransportMetrics};
 
 pub const RUNTIME_HOSTS_MAX: usize = STORED_HOSTS_MAX;
 pub const RUNTIME_USB_INTERFACES_MAX: usize = 8;
@@ -182,6 +188,7 @@ pub enum RuntimeInput<'a> {
         name: FixedName,
     },
     DiagnosticsEvent(RuntimeDiagnosticsEvent),
+    StorageHealthChanged(StorageHealth),
     #[cfg(feature = "dual-s3-wired")]
     DeviceCommandRequested(DeviceTaskCommand),
     #[cfg(feature = "dual-s3-wired")]
@@ -230,6 +237,7 @@ pub struct BridgeRuntime<const HOSTS: usize, const USB_INTERFACES: usize> {
     pending_target_switch: Option<PendingTargetSwitch>,
     status_sequence: u64,
     counters: RuntimeCounters,
+    storage_health: StorageHealth,
     mouse_scale_remainders: [MouseScaleRemainders; HOSTS],
     #[cfg(feature = "dual-s3-wired")]
     last_profile_result: Option<ProfileResult>,
@@ -302,6 +310,7 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             pending_target_switch: None,
             status_sequence: 0,
             counters: RuntimeCounters::new(),
+            storage_health: StorageHealth::Persistent,
             mouse_scale_remainders: [MouseScaleRemainders::ZERO; HOSTS],
             #[cfg(feature = "dual-s3-wired")]
             last_profile_result: None,
@@ -453,42 +462,38 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         self.counters
     }
 
-    pub fn observe_outbox_usage(&mut self, ble: usize, usb: usize, storage: usize, status: usize) {
-        self.counters.ble_control_queue_high_watermark = self
-            .counters
-            .ble_control_queue_high_watermark
-            .max(ble.min(u16::MAX as usize) as u16);
-        self.counters.ble_notify_queue_high_watermark = self
-            .counters
-            .ble_notify_queue_high_watermark
-            .max(ble.min(u16::MAX as usize) as u16);
-        self.counters.usb_command_queue_high_watermark = self
-            .counters
-            .usb_command_queue_high_watermark
-            .max(usb.min(u16::MAX as usize) as u16);
-        self.counters.storage_queue_high_watermark = self
-            .counters
-            .storage_queue_high_watermark
-            .max(storage.min(u16::MAX as usize) as u16);
-        self.counters.status_queue_high_watermark = self
-            .counters
-            .status_queue_high_watermark
-            .max(status.min(u16::MAX as usize) as u16);
+    pub const fn storage_health(&self) -> StorageHealth {
+        self.storage_health
     }
 
-    pub fn observe_transport_metrics(
-        &mut self,
-        runtime_input_depth: usize,
-        mouse: crate::mouse_accumulator::MouseAccumulatorStats,
-        status_updates_dropped: u32,
-    ) {
+    pub fn observe_transport_metrics(&mut self, metrics: RuntimeTransportMetrics) {
         self.counters.runtime_input_queue_high_watermark = self
             .counters
             .runtime_input_queue_high_watermark
-            .max(runtime_input_depth.min(u16::MAX as usize) as u16);
-        self.counters.mouse_reports_coalesced = mouse.reports_coalesced;
-        self.counters.mouse_movement_saturated = mouse.movement_saturated;
-        self.counters.status_updates_dropped = status_updates_dropped;
+            .max(saturating_depth(metrics.runtime_input_depth));
+        self.counters.ble_control_queue_high_watermark = self
+            .counters
+            .ble_control_queue_high_watermark
+            .max(saturating_depth(metrics.ble_control_depth));
+        self.counters.ble_notify_queue_high_watermark = self
+            .counters
+            .ble_notify_queue_high_watermark
+            .max(saturating_depth(metrics.ble_notify_depth));
+        self.counters.usb_command_queue_high_watermark = self
+            .counters
+            .usb_command_queue_high_watermark
+            .max(saturating_depth(metrics.usb_depth));
+        self.counters.storage_queue_high_watermark = self
+            .counters
+            .storage_queue_high_watermark
+            .max(saturating_depth(metrics.storage_depth));
+        self.counters.status_queue_high_watermark = self
+            .counters
+            .status_queue_high_watermark
+            .max(saturating_depth(metrics.status_depth));
+        self.counters.mouse_reports_coalesced = metrics.mouse.reports_coalesced;
+        self.counters.mouse_movement_saturated = metrics.mouse.movement_saturated;
+        self.counters.status_updates_dropped = metrics.status_updates_dropped;
     }
 
     pub fn storage_state(&self) -> Result<StorageState, StorageError> {
@@ -522,7 +527,6 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         };
         self.bridge.restore_storage_state(&restored, &mut actions)?;
         self.storage_generation = storage.generation;
-        self.diagnostics.flash_write_count = storage.generation.min(u8::MAX as u32) as u8;
         self.global_settings = storage.global_settings;
         for (destination, source) in self.host_settings.iter_mut().zip(storage.host_settings) {
             *destination = source;
@@ -642,6 +646,11 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             RuntimeInput::DiagnosticsEvent(event) => {
                 commands.clear();
                 self.apply_diagnostics_event(event);
+                Ok(())
+            }
+            RuntimeInput::StorageHealthChanged(health) => {
+                commands.clear();
+                self.storage_health = health;
                 Ok(())
             }
             #[cfg(feature = "dual-s3-wired")]
@@ -1236,191 +1245,202 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         commands: &mut heapless::Vec<RuntimeCommand, COMMANDS>,
     ) -> Result<(), RuntimeError> {
         commands.clear();
-        let result = match request.command {
-            ManagementCommand::GetStatus => ManagementResult::Ok,
-            ManagementCommand::SelectHost(host_id) => {
-                if !valid_management_host::<HOSTS>(host_id) {
-                    ManagementResult::InvalidHost
-                } else if self.bridge.state().hosts.host(host_id).is_none() {
-                    ManagementResult::HostNotFound
-                } else {
-                    self.request_target_switch_append::<COMMANDS, ACTIONS>(
-                        host_id, now_ms, commands,
-                    )?;
-                    ManagementResult::Ok
+        let result = if management_command_requires_storage(&request.command)
+            && !self.storage_health.allows_persistent_mutation()
+        {
+            ManagementResult::Unavailable
+        } else {
+            match request.command {
+                ManagementCommand::GetStatus => ManagementResult::Ok,
+                ManagementCommand::SelectHost(host_id) => {
+                    if !valid_management_host::<HOSTS>(host_id) {
+                        ManagementResult::InvalidHost
+                    } else if self.bridge.state().hosts.host(host_id).is_none() {
+                        ManagementResult::HostNotFound
+                    } else {
+                        self.request_target_switch_append::<COMMANDS, ACTIONS>(
+                            host_id, now_ms, commands,
+                        )?;
+                        ManagementResult::Ok
+                    }
                 }
-            }
-            ManagementCommand::StartPairing(host_id) => {
-                if !valid_management_host::<HOSTS>(host_id) {
-                    ManagementResult::InvalidHost
-                } else if self
-                    .bridge
-                    .state()
-                    .hosts
-                    .host(host_id)
-                    .is_some_and(|host| host.bonded || host.bond.is_some())
-                {
-                    ManagementResult::HostAlreadyBonded
-                } else {
-                    self.pairing_mode = Some(PairingModeState {
-                        host_id,
-                        deadline_ms: now_ms.saturating_add(PAIRING_MODE_TIMEOUT_MS),
-                    });
-                    self.handle_bridge_event_append::<COMMANDS, ACTIONS>(
-                        BridgeEvent::EnterPairingMode { host_id },
-                        commands,
-                    )?;
-                    ManagementResult::Ok
-                }
-            }
-            ManagementCommand::ForgetHost(host_id) => {
-                if !valid_management_host::<HOSTS>(host_id) {
-                    ManagementResult::InvalidHost
-                } else if self.bridge.state().hosts.host(host_id).is_none() {
-                    ManagementResult::HostNotFound
-                } else {
-                    self.handle_bridge_event_append::<COMMANDS, ACTIONS>(
-                        BridgeEvent::ClearHost { host_id },
-                        commands,
-                    )?;
-                    ManagementResult::Ok
-                }
-            }
-            ManagementCommand::GetHostInfo(host_id) => {
-                if !valid_management_host::<HOSTS>(host_id) {
-                    ManagementResult::InvalidHost
-                } else if self.bridge.state().hosts.host(host_id).is_none() {
-                    ManagementResult::HostNotFound
-                } else {
-                    ManagementResult::Ok
-                }
-            }
-            ManagementCommand::SetHostName { host_id, name } => {
-                if !valid_management_host::<HOSTS>(host_id) {
-                    ManagementResult::InvalidHost
-                } else if self.bridge.state().hosts.host(host_id).is_none() {
-                    ManagementResult::HostNotFound
-                } else {
-                    let name = core::str::from_utf8(name.as_bytes())
-                        .ok()
-                        .and_then(FixedName::from_ascii);
-                    if let Some(name) = name {
+                ManagementCommand::StartPairing(host_id) => {
+                    if !valid_management_host::<HOSTS>(host_id) {
+                        ManagementResult::InvalidHost
+                    } else if self
+                        .bridge
+                        .state()
+                        .hosts
+                        .host(host_id)
+                        .is_some_and(|host| host.bonded || host.bond.is_some())
+                    {
+                        ManagementResult::HostAlreadyBonded
+                    } else {
+                        self.pairing_mode = Some(PairingModeState {
+                            host_id,
+                            deadline_ms: now_ms.saturating_add(PAIRING_MODE_TIMEOUT_MS),
+                        });
                         self.handle_bridge_event_append::<COMMANDS, ACTIONS>(
-                            BridgeEvent::SetHostName { host_id, name },
+                            BridgeEvent::EnterPairingMode { host_id },
+                            commands,
+                        )?;
+                        ManagementResult::Ok
+                    }
+                }
+                ManagementCommand::ForgetHost(host_id) => {
+                    if !valid_management_host::<HOSTS>(host_id) {
+                        ManagementResult::InvalidHost
+                    } else if self.bridge.state().hosts.host(host_id).is_none() {
+                        ManagementResult::HostNotFound
+                    } else {
+                        self.handle_bridge_event_append::<COMMANDS, ACTIONS>(
+                            BridgeEvent::ClearHost { host_id },
+                            commands,
+                        )?;
+                        ManagementResult::Ok
+                    }
+                }
+                ManagementCommand::GetHostInfo(host_id) => {
+                    if !valid_management_host::<HOSTS>(host_id) {
+                        ManagementResult::InvalidHost
+                    } else if self.bridge.state().hosts.host(host_id).is_none() {
+                        ManagementResult::HostNotFound
+                    } else {
+                        ManagementResult::Ok
+                    }
+                }
+                ManagementCommand::SetHostName { host_id, name } => {
+                    if !valid_management_host::<HOSTS>(host_id) {
+                        ManagementResult::InvalidHost
+                    } else if self.bridge.state().hosts.host(host_id).is_none() {
+                        ManagementResult::HostNotFound
+                    } else {
+                        let name = core::str::from_utf8(name.as_bytes())
+                            .ok()
+                            .and_then(FixedName::from_ascii);
+                        if let Some(name) = name {
+                            self.handle_bridge_event_append::<COMMANDS, ACTIONS>(
+                                BridgeEvent::SetHostName { host_id, name },
+                                commands,
+                            )?;
+                            ManagementResult::Ok
+                        } else {
+                            ManagementResult::InvalidName
+                        }
+                    }
+                }
+                ManagementCommand::CancelPairing => {
+                    if let Some(pairing) = self.pairing_mode.take() {
+                        self.handle_bridge_event_append::<COMMANDS, ACTIONS>(
+                            BridgeEvent::PairingModeExpired {
+                                host_id: pairing.host_id,
+                            },
                             commands,
                         )?;
                         ManagementResult::Ok
                     } else {
-                        ManagementResult::InvalidName
+                        ManagementResult::NotFound
                     }
                 }
-            }
-            ManagementCommand::CancelPairing => {
-                if let Some(pairing) = self.pairing_mode.take() {
-                    self.handle_bridge_event_append::<COMMANDS, ACTIONS>(
-                        BridgeEvent::PairingModeExpired {
-                            host_id: pairing.host_id,
-                        },
-                        commands,
-                    )?;
-                    ManagementResult::Ok
-                } else {
-                    ManagementResult::NotFound
+                ManagementCommand::GetUsbDevice { index, .. } => {
+                    if self.management_usb_device(index, 0).is_some() {
+                        ManagementResult::Ok
+                    } else {
+                        ManagementResult::NotFound
+                    }
                 }
-            }
-            ManagementCommand::GetUsbDevice { index, .. } => {
-                if self.management_usb_device(index, 0).is_some() {
-                    ManagementResult::Ok
-                } else {
-                    ManagementResult::NotFound
+                ManagementCommand::GetDiagnostics
+                | ManagementCommand::GetHistory { .. }
+                | ManagementCommand::GetSchema => ManagementResult::Ok,
+                ManagementCommand::GetHostTiming(host_id) => {
+                    if valid_management_host::<HOSTS>(host_id) {
+                        ManagementResult::Ok
+                    } else {
+                        ManagementResult::InvalidHost
+                    }
                 }
-            }
-            ManagementCommand::GetDiagnostics
-            | ManagementCommand::GetHistory { .. }
-            | ManagementCommand::GetSchema => ManagementResult::Ok,
-            ManagementCommand::GetHostTiming(host_id) => {
-                if valid_management_host::<HOSTS>(host_id) {
-                    ManagementResult::Ok
-                } else {
-                    ManagementResult::InvalidHost
+                ManagementCommand::GetSetting { id, target } => {
+                    if self.setting_value(id, target).is_some() {
+                        ManagementResult::Ok
+                    } else {
+                        ManagementResult::InvalidSetting
+                    }
                 }
-            }
-            ManagementCommand::GetSetting { id, target } => {
-                if self.setting_value(id, target).is_some() {
-                    ManagementResult::Ok
-                } else {
-                    ManagementResult::InvalidSetting
+                ManagementCommand::SetSetting { id, target, value } => {
+                    let changed = self.setting_value(id, target) != Some(value);
+                    if self.set_setting(id, target, value) {
+                        self.push_storage_snapshot(commands, StoragePersistPriority::Critical)?;
+                        if changed && id == SettingId::LogLevel {
+                            push_command(
+                                commands,
+                                RuntimeCommand::ApplyEffect(RuntimeEffect::SetLogLevel(
+                                    value as u8,
+                                )),
+                            )?;
+                        }
+                        ManagementResult::Ok
+                    } else {
+                        ManagementResult::InvalidSetting
+                    }
                 }
-            }
-            ManagementCommand::SetSetting { id, target, value } => {
-                let changed = self.setting_value(id, target) != Some(value);
-                if self.set_setting(id, target, value) {
-                    self.push_storage_snapshot(commands, StoragePersistPriority::Critical)?;
-                    if changed && id == SettingId::LogLevel {
-                        push_command(
+                #[cfg(feature = "dual-s3-wired")]
+                ManagementCommand::SelectOutputTarget(target) => {
+                    let output_target = target.to_output_target();
+                    if output_target.validate().is_err()
+                        || matches!(output_target, OutputTarget::Ble(host) if !valid_management_host::<HOSTS>(host))
+                    {
+                        ManagementResult::InvalidHost
+                    } else {
+                        self.pending_target_switch = None;
+                        self.handle_bridge_event_append::<COMMANDS, ACTIONS>(
+                            BridgeEvent::SelectOutputTarget {
+                                target: output_target,
+                            },
                             commands,
-                            RuntimeCommand::ApplyEffect(RuntimeEffect::SetLogLevel(value as u8)),
                         )?;
+                        ManagementResult::Ok
                     }
-                    ManagementResult::Ok
-                } else {
-                    ManagementResult::InvalidSetting
                 }
-            }
-            #[cfg(feature = "dual-s3-wired")]
-            ManagementCommand::SelectOutputTarget(target) => {
-                let output_target = target.to_output_target();
-                if output_target.validate().is_err()
-                    || matches!(output_target, OutputTarget::Ble(host) if !valid_management_host::<HOSTS>(host))
-                {
-                    ManagementResult::InvalidHost
-                } else {
-                    self.pending_target_switch = None;
-                    self.handle_bridge_event_append::<COMMANDS, ACTIONS>(
-                        BridgeEvent::SelectOutputTarget {
-                            target: output_target,
-                        },
-                        commands,
-                    )?;
-                    ManagementResult::Ok
+                #[cfg(feature = "dual-s3-wired")]
+                ManagementCommand::GetOutputTargetStatus => ManagementResult::Ok,
+                #[cfg(feature = "dual-s3-wired")]
+                ManagementCommand::GetMirrorCandidate(candidate) => {
+                    if self.mirror_candidates.get(candidate).is_some() {
+                        ManagementResult::Ok
+                    } else {
+                        ManagementResult::NotFound
+                    }
                 }
-            }
-            #[cfg(feature = "dual-s3-wired")]
-            ManagementCommand::GetOutputTargetStatus => ManagementResult::Ok,
-            #[cfg(feature = "dual-s3-wired")]
-            ManagementCommand::GetMirrorCandidate(candidate) => {
-                if self.mirror_candidates.get(candidate).is_some() {
-                    ManagementResult::Ok
-                } else {
-                    ManagementResult::NotFound
+                #[cfg(feature = "dual-s3-wired")]
+                ManagementCommand::SetMirrorTarget(candidate) => {
+                    if let (Some(profile_hash), Some(stable_id)) = (
+                        self.mirror_profile_hash(candidate),
+                        self.mirror_stable_id(candidate),
+                    ) {
+                        self.bridge
+                            .set_mirror_target(Some(StoredMirrorTarget(stable_id)));
+                        self.push_storage_snapshot(commands, StoragePersistPriority::Critical)?;
+                        if self.bridge.state().output_target.selected == OutputTarget::Wired {
+                            debug_assert_eq!(
+                                self.mirror_profile_hash(candidate),
+                                Some(profile_hash)
+                            );
+                            self.begin_presentation_transition(Some(candidate), commands)?;
+                        }
+                        ManagementResult::Ok
+                    } else {
+                        ManagementResult::NotFound
+                    }
                 }
-            }
-            #[cfg(feature = "dual-s3-wired")]
-            ManagementCommand::SetMirrorTarget(candidate) => {
-                if let (Some(profile_hash), Some(stable_id)) = (
-                    self.mirror_profile_hash(candidate),
-                    self.mirror_stable_id(candidate),
-                ) {
-                    self.bridge
-                        .set_mirror_target(Some(StoredMirrorTarget(stable_id)));
+                #[cfg(feature = "dual-s3-wired")]
+                ManagementCommand::ClearMirrorTarget => {
+                    self.bridge.set_mirror_target(None);
                     self.push_storage_snapshot(commands, StoragePersistPriority::Critical)?;
                     if self.bridge.state().output_target.selected == OutputTarget::Wired {
-                        debug_assert_eq!(self.mirror_profile_hash(candidate), Some(profile_hash));
-                        self.begin_presentation_transition(Some(candidate), commands)?;
+                        self.begin_presentation_transition(None, commands)?;
                     }
                     ManagementResult::Ok
-                } else {
-                    ManagementResult::NotFound
                 }
-            }
-            #[cfg(feature = "dual-s3-wired")]
-            ManagementCommand::ClearMirrorTarget => {
-                self.bridge.set_mirror_target(None);
-                self.push_storage_snapshot(commands, StoragePersistPriority::Critical)?;
-                if self.bridge.state().output_target.selected == OutputTarget::Wired {
-                    self.begin_presentation_transition(None, commands)?;
-                }
-                ManagementResult::Ok
             }
         };
 
@@ -1521,6 +1541,7 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         status.active_host = self.bridge.state().hosts.active_target();
         status.pairing_host = self.bridge.state().pairable_host;
         status.usb = self.management_usb_status();
+        status.storage_health = self.storage_health;
         for index in 0..HOSTS.min(4) {
             let host_id = HostId((index + 1) as u8);
             if let Some(host) = self.bridge.state().hosts.host(host_id) {
@@ -1795,6 +1816,9 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         commands: &mut heapless::Vec<RuntimeCommand, COMMANDS>,
         priority: StoragePersistPriority,
     ) -> Result<(), RuntimeError> {
+        if !self.storage_health.allows_persistent_mutation() {
+            return Err(RuntimeError::StorageUnavailable);
+        }
         self.storage_generation = self.storage_generation.wrapping_add(1);
         let mut state = self.bridge.storage_state(self.storage_generation)?;
         state.global_settings = self.global_settings;
@@ -2334,72 +2358,6 @@ pub struct UsbHidInterfaceRuntimeState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RuntimeDiagnosticsEvent {
-    ResetReason(u8),
-    Brownout,
-    BleDisconnected { host_id: HostId, reason: u8 },
-    BleNotifyFailed,
-    BleNotifyTimedOut { critical_release: bool },
-    BleManagementNotifyTimedOut,
-    UsbLedWriteTimedOut,
-    UsbError,
-    FlashWrite { success: bool },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RuntimeCounters {
-    pub runtime_input_queue_high_watermark: u16,
-    pub ble_control_queue_high_watermark: u16,
-    pub ble_notify_queue_high_watermark: u16,
-    pub usb_command_queue_high_watermark: u16,
-    pub storage_queue_high_watermark: u16,
-    pub status_queue_high_watermark: u16,
-    pub ble_notify_dropped: u32,
-    pub ble_notify_timeouts: u32,
-    pub critical_release_failures: u32,
-    pub mouse_reports_coalesced: u32,
-    pub mouse_movement_saturated: u32,
-    pub runtime_input_dropped: u32,
-    pub mirror_non_target_input_dropped: u32,
-    pub status_updates_dropped: u32,
-    pub usb_led_write_timeouts: u32,
-    pub runtime_processing_max_us: u32,
-    pub usb_to_ble_latency_max_us: u32,
-    pub ble_notify_max_us: u32,
-}
-
-impl RuntimeCounters {
-    pub const fn new() -> Self {
-        Self {
-            runtime_input_queue_high_watermark: 0,
-            ble_control_queue_high_watermark: 0,
-            ble_notify_queue_high_watermark: 0,
-            usb_command_queue_high_watermark: 0,
-            storage_queue_high_watermark: 0,
-            status_queue_high_watermark: 0,
-            ble_notify_dropped: 0,
-            ble_notify_timeouts: 0,
-            critical_release_failures: 0,
-            mouse_reports_coalesced: 0,
-            mouse_movement_saturated: 0,
-            runtime_input_dropped: 0,
-            mirror_non_target_input_dropped: 0,
-            status_updates_dropped: 0,
-            usb_led_write_timeouts: 0,
-            runtime_processing_max_us: 0,
-            usb_to_ble_latency_max_us: 0,
-            ble_notify_max_us: 0,
-        }
-    }
-}
-
-impl Default for RuntimeCounters {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StatusSnapshot {
     pub sequence: u64,
     pub active_host: Option<HostId>,
@@ -2685,9 +2643,14 @@ impl UsbHostTaskCommand {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StorageTaskCommand {
-    pub state: StorageState,
-    pub priority: StoragePersistPriority,
+// Storage snapshots stay inline so the no_std firmware does not allocate.
+#[allow(clippy::large_enum_variant)]
+pub enum StorageTaskCommand {
+    Persist {
+        state: StorageState,
+        priority: StoragePersistPriority,
+    },
+    FactoryReset,
 }
 
 impl StorageTaskCommand {
@@ -2873,7 +2836,7 @@ impl<const BLE: usize, const USB_HOST: usize, const STORAGE: usize, const STATUS
                 .map_err(|_| RuntimeDispatchError::UsbQueueCapacity),
             RuntimeCommand::PersistStorage { state, priority } => self
                 .storage
-                .push(StorageTaskCommand {
+                .push(StorageTaskCommand::Persist {
                     state: state.clone(),
                     priority: *priority,
                 })
@@ -2947,6 +2910,7 @@ pub enum RuntimeError {
         interface_id: InterfaceId,
     },
     CommandCapacity,
+    StorageUnavailable,
     UnexpectedRealtimeAction,
     WiredFeatureDisabled,
     #[cfg(feature = "dual-s3-wired")]
@@ -2994,6 +2958,21 @@ const fn storage_persist_priority_for_event(event: &BridgeEvent) -> Option<Stora
         BridgeEvent::CccdChanged { .. } => Some(StoragePersistPriority::Normal),
         BridgeEvent::SwitchTarget { .. } => Some(StoragePersistPriority::Lazy),
         _ => None,
+    }
+}
+
+const fn management_command_requires_storage(command: &ManagementCommand) -> bool {
+    match command {
+        ManagementCommand::SelectHost(_)
+        | ManagementCommand::StartPairing(_)
+        | ManagementCommand::ForgetHost(_)
+        | ManagementCommand::SetHostName { .. }
+        | ManagementCommand::SetSetting { .. } => true,
+        #[cfg(feature = "dual-s3-wired")]
+        ManagementCommand::SelectOutputTarget(_)
+        | ManagementCommand::SetMirrorTarget(_)
+        | ManagementCommand::ClearMirrorTarget => true,
+        _ => false,
     }
 }
 
@@ -3081,6 +3060,10 @@ mod tests {
         };
         assert_eq!(status.host_count, 4);
         assert_eq!(
+            status.storage_health,
+            crate::storage::StorageHealth::Persistent
+        );
+        assert_eq!(
             status.hosts[1],
             ManagementHostStatus {
                 known: true,
@@ -3089,6 +3072,138 @@ mod tests {
                 bonded: true,
             }
         );
+    }
+
+    #[test]
+    fn unavailable_storage_rejects_persistent_management_mutations() {
+        let mut runtime = BridgeRuntime::<4, 1>::new(0);
+        let mut commands = heapless::Vec::<RuntimeCommand, 12>::new();
+        runtime
+            .handle_input::<12, 12, 2>(
+                RuntimeInput::StorageHealthChanged(crate::storage::StorageHealth::Unavailable),
+                &mut commands,
+            )
+            .unwrap();
+
+        runtime
+            .handle_input::<12, 12, 2>(
+                management_request(
+                    ManagementCommand::SetSetting {
+                        id: SettingId::MouseSensitivityPercent,
+                        target: SettingTarget::Host(HostId(2)),
+                        value: 175,
+                    },
+                    1,
+                ),
+                &mut commands,
+            )
+            .unwrap();
+
+        assert_eq!(
+            management_response(&commands).result,
+            ManagementResult::Unavailable
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, RuntimeCommand::PersistStorage { .. }))
+        );
+        assert_eq!(
+            runtime.setting_value(
+                SettingId::MouseSensitivityPercent,
+                SettingTarget::Host(HostId(2))
+            ),
+            Some(100)
+        );
+
+        runtime
+            .handle_input::<12, 12, 2>(
+                management_request(ManagementCommand::GetStatus, 2),
+                &mut commands,
+            )
+            .unwrap();
+        assert_eq!(
+            management_status(&commands).storage_health,
+            crate::storage::StorageHealth::Unavailable
+        );
+    }
+
+    #[test]
+    fn degraded_storage_rejects_new_mutations_until_retry_recovers() {
+        let mut runtime = BridgeRuntime::<4, 1>::new(0);
+        let mut commands = heapless::Vec::<RuntimeCommand, 12>::new();
+        runtime
+            .handle_input::<12, 12, 2>(
+                RuntimeInput::StorageHealthChanged(crate::storage::StorageHealth::Degraded),
+                &mut commands,
+            )
+            .unwrap();
+
+        runtime
+            .handle_input::<12, 12, 2>(
+                management_request(
+                    ManagementCommand::SetSetting {
+                        id: SettingId::AutoReconnect,
+                        target: SettingTarget::Global,
+                        value: 0,
+                    },
+                    1,
+                ),
+                &mut commands,
+            )
+            .unwrap();
+
+        assert_eq!(
+            management_response(&commands).result,
+            ManagementResult::Unavailable
+        );
+        assert_eq!(
+            runtime.storage_health(),
+            crate::storage::StorageHealth::Degraded
+        );
+        assert_eq!(
+            runtime.setting_value(SettingId::AutoReconnect, SettingTarget::Global),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn restoring_storage_does_not_invent_flash_write_count() {
+        let mut runtime = BridgeRuntime::<4, 1>::new(0);
+        let mut commands = heapless::Vec::<RuntimeCommand, 4>::new();
+        runtime
+            .restore_storage_state(&StorageState::new(77), &mut commands)
+            .unwrap();
+
+        assert_eq!(runtime.diagnostics.flash_write_count, 0);
+    }
+
+    #[test]
+    fn transport_metrics_keep_ble_lanes_and_actual_channels_distinct() {
+        let mut runtime = BridgeRuntime::<4, 1>::new(0);
+        runtime.observe_transport_metrics(RuntimeTransportMetrics {
+            runtime_input_depth: 1,
+            ble_control_depth: 2,
+            ble_notify_depth: 3,
+            usb_depth: 4,
+            storage_depth: 5,
+            status_depth: 6,
+            mouse: crate::mouse_accumulator::MouseAccumulatorStats {
+                reports_coalesced: 7,
+                movement_saturated: 8,
+            },
+            status_updates_dropped: 9,
+        });
+
+        assert_eq!(runtime.counters.runtime_input_queue_high_watermark, 1);
+        assert_eq!(runtime.counters.ble_control_queue_high_watermark, 2);
+        assert_eq!(runtime.counters.ble_notify_queue_high_watermark, 3);
+        assert_eq!(runtime.counters.usb_command_queue_high_watermark, 4);
+        assert_eq!(runtime.counters.storage_queue_high_watermark, 5);
+        assert_eq!(runtime.counters.status_queue_high_watermark, 6);
+        assert_eq!(runtime.counters.mouse_reports_coalesced, 7);
+        assert_eq!(runtime.counters.mouse_movement_saturated, 8);
+        assert_eq!(runtime.counters.status_updates_dropped, 9);
     }
 
     #[test]
@@ -4593,6 +4708,7 @@ mod tests {
             .handle_ble_host_event::<8, 8, 2>(
                 HostId(1),
                 BleHostAdapterEvent::GattWrite {
+                    encrypted: true,
                     attribute: BleHidAttribute::KeyboardInputCccd,
                     data: &[0x01, 0x00],
                 },
@@ -4651,6 +4767,7 @@ mod tests {
             .handle_ble_host_event::<8, 8, 2>(
                 HostId(1),
                 BleHostAdapterEvent::GattWrite {
+                    encrypted: true,
                     attribute: BleHidAttribute::BootKeyboardOutputReport,
                     data: &[0b0000_0011],
                 },
@@ -4701,6 +4818,7 @@ mod tests {
                 RuntimeInput::BleHostEvent {
                     host_id: HostId(1),
                     event: BleHostAdapterEvent::GattWrite {
+                        encrypted: true,
                         attribute: BleHidAttribute::BootKeyboardOutputReport,
                         data: &[0b0000_0010],
                     },
@@ -4751,6 +4869,27 @@ mod tests {
                 })
             )
         }));
+    }
+
+    #[test]
+    fn empty_device_can_persist_global_settings_without_a_phantom_active_host() {
+        let mut runtime = BridgeRuntime::<2, 1>::new(0);
+        let mut commands = heapless::Vec::<RuntimeCommand, 8>::new();
+        let restored = crate::runtime::bootstrap::storage_with_default_target(
+            &StorageState::new(0),
+            HostId(1),
+        );
+
+        runtime
+            .restore_storage_state::<8>(&restored, &mut commands)
+            .unwrap();
+        runtime.global_settings.auto_reconnect = false;
+
+        let snapshot = runtime.storage_state().unwrap();
+        assert!(!snapshot.global_settings.auto_reconnect);
+        assert_eq!(snapshot.last_active_host, None);
+        assert!(snapshot.hosts().is_empty());
+        snapshot.validate().unwrap();
     }
 
     #[test]
@@ -5617,8 +5756,13 @@ mod tests {
         queues.dispatch_from(commands.as_slice()).unwrap();
 
         assert_eq!(queues.storage.len(), 4);
-        assert_eq!(queues.storage[3].state.generation, 4);
-        assert_eq!(queues.storage[3].priority, StoragePersistPriority::Normal);
+        assert_eq!(
+            queues.storage[3],
+            StorageTaskCommand::Persist {
+                state: StorageState::new(4),
+                priority: StoragePersistPriority::Normal,
+            }
+        );
     }
 
     #[test]

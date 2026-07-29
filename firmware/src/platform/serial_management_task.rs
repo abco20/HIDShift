@@ -57,8 +57,8 @@ pub async fn serial_management_task(
     _boot_session_id: u32,
 ) {
     let Ok(uart) = Uart::new(uart, Config::default()) else {
-        log::error!("firmware: management UART init failed");
-        return;
+        log::error!("firmware: management UART init failed; resetting");
+        esp_hal::system::software_reset();
     };
     let mut uart = uart.with_rx(rx).into_async();
     let mut line = [0u8; SERIAL_LINE_CAPACITY];

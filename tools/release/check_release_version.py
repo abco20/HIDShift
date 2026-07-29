@@ -13,6 +13,7 @@ from pathlib import Path
 MANIFESTS = (
     Path("Cargo.toml"),
     Path("firmware/Cargo.toml"),
+    Path("device-firmware/Cargo.toml"),
     Path("tools/hidshift-client/Cargo.toml"),
     Path("tools/hidshiftctl/Cargo.toml"),
     Path("web/Cargo.toml"),
