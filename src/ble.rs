@@ -24,6 +24,7 @@ pub enum BleHostAdapterEvent<'a> {
         bond: Option<StoredBond>,
     },
     GattWrite {
+        encrypted: bool,
         attribute: BleHidAttribute,
         data: &'a [u8],
     },
@@ -34,6 +35,7 @@ pub enum BleHostAdapterError {
     Output(BleKeyboardOutputError),
     InvalidCccdLength,
     InvalidOutputReportLength,
+    EncryptionRequired,
     EventCapacity,
 }
 
@@ -68,7 +70,14 @@ pub fn bridge_events_from_ble_host_event<const N: usize>(
                 bond,
             },
         ),
-        BleHostAdapterEvent::GattWrite { attribute, data } => {
+        BleHostAdapterEvent::GattWrite {
+            encrypted,
+            attribute,
+            data,
+        } => {
+            if !encrypted {
+                return Err(BleHostAdapterError::EncryptionRequired);
+            }
             bridge_events_from_gatt_write(host_id, attribute, data, out)
         }
     }
@@ -188,6 +197,7 @@ mod tests {
         bridge_events_from_ble_host_event(
             HOST,
             BleHostAdapterEvent::GattWrite {
+                encrypted: true,
                 attribute: BleHidAttribute::MouseInputCccd,
                 data: &[0x01, 0x00],
             },
@@ -212,6 +222,7 @@ mod tests {
         bridge_events_from_ble_host_event(
             HOST,
             BleHostAdapterEvent::GattWrite {
+                encrypted: true,
                 attribute: BleHidAttribute::KeyboardOutputReport,
                 data: &[KEYBOARD_REPORT_ID, 0b0000_0010],
             },
@@ -229,6 +240,7 @@ mod tests {
         bridge_events_from_ble_host_event(
             HOST,
             BleHostAdapterEvent::GattWrite {
+                encrypted: true,
                 attribute: BleHidAttribute::BootKeyboardOutputReport,
                 data: &[0b0000_0101],
             },
@@ -252,6 +264,7 @@ mod tests {
             bridge_events_from_ble_host_event(
                 HOST,
                 BleHostAdapterEvent::GattWrite {
+                    encrypted: true,
                     attribute: BleHidAttribute::KeyboardInputCccd,
                     data: &[0x01],
                 },
@@ -263,6 +276,7 @@ mod tests {
             bridge_events_from_ble_host_event(
                 HOST,
                 BleHostAdapterEvent::GattWrite {
+                    encrypted: true,
                     attribute: BleHidAttribute::KeyboardOutputReport,
                     data: &[0xff, 0x00],
                 },
@@ -270,5 +284,24 @@ mod tests {
             ),
             Err(BleHostAdapterError::InvalidOutputReportLength)
         );
+    }
+
+    #[test]
+    fn unencrypted_gatt_writes_are_rejected_before_bridge_state_changes() {
+        let mut events = heapless::Vec::<BridgeEvent, 1>::new();
+
+        assert_eq!(
+            bridge_events_from_ble_host_event(
+                HOST,
+                BleHostAdapterEvent::GattWrite {
+                    encrypted: false,
+                    attribute: BleHidAttribute::KeyboardInputCccd,
+                    data: &[0x01, 0x00],
+                },
+                &mut events,
+            ),
+            Err(BleHostAdapterError::EncryptionRequired)
+        );
+        assert!(events.is_empty());
     }
 }

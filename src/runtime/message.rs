@@ -2,7 +2,7 @@ use crate::ble::{BleHidAttribute, BleHostAdapterEvent};
 use crate::bridge::BridgeEvent;
 use crate::ids::{DeviceId, HostId, InterfaceId};
 use crate::management::{ManagementDestination, ManagementRequest};
-use crate::storage::{StorageState, StoredBond};
+use crate::storage::{StorageHealth, StorageState, StoredBond};
 use crate::target_control::ButtonIntent;
 use crate::usb_hid::output::KeyboardLedOutputReport;
 
@@ -49,6 +49,7 @@ pub enum RuntimeInputMessage {
         name: crate::storage::FixedName,
     },
     DiagnosticsEvent(RuntimeDiagnosticsEvent),
+    StorageHealthChanged(StorageHealth),
     #[cfg(feature = "dual-s3-wired")]
     DeviceCommandRequested(crate::runtime::DeviceTaskCommand),
     #[cfg(feature = "dual-s3-wired")]
@@ -133,6 +134,7 @@ impl RuntimeInputMessage {
                 name: *name,
             },
             Self::DiagnosticsEvent(event) => RuntimeInput::DiagnosticsEvent(*event),
+            Self::StorageHealthChanged(health) => RuntimeInput::StorageHealthChanged(*health),
             #[cfg(feature = "dual-s3-wired")]
             Self::DeviceCommandRequested(command) => RuntimeInput::DeviceCommandRequested(*command),
             #[cfg(feature = "dual-s3-wired")]
@@ -227,6 +229,7 @@ impl TryFrom<RuntimeInput<'_>> for RuntimeInputMessage {
                 Ok(Self::HostNameDiscovered { host_id, name })
             }
             RuntimeInput::DiagnosticsEvent(event) => Ok(Self::DiagnosticsEvent(event)),
+            RuntimeInput::StorageHealthChanged(health) => Ok(Self::StorageHealthChanged(health)),
             #[cfg(feature = "dual-s3-wired")]
             RuntimeInput::DeviceCommandRequested(command) => {
                 Ok(Self::DeviceCommandRequested(command))
@@ -280,6 +283,7 @@ pub enum RuntimeBleHostEvent {
         bond: Option<StoredBond>,
     },
     GattWrite {
+        encrypted: bool,
         attribute: BleHidAttribute,
         data: RuntimeBleGattWrite,
     },
@@ -299,7 +303,12 @@ impl RuntimeBleHostEvent {
                 bonded: *bonded,
                 bond: *bond,
             },
-            Self::GattWrite { attribute, data } => BleHostAdapterEvent::GattWrite {
+            Self::GattWrite {
+                encrypted,
+                attribute,
+                data,
+            } => BleHostAdapterEvent::GattWrite {
+                encrypted: *encrypted,
                 attribute: *attribute,
                 data: data.as_slice(),
             },
@@ -323,7 +332,12 @@ impl TryFrom<BleHostAdapterEvent<'_>> for RuntimeBleHostEvent {
                 bonded,
                 bond,
             }),
-            BleHostAdapterEvent::GattWrite { attribute, data } => Ok(Self::GattWrite {
+            BleHostAdapterEvent::GattWrite {
+                encrypted,
+                attribute,
+                data,
+            } => Ok(Self::GattWrite {
+                encrypted,
                 attribute,
                 data: RuntimeBleGattWrite::from_slice(data)?,
             }),
@@ -373,6 +387,7 @@ mod tests {
         let message = RuntimeInputMessage::try_from(RuntimeInput::BleHostEvent {
             host_id: HostId(2),
             event: BleHostAdapterEvent::GattWrite {
+                encrypted: true,
                 attribute: BleHidAttribute::KeyboardOutputReport,
                 data: &[1, 2],
             },
@@ -384,6 +399,7 @@ mod tests {
             RuntimeInputMessage::BleHostEvent {
                 host_id: HostId(2),
                 event: RuntimeBleHostEvent::GattWrite {
+                    encrypted: true,
                     attribute: BleHidAttribute::KeyboardOutputReport,
                     data: RuntimeBleGattWrite::from_slice(&[1, 2]).unwrap(),
                 },
@@ -477,6 +493,7 @@ mod tests {
         let message = RuntimeInputMessage::BleHostEvent {
             host_id: HostId(1),
             event: RuntimeBleHostEvent::GattWrite {
+                encrypted: true,
                 attribute: BleHidAttribute::BootKeyboardOutputReport,
                 data: RuntimeBleGattWrite::from_slice(&[KeyboardLedState::CAPS_LOCK.bits()])
                     .unwrap(),
@@ -486,11 +503,17 @@ mod tests {
         let RuntimeInput::BleHostEvent { host_id, event } = message.as_runtime_input() else {
             panic!("expected ble host input");
         };
-        let BleHostAdapterEvent::GattWrite { attribute, data } = event else {
+        let BleHostAdapterEvent::GattWrite {
+            encrypted,
+            attribute,
+            data,
+        } = event
+        else {
             panic!("expected gatt write event");
         };
 
         assert_eq!(host_id, HostId(1));
+        assert!(encrypted);
         assert_eq!(attribute, BleHidAttribute::BootKeyboardOutputReport);
         assert_eq!(data, &[KeyboardLedState::CAPS_LOCK.bits()]);
     }

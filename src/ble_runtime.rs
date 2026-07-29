@@ -71,6 +71,7 @@ pub fn security_changed_message(
 
 pub fn gatt_write_message(
     host_id: HostId,
+    encrypted: bool,
     handles: BleHidAttributeHandles,
     handle: u16,
     data: &[u8],
@@ -78,6 +79,7 @@ pub fn gatt_write_message(
     Ok(RuntimeInputMessage::BleHostEvent {
         host_id,
         event: RuntimeBleHostEvent::GattWrite {
+            encrypted,
             attribute: handles.resolve(handle),
             data: RuntimeBleGattWrite::from_slice(data)?,
         },
@@ -143,10 +145,11 @@ mod tests {
     #[test]
     fn gatt_write_message_resolves_attribute_and_owns_payload() {
         assert_eq!(
-            gatt_write_message(HostId(1), HANDLES, 20, &[1, 2]).unwrap(),
+            gatt_write_message(HostId(1), true, HANDLES, 20, &[1, 2]).unwrap(),
             RuntimeInputMessage::BleHostEvent {
                 host_id: HostId(1),
                 event: RuntimeBleHostEvent::GattWrite {
+                    encrypted: true,
                     attribute: BleHidAttribute::KeyboardOutputReport,
                     data: RuntimeBleGattWrite::from_slice(&[1, 2]).unwrap(),
                 },
@@ -157,7 +160,7 @@ mod tests {
     #[test]
     fn gatt_write_message_rejects_payloads_beyond_runtime_boundary() {
         assert_eq!(
-            gatt_write_message(HostId(1), HANDLES, 20, &[0, 1, 2]),
+            gatt_write_message(HostId(1), true, HANDLES, 20, &[0, 1, 2]),
             Err(RuntimeInputMessageError::BleGattWriteTooLong)
         );
     }

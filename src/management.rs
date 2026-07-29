@@ -4,8 +4,9 @@ use crate::ids::HostId;
 #[cfg(feature = "dual-s3-wired")]
 use crate::output_target::{OutputTarget, OutputTargetAvailability, UsbPresentation};
 use crate::settings::{SettingId, SettingTarget};
+use crate::storage::StorageHealth;
 
-pub const MANAGEMENT_PROTOCOL_VERSION: u8 = 1;
+pub const MANAGEMENT_PROTOCOL_VERSION: u8 = 3;
 pub const MANAGEMENT_REQUEST_LEN: usize = 20;
 pub const MANAGEMENT_RESPONSE_LEN: usize = 20;
 pub const MANAGEMENT_HOST_NAME_LEN: usize = 12;
@@ -53,7 +54,7 @@ const PAYLOAD_HOST_TIMING: u8 = 8;
 const PAYLOAD_OUTPUT_TARGET_STATUS: u8 = 9;
 #[cfg(feature = "dual-s3-wired")]
 const PAYLOAD_MIRROR_CANDIDATE: u8 = 10;
-const STATUS_PAYLOAD_LEN: u8 = 10;
+const STATUS_PAYLOAD_LEN: u8 = 11;
 const HOST_INFO_PAYLOAD_LEN: u8 = 15;
 const USB_DEVICE_PAYLOAD_LEN: u8 = 15;
 const DIAGNOSTICS_PAYLOAD_LEN: u8 = 15;
@@ -378,6 +379,7 @@ impl ManagementResponse {
                 for (index, host) in status.hosts.iter().enumerate() {
                     bytes[11 + index] = host.bits();
                 }
+                bytes[15] = status.storage_health as u8;
             }
             ManagementResponsePayload::HostInfo(info) => {
                 bytes[3] = PAYLOAD_HOST_INFO;
@@ -517,6 +519,8 @@ impl ManagementResponse {
                         ManagementHostStatus::from_bits(bytes[13]),
                         ManagementHostStatus::from_bits(bytes[14]),
                     ],
+                    storage_health: StorageHealth::from_byte(bytes[15])
+                        .ok_or(ManagementProtocolError::InvalidArgument)?,
                 })
             }
             (PAYLOAD_HOST_INFO, HOST_INFO_PAYLOAD_LEN) => {
@@ -707,6 +711,7 @@ pub struct ManagementStatus {
     pub host_count: u8,
     pub usb: ManagementUsbStatus,
     pub hosts: [ManagementHostStatus; 4],
+    pub storage_health: StorageHealth,
 }
 
 impl ManagementStatus {
@@ -717,6 +722,7 @@ impl ManagementStatus {
             host_count,
             usb: ManagementUsbStatus::empty(),
             hosts: [ManagementHostStatus::empty(); 4],
+            storage_health: StorageHealth::Persistent,
         }
     }
 }

@@ -10,6 +10,9 @@ use hidshift_client::ManagementClient;
 use crate::transport::BrowserTransport;
 
 const REQUEST_TIMEOUT_MS: u32 = 10_000;
+const SERIAL_READY_PROBE_TIMEOUT_MS: u32 = 1_000;
+const SERIAL_READY_RETRY_DELAY_MS: u32 = 100;
+const SERIAL_READY_ATTEMPTS: usize = 10;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BrowserClientError {
@@ -70,6 +73,36 @@ impl BrowserClient {
         &self,
         command: ManagementCommand,
     ) -> Result<ManagementResponse, BrowserClientError> {
+        self.request_with_timeout(command, REQUEST_TIMEOUT_MS).await
+    }
+
+    pub async fn wait_for_serial_readiness(&self) -> Result<(), BrowserClientError> {
+        for attempt in 0..SERIAL_READY_ATTEMPTS {
+            match self
+                .request_with_timeout(ManagementCommand::GetStatus, SERIAL_READY_PROBE_TIMEOUT_MS)
+                .await
+            {
+                Ok(response) if response.result == hidshift::ManagementResult::Ok => return Ok(()),
+                Ok(response) => {
+                    return Err(BrowserClientError::Protocol(format!(
+                        "readiness probe failed: {:?}",
+                        response.result
+                    )));
+                }
+                Err(BrowserClientError::Timeout) if attempt + 1 < SERIAL_READY_ATTEMPTS => {
+                    TimeoutFuture::new(SERIAL_READY_RETRY_DELAY_MS).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(BrowserClientError::Timeout)
+    }
+
+    async fn request_with_timeout(
+        &self,
+        command: ManagementCommand,
+        timeout_ms: u32,
+    ) -> Result<ManagementResponse, BrowserClientError> {
         if self.response_sender.borrow().is_some() {
             return Err(BrowserClientError::Busy);
         }
@@ -93,7 +126,7 @@ impl BrowserClient {
         }
 
         let receiver = Box::pin(receiver);
-        let timeout = Box::pin(TimeoutFuture::new(REQUEST_TIMEOUT_MS));
+        let timeout = Box::pin(TimeoutFuture::new(timeout_ms));
         match select(receiver, timeout).await {
             Either::Left((Ok(response), _)) => response,
             Either::Left((Err(_), _)) => Err(BrowserClientError::Disconnected),
@@ -182,5 +215,15 @@ mod tests {
 
         assert!(client.response_sender.borrow().is_none());
         assert!(!client.protocol.borrow().is_pending());
+    }
+
+    #[test]
+    fn serial_readiness_has_a_bounded_retry_budget() {
+        assert_eq!(SERIAL_READY_ATTEMPTS, 10);
+        assert_eq!(
+            SERIAL_READY_ATTEMPTS as u32 * SERIAL_READY_PROBE_TIMEOUT_MS
+                + (SERIAL_READY_ATTEMPTS as u32 - 1) * SERIAL_READY_RETRY_DELAY_MS,
+            10_900
+        );
     }
 }

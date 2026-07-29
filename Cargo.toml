@@ -43,6 +43,9 @@ dual-s3-wired = []
 # Test-only synthetic Mirror transport. Firmware propagates this exclusively
 # from its hardware-e2e build so production binaries contain no fixture API.
 hardware-e2e = []
+# Future destination/input/update aggregate. It is intentionally excluded from
+# production firmware until adapters persist and execute this model end to end.
+experimental-domain = []
 
 [dependencies]
 bitflags = "2.10.0"

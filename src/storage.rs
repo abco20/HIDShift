@@ -193,6 +193,34 @@ pub enum StorageError {
     FlashErase,
     FlashWrite,
     FlashVerify,
+    Unavailable,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StorageHealth {
+    Initializing = 0,
+    Persistent = 1,
+    VolatileTest = 2,
+    Unavailable = 3,
+    Degraded = 4,
+}
+
+impl StorageHealth {
+    pub const fn allows_persistent_mutation(self) -> bool {
+        matches!(self, Self::Persistent | Self::VolatileTest)
+    }
+
+    pub const fn from_byte(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Initializing),
+            1 => Some(Self::Persistent),
+            2 => Some(Self::VolatileTest),
+            3 => Some(Self::Unavailable),
+            4 => Some(Self::Degraded),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -412,6 +440,14 @@ impl StoragePersistence {
 
     pub const fn retry_suspended(&self) -> bool {
         self.retry_suspended
+    }
+
+    pub const fn effective_health(&self, backend_health: StorageHealth) -> StorageHealth {
+        if matches!(backend_health, StorageHealth::Persistent) && self.consecutive_failures > 0 {
+            StorageHealth::Degraded
+        } else {
+            backend_health
+        }
     }
 
     fn record_failure(&mut self, now_ms: u64) {
@@ -832,6 +868,18 @@ where
     pub fn release(self) -> F {
         self.flash
     }
+
+    pub fn erase_all(&mut self) -> Result<(), StorageError> {
+        self.flash
+            .erase(
+                self.layout.base_offset,
+                self.layout.base_offset + self.layout.len(),
+            )
+            .map_err(|_| StorageError::FlashErase)?;
+        self.slots = [[0xff; STORAGE_IMAGE_LEN]; STORAGE_FLASH_SLOT_COUNT];
+        self.next_record = [0; STORAGE_FLASH_SLOT_COUNT];
+        Ok(())
+    }
 }
 
 impl<F> StorageSlotBackend for NorFlashStorageBackend<F>
@@ -858,14 +906,17 @@ where
             record_index = 0;
         }
         let offset = slot_offset + record_index * STORAGE_IMAGE_LEN as u32;
-        self.flash
-            .write(offset, &image)
-            .map_err(|_| StorageError::FlashWrite)?;
+        if self.flash.write(offset, &image).is_err() {
+            self.next_record[slot_number] = record_index + 1;
+            return Err(StorageError::FlashWrite);
+        }
         let mut verified = [0u8; STORAGE_IMAGE_LEN];
-        self.flash
-            .read(offset, &mut verified)
-            .map_err(|_| StorageError::FlashRead)?;
+        if self.flash.read(offset, &mut verified).is_err() {
+            self.next_record[slot_number] = record_index + 1;
+            return Err(StorageError::FlashRead);
+        }
         if verified != image || decode_storage_image(&verified).is_err() {
+            self.next_record[slot_number] = record_index + 1;
             return Err(StorageError::FlashVerify);
         }
         self.slots[slot_number] = image;
@@ -1691,6 +1742,10 @@ mod tests {
             persistence.pending_priority(),
             Some(StoragePersistPriority::Critical)
         );
+        assert_eq!(
+            persistence.effective_health(StorageHealth::Persistent),
+            StorageHealth::Degraded
+        );
 
         let retried = persistence
             .persist_due(&mut backend, 2_000)
@@ -1699,6 +1754,10 @@ mod tests {
         assert_eq!(retried.state.generation, 9);
         assert_eq!(backend.write_count, 2);
         assert!(!persistence.is_pending());
+        assert_eq!(
+            persistence.effective_health(StorageHealth::Persistent),
+            StorageHealth::Persistent
+        );
     }
 
     #[test]
@@ -1943,6 +2002,58 @@ mod tests {
     }
 
     #[test]
+    fn nor_flash_backend_factory_reset_erases_both_journal_slots() {
+        let layout = StorageFlashLayout::new(0);
+        let flash = TestNorFlash::<{ STORAGE_FLASH_LEN }>::new();
+        let mut backend = NorFlashStorageBackend::new(flash, layout).unwrap();
+        persist_storage_state(&mut backend, &StorageState::new(1)).unwrap();
+
+        backend.erase_all().unwrap();
+
+        assert_eq!(restore_latest_storage_state(&backend), None);
+        assert_eq!(
+            backend.slot(StorageSlotIndex::A),
+            &[0xff; STORAGE_IMAGE_LEN]
+        );
+        assert_eq!(
+            backend.slot(StorageSlotIndex::B),
+            &[0xff; STORAGE_IMAGE_LEN]
+        );
+        let flash = backend.release();
+        assert_eq!(flash.last_erased, Some((0, STORAGE_FLASH_LEN as u32)));
+    }
+
+    #[test]
+    fn nor_flash_backend_skips_a_record_that_failed_verification() {
+        let layout = StorageFlashLayout::new(0);
+        let mut flash = TestNorFlash::<{ STORAGE_FLASH_LEN }>::new();
+        flash.corrupt_next_write = true;
+        let mut backend = NorFlashStorageBackend::new(flash, layout).unwrap();
+        let state = StorageState::new(1);
+
+        assert_eq!(
+            persist_storage_state(&mut backend, &state),
+            Err(StorageError::FlashVerify)
+        );
+        persist_storage_state(&mut backend, &state).unwrap();
+
+        let flash = backend.release();
+        assert_eq!(
+            flash.last_written,
+            Some((STORAGE_IMAGE_LEN as u32, STORAGE_IMAGE_LEN))
+        );
+    }
+
+    #[test]
+    fn storage_health_distinguishes_retrying_flash_from_healthy_flash() {
+        assert!(StorageHealth::Persistent.allows_persistent_mutation());
+        assert!(StorageHealth::VolatileTest.allows_persistent_mutation());
+        assert!(!StorageHealth::Degraded.allows_persistent_mutation());
+        assert!(!StorageHealth::Unavailable.allows_persistent_mutation());
+        assert_eq!(StorageHealth::from_byte(4), Some(StorageHealth::Degraded));
+    }
+
+    #[test]
     fn nor_flash_backend_rejects_layout_that_does_not_fit_flash() {
         let layout = StorageFlashLayout::new(0);
         let flash = TestNorFlash::<{ STORAGE_FLASH_LEN - 1 }>::new();
@@ -1960,6 +2071,7 @@ mod tests {
         write_calls: usize,
         last_erased: Option<(u32, u32)>,
         last_written: Option<(u32, usize)>,
+        corrupt_next_write: bool,
     }
 
     impl<const SIZE: usize> TestNorFlash<SIZE> {
@@ -1970,6 +2082,7 @@ mod tests {
                 write_calls: 0,
                 last_erased: None,
                 last_written: None,
+                corrupt_next_write: false,
             }
         }
 
@@ -2016,6 +2129,10 @@ mod tests {
             self.last_written = Some((offset, bytes.len()));
             let offset = offset as usize;
             self.bytes[offset..offset + bytes.len()].copy_from_slice(bytes);
+            if self.corrupt_next_write {
+                self.corrupt_next_write = false;
+                self.bytes[offset] ^= 0x01;
+            }
             Ok(())
         }
     }

@@ -1,6 +1,6 @@
 use std::env;
 use std::error::Error;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use btleplug::api::{Central, CharPropFlags, Manager as _, Peripheral as _, ScanFilter, WriteType};
@@ -19,13 +19,64 @@ use hidshift_client::{
 use serialport::{FlowControl, SerialPort};
 use uuid::Uuid;
 
+macro_rules! println {
+    ($($argument:tt)*) => {
+        write_stdout_line(format_args!($($argument)*))
+    };
+}
+
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn write_stdout_line(arguments: std::fmt::Arguments<'_>) {
+    let mut stdout = io::stdout().lock();
+    let result = writeln!(stdout, "{arguments}");
+    if let Err(error) = normalize_stdout_result(result) {
+        eprintln!("error: failed writing output: {error}");
+        std::process::exit(1);
+    }
+}
+
+fn normalize_stdout_result(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        result => result,
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Transport {
     Auto,
     Serial(String),
     Ble(Option<String>),
+}
+
+struct ManagementTransport {
+    configured: Transport,
+    resolved: Option<Transport>,
+    serial: Option<SerialManagementSession>,
+}
+
+impl ManagementTransport {
+    const fn new(configured: Transport) -> Self {
+        Self {
+            configured,
+            resolved: None,
+            serial: None,
+        }
+    }
+
+    fn resolve(&mut self) -> Result<Transport, Box<dyn Error>> {
+        if self.resolved.is_none() {
+            self.resolved = Some(if self.configured == Transport::Auto {
+                resolve_auto_transport()?
+            } else {
+                self.configured.clone()
+            });
+        }
+        self.resolved
+            .clone()
+            .ok_or_else(|| "management transport resolution produced no result".into())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -306,34 +357,34 @@ async fn run() -> Result<(), Box<dyn Error>> {
     if arguments.json {
         return run_json(arguments).await;
     }
+    let mut transport = ManagementTransport::new(arguments.transport);
     match arguments.command {
         CliCommand::Request(command) => {
-            let response = request(&arguments.transport, command).await?;
+            let response = request(&mut transport, command).await?;
             print_response(response);
             ensure_ok(response)
         }
-        CliCommand::Devices => print_devices(&arguments.transport).await,
         CliCommand::Diagnostics => {
-            let response = request(&arguments.transport, ManagementCommand::GetDiagnostics).await?;
+            let response = request(&mut transport, ManagementCommand::GetDiagnostics).await?;
             print_response(response);
             ensure_ok(response)
         }
-        CliCommand::History => print_history(&arguments.transport).await,
-        CliCommand::MirrorList => print_mirror_candidates(&arguments.transport).await,
-        CliCommand::SettingsList => print_settings(&arguments.transport).await,
+        CliCommand::History => print_history(&mut transport).await,
+        CliCommand::MirrorList => print_mirror_candidates(&mut transport).await,
+        CliCommand::SettingsList => print_settings(&mut transport).await,
         CliCommand::SettingDescribe { key } => {
             print_setting_description(&key)?;
             Ok(())
         }
         CliCommand::SettingGet { key, slot } => {
             let command = setting_command(&key, slot, None)?;
-            let response = request(&arguments.transport, command).await?;
+            let response = request(&mut transport, command).await?;
             print_response(response);
             ensure_ok(response)
         }
         CliCommand::SettingSet { key, slot, value } => {
             let command = setting_command(&key, slot, Some(value))?;
-            let response = request(&arguments.transport, command).await?;
+            let response = request(&mut transport, command).await?;
             print_response(response);
             ensure_ok(response)
         }
@@ -342,31 +393,33 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 ManagementCommand::GetStatus,
                 ManagementCommand::GetDiagnostics,
             ] {
-                print_response(request(&arguments.transport, command).await?);
+                print_response(request(&mut transport, command).await?);
             }
-            print_devices(&arguments.transport).await?;
-            print_history(&arguments.transport).await
+            print_devices(&mut transport).await?;
+            print_history(&mut transport).await
         }
-        CliCommand::Destinations => print_destinations(&arguments.transport).await,
+        CliCommand::Devices => print_devices(&mut transport).await,
+        CliCommand::Destinations => print_destinations(&mut transport).await,
     }
 }
 
 async fn run_json(arguments: Arguments) -> Result<(), Box<dyn Error>> {
+    let mut transport = ManagementTransport::new(arguments.transport);
     let data = match arguments.command {
         CliCommand::Request(command) => {
-            let response = request(&arguments.transport, command).await?;
+            let response = request(&mut transport, command).await?;
             ensure_ok(response)?;
             response_json(response)
         }
         CliCommand::Diagnostics => {
-            let response = request(&arguments.transport, ManagementCommand::GetDiagnostics).await?;
+            let response = request(&mut transport, ManagementCommand::GetDiagnostics).await?;
             ensure_ok(response)?;
             response_json(response)
         }
-        CliCommand::Devices => devices_json(&arguments.transport).await?,
-        CliCommand::History => history_json(&arguments.transport).await?,
-        CliCommand::MirrorList => mirror_json(&arguments.transport).await?,
-        CliCommand::SettingsList => settings_json(&arguments.transport).await?,
+        CliCommand::Devices => devices_json(&mut transport).await?,
+        CliCommand::History => history_json(&mut transport).await?,
+        CliCommand::MirrorList => mirror_json(&mut transport).await?,
+        CliCommand::SettingsList => settings_json(&mut transport).await?,
         CliCommand::SettingDescribe { key } => {
             let descriptor = setting_by_key(&key).ok_or_else(|| unknown_setting_message(&key))?;
             serde_json::json!({
@@ -382,26 +435,22 @@ async fn run_json(arguments: Arguments) -> Result<(), Box<dyn Error>> {
             })
         }
         CliCommand::SettingGet { key, slot } => {
-            let response =
-                request(&arguments.transport, setting_command(&key, slot, None)?).await?;
+            let response = request(&mut transport, setting_command(&key, slot, None)?).await?;
             ensure_ok(response)?;
             response_json(response)
         }
         CliCommand::SettingSet { key, slot, value } => {
-            let response = request(
-                &arguments.transport,
-                setting_command(&key, slot, Some(value))?,
-            )
-            .await?;
+            let response =
+                request(&mut transport, setting_command(&key, slot, Some(value))?).await?;
             ensure_ok(response)?;
             response_json(response)
         }
-        CliCommand::Destinations => destinations_json(&arguments.transport).await?,
+        CliCommand::Destinations => destinations_json(&mut transport).await?,
         CliCommand::Overview => serde_json::json!({
-            "status": response_json(request(&arguments.transport, ManagementCommand::GetStatus).await?),
-            "inputs": devices_json(&arguments.transport).await?,
-            "diagnostics": response_json(request(&arguments.transport, ManagementCommand::GetDiagnostics).await?),
-            "events": history_json(&arguments.transport).await?,
+            "status": response_json(request(&mut transport, ManagementCommand::GetStatus).await?),
+            "inputs": devices_json(&mut transport).await?,
+            "diagnostics": response_json(request(&mut transport, ManagementCommand::GetDiagnostics).await?),
+            "events": history_json(&mut transport).await?,
         }),
     };
     println!(
@@ -414,7 +463,9 @@ async fn run_json(arguments: Arguments) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn destinations_json(transport: &Transport) -> Result<serde_json::Value, Box<dyn Error>> {
+async fn destinations_json(
+    transport: &mut ManagementTransport,
+) -> Result<serde_json::Value, Box<dyn Error>> {
     let response = request(transport, ManagementCommand::GetStatus).await?;
     ensure_ok(response)?;
     let ManagementResponsePayload::Status(status) = response.payload else {
@@ -440,7 +491,9 @@ async fn destinations_json(transport: &Transport) -> Result<serde_json::Value, B
     }))
 }
 
-async fn devices_json(transport: &Transport) -> Result<serde_json::Value, Box<dyn Error>> {
+async fn devices_json(
+    transport: &mut ManagementTransport,
+) -> Result<serde_json::Value, Box<dyn Error>> {
     let response = request(transport, ManagementCommand::GetStatus).await?;
     ensure_ok(response)?;
     let ManagementResponsePayload::Status(status) = response.payload else {
@@ -462,7 +515,9 @@ async fn devices_json(transport: &Transport) -> Result<serde_json::Value, Box<dy
     Ok(serde_json::Value::Array(devices))
 }
 
-async fn history_json(transport: &Transport) -> Result<serde_json::Value, Box<dyn Error>> {
+async fn history_json(
+    transport: &mut ManagementTransport,
+) -> Result<serde_json::Value, Box<dyn Error>> {
     let mut events = Vec::new();
     for index in 0..16 {
         let response = request(transport, ManagementCommand::GetHistory { index }).await?;
@@ -475,7 +530,9 @@ async fn history_json(transport: &Transport) -> Result<serde_json::Value, Box<dy
     Ok(serde_json::Value::Array(events))
 }
 
-async fn mirror_json(transport: &Transport) -> Result<serde_json::Value, Box<dyn Error>> {
+async fn mirror_json(
+    transport: &mut ManagementTransport,
+) -> Result<serde_json::Value, Box<dyn Error>> {
     let mut candidates = Vec::new();
     for id in 0..4 {
         let response = request(
@@ -492,7 +549,9 @@ async fn mirror_json(transport: &Transport) -> Result<serde_json::Value, Box<dyn
     Ok(serde_json::Value::Array(candidates))
 }
 
-async fn settings_json(transport: &Transport) -> Result<serde_json::Value, Box<dyn Error>> {
+async fn settings_json(
+    transport: &mut ManagementTransport,
+) -> Result<serde_json::Value, Box<dyn Error>> {
     let mut settings = Vec::new();
     for descriptor in SETTING_DESCRIPTORS {
         let targets: Vec<_> = match descriptor.scope {
@@ -526,6 +585,7 @@ fn response_json(response: ManagementResponse) -> serde_json::Value {
                 "interfaces": status.usb.interface_count,
                 "keyboards": status.usb.keyboard_count,
             },
+            "storage": format!("{:?}", status.storage_health),
             "destinations": status.hosts[..status.host_count.min(4) as usize]
                 .iter()
                 .enumerate()
@@ -560,12 +620,12 @@ fn response_json(response: ManagementResponse) -> serde_json::Value {
         ManagementResponsePayload::Diagnostics(value) => serde_json::json!({
             "uptime_seconds": value.uptime_seconds,
             "reset_reason": value.reset_reason,
-            "brownouts": value.brownout_count,
+            "brownouts_this_boot": value.brownout_count,
             "ble_disconnects": value.ble_disconnect_count,
             "ble_notify_failures": value.ble_notify_failure_count,
             "usb_errors": value.usb_error_count,
-            "flash_writes": value.flash_write_count,
-            "flash_failures": value.flash_failure_count,
+            "flash_writes_this_boot": value.flash_write_count,
+            "flash_failures_this_boot": value.flash_failure_count,
         }),
         ManagementResponsePayload::History(event) => serde_json::json!({
             "sequence": event.sequence,
@@ -578,7 +638,7 @@ fn response_json(response: ManagementResponse) -> serde_json::Value {
         }),
         ManagementResponsePayload::Schema(schema) => serde_json::json!({
             "firmware": [schema.firmware_major, schema.firmware_minor, schema.firmware_patch],
-            "protocol_version": 1,
+            "protocol_version": hidshift::MANAGEMENT_PROTOCOL_VERSION,
             "settings_schema_version": schema.version,
             "settings_schema_hash": schema.hash,
             "capabilities": schema.capabilities,
@@ -628,7 +688,7 @@ fn output_target_json(target: ManagementOutputTarget) -> serde_json::Value {
     }
 }
 
-async fn print_destinations(transport: &Transport) -> Result<(), Box<dyn Error>> {
+async fn print_destinations(transport: &mut ManagementTransport) -> Result<(), Box<dyn Error>> {
     let response = request(transport, ManagementCommand::GetStatus).await?;
     ensure_ok(response)?;
     let ManagementResponsePayload::Status(status) = response.payload else {
@@ -664,7 +724,7 @@ async fn print_destinations(transport: &Transport) -> Result<(), Box<dyn Error>>
 }
 
 async fn request(
-    transport: &Transport,
+    transport: &mut ManagementTransport,
     command: ManagementCommand,
 ) -> Result<ManagementResponse, Box<dyn Error>> {
     let request_id = SystemTime::now().duration_since(UNIX_EPOCH)?.subsec_nanos() as u8;
@@ -673,16 +733,21 @@ async fn request(
         .begin(command)
         .map_err(|error| format!("could not start request: {error:?}"))?;
 
-    let resolved;
-    let transport = if *transport == Transport::Auto {
-        resolved = resolve_auto_transport()?;
-        &resolved
-    } else {
-        transport
-    };
-    let bytes = match transport {
-        Transport::Auto => unreachable!("automatic transport is resolved above"),
-        Transport::Serial(port) => serial_request(port, request, DEFAULT_TIMEOUT)?,
+    let resolved = transport.resolve()?;
+    let bytes = match resolved {
+        Transport::Auto => return Err("automatic transport was not resolved".into()),
+        Transport::Serial(port) => {
+            if transport.serial.is_none() {
+                let mut serial = SerialManagementSession::open(&port)?;
+                wait_for_serial_readiness(&mut serial, DEFAULT_TIMEOUT)?;
+                transport.serial = Some(serial);
+            }
+            transport
+                .serial
+                .as_mut()
+                .ok_or("serial session initialization produced no session")?
+                .exchange(request, DEFAULT_TIMEOUT)?
+        }
         Transport::Ble(address) => {
             ble_request(address.as_deref(), request, DEFAULT_TIMEOUT).await?
         }
@@ -742,54 +807,109 @@ fn ensure_ok(response: ManagementResponse) -> Result<(), Box<dyn Error>> {
         .ok_or_else(|| result_message(response.result).into())
 }
 
-fn serial_request(
-    port_name: &str,
-    request: PendingRequest,
-    timeout: Duration,
-) -> Result<[u8; MANAGEMENT_RESPONSE_LEN], Box<dyn Error>> {
-    let mut port = open_management_serial(port_name)?;
-    port.write_all(&encode_serial_request(request))?;
-    port.flush()?;
-
-    let deadline = Instant::now() + timeout;
-    let mut reader = port.try_clone()?;
-    let mut decoder = SerialResponseDecoder::default();
-    let mut chunk = [0u8; 128];
-    let mut diagnostic_tail = Vec::with_capacity(512);
-    let mut boot_diagnostic = None;
-    while Instant::now() < deadline {
-        let length = match reader.read(&mut chunk) {
-            Ok(0) => continue,
-            Ok(length) => length,
-            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => continue,
-            Err(error) => return Err(error.into()),
-        };
-        diagnostic_tail.extend_from_slice(&chunk[..length]);
-        boot_diagnostic = boot_diagnostic.or_else(|| serial_boot_diagnostic(&diagnostic_tail));
-        if diagnostic_tail.len() > 512 {
-            diagnostic_tail.drain(..diagnostic_tail.len() - 512);
-        }
-        for response in decoder.push(&chunk[..length]) {
-            if response[1] == request.request().request_id {
-                return Ok(response);
-            }
-        }
-    }
-    Err(boot_diagnostic
-        .unwrap_or("timed out waiting for HIDShift on the serial port")
-        .into())
+trait SerialExchange {
+    fn exchange(
+        &mut self,
+        request: PendingRequest,
+        timeout: Duration,
+    ) -> Result<[u8; MANAGEMENT_RESPONSE_LEN], Box<dyn Error>>;
 }
 
-fn open_management_serial(port_name: &str) -> Result<Box<dyn SerialPort>, Box<dyn Error>> {
-    let mut port = serialport::new(port_name, 115_200)
-        .timeout(Duration::from_millis(200))
-        .open()?;
-    let _ = port.set_flow_control(FlowControl::None);
-    // CH340 auto-reset wiring can otherwise leave EN/BOOT asserted for the
-    // lifetime of the process or after an interrupted management command.
-    let _ = port.write_data_terminal_ready(false);
-    let _ = port.write_request_to_send(false);
-    Ok(port)
+struct SerialManagementSession {
+    port: Box<dyn SerialPort>,
+    decoder: SerialResponseDecoder,
+    diagnostic_tail: Vec<u8>,
+    boot_diagnostic: Option<&'static str>,
+}
+
+impl SerialManagementSession {
+    fn open(port_name: &str) -> Result<Self, Box<dyn Error>> {
+        let mut port = serialport::new(port_name, 115_200)
+            .timeout(Duration::from_millis(200))
+            .open()?;
+        let _ = port.set_flow_control(FlowControl::None);
+        // CH340 auto-reset wiring can otherwise leave EN/BOOT asserted for the
+        // lifetime of the process or after an interrupted management command.
+        let _ = port.write_data_terminal_ready(false);
+        let _ = port.write_request_to_send(false);
+        Ok(Self {
+            port,
+            decoder: SerialResponseDecoder::default(),
+            diagnostic_tail: Vec::with_capacity(512),
+            boot_diagnostic: None,
+        })
+    }
+}
+
+impl SerialExchange for SerialManagementSession {
+    fn exchange(
+        &mut self,
+        request: PendingRequest,
+        timeout: Duration,
+    ) -> Result<[u8; MANAGEMENT_RESPONSE_LEN], Box<dyn Error>> {
+        self.port.write_all(&encode_serial_request(request))?;
+        self.port.flush()?;
+
+        let deadline = Instant::now() + timeout;
+        let mut chunk = [0u8; 128];
+        while Instant::now() < deadline {
+            let length = match self.port.read(&mut chunk) {
+                Ok(0) => continue,
+                Ok(length) => length,
+                Err(error) if error.kind() == std::io::ErrorKind::TimedOut => continue,
+                Err(error) => return Err(error.into()),
+            };
+            self.diagnostic_tail.extend_from_slice(&chunk[..length]);
+            self.boot_diagnostic = self
+                .boot_diagnostic
+                .or_else(|| serial_boot_diagnostic(&self.diagnostic_tail));
+            if self.diagnostic_tail.len() > 512 {
+                self.diagnostic_tail
+                    .drain(..self.diagnostic_tail.len() - 512);
+            }
+            for response in self.decoder.push(&chunk[..length]) {
+                if response[1] == request.request().request_id {
+                    return Ok(response);
+                }
+            }
+        }
+        Err(self
+            .boot_diagnostic
+            .unwrap_or("timed out waiting for HIDShift on the serial port")
+            .into())
+    }
+}
+
+fn wait_for_serial_readiness<S: SerialExchange>(
+    serial: &mut S,
+    timeout: Duration,
+) -> Result<(), Box<dyn Error>> {
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+    let deadline = Instant::now() + timeout;
+    let mut request_id = 0x80u8;
+    let mut last_error = None;
+    while Instant::now() < deadline {
+        let mut client = ManagementClient::new(request_id);
+        let request = client
+            .begin(ManagementCommand::GetStatus)
+            .map_err(|error| format!("could not start readiness probe: {error:?}"))?;
+        match serial.exchange(request, PROBE_TIMEOUT) {
+            Ok(bytes) => match client.accept(&bytes) {
+                Ok(response) if response.result == ManagementResult::Ok => return Ok(()),
+                Ok(response) => {
+                    last_error = Some(format!("readiness probe returned {:?}", response.result))
+                }
+                Err(error) => last_error = Some(format!("invalid readiness response: {error:?}")),
+            },
+            Err(error) => last_error = Some(error.to_string()),
+        }
+        request_id = request_id.wrapping_add(1);
+    }
+    Err(format!(
+        "serial management did not become ready after open: {}",
+        last_error.unwrap_or_else(|| "no response".to_owned())
+    )
+    .into())
 }
 
 fn serial_boot_diagnostic(bytes: &[u8]) -> Option<&'static str> {
@@ -943,6 +1063,7 @@ fn print_response(response: ManagementResponse) {
                 "usb:     {} device(s), {} HID interface(s), {} keyboard(s)",
                 status.usb.device_count, status.usb.interface_count, status.usb.keyboard_count
             );
+            println!("storage: {:?}", status.storage_health);
             println!("slots:");
             for (index, host_status) in status
                 .hosts
@@ -954,7 +1075,7 @@ fn print_response(response: ManagementResponse) {
             }
         }
         ManagementResponsePayload::Diagnostics(value) => println!(
-            "firmware: {}s uptime, reset=0x{:02x}, brownouts={}, BLE disconnects={}, notify failures={}, USB errors={}, flash writes={}, flash failures={}",
+            "firmware: {}s uptime, reset=0x{:02x}, brownouts(this boot)={}, BLE disconnects={}, notify failures={}, USB errors={}, flash writes(this boot)={}, flash failures(this boot)={}",
             value.uptime_seconds,
             value.reset_reason,
             value.brownout_count,
@@ -1070,7 +1191,7 @@ fn display_output_target(target: ManagementOutputTarget) -> String {
     }
 }
 
-async fn print_devices(transport: &Transport) -> Result<(), Box<dyn Error>> {
+async fn print_devices(transport: &mut ManagementTransport) -> Result<(), Box<dyn Error>> {
     let status = request(transport, ManagementCommand::GetStatus).await?;
     ensure_ok(status)?;
     let ManagementResponsePayload::Status(status) = status.payload else {
@@ -1135,7 +1256,9 @@ async fn print_devices(transport: &Transport) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn print_mirror_candidates(transport: &Transport) -> Result<(), Box<dyn Error>> {
+async fn print_mirror_candidates(
+    transport: &mut ManagementTransport,
+) -> Result<(), Box<dyn Error>> {
     let mut found = 0usize;
     for candidate in 0..4 {
         let response = request(
@@ -1156,7 +1279,7 @@ async fn print_mirror_candidates(transport: &Transport) -> Result<(), Box<dyn Er
     Ok(())
 }
 
-async fn print_history(transport: &Transport) -> Result<(), Box<dyn Error>> {
+async fn print_history(transport: &mut ManagementTransport) -> Result<(), Box<dyn Error>> {
     for index in 0..16 {
         let response = request(transport, ManagementCommand::GetHistory { index }).await?;
         ensure_ok(response)?;
@@ -1168,7 +1291,7 @@ async fn print_history(transport: &Transport) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn print_settings(transport: &Transport) -> Result<(), Box<dyn Error>> {
+async fn print_settings(transport: &mut ManagementTransport) -> Result<(), Box<dyn Error>> {
     let schema = request(transport, ManagementCommand::GetSchema).await?;
     ensure_ok(schema)?;
     let ManagementResponsePayload::Schema(schema_info) = schema.payload else {
@@ -1602,6 +1725,31 @@ where
 mod tests {
     use super::*;
 
+    struct FakeSerialExchange {
+        failures_remaining: usize,
+        commands: Vec<ManagementCommand>,
+    }
+
+    impl SerialExchange for FakeSerialExchange {
+        fn exchange(
+            &mut self,
+            request: PendingRequest,
+            _timeout: Duration,
+        ) -> Result<[u8; MANAGEMENT_RESPONSE_LEN], Box<dyn Error>> {
+            self.commands.push(request.request().command);
+            if self.failures_remaining > 0 {
+                self.failures_remaining -= 1;
+                return Err("firmware still booting".into());
+            }
+            Ok(ManagementResponse {
+                request_id: request.request().request_id,
+                result: ManagementResult::Ok,
+                payload: ManagementResponsePayload::Status(hidshift::ManagementStatus::empty(4)),
+            }
+            .encode())
+        }
+    }
+
     #[test]
     fn parses_serial_and_ble_commands() {
         assert_eq!(
@@ -1787,5 +1935,41 @@ mod tests {
             )
         );
         assert_eq!(serial_boot_diagnostic(b"normal management response"), None);
+    }
+
+    #[test]
+    fn serial_readiness_retries_only_idempotent_status_requests() {
+        let mut serial = FakeSerialExchange {
+            failures_remaining: 2,
+            commands: Vec::new(),
+        };
+
+        wait_for_serial_readiness(&mut serial, Duration::from_secs(1)).unwrap();
+
+        assert_eq!(
+            serial.commands,
+            vec![
+                ManagementCommand::GetStatus,
+                ManagementCommand::GetStatus,
+                ManagementCommand::GetStatus,
+            ]
+        );
+    }
+
+    #[test]
+    fn broken_stdout_pipe_is_a_normal_cli_termination() {
+        assert!(
+            normalize_stdout_result(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "reader closed the pipe",
+            )))
+            .is_ok()
+        );
+        assert_eq!(
+            normalize_stdout_result(Err(io::Error::other("device failed")))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Other
+        );
     }
 }

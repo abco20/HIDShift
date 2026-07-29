@@ -36,6 +36,21 @@ espflash flash \
 cargo build --locked --release --manifest-path tools/hidshiftctl/Cargo.toml
 ctl="$repo_root/tools/hidshiftctl/target/release/hidshiftctl"
 
-"$ctl" --serial "$dut_port" --json status
+wait_for_management() {
+  local attempt
+  for attempt in 1 2 3; do
+    if "$ctl" --serial "$dut_port" --json status; then
+      return 0
+    fi
+    echo "management endpoint not ready (attempt $attempt/3)" >&2
+    sleep 1
+  done
+  return 1
+}
+
+# espflash returns as soon as the image has been written. Depending on the
+# serial adapter, the first request can race the application boot and be lost
+# before UART0 is listening, so establish readiness with an idempotent query.
+wait_for_management
 "$ctl" --serial "$dut_port" --json input list
 "$ctl" --serial "$dut_port" --json support status

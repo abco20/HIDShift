@@ -3,6 +3,7 @@
 
 extern crate alloc;
 
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use embassy_executor::{SpawnError, SpawnToken, Spawner};
 use embassy_futures::select::{Either, select};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -16,7 +17,7 @@ use esp_hal::clock::CpuClock;
 use esp_hal::interrupt::software::SoftwareInterruptControl;
 #[cfg(not(feature = "dual-s3-wired"))]
 use esp_hal::system::Stack;
-use esp_hal::timer::timg::TimerGroup;
+use esp_hal::timer::timg::{MwdtStage, TimerGroup, Wdt};
 use esp32s3_platform::ble_hid_task::BleRuntimeSnapshot;
 use esp32s3_platform::ble_hid_task::active_ble_connections;
 use esp32s3_platform::button_task::control_task;
@@ -25,7 +26,6 @@ use esp32s3_platform::usb_host_task::usb_input_task;
 use hidshift::DefaultRuntimeOwner;
 use hidshift::mouse_accumulator::MouseReportAccumulator;
 use hidshift::runtime::RUNTIME_HOSTS_MAX;
-use hidshift::runtime::driver::RuntimeTaskSink;
 use hidshift::runtime::message::RuntimeInputMessage;
 use hidshift::runtime::{
     BleCommandLane, BleTaskCommand, RUNTIME_BLE_CONTROL_COMMAND_QUEUE_CAPACITY,
@@ -49,6 +49,9 @@ static RUNTIME_INPUT_CHANNEL: Channel<
 > = Channel::new();
 static RUNTIME_TICK_PENDING: hidshift::runtime::RuntimeTickPending =
     hidshift::runtime::RuntimeTickPending::new();
+static RUNTIME_HEARTBEAT: AtomicU32 = AtomicU32::new(0);
+static BLE_EXECUTOR_HEARTBEAT: AtomicU32 = AtomicU32::new(0);
+static RUNTIME_QUIESCED: AtomicBool = AtomicBool::new(false);
 static BLE_CONTROL_COMMAND_CHANNEL: Channel<
     CriticalSectionRawMutex,
     BleTaskCommand,
@@ -171,6 +174,7 @@ fn run_firmware(
     boot_session_id: u32,
 ) -> ! {
     let timg0 = TimerGroup::new(peripherals.TIMG0);
+    let watchdog = timg0.wdt;
     let sw_ints = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     let scheduler_interrupt = sw_ints.software_interrupt0;
     #[cfg(not(feature = "dual-s3-wired"))]
@@ -221,6 +225,7 @@ fn run_firmware(
                 gpio19,
                 boot_session_id,
                 flash,
+                watchdog,
                 #[cfg(feature = "dual-s3-wired")]
                 ble_resources,
                 #[cfg(feature = "dual-s3-wired")]
@@ -257,6 +262,11 @@ fn spawn_runtime_and_ble(
 ) {
     spawn_or_reset(
         spawner,
+        ble_executor_heartbeat_task(),
+        "ble-executor-heartbeat",
+    );
+    spawn_or_reset(
+        spawner,
         runtime_owner_task(
             RUNTIME_INPUT_CHANNEL.receiver(),
             &RUNTIME_TICK_PENDING,
@@ -291,6 +301,14 @@ fn spawn_runtime_and_ble(
     );
 }
 
+#[embassy_executor::task]
+async fn ble_executor_heartbeat_task() {
+    loop {
+        BLE_EXECUTOR_HEARTBEAT.fetch_add(1, Ordering::Relaxed);
+        embassy_time::Timer::after_millis(500).await;
+    }
+}
+
 #[cfg(not(feature = "dual-s3-wired"))]
 #[inline(never)]
 fn start_ble_core(
@@ -323,6 +341,7 @@ async fn startup_task(
     gpio19: esp_hal::peripherals::GPIO19<'static>,
     boot_session_id: u32,
     flash: esp_hal::peripherals::FLASH<'static>,
+    watchdog: Wdt<esp_hal::peripherals::TIMG0<'static>>,
     #[cfg(feature = "dual-s3-wired")] ble_resources: BleTaskResources,
     #[cfg(feature = "dual-s3-wired")] mirror_spi: (
         esp_hal::peripherals::SPI2<'static>,
@@ -333,6 +352,7 @@ async fn startup_task(
         esp_hal::peripherals::GPIO13<'static>,
     ),
 ) {
+    spawn_or_reset(&spawner, watchdog_task(watchdog), "watchdog");
     #[cfg(feature = "dual-s3-wired")]
     {
         let sink = init_channel_task_sink();
@@ -352,6 +372,9 @@ async fn startup_task(
     let _ = RUNTIME_INPUT_CHANNEL.try_send(RuntimeInputMessage::DiagnosticsEvent(
         RuntimeDiagnosticsEvent::ResetReason(reset_reason_code),
     ));
+    let _ = RUNTIME_INPUT_CHANNEL.try_send(RuntimeInputMessage::StorageHealthChanged(
+        hidshift::storage::StorageHealth::Initializing,
+    ));
     if was_brownout {
         let _ = RUNTIME_INPUT_CHANNEL.try_send(RuntimeInputMessage::DiagnosticsEvent(
             RuntimeDiagnosticsEvent::Brownout,
@@ -359,7 +382,12 @@ async fn startup_task(
     }
     spawn_or_reset(
         &spawner,
-        control_task(RUNTIME_INPUT_CHANNEL.sender(), &RUNTIME_TICK_PENDING, gpio0),
+        control_task(
+            RUNTIME_INPUT_CHANNEL.sender(),
+            STORAGE_COMMAND_CHANNEL.sender(),
+            &RUNTIME_TICK_PENDING,
+            gpio0,
+        ),
         "control",
     );
     spawn_or_reset(
@@ -488,14 +516,20 @@ async fn runtime_owner_task(
     log::info!("firmware: runtime owner task boot");
 
     loop {
-        owner.observe_transport_metrics(
-            receiver.len(),
-            sink.mouse.stats(),
-            sink.status_updates_dropped,
-        );
+        owner.observe_transport_metrics(hidshift::runtime::RuntimeTransportMetrics {
+            runtime_input_depth: receiver.len(),
+            ble_control_depth: sink.ble_control.len(),
+            ble_notify_depth: sink.ble_notify.len(),
+            usb_depth: sink.usb.len(),
+            storage_depth: sink.storage.len(),
+            status_depth: sink.status.len(),
+            mouse: sink.mouse.stats(),
+            status_updates_dropped: sink.status_updates_dropped,
+        });
         let message = match select(receiver.receive(), barrier_request.receive()).await {
             Either::First(message) => message,
             Either::Second(active_host_mask) => {
+                RUNTIME_QUIESCED.store(true, Ordering::Release);
                 if let Err(error) = owner.prepare_for_quiesce() {
                     log::error!("firmware: runtime quiesce preparation failed {:?}", error);
                 }
@@ -522,6 +556,8 @@ async fn runtime_owner_task(
                     })
                     .await;
                 barrier_resume.receive().await;
+                RUNTIME_QUIESCED.store(false, Ordering::Release);
+                RUNTIME_HEARTBEAT.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
         };
@@ -529,6 +565,70 @@ async fn runtime_owner_task(
             tick_pending.mark_processed();
         }
         process_runtime_message(&mut owner, &mut sink, message).await;
+        RUNTIME_HEARTBEAT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[embassy_executor::task]
+async fn watchdog_task(mut watchdog: Wdt<esp_hal::peripherals::TIMG0<'static>>) {
+    const WATCHDOG_TIMEOUT_SECONDS: u64 = 5;
+    const HEARTBEAT_SAMPLE_SECONDS: u64 = 1;
+    const ALLOWED_MISSED_INTERVALS: u8 = 2;
+
+    watchdog.set_timeout(
+        MwdtStage::Stage0,
+        esp_hal::time::Duration::from_secs(WATCHDOG_TIMEOUT_SECONDS),
+    );
+    watchdog.enable();
+    watchdog.feed();
+    let mut heartbeat_group = hidshift::support::HeartbeatGroup::new(
+        [
+            RUNTIME_HEARTBEAT.load(Ordering::Relaxed),
+            BLE_EXECUTOR_HEARTBEAT.load(Ordering::Relaxed),
+        ],
+        ALLOWED_MISSED_INTERVALS,
+    );
+    let mut minimum_heap_free = esp_alloc::HEAP.free();
+    let mut heap_log_interval = 0u8;
+    let mut quiesced_intervals = 0u8;
+    log::info!(
+        "firmware: watchdog enabled timeout_s={}",
+        WATCHDOG_TIMEOUT_SECONDS
+    );
+
+    loop {
+        embassy_time::Timer::after_secs(HEARTBEAT_SAMPLE_SECONDS).await;
+        let heartbeat = RUNTIME_HEARTBEAT.load(Ordering::Relaxed);
+        let ble_executor_heartbeat = BLE_EXECUTOR_HEARTBEAT.load(Ordering::Relaxed);
+        let quiesced = RUNTIME_QUIESCED.load(Ordering::Acquire);
+        if quiesced {
+            quiesced_intervals = quiesced_intervals.saturating_add(1);
+        } else {
+            quiesced_intervals = 0;
+        }
+        let task_heartbeats_healthy = heartbeat_group
+            .should_feed_watchdog([heartbeat, ble_executor_heartbeat], [!quiesced, true]);
+        let healthy = task_heartbeats_healthy && (!quiesced || quiesced_intervals <= 31);
+        if healthy {
+            watchdog.feed();
+            minimum_heap_free = minimum_heap_free.min(esp_alloc::HEAP.free());
+            heap_log_interval = heap_log_interval.saturating_add(1);
+            if heap_log_interval >= 30 {
+                heap_log_interval = 0;
+                log::info!(
+                    "firmware: heap free={} minimum_free={}",
+                    esp_alloc::HEAP.free(),
+                    minimum_heap_free
+                );
+            }
+        } else {
+            log::error!(
+                "firmware: task heartbeat stalled runtime={} ble_executor={}; watchdog reset pending",
+                heartbeat,
+                ble_executor_heartbeat
+            );
+            core::future::pending::<()>().await;
+        }
     }
 }
 
@@ -988,84 +1088,6 @@ impl ChannelTaskSink {
         if self.status.try_send(command).is_err() {
             self.pending_status = Some(command);
         }
-    }
-}
-
-impl RuntimeTaskSink for ChannelTaskSink {
-    type Error = ChannelTaskSendError;
-
-    fn reserve_batch<
-        const BLE: usize,
-        const USB: usize,
-        const STORAGE: usize,
-        const STATUS: usize,
-    >(
-        &mut self,
-        queues: &hidshift::RuntimeCommandQueues<BLE, USB, STORAGE, STATUS>,
-    ) -> Result<(), (hidshift::runtime::driver::RuntimeTaskKind, Self::Error)> {
-        self.ensure_capacity(queues).map_err(|error| {
-            let task = match error {
-                ChannelTaskSendError::BleQueueFull => {
-                    hidshift::runtime::driver::RuntimeTaskKind::Ble
-                }
-                #[cfg(feature = "dual-s3-wired")]
-                ChannelTaskSendError::DeviceQueueFull => {
-                    hidshift::runtime::driver::RuntimeTaskKind::Device
-                }
-                ChannelTaskSendError::UsbQueueFull => {
-                    hidshift::runtime::driver::RuntimeTaskKind::UsbHost
-                }
-                ChannelTaskSendError::StorageQueueFull => {
-                    hidshift::runtime::driver::RuntimeTaskKind::Storage
-                }
-                ChannelTaskSendError::StatusQueueFull => {
-                    hidshift::runtime::driver::RuntimeTaskKind::Status
-                }
-            };
-            (task, error)
-        })
-    }
-
-    fn send_ble(&mut self, command: BleTaskCommand) -> Result<(), Self::Error> {
-        match command.lane() {
-            BleCommandLane::Control => self
-                .ble_control
-                .try_send(command)
-                .map_err(ChannelTaskSendError::from),
-            BleCommandLane::Notify => self
-                .ble_notify
-                .try_send(command)
-                .map_err(ChannelTaskSendError::from),
-        }
-    }
-
-    #[cfg(feature = "dual-s3-wired")]
-    fn send_device(&mut self, command: DeviceTaskCommand) -> Result<(), Self::Error> {
-        self.device
-            .try_send(command)
-            .map_err(ChannelTaskSendError::from)
-    }
-
-    fn send_usb_host(&mut self, command: UsbHostTaskCommand) -> Result<(), Self::Error> {
-        self.usb
-            .try_send(command)
-            .map_err(ChannelTaskSendError::from)
-    }
-
-    fn send_storage(&mut self, command: StorageTaskCommand) -> Result<(), Self::Error> {
-        self.storage
-            .try_send(command)
-            .map_err(ChannelTaskSendError::from)
-    }
-
-    fn send_status(&mut self, command: StatusTaskCommand) -> Result<(), Self::Error> {
-        self.status
-            .try_send(command)
-            .map_err(ChannelTaskSendError::from)
-    }
-
-    fn apply_effect(&mut self, effect: hidshift::runtime::RuntimeEffect) {
-        apply_runtime_effect(effect);
     }
 }
 

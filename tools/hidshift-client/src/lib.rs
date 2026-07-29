@@ -304,6 +304,14 @@ mod tests {
             line.len(),
             SERIAL_PREFIX.len() + MANAGEMENT_REQUEST_LEN * 2 + 1
         );
-        assert!(line.starts_with(b"@HIDSHIFT:012a030103"));
+        assert!(
+            line.starts_with(
+                format!(
+                    "@HIDSHIFT:{:02x}2a030103",
+                    hidshift::MANAGEMENT_PROTOCOL_VERSION
+                )
+                .as_bytes()
+            )
+        );
     }
 }

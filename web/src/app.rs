@@ -3,6 +3,7 @@ use std::rc::Rc;
 use hidshift::{
     HostId, ManagementCommand, ManagementDiagnostics, ManagementHistoryEvent, ManagementHostName,
     ManagementHostStatus, ManagementOutputTarget, ManagementOutputTargetStatus, ManagementStatus,
+    StorageHealth,
 };
 use leptos::prelude::*;
 use send_wrapper::SendWrapper;
@@ -500,6 +501,7 @@ fn support_page(state: AppState) -> impl IntoView {
         <section class="section">
             <div class="section-heading"><h2>{text(locale, "システム状態", "System status")}</h2></div>
             {move || state.diagnostics.get().map(diagnostics_view)}
+            <div class="row-list"><div class="row"><span class="row-icon"><SupportIcon/></span><div class="row-copy"><strong>{text(locale, "保存領域", "Storage")}</strong><small>{move || storage_health_label(state.status.get().map(|status| status.storage_health), locale)}</small></div></div></div>
         </section>
         <section class="section">
             <div class="section-heading"><div><h2>{text(locale, "イベント履歴", "Event history")}</h2><p>{text(locale, "再起動で消去されるRAM内の履歴です。", "RAM-only history, cleared on reboot.")}</p></div><button class="secondary compact" on:click=copy_history>{text(locale, "コピー", "Copy")}</button></div>
@@ -507,12 +509,11 @@ fn support_page(state: AppState) -> impl IntoView {
         </section>
         <section class="section">
             <div class="section-heading"><h2>{text(locale, "バージョン", "Version")}</h2></div>
-            <div class="row-list"><div class="row"><span class="row-icon"><SupportIcon/></span><div class="row-copy"><strong>"HIDShift firmware"</strong><small>{move || state.schema.get().map(|schema| format!("{}.{}.{} · protocol v1 · schema {}", schema.firmware_major, schema.firmware_minor, schema.firmware_patch, schema.version)).unwrap_or_else(|| "—".into())}</small></div></div></div>
+            <div class="row-list"><div class="row"><span class="row-icon"><SupportIcon/></span><div class="row-copy"><strong>"HIDShift firmware"</strong><small>{move || state.schema.get().map(|schema| format!("{}.{}.{} · protocol v{} · schema {}", schema.firmware_major, schema.firmware_minor, schema.firmware_patch, hidshift::MANAGEMENT_PROTOCOL_VERSION, schema.version)).unwrap_or_else(|| "—".into())}</small></div></div></div>
         </section>
         <section class="section danger-zone">
             <h2>{text(locale, "復旧操作", "Recovery actions")}</h2>
-            <p>{text(locale, "再起動と工場出荷状態への初期化は、新しいmanagement protocolで提供予定です。GPIO0を押しながら起動するとStandard modeで復旧できます。", "Reboot and factory reset are provided by the new management protocol. Hold GPIO0 while booting to recover in Standard mode.")}</p>
-            <div class="support-actions"><button class="danger" disabled=true>{text(locale, "工場出荷状態に戻す", "Factory reset")}</button></div>
+            <p>{text(locale, "工場出荷状態へ戻すには、GPIO0を離した状態で電源投入またはresetし、firmware起動後3秒以内にGPIO0を押し始めて5秒以上保持してから離してください。GPIO0はROM download modeのstrapでもあるため、reset中は押さないでください。保存済みのbond、設定、active targetを消去して自動的に再起動します。", "To factory-reset the device, power or reset it with GPIO0 released, then press GPIO0 within the first three seconds of firmware startup, hold it for at least five seconds, and release it. GPIO0 is also the ROM download-mode strap, so do not hold it during reset. Saved bonds, settings, and the active target are erased before an automatic reboot.")}</p>
         </section>
     }
 }
@@ -522,11 +523,26 @@ fn diagnostics_view(value: ManagementDiagnostics) -> impl IntoView {
         <div class="diagnostics-grid">
             <article><span>"Uptime"</span><strong>{format_duration(value.uptime_seconds)}</strong></article>
             <article><span>"Reset reason"</span><strong>{format!("0x{:02x}", value.reset_reason)}</strong></article>
-            <article><span>"Brownout"</span><strong>{value.brownout_count}</strong></article>
+            <article><span>"Brownout (this boot)"</span><strong>{value.brownout_count}</strong></article>
             <article><span>"BLE disconnect"</span><strong>{value.ble_disconnect_count}</strong></article>
             <article><span>"Notify failure"</span><strong>{value.ble_notify_failure_count}</strong></article>
             <article><span>"USB / Flash error"</span><strong>{format!("{} / {}", value.usb_error_count, value.flash_failure_count)}</strong></article>
         </div>
+    }
+}
+
+fn storage_health_label(health: Option<StorageHealth>, locale: Locale) -> &'static str {
+    match health {
+        Some(StorageHealth::Persistent) => text(locale, "正常（flash）", "Healthy (flash)"),
+        Some(StorageHealth::VolatileTest) => {
+            text(locale, "テスト用揮発storage", "Volatile test storage")
+        }
+        Some(StorageHealth::Degraded) => {
+            text(locale, "書き込み失敗・再試行中", "Write failure; retrying")
+        }
+        Some(StorageHealth::Unavailable) => text(locale, "利用不可", "Unavailable"),
+        Some(StorageHealth::Initializing) => text(locale, "初期化中", "Initializing"),
+        None => "—",
     }
 }
 

@@ -2,15 +2,19 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Sender;
 use embassy_time::{Duration, Instant, Timer};
 use esp_hal::gpio::{Input, InputConfig, Pull};
-use hidshift::runtime::RUNTIME_INPUT_QUEUE_CAPACITY;
 use hidshift::runtime::RuntimeTickPending;
 use hidshift::runtime::message::RuntimeInputMessage;
-use hidshift::target_control::TargetSwitchControl;
+use hidshift::runtime::{
+    RUNTIME_INPUT_QUEUE_CAPACITY, RUNTIME_STORAGE_COMMAND_QUEUE_CAPACITY, StorageTaskCommand,
+};
+use hidshift::target_control::{BootRecoveryAction, BootRecoveryControl, TargetSwitchControl};
 
 pub const TARGET_BUTTON_SAMPLE_MS: u64 = 5;
 // Runtime deadlines include a configurable target-switch delay as short as 5 ms.
 // A 10 ms tick keeps that setting responsive without flooding the input queue.
 pub const TARGET_BUTTON_TICK_MS: u64 = 10;
+pub const BOOT_FACTORY_RESET_ARM_WINDOW_MS: u64 = 3_000;
+pub const BOOT_FACTORY_RESET_HOLD_MS: u64 = 5_000;
 
 #[embassy_executor::task]
 pub async fn control_task(
@@ -19,6 +23,12 @@ pub async fn control_task(
         CriticalSectionRawMutex,
         RuntimeInputMessage,
         RUNTIME_INPUT_QUEUE_CAPACITY,
+    >,
+    storage: Sender<
+        'static,
+        CriticalSectionRawMutex,
+        StorageTaskCommand,
+        RUNTIME_STORAGE_COMMAND_QUEUE_CAPACITY,
     >,
     tick_pending: &'static RuntimeTickPending,
     button_pin: esp_hal::peripherals::GPIO0<'static>,
@@ -31,6 +41,12 @@ pub async fn control_task(
 
     let mut next_tick = Instant::now() + Duration::from_millis(TARGET_BUTTON_TICK_MS);
     let mut last_pressed = button.is_low();
+    let boot_started_ms = Instant::now().as_millis();
+    let mut boot_recovery = BootRecoveryControl::new(
+        boot_started_ms,
+        BOOT_FACTORY_RESET_ARM_WINDOW_MS,
+        BOOT_FACTORY_RESET_HOLD_MS,
+    );
     log::debug!(
         "firmware: target button GPIO0 initial_pressed={}",
         last_pressed
@@ -49,10 +65,19 @@ pub async fn control_task(
             last_pressed = pressed;
         }
 
-        if let Some(intent) = target_control.target_button_sample(pressed, now_ms) {
-            let message = RuntimeInputMessage::ButtonIntent { intent, now_ms };
-            log::info!("firmware: target button runtime_input {:?}", message);
-            sender.send(message).await;
+        match boot_recovery.sample(pressed, now_ms) {
+            BootRecoveryAction::FactoryReset => {
+                log::warn!("firmware: GPIO0 recovery hold released; requesting factory reset");
+                storage.send(StorageTaskCommand::FactoryReset).await;
+            }
+            BootRecoveryAction::Suppress => {}
+            BootRecoveryAction::Normal => {
+                if let Some(intent) = target_control.target_button_sample(pressed, now_ms) {
+                    let message = RuntimeInputMessage::ButtonIntent { intent, now_ms };
+                    log::info!("firmware: target button runtime_input {:?}", message);
+                    sender.send(message).await;
+                }
+            }
         }
 
         Timer::after(Duration::from_millis(TARGET_BUTTON_SAMPLE_MS)).await;
