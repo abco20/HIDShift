@@ -2,7 +2,12 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -44,7 +49,8 @@ jobs:
       - name: Test release version validation
         run: python3 -m unittest discover -s tools/release -p 'test_*.py'
 
-  firmware:
+  firmware-release:
+    name: Firmware / production release
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -56,7 +62,7 @@ jobs:
           ldproxy: false
       - uses: Swatinem/rust-cache@v2
         with:
-          key: esp32s3
+          key: esp32s3-release
       - name: Build production firmware
         run: >-
           cargo +esp build --locked -Zbuild-std=core,alloc --release
@@ -64,6 +70,21 @@ jobs:
           --target xtensa-esp32s3-none-elf
       - name: Record firmware size
         run: stat --printf='firmware_bytes=%s\n' target/xtensa-esp32s3-none-elf/release/firmware
+
+  firmware-features:
+    name: Firmware / feature combinations
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ESP Xtensa Rust toolchain
+        uses: esp-rs/xtensa-toolchain@v1.7.0
+        with:
+          buildtargets: esp32s3
+          default: false
+          ldproxy: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: esp32s3-features
       - name: Check hardware E2E firmware
         run: >-
           cargo +esp check --locked -Zbuild-std=core,alloc
@@ -82,6 +103,22 @@ jobs:
           --manifest-path firmware/Cargo.toml --bin firmware
           --features dual-s3-wired,hardware-e2e
           --target xtensa-esp32s3-none-elf
+
+  device-firmware:
+    name: Firmware / dual-S3 Device
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ESP Xtensa Rust toolchain
+        uses: esp-rs/xtensa-toolchain@v1.7.0
+        with:
+          buildtargets: esp32s3
+          default: false
+          ldproxy: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: esp32s3-device
+          workspaces: device-firmware
       - name: Check dual-S3 Device firmware
         run: >-
           cargo +esp check --locked -Zbuild-std=core
@@ -93,6 +130,22 @@ jobs:
           --manifest-path device-firmware/Cargo.toml --bin hidshift-device
           --features hardware-e2e
           --target xtensa-esp32s3-none-elf
+
+  probe-firmware:
+    name: Firmware / ESP32-S3 BLE Central probe
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ESP Xtensa Rust toolchain
+        uses: esp-rs/xtensa-toolchain@v1.7.0
+        with:
+          buildtargets: esp32s3
+          default: false
+          ldproxy: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: esp32s3-probe
+          workspaces: e2e/probe-firmware
       - name: Check ESP32-S3 BLE Central probe
         run: >-
           cargo +esp check --locked -Zbuild-std=core,alloc
