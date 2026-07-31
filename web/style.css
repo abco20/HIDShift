@@ -153,6 +153,8 @@ button.icon-button { display: grid; width: 40px; padding: 0; place-items: center
 .state.waiting { color: var(--warning); }
 .row-actions { display: flex; align-items: center; gap: 6px; }
 .empty-row { padding: 28px 16px; color: var(--muted); font-size: 11px; text-align: center; }
+.input-device-card + .input-device-card { border-top: 1px solid var(--border); }
+.input-device-card .settings-list { margin: 0 14px 14px 60px; }
 
 .hero-route {
   display: flex; min-height: 92px; align-items: center; gap: 14px; padding: 16px;
@@ -188,10 +190,6 @@ button.icon-button { display: grid; width: 40px; padding: 0; place-items: center
 .setting-group-title h3 { margin: 0 0 3px; font-size: 13px; }
 .setting-group-title p { margin: 0; color: var(--muted); font-size: 10px; }
 .settings-list { overflow: hidden; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); }
-.host-setting-groups { display: grid; gap: 8px; grid-template-columns: repeat(2, 1fr); }
-.host-setting-groups details { overflow: hidden; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
-.host-setting-groups summary { padding: 12px; color: var(--text); font-size: 11px; cursor: pointer; }
-.host-setting-groups .setting-row { grid-template-columns: 1fr; gap: 8px; }
 .advanced-usage { border: 0 !important; }
 .advanced-usage summary { padding: 3px 0 !important; color: var(--accent); font-size: 10px; }
 .advanced-usage label { display: grid; gap: 6px; grid-template-columns: auto 1fr; margin-top: 6px; color: var(--muted); font-size: 10px; }

@@ -1,14 +1,22 @@
 use heapless::Vec;
 
 use crate::input::{ConsumerUsage, KeyUsage, KeyboardFrame, StandardInputFrame};
+use crate::settings::InputSettings;
 
 pub const INPUT_PROFILE_CAPACITY: usize = 8;
-pub const REMAP_RULE_CAPACITY: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct InputProfileId(u8);
 
 impl InputProfileId {
+    pub const fn new(value: u8) -> Option<Self> {
+        if value >= 1 && value <= INPUT_PROFILE_CAPACITY as u8 {
+            Some(Self(value))
+        } else {
+            None
+        }
+    }
+
     pub const fn get(self) -> u8 {
         self.0
     }
@@ -18,27 +26,79 @@ impl InputProfileId {
 pub struct InputIdentity {
     pub vendor_id: u16,
     pub product_id: u16,
-    /// Stable serial hash when present, otherwise a stable physical-path hash.
+    /// Hash of the serial string, or of the physical port path when no serial exists.
     pub instance_hash: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum KeyboardLayout {
-    Unchanged,
-    Us,
-    Jis,
+impl InputIdentity {
+    pub fn from_serial(vendor_id: u16, product_id: u16, serial: &[u8]) -> Option<Self> {
+        if serial.is_empty() {
+            return None;
+        }
+        Some(Self {
+            vendor_id,
+            product_id,
+            instance_hash: identity_hash(0x53, serial),
+        })
+    }
+
+    pub fn from_serial_utf16(vendor_id: u16, product_id: u16, serial: &[u16]) -> Option<Self> {
+        if serial.is_empty() {
+            return None;
+        }
+        let mut hash = identity_hash_start(0x53);
+        for unit in serial {
+            for byte in unit.to_le_bytes() {
+                hash = identity_hash_byte(hash, byte);
+            }
+        }
+        Some(Self {
+            vendor_id,
+            product_id,
+            instance_hash: hash,
+        })
+    }
+
+    pub fn from_port_path(vendor_id: u16, product_id: u16, port_path: &[u8]) -> Self {
+        Self {
+            vendor_id,
+            product_id,
+            instance_hash: identity_hash(0x50, port_path),
+        }
+    }
+}
+
+fn identity_hash(kind: u8, bytes: &[u8]) -> u64 {
+    let mut hash = identity_hash_start(kind);
+    for byte in bytes {
+        hash = identity_hash_byte(hash, *byte);
+    }
+    hash
+}
+
+fn identity_hash_start(kind: u8) -> u64 {
+    identity_hash_byte(0xcbf2_9ce4_8422_2325, kind)
+}
+
+fn identity_hash_byte(hash: u64, byte: u8) -> u64 {
+    (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Usage {
-    pub page: u16,
-    pub id: u16,
+struct MouseScaleRemainders {
+    x: i32,
+    y: i32,
+    wheel: i32,
+    pan: i32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RemapRule {
-    pub from: Usage,
-    pub to: Usage,
+impl MouseScaleRemainders {
+    const ZERO: Self = Self {
+        x: 0,
+        y: 0,
+        wheel: 0,
+        pan: 0,
+    };
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -47,82 +107,110 @@ pub struct InputProfile {
     pub identity: InputIdentity,
     pub connected: bool,
     pub last_seen: u64,
-    pub keyboard_layout: KeyboardLayout,
-    pub mouse_sensitivity_percent: u16,
-    pub scroll_multiplier_percent: u16,
-    pub remaps: Vec<RemapRule, REMAP_RULE_CAPACITY>,
+    pub settings: InputSettings,
+    mouse_remainders: MouseScaleRemainders,
 }
 
 impl InputProfile {
-    pub fn is_default(&self) -> bool {
-        self.keyboard_layout == KeyboardLayout::Unchanged
-            && self.mouse_sensitivity_percent == 100
-            && self.scroll_multiplier_percent == 100
-            && self.remaps.is_empty()
+    pub const fn restored(
+        id: InputProfileId,
+        identity: InputIdentity,
+        last_seen: u64,
+        settings: InputSettings,
+    ) -> Self {
+        Self {
+            id,
+            identity,
+            connected: false,
+            last_seen,
+            settings,
+            mouse_remainders: MouseScaleRemainders::ZERO,
+        }
     }
 
-    /// Applies device-owned transforms while the physical device and
-    /// interface identity are still present. Callers run this before input
-    /// aggregation so settings never become destination-owned.
-    pub fn transform(&self, frame: &mut StandardInputFrame) {
+    /// Applies device-owned transforms before input aggregation.
+    pub fn transform(&mut self, frame: &mut StandardInputFrame) {
         if let Some(keyboard) = frame.keyboard.take() {
             let mut transformed = KeyboardFrame::new(keyboard.modifiers);
             for key in keyboard.keys_down() {
-                let layout_key = match (self.keyboard_layout, key.0) {
-                    (KeyboardLayout::Us, 0x89) => 0x35,
-                    (KeyboardLayout::Jis, 0x35) => 0x89,
+                let layout_key = match (self.settings.keyboard_layout, key.0) {
+                    (1, 0x89) => 0x35,
+                    (2, 0x35) => 0x89,
                     _ => key.0,
                 };
-                let mapped = self
-                    .remaps
-                    .iter()
-                    .find(|rule| rule.from.page == 0x07 && rule.from.id == u16::from(layout_key))
-                    .filter(|rule| rule.to.page == 0x07 && rule.to.id <= u16::from(u8::MAX))
-                    .map_or(layout_key, |rule| rule.to.id as u8);
+                let mapped = if self.settings.remap_from_usage != 0
+                    && layout_key == self.settings.remap_from_usage
+                {
+                    self.settings.remap_to_usage
+                } else {
+                    layout_key
+                };
                 let _ = transformed.push_key(KeyUsage(mapped));
             }
             frame.keyboard = Some(transformed);
         }
         if let Some(mouse) = frame.mouse.as_mut() {
-            mouse.movement.x = scale_i16(mouse.movement.x, self.mouse_sensitivity_percent);
-            mouse.movement.y = scale_i16(mouse.movement.y, self.mouse_sensitivity_percent);
-            mouse.movement.wheel = scale_i8(mouse.movement.wheel, self.scroll_multiplier_percent);
-            mouse.movement.pan = scale_i8(mouse.movement.pan, self.scroll_multiplier_percent);
+            mouse.movement.x = scale_i16_with_remainder(
+                mouse.movement.x,
+                self.settings.mouse_sensitivity_percent,
+                &mut self.mouse_remainders.x,
+            );
+            mouse.movement.y = scale_i16_with_remainder(
+                mouse.movement.y,
+                self.settings.mouse_sensitivity_percent,
+                &mut self.mouse_remainders.y,
+            );
+            mouse.movement.wheel = scale_i8_with_remainder(
+                mouse.movement.wheel,
+                self.settings.scroll_multiplier_percent,
+                &mut self.mouse_remainders.wheel,
+            );
+            mouse.movement.pan = scale_i8_with_remainder(
+                mouse.movement.pan,
+                self.settings.scroll_multiplier_percent,
+                &mut self.mouse_remainders.pan,
+            );
         }
         if let Some(consumer) = frame.consumer.as_mut()
             && let Some(active) = consumer.active
-            && let Some(rule) = self
-                .remaps
-                .iter()
-                .find(|rule| rule.from.page == 0x0c && rule.from.id == active.0)
-                .filter(|rule| rule.to.page == 0x0c)
+            && self.settings.consumer_from_usage != 0
+            && active.0 == self.settings.consumer_from_usage
         {
-            consumer.active = Some(ConsumerUsage(rule.to.id));
+            consumer.active = Some(ConsumerUsage(self.settings.consumer_to_usage));
         }
+    }
+
+    pub fn reset_transform_state(&mut self) {
+        self.mouse_remainders = MouseScaleRemainders::ZERO;
     }
 }
 
-fn scale_i16(value: i16, percent: u16) -> i16 {
-    (i32::from(value) * i32::from(percent) / 100).clamp(i32::from(i16::MIN), i32::from(i16::MAX))
-        as i16
+fn scale_i16_with_remainder(value: i16, percent: u16, remainder: &mut i32) -> i16 {
+    let scaled = i32::from(value) * i32::from(percent) + *remainder;
+    let output = scaled / 100;
+    *remainder = scaled % 100;
+    output.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
 }
 
-fn scale_i8(value: i8, percent: u16) -> i8 {
-    (i32::from(value) * i32::from(percent) / 100).clamp(i32::from(i8::MIN), i32::from(i8::MAX))
-        as i8
+fn scale_i8_with_remainder(value: i8, percent: u16, remainder: &mut i32) -> i8 {
+    let scaled = i32::from(value) * i32::from(percent) + *remainder;
+    let output = scaled / 100;
+    *remainder = scaled % 100;
+    output.clamp(i32::from(i8::MIN), i32::from(i8::MAX)) as i8
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputProfileError {
-    RegistryFullWithCustomizedProfiles,
+    RegistryFullWithConnectedProfiles,
     UnknownProfile,
-    RemapCapacity,
-    InvalidScale,
+    DuplicateProfileId,
+    DuplicateIdentity,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InputProfileRegistry {
     profiles: Vec<InputProfile, INPUT_PROFILE_CAPACITY>,
+    next_sequence: u64,
 }
 
 impl Default for InputProfileRegistry {
@@ -135,6 +223,7 @@ impl InputProfileRegistry {
     pub const fn new() -> Self {
         Self {
             profiles: Vec::new(),
+            next_sequence: 1,
         }
     }
 
@@ -142,18 +231,36 @@ impl InputProfileRegistry {
         &self.profiles
     }
 
+    pub fn restore(&mut self, profile: InputProfile) -> Result<(), InputProfileError> {
+        if self.profiles.iter().any(|item| item.id == profile.id) {
+            return Err(InputProfileError::DuplicateProfileId);
+        }
+        if self
+            .profiles
+            .iter()
+            .any(|item| item.identity == profile.identity)
+        {
+            return Err(InputProfileError::DuplicateIdentity);
+        }
+        self.next_sequence = self.next_sequence.max(profile.last_seen.wrapping_add(1));
+        self.profiles
+            .push(profile)
+            .map_err(|_| InputProfileError::RegistryFullWithConnectedProfiles)
+    }
+
     pub fn observe(
         &mut self,
         identity: InputIdentity,
-        now: u64,
+        _now: u64,
     ) -> Result<InputProfileId, InputProfileError> {
+        let sequence = self.take_sequence();
         if let Some(profile) = self
             .profiles
             .iter_mut()
-            .find(|profile| profile.identity == identity)
+            .find(|item| item.identity == identity)
         {
             profile.connected = true;
-            profile.last_seen = now;
+            profile.last_seen = sequence;
             return Ok(profile.id);
         }
         if self.profiles.is_full() {
@@ -161,85 +268,51 @@ impl InputProfileRegistry {
                 .profiles
                 .iter()
                 .enumerate()
-                .filter(|(_, profile)| !profile.connected && profile.is_default())
+                .filter(|(_, profile)| !profile.connected)
                 .min_by_key(|(_, profile)| profile.last_seen)
                 .map(|(index, _)| index)
-                .ok_or(InputProfileError::RegistryFullWithCustomizedProfiles)?;
-            self.profiles.swap_remove(removable);
+                .ok_or(InputProfileError::RegistryFullWithConnectedProfiles)?;
+            let id = self.profiles[removable].id;
+            self.profiles[removable] =
+                InputProfile::restored(id, identity, sequence, InputSettings::DEFAULT);
+            self.profiles[removable].connected = true;
+            return Ok(id);
         }
         let id = (1..=INPUT_PROFILE_CAPACITY as u8)
-            .find(|candidate| {
-                !self
-                    .profiles
-                    .iter()
-                    .any(|profile| profile.id.get() == *candidate)
+            .find_map(|candidate| {
+                let id = InputProfileId::new(candidate)?;
+                (!self.profiles.iter().any(|profile| profile.id == id)).then_some(id)
             })
-            .map(InputProfileId)
-            .ok_or(InputProfileError::RegistryFullWithCustomizedProfiles)?;
+            .ok_or(InputProfileError::RegistryFullWithConnectedProfiles)?;
+        let mut profile = InputProfile::restored(id, identity, sequence, InputSettings::DEFAULT);
+        profile.connected = true;
         self.profiles
-            .push(InputProfile {
-                id,
-                identity,
-                connected: true,
-                last_seen: now,
-                keyboard_layout: KeyboardLayout::Unchanged,
-                mouse_sensitivity_percent: 100,
-                scroll_multiplier_percent: 100,
-                remaps: Vec::new(),
-            })
-            .map_err(|_| InputProfileError::RegistryFullWithCustomizedProfiles)?;
+            .push(profile)
+            .map_err(|_| InputProfileError::RegistryFullWithConnectedProfiles)?;
         Ok(id)
     }
 
-    pub fn disconnect(&mut self, id: InputProfileId, now: u64) -> Result<(), InputProfileError> {
-        let profile = self.profile_mut(id)?;
+    pub fn disconnect(&mut self, id: InputProfileId, _now: u64) -> Result<(), InputProfileError> {
+        let sequence = self.take_sequence();
+        let profile = self.get_mut(id).ok_or(InputProfileError::UnknownProfile)?;
         profile.connected = false;
-        profile.last_seen = now;
+        profile.last_seen = sequence;
+        profile.reset_transform_state();
         Ok(())
     }
 
-    pub fn set_layout(
-        &mut self,
-        id: InputProfileId,
-        layout: KeyboardLayout,
-    ) -> Result<(), InputProfileError> {
-        self.profile_mut(id)?.keyboard_layout = layout;
-        Ok(())
+    pub fn get(&self, id: InputProfileId) -> Option<&InputProfile> {
+        self.profiles.iter().find(|profile| profile.id == id)
     }
 
-    pub fn set_scales(
-        &mut self,
-        id: InputProfileId,
-        mouse_percent: u16,
-        scroll_percent: u16,
-    ) -> Result<(), InputProfileError> {
-        if !(10..=400).contains(&mouse_percent) || !(10..=400).contains(&scroll_percent) {
-            return Err(InputProfileError::InvalidScale);
-        }
-        let profile = self.profile_mut(id)?;
-        profile.mouse_sensitivity_percent = mouse_percent;
-        profile.scroll_multiplier_percent = scroll_percent;
-        Ok(())
+    pub fn get_mut(&mut self, id: InputProfileId) -> Option<&mut InputProfile> {
+        self.profiles.iter_mut().find(|profile| profile.id == id)
     }
 
-    pub fn set_remaps(
-        &mut self,
-        id: InputProfileId,
-        rules: &[RemapRule],
-    ) -> Result<(), InputProfileError> {
-        let mut replacement = Vec::new();
-        replacement
-            .extend_from_slice(rules)
-            .map_err(|_| InputProfileError::RemapCapacity)?;
-        self.profile_mut(id)?.remaps = replacement;
-        Ok(())
-    }
-
-    fn profile_mut(&mut self, id: InputProfileId) -> Result<&mut InputProfile, InputProfileError> {
-        self.profiles
-            .iter_mut()
-            .find(|profile| profile.id == id)
-            .ok_or(InputProfileError::UnknownProfile)
+    fn take_sequence(&mut self) -> u64 {
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.wrapping_add(1);
+        sequence
     }
 }
 
@@ -247,128 +320,88 @@ impl InputProfileRegistry {
 mod tests {
     use super::*;
     use crate::ids::{DeviceId, InterfaceId};
-    use crate::input::{
-        ConsumerFrame, ModifierState, MouseButtons, MouseFrame, MouseMovement, StandardInputFrame,
-    };
+    use crate::input::{MouseButtons, MouseFrame, MouseMovement};
 
     fn identity(value: u16) -> InputIdentity {
-        InputIdentity {
-            vendor_id: value,
-            product_id: value,
-            instance_hash: value as u64,
-        }
+        InputIdentity::from_port_path(value, value, &[value as u8])
     }
 
     #[test]
-    fn oldest_disconnected_default_profile_is_pruned_at_capacity() {
+    fn serial_and_path_identity_are_stable_and_distinct() {
+        let serial = InputIdentity::from_serial(1, 2, b"abc").unwrap();
+        assert_eq!(serial, InputIdentity::from_serial(1, 2, b"abc").unwrap());
+        assert_ne!(serial, InputIdentity::from_port_path(1, 2, b"abc"));
+        assert_eq!(InputIdentity::from_serial(1, 2, b""), None);
+    }
+
+    #[test]
+    fn oldest_disconnected_profile_is_replaced_even_when_customized() {
         let mut registry = InputProfileRegistry::new();
-        let mut ids = Vec::<InputProfileId, INPUT_PROFILE_CAPACITY>::new();
+        let mut oldest = None;
         for value in 1..=8 {
             let id = registry.observe(identity(value), value as u64).unwrap();
+            registry.get_mut(id).unwrap().settings.keyboard_layout = 2;
             registry.disconnect(id, value as u64).unwrap();
-            ids.push(id).unwrap();
+            oldest.get_or_insert(id);
         }
-        registry.set_layout(ids[0], KeyboardLayout::Jis).unwrap();
         let replacement = registry.observe(identity(9), 9).unwrap();
-        assert_eq!(replacement, ids[1]);
-        assert!(
-            registry
-                .profiles()
-                .iter()
-                .any(|profile| profile.id == ids[0])
+        assert_eq!(replacement, oldest.unwrap());
+        assert_eq!(
+            registry.get(replacement).unwrap().settings,
+            InputSettings::DEFAULT
         );
     }
 
     #[test]
-    fn connected_or_customized_profiles_are_never_automatically_deleted() {
+    fn connected_profiles_are_not_replaced() {
         let mut registry = InputProfileRegistry::new();
         for value in 1..=8 {
-            let id = registry.observe(identity(value), value as u64).unwrap();
-            if value != 1 {
-                registry.disconnect(id, value as u64).unwrap();
-                registry.set_layout(id, KeyboardLayout::Us).unwrap();
-            }
+            registry.observe(identity(value), value as u64).unwrap();
         }
         assert_eq!(
             registry.observe(identity(9), 9),
-            Err(InputProfileError::RegistryFullWithCustomizedProfiles)
+            Err(InputProfileError::RegistryFullWithConnectedProfiles)
         );
     }
 
     #[test]
-    fn remap_capacity_is_shared_across_usage_pages() {
+    fn reconnect_restores_the_same_profile_and_settings() {
         let mut registry = InputProfileRegistry::new();
         let id = registry.observe(identity(1), 1).unwrap();
-        let rules = [RemapRule {
-            from: Usage { page: 7, id: 4 },
-            to: Usage { page: 12, id: 233 },
-        }; REMAP_RULE_CAPACITY];
-        registry.set_remaps(id, &rules).unwrap();
-        let mut too_many = [rules[0]; REMAP_RULE_CAPACITY + 1];
-        too_many[REMAP_RULE_CAPACITY].from.id = 5;
-        assert_eq!(
-            registry.set_remaps(id, &too_many),
-            Err(InputProfileError::RemapCapacity)
-        );
+        registry.get_mut(id).unwrap().settings.remap_from_usage = 4;
+        registry.get_mut(id).unwrap().settings.remap_to_usage = 5;
+        registry.disconnect(id, 2).unwrap();
+
+        assert_eq!(registry.observe(identity(1), 3), Ok(id));
+        assert_eq!(registry.get(id).unwrap().settings.remap_to_usage, 5);
     }
 
     #[test]
-    fn transforms_are_owned_by_input_and_run_before_aggregation() {
-        let mut registry = InputProfileRegistry::new();
-        let id = registry.observe(identity(1), 1).unwrap();
-        registry.set_layout(id, KeyboardLayout::Us).unwrap();
-        registry.set_scales(id, 200, 50).unwrap();
-        registry
-            .set_remaps(
-                id,
-                &[
-                    RemapRule {
-                        from: Usage {
-                            page: 0x07,
-                            id: 0x35,
-                        },
-                        to: Usage {
-                            page: 0x07,
-                            id: 0x04,
-                        },
-                    },
-                    RemapRule {
-                        from: Usage {
-                            page: 0x0c,
-                            id: 0xe9,
-                        },
-                        to: Usage {
-                            page: 0x0c,
-                            id: 0xea,
-                        },
-                    },
-                ],
-            )
-            .unwrap();
-        let profile = registry.profiles().first().unwrap();
-        let mut keyboard = KeyboardFrame::new(ModifierState::empty());
-        keyboard.push_key(KeyUsage(0x89)).unwrap();
+    fn transform_keeps_fractional_mouse_movement_per_axis() {
+        let id = InputProfileId::new(1).unwrap();
+        let mut profile = InputProfile::restored(id, identity(1), 0, InputSettings::DEFAULT);
+        profile.settings.mouse_sensitivity_percent = 50;
         let mut frame = StandardInputFrame {
             device_id: DeviceId(1),
             interface_id: InterfaceId(1),
-            keyboard: Some(keyboard),
+            keyboard: None,
             mouse: Some(MouseFrame {
                 buttons: MouseButtons::empty(),
                 movement: MouseMovement {
-                    x: 10,
-                    y: -10,
-                    wheel: 4,
-                    pan: -4,
+                    x: 1,
+                    y: -1,
+                    wheel: 0,
+                    pan: 0,
                 },
             }),
-            consumer: Some(ConsumerFrame {
-                active: Some(ConsumerUsage(0xe9)),
-            }),
+            consumer: None,
         };
         profile.transform(&mut frame);
-        assert_eq!(frame.keyboard.unwrap().keys_down(), &[KeyUsage(0x04)]);
-        assert_eq!(frame.mouse.unwrap().movement.x, 20);
-        assert_eq!(frame.mouse.unwrap().movement.wheel, 2);
-        assert_eq!(frame.consumer.unwrap().active, Some(ConsumerUsage(0xea)));
+        assert_eq!(frame.mouse.unwrap().movement.x, 0);
+        frame.mouse.as_mut().unwrap().movement.x = 1;
+        frame.mouse.as_mut().unwrap().movement.y = -1;
+        profile.transform(&mut frame);
+        assert_eq!(frame.mouse.unwrap().movement.x, 1);
+        assert_eq!(frame.mouse.unwrap().movement.y, -1);
     }
 }

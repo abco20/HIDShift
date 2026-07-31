@@ -1,6 +1,7 @@
 use crate::ble::{BleHostAdapterError, BleHostAdapterEvent, bridge_events_from_ble_host_event};
 use crate::bridge::{Bridge, BridgeAction, BridgeError, BridgeEvent, BridgeStatus, NotifyReason};
 use crate::ids::{DeviceId, HostId, InterfaceId};
+use crate::input_profile::{InputIdentity, InputProfileId, InputProfileRegistry};
 #[cfg(feature = "dual-s3-wired")]
 use crate::interchip::{
     ActivateProfile, MirrorControlRequest, MirrorControlResponse, ProfileBegin, ProfileChunkData,
@@ -25,12 +26,12 @@ use crate::output_target::OutputTarget;
 use crate::output_target::{
     MirrorCandidateId, MirrorStableId, OutputTargetAvailability, StoredMirrorTarget,
 };
+use crate::reports::BleHidReport;
 #[cfg(feature = "dual-s3-wired")]
 use crate::reports::StandardHidReport;
-use crate::reports::{BleConsumerReport, BleHidReport, BleKeyboard6KroReport, BleMouseReport};
 use crate::settings::{
-    GlobalSettings, HostSettings, SETTING_COUNT, SETTINGS_SCHEMA_HASH, SETTINGS_SCHEMA_VERSION,
-    SettingId, SettingScope, SettingTarget, setting_descriptor, validate_setting_value,
+    GlobalSettings, SETTING_COUNT, SETTINGS_SCHEMA_HASH, SETTINGS_SCHEMA_VERSION, SettingId,
+    SettingScope, SettingTarget, setting_descriptor, validate_setting_value,
 };
 use crate::storage::{
     FixedName, STORED_HOSTS_MAX, StorageError, StorageHealth, StoragePersistPriority, StorageState,
@@ -180,6 +181,7 @@ pub enum RuntimeInput<'a> {
         device_id: DeviceId,
         vendor_id: u16,
         product_id: u16,
+        instance_hash: u64,
         name: FixedName,
         flags: u8,
     },
@@ -226,7 +228,7 @@ pub struct BridgeRuntime<const HOSTS: usize, const USB_INTERFACES: usize> {
     storage_generation: u32,
     pairing_mode: Option<PairingModeState>,
     global_settings: GlobalSettings,
-    host_settings: [HostSettings; HOSTS],
+    input_profiles: InputProfileRegistry,
     now_ms: u64,
     diagnostics: ManagementDiagnostics,
     history: heapless::Deque<ManagementHistoryEvent, RUNTIME_HISTORY_CAPACITY>,
@@ -238,7 +240,6 @@ pub struct BridgeRuntime<const HOSTS: usize, const USB_INTERFACES: usize> {
     status_sequence: u64,
     counters: RuntimeCounters,
     storage_health: StorageHealth,
-    mouse_scale_remainders: [MouseScaleRemainders; HOSTS],
     #[cfg(feature = "dual-s3-wired")]
     last_profile_result: Option<ProfileResult>,
     #[cfg(feature = "dual-s3-wired")]
@@ -265,23 +266,6 @@ pub struct BridgeRuntime<const HOSTS: usize, const USB_INTERFACES: usize> {
     synthetic_control_response: Option<MirrorControlResponse>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct MouseScaleRemainders {
-    x: i32,
-    y: i32,
-    wheel: i32,
-    pan: i32,
-}
-
-impl MouseScaleRemainders {
-    const ZERO: Self = Self {
-        x: 0,
-        y: 0,
-        wheel: 0,
-        pan: 0,
-    };
-}
-
 impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_INTERFACES> {
     pub const fn new(storage_generation: u32) -> Self {
         Self {
@@ -290,7 +274,7 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             storage_generation,
             pairing_mode: None,
             global_settings: GlobalSettings::DEFAULT,
-            host_settings: [HostSettings::DEFAULT; HOSTS],
+            input_profiles: InputProfileRegistry::new(),
             now_ms: 0,
             diagnostics: ManagementDiagnostics {
                 uptime_seconds: 0,
@@ -311,7 +295,6 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             status_sequence: 0,
             counters: RuntimeCounters::new(),
             storage_health: StorageHealth::Persistent,
-            mouse_scale_remainders: [MouseScaleRemainders::ZERO; HOSTS],
             #[cfg(feature = "dual-s3-wired")]
             last_profile_result: None,
             #[cfg(feature = "dual-s3-wired")]
@@ -499,9 +482,7 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
     pub fn storage_state(&self) -> Result<StorageState, StorageError> {
         let mut state = self.bridge.storage_state(self.storage_generation)?;
         state.global_settings = self.global_settings;
-        for (destination, source) in state.host_settings.iter_mut().zip(self.host_settings) {
-            *destination = source;
-        }
+        state.input_profiles = self.input_profiles.clone();
         Ok(state)
     }
 
@@ -528,9 +509,7 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         self.bridge.restore_storage_state(&restored, &mut actions)?;
         self.storage_generation = storage.generation;
         self.global_settings = storage.global_settings;
-        for (destination, source) in self.host_settings.iter_mut().zip(storage.host_settings) {
-            *destination = source;
-        }
+        self.input_profiles = storage.input_profiles.clone();
         self.pairing_mode = None;
         push_command(
             commands,
@@ -562,7 +541,10 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         commands: &mut heapless::Vec<RuntimeCommand, COMMANDS>,
     ) -> Result<(), RuntimeError> {
         match input {
-            RuntimeInput::BridgeEvent(event) => {
+            RuntimeInput::BridgeEvent(mut event) => {
+                if let BridgeEvent::InputFrame(frame) = &mut event {
+                    self.transform_input_frame(frame);
+                }
                 #[cfg(feature = "dual-s3-wired")]
                 let event = match event {
                     BridgeEvent::WiredAvailabilityChanged {
@@ -615,16 +597,32 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                 device_id,
                 vendor_id,
                 product_id,
+                instance_hash,
                 name,
                 flags,
             } => {
                 commands.clear();
+                let identity = InputIdentity {
+                    vendor_id,
+                    product_id,
+                    instance_hash,
+                };
+                let is_new_profile = !self
+                    .input_profiles
+                    .profiles()
+                    .iter()
+                    .any(|profile| profile.identity == identity);
+                let profile_id = self
+                    .input_profiles
+                    .observe(identity, self.now_ms)
+                    .map_err(|_| RuntimeError::InputProfileCapacity)?;
                 for interface in self.usb_interfaces.iter_mut().flatten() {
                     if interface.device_id == device_id {
                         interface.vendor_id = vendor_id;
                         interface.product_id = product_id;
                         interface.name = name;
                         interface.flags |= flags;
+                        interface.input_profile_id = Some(profile_id);
                     }
                 }
                 if let Some(last) = self.history.back_mut()
@@ -633,6 +631,9 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                 {
                     last.vendor_id = vendor_id;
                     last.product_id = product_id;
+                }
+                if is_new_profile && self.storage_health.allows_persistent_mutation() {
+                    self.push_storage_snapshot(commands, StoragePersistPriority::Lazy)?;
                 }
                 Ok(())
             }
@@ -898,9 +899,10 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
     #[cfg(not(feature = "dual-s3-wired"))]
     pub(crate) fn handle_realtime_input_frame_in_place<const BLE: usize>(
         &mut self,
-        frame: crate::input::InputFrame,
+        mut frame: crate::input::InputFrame,
         ble: &mut heapless::Vec<BleTaskCommand, BLE>,
     ) -> Result<(), RuntimeError> {
+        self.transform_input_frame(&mut frame);
         let maximum_notifications = match &frame {
             crate::input::InputFrame::Standard(frame) => {
                 usize::from(frame.keyboard.is_some())
@@ -928,10 +930,9 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             else {
                 return Err(RuntimeError::UnexpectedRealtimeAction);
             };
-            let report = self.apply_host_report_settings(host_id, report.into());
             ble.push(BleTaskCommand::Notify {
                 host_id,
-                report,
+                report: report.into(),
                 reason,
             })
             .map_err(|_| RuntimeError::CommandCapacity)?;
@@ -942,10 +943,11 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
     #[cfg(feature = "dual-s3-wired")]
     pub(crate) fn handle_realtime_input_frame_in_place<const BLE: usize, const DEVICE: usize>(
         &mut self,
-        frame: crate::input::InputFrame,
+        mut frame: crate::input::InputFrame,
         ble: &mut heapless::Vec<BleTaskCommand, BLE>,
         device: &mut heapless::Vec<DeviceTaskCommand, DEVICE>,
     ) -> Result<(), RuntimeError> {
+        self.transform_input_frame(&mut frame);
         if (self.presentation_transition_pending
             && self.bridge.state().output_target.selected == OutputTarget::Wired)
             || (self.bridge.state().output_target.active == Some(OutputTarget::Wired)
@@ -1020,10 +1022,9 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             };
             match target {
                 OutputTarget::Ble(host_id) => {
-                    let report = self.apply_host_report_settings(host_id, report.into());
                     ble.push(BleTaskCommand::Notify {
                         host_id,
-                        report,
+                        report: report.into(),
                         reason,
                     })
                     .map_err(|_| RuntimeError::CommandCapacity)?;
@@ -1068,9 +1069,9 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         interface_id: InterfaceId,
         commands: &mut heapless::Vec<RuntimeCommand, COMMANDS>,
     ) -> Result<(), RuntimeError> {
-        let removed_device = self
+        let removed = self
             .usb_hid_interface_index(interface_id)
-            .and_then(|index| self.usb_interfaces[index].map(|state| state.device_id));
+            .and_then(|index| self.usb_interfaces[index]);
         if let Some(index) = self.usb_hid_interface_index(interface_id) {
             self.usb_interfaces[index] = None;
         }
@@ -1078,13 +1079,26 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             BridgeEvent::UsbDeviceRemoved { interface_id },
             commands,
         )?;
-        if let Some(device_id) = removed_device
+        if let Some(device_id) = removed.map(|interface| interface.device_id)
             && !self
                 .usb_interfaces
                 .iter()
                 .flatten()
                 .any(|interface| interface.device_id == device_id)
         {
+            let disconnected_profile = removed.and_then(|interface| interface.input_profile_id);
+            if let Some(profile_id) = disconnected_profile
+                && !self
+                    .usb_interfaces
+                    .iter()
+                    .flatten()
+                    .any(|interface| interface.input_profile_id == Some(profile_id))
+            {
+                let _ = self.input_profiles.disconnect(profile_id, self.now_ms);
+                if self.storage_health.allows_persistent_mutation() {
+                    self.push_storage_snapshot(commands, StoragePersistPriority::Lazy)?;
+                }
+            }
             self.record_history(4, device_id.0, 0, 0, 0);
             #[cfg(feature = "dual-s3-wired")]
             {
@@ -1369,6 +1383,9 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                 ManagementCommand::SetSetting { id, target, value } => {
                     let changed = self.setting_value(id, target) != Some(value);
                     if self.set_setting(id, target, value) {
+                        if changed && let SettingTarget::Input(profile_id) = target {
+                            self.reset_profile_inputs::<COMMANDS, ACTIONS>(profile_id, commands)?;
+                        }
                         self.push_storage_snapshot(commands, StoragePersistPriority::Critical)?;
                         if changed && id == SettingId::LogLevel {
                             push_command(
@@ -1682,8 +1699,8 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         let selected = selected?;
         let name = selected.name.as_bytes();
         let offset = (name_offset as usize).min(name.len());
-        let chunk_len = (name.len() - offset).min(5);
-        let mut name_chunk = [0; 5];
+        let chunk_len = (name.len() - offset).min(4);
+        let mut name_chunk = [0; 4];
         name_chunk[..chunk_len].copy_from_slice(&name[offset..offset + chunk_len]);
         let mut flags = selected.flags | 0x01;
         for interface in self.usb_interfaces.iter().flatten() {
@@ -1697,6 +1714,7 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             flags,
             vendor_id: selected.vendor_id,
             product_id: selected.product_id,
+            input_profile_id: selected.input_profile_id?,
             name_len: name.len().min(u8::MAX as usize) as u8,
             name_offset,
             name_chunk_len: chunk_len as u8,
@@ -1709,7 +1727,7 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         if descriptor.scope
             != match target {
                 SettingTarget::Global => SettingScope::Global,
-                SettingTarget::Host(_) => SettingScope::Host,
+                SettingTarget::Input(_) => SettingScope::Input,
             }
         {
             return None;
@@ -1737,8 +1755,8 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                 self.global_settings.button_very_long_action as i32
             }
             (SettingId::LogLevel, SettingTarget::Global) => self.global_settings.log_level as i32,
-            (id, SettingTarget::Host(host)) => {
-                let settings = self.host_settings.get(host.0.checked_sub(1)? as usize)?;
+            (id, SettingTarget::Input(profile_id)) => {
+                let settings = self.input_profiles.get(profile_id)?.settings;
                 match id {
                     SettingId::KeyboardLayout => settings.keyboard_layout as i32,
                     SettingId::RemapFromUsage => settings.remap_from_usage as i32,
@@ -1783,14 +1801,11 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             (SettingId::LogLevel, SettingTarget::Global) => {
                 self.global_settings.log_level = value as u8;
             }
-            (id, SettingTarget::Host(host)) => {
-                let Some(settings) = host
-                    .0
-                    .checked_sub(1)
-                    .and_then(|index| self.host_settings.get_mut(index as usize))
-                else {
+            (id, SettingTarget::Input(profile_id)) => {
+                let Some(profile) = self.input_profiles.get_mut(profile_id) else {
                     return false;
                 };
+                let settings = &mut profile.settings;
                 match id {
                     SettingId::KeyboardLayout => settings.keyboard_layout = value as u8,
                     SettingId::RemapFromUsage => settings.remap_from_usage = value as u8,
@@ -1822,9 +1837,7 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         self.storage_generation = self.storage_generation.wrapping_add(1);
         let mut state = self.bridge.storage_state(self.storage_generation)?;
         state.global_settings = self.global_settings;
-        for (destination, source) in state.host_settings.iter_mut().zip(self.host_settings) {
-            *destination = source;
-        }
+        state.input_profiles = self.input_profiles.clone();
         push_command(commands, RuntimeCommand::PersistStorage { state, priority })
     }
 
@@ -2074,17 +2087,14 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                 report,
                 reason,
             } => match target {
-                OutputTarget::Ble(host_id) => {
-                    let report = self.apply_host_report_settings(host_id, report.into());
-                    push_command(
-                        commands,
-                        RuntimeCommand::BleCommand(BleTaskCommand::Notify {
-                            host_id,
-                            report,
-                            reason,
-                        }),
-                    )
-                }
+                OutputTarget::Ble(host_id) => push_command(
+                    commands,
+                    RuntimeCommand::BleCommand(BleTaskCommand::Notify {
+                        host_id,
+                        report: report.into(),
+                        reason,
+                    }),
+                ),
                 OutputTarget::Wired => {
                     #[cfg(feature = "dual-s3-wired")]
                     {
@@ -2187,77 +2197,6 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         }
     }
 
-    /// Raw USB usages remain owned by `Bridge`; host-specific conversion is
-    /// deliberately delayed until the BLE report leaves the runtime.
-    fn apply_host_report_settings(
-        &mut self,
-        host_id: HostId,
-        report: BleHidReport,
-    ) -> BleHidReport {
-        let Some(index) = host_id.0.checked_sub(1).map(usize::from) else {
-            return report;
-        };
-        let Some(settings) = self.host_settings.get(index).copied() else {
-            return report;
-        };
-        match report {
-            BleHidReport::Keyboard(report) => {
-                let mut bytes = *report.as_bytes();
-                for usage in &mut bytes[2..] {
-                    let layout_usage = match (settings.keyboard_layout, *usage) {
-                        (1, 0x89) => 0x35,
-                        (2, 0x35) => 0x89,
-                        _ => *usage,
-                    };
-                    *usage = if layout_usage == settings.remap_from_usage
-                        && settings.remap_from_usage != 0
-                    {
-                        settings.remap_to_usage
-                    } else {
-                        layout_usage
-                    };
-                }
-                BleHidReport::Keyboard(BleKeyboard6KroReport::from_bytes(bytes))
-            }
-            BleHidReport::Consumer(report) => {
-                let usage = u16::from_le_bytes(*report.as_bytes());
-                let usage =
-                    if usage == settings.consumer_from_usage && settings.consumer_from_usage != 0 {
-                        settings.consumer_to_usage
-                    } else {
-                        usage
-                    };
-                BleHidReport::Consumer(BleConsumerReport::from_usage_id(usage))
-            }
-            BleHidReport::Mouse(report) => {
-                let mut bytes = *report.as_bytes();
-                if let Some(remainders) = self.mouse_scale_remainders.get_mut(index) {
-                    bytes[1] = scale_axis_with_remainder(
-                        bytes[1] as i8,
-                        settings.mouse_sensitivity_percent,
-                        &mut remainders.x,
-                    ) as u8;
-                    bytes[2] = scale_axis_with_remainder(
-                        bytes[2] as i8,
-                        settings.mouse_sensitivity_percent,
-                        &mut remainders.y,
-                    ) as u8;
-                    bytes[3] = scale_axis_with_remainder(
-                        bytes[3] as i8,
-                        settings.scroll_multiplier_percent,
-                        &mut remainders.wheel,
-                    ) as u8;
-                    bytes[4] = scale_axis_with_remainder(
-                        bytes[4] as i8,
-                        settings.scroll_multiplier_percent,
-                        &mut remainders.pan,
-                    ) as u8;
-                }
-                BleHidReport::Mouse(BleMouseReport::from_bytes(bytes))
-            }
-        }
-    }
-
     fn next_status_snapshot(&mut self, status: BridgeStatus) -> StatusSnapshot {
         self.status_sequence = self.status_sequence.wrapping_add(1);
         let mut connected_hosts = 0u8;
@@ -2293,6 +2232,7 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                 product_id: 0,
                 name: FixedName::empty(),
                 flags: if led_output.is_some() { 0x02 } else { 0 },
+                input_profile_id: None,
             });
             return Ok(());
         }
@@ -2308,6 +2248,7 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             product_id: 0,
             name: FixedName::empty(),
             flags: if led_output.is_some() { 0x02 } else { 0 },
+            input_profile_id: None,
         });
         Ok(())
     }
@@ -2321,6 +2262,51 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         self.usb_interfaces
             .iter()
             .position(|state| matches!(state, Some(state) if state.interface_id == interface_id))
+    }
+
+    fn input_profile_for_device(&self, device_id: DeviceId) -> Option<InputProfileId> {
+        self.usb_interfaces
+            .iter()
+            .flatten()
+            .find(|interface| interface.device_id == device_id)
+            .and_then(|interface| interface.input_profile_id)
+    }
+
+    fn reset_profile_inputs<const COMMANDS: usize, const ACTIONS: usize>(
+        &mut self,
+        profile_id: InputProfileId,
+        commands: &mut heapless::Vec<RuntimeCommand, COMMANDS>,
+    ) -> Result<(), RuntimeError> {
+        if let Some(profile) = self.input_profiles.get_mut(profile_id) {
+            profile.reset_transform_state();
+        }
+        let mut devices = heapless::Vec::<DeviceId, USB_INTERFACES>::new();
+        for interface in self.usb_interfaces.iter().flatten() {
+            if interface.input_profile_id == Some(profile_id)
+                && !devices.contains(&interface.device_id)
+            {
+                let _ = devices.push(interface.device_id);
+            }
+        }
+        for device_id in devices {
+            self.handle_bridge_event_append::<COMMANDS, ACTIONS>(
+                BridgeEvent::ResetInputDevice { device_id },
+                commands,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn transform_input_frame(&mut self, frame: &mut crate::input::InputFrame) {
+        let crate::input::InputFrame::Standard(frame) = frame else {
+            return;
+        };
+        let Some(profile_id) = self.input_profile_for_device(frame.device_id) else {
+            return;
+        };
+        if let Some(profile) = self.input_profiles.get_mut(profile_id) {
+            profile.transform(frame);
+        }
     }
 }
 
@@ -2355,6 +2341,7 @@ pub struct UsbHidInterfaceRuntimeState {
     pub product_id: u16,
     pub name: FixedName,
     pub flags: u8,
+    pub input_profile_id: Option<InputProfileId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2901,6 +2888,7 @@ pub type DefaultRuntimeCommandQueues = RuntimeCommandQueues<
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeError {
+    InputProfileCapacity,
     Bridge(BridgeError),
     Storage(StorageError),
     UsbLed(KeyboardLedOutputError),
@@ -2974,17 +2962,6 @@ const fn management_command_requires_storage(command: &ManagementCommand) -> boo
         | ManagementCommand::ClearMirrorTarget => true,
         _ => false,
     }
-}
-
-fn scale_axis_with_remainder(value: i8, percent: u16, remainder: &mut i32) -> i8 {
-    if value == 0 {
-        return 0;
-    }
-    let scaled = remainder.saturating_add(i32::from(value) * i32::from(percent));
-    let available = scaled / 100;
-    let output = available.clamp(i8::MIN as i32, i8::MAX as i32) as i8;
-    *remainder = scaled - i32::from(output) * 100;
-    output
 }
 
 #[cfg(test)]
@@ -3077,6 +3054,10 @@ mod tests {
     #[test]
     fn unavailable_storage_rejects_persistent_management_mutations() {
         let mut runtime = BridgeRuntime::<4, 1>::new(0);
+        let profile = runtime
+            .input_profiles
+            .observe(InputIdentity::from_port_path(1, 2, &[1]), 0)
+            .unwrap();
         let mut commands = heapless::Vec::<RuntimeCommand, 12>::new();
         runtime
             .handle_input::<12, 12, 2>(
@@ -3090,7 +3071,7 @@ mod tests {
                 management_request(
                     ManagementCommand::SetSetting {
                         id: SettingId::MouseSensitivityPercent,
-                        target: SettingTarget::Host(HostId(2)),
+                        target: SettingTarget::Input(profile),
                         value: 175,
                     },
                     1,
@@ -3111,7 +3092,7 @@ mod tests {
         assert_eq!(
             runtime.setting_value(
                 SettingId::MouseSensitivityPercent,
-                SettingTarget::Host(HostId(2))
+                SettingTarget::Input(profile)
             ),
             Some(100)
         );
@@ -3210,7 +3191,11 @@ mod tests {
     fn management_generated_settings_validate_persist_and_restore() {
         let mut runtime = BridgeRuntime::<4, 1>::new(0);
         let mut commands = heapless::Vec::<RuntimeCommand, 12>::new();
-        let target = SettingTarget::Host(HostId(2));
+        let profile = runtime
+            .input_profiles
+            .observe(InputIdentity::from_port_path(1, 2, &[1]), 0)
+            .unwrap();
+        let target = SettingTarget::Input(profile);
         runtime
             .handle_input::<12, 12, 2>(
                 management_request(
@@ -3235,7 +3220,15 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        assert_eq!(snapshot.host_settings[1].mouse_sensitivity_percent, 175);
+        assert_eq!(
+            snapshot
+                .input_profiles
+                .get(profile)
+                .unwrap()
+                .settings
+                .mouse_sensitivity_percent,
+            175
+        );
 
         runtime
             .handle_input::<12, 12, 2>(
@@ -3297,6 +3290,7 @@ mod tests {
                     device_id: DeviceId(9),
                     vendor_id: 0x1234,
                     product_id: 0xabcd,
+                    instance_hash: 7,
                     name: FixedName::from_ascii("Mechanical Keyboard").unwrap(),
                     flags: 0x02,
                 },
@@ -3341,7 +3335,7 @@ mod tests {
         };
         assert_eq!(device.vendor_id, 0x1234);
         assert_eq!(device.product_id, 0xabcd);
-        assert_eq!(device.name_chunk(), b"nical");
+        assert_eq!(device.name_chunk(), b"nica");
 
         runtime
             .handle_input::<12, 12, 2>(
@@ -5017,282 +5011,117 @@ mod tests {
         }
     }
 
-    #[test]
-    fn keyboard_layout_normalizes_jis_yen_and_us_grave_usages() {
-        let mut runtime = ready_runtime();
-        runtime.host_settings[0].keyboard_layout = 1;
-        let mut commands = heapless::Vec::<RuntimeCommand, 8>::new();
-        runtime
-            .handle_input::<8, 8, 2>(
-                RuntimeInput::BridgeEvent(BridgeEvent::InputFrame(
-                    crate::input::InputFrame::Standard(keyboard_input(KeyUsage(0x89))),
-                )),
-                &mut commands,
-            )
-            .unwrap();
-        assert!(commands.iter().any(|command| matches!(
-            command,
-            RuntimeCommand::BleCommand(BleTaskCommand::Notify {
-                report: BleHidReport::Keyboard(report),
-                ..
-            }) if report.as_bytes()[2] == 0x35
-        )));
-        assert_eq!(
-            runtime.bridge.state().input.keyboard.keys(),
-            &[KeyUsage(0x89)]
-        );
-
-        runtime.host_settings[0].keyboard_layout = 2;
-        runtime
-            .handle_input::<8, 8, 2>(
-                RuntimeInput::BridgeEvent(BridgeEvent::InputFrame(
-                    crate::input::InputFrame::Standard(keyboard_input(KeyUsage(0x35))),
-                )),
-                &mut commands,
-            )
-            .unwrap();
-        assert!(commands.iter().any(|command| matches!(
-            command,
-            RuntimeCommand::BleCommand(BleTaskCommand::Notify {
-                report: BleHidReport::Keyboard(report),
-                ..
-            }) if report.as_bytes()[2] == 0x89
-        )));
-        assert_eq!(
-            runtime.bridge.state().input.keyboard.keys(),
-            &[KeyUsage(0x35)]
-        );
-    }
-
-    #[test]
-    fn mouse_scaling_preserves_signed_fractional_movement_per_host_and_axis() {
-        let mut runtime = BridgeRuntime::<2, 0>::new(0);
-        runtime.host_settings[0].mouse_sensitivity_percent = 50;
-        runtime.host_settings[0].scroll_multiplier_percent = 50;
-        runtime.host_settings[1].mouse_sensitivity_percent = 50;
-        runtime.host_settings[1].scroll_multiplier_percent = 50;
-
-        let input = BleHidReport::Mouse(BleMouseReport::from_bytes([0, 1, 255, 1, 255]));
-        let first = runtime.apply_host_report_settings(HostId(1), input);
-        let second = runtime.apply_host_report_settings(HostId(1), input);
-        let other_host_first = runtime.apply_host_report_settings(HostId(2), input);
-
-        let BleHidReport::Mouse(first) = first else {
-            panic!("mouse report");
-        };
-        let BleHidReport::Mouse(second) = second else {
-            panic!("mouse report");
-        };
-        let BleHidReport::Mouse(other_host_first) = other_host_first else {
-            panic!("mouse report");
-        };
-        assert_eq!(first.as_bytes(), &[0, 0, 0, 0, 0]);
-        assert_eq!(second.as_bytes(), &[0, 1, 255, 1, 255]);
-        assert_eq!(other_host_first.as_bytes(), &[0, 0, 0, 0, 0]);
-    }
-
-    #[test]
-    fn held_raw_usage_is_suppressed_across_hosts_with_different_maps() {
-        let mut runtime = ready_runtime();
+    fn attach_input_profile(
+        runtime: &mut BridgeRuntime<2, 2>,
+        device_id: DeviceId,
+        interface_id: InterfaceId,
+        instance_hash: u64,
+        flags: u8,
+    ) -> InputProfileId {
         let mut commands = heapless::Vec::<RuntimeCommand, 16>::new();
-        runtime.host_settings[0].keyboard_layout = 1;
-        runtime.host_settings[0].consumer_from_usage = 0x00e9;
-        runtime.host_settings[0].consumer_to_usage = 0x00cd;
+        runtime
+            .handle_input::<16, 16, 2>(
+                RuntimeInput::UsbHidInterfaceConnected {
+                    interface_id,
+                    device_id,
+                    led_output: None,
+                },
+                &mut commands,
+            )
+            .unwrap();
+        runtime
+            .handle_input::<16, 16, 2>(
+                RuntimeInput::UsbDeviceMetadataUpdated {
+                    device_id,
+                    vendor_id: 0x1234,
+                    product_id: 0xabcd,
+                    instance_hash,
+                    name: FixedName::empty(),
+                    flags,
+                },
+                &mut commands,
+            )
+            .unwrap();
+        runtime.input_profile_for_device(device_id).unwrap()
+    }
+
+    #[test]
+    fn composite_interfaces_share_one_input_profile_and_transform_before_aggregation() {
+        let mut runtime = BridgeRuntime::<2, 2>::new(0);
+        let first = attach_input_profile(&mut runtime, DeviceId(1), InterfaceId(1), 7, 0x02);
+        let second = attach_input_profile(&mut runtime, DeviceId(1), InterfaceId(2), 7, 0x02);
+        assert_eq!(first, second);
+        let settings = &mut runtime.input_profiles.get_mut(first).unwrap().settings;
+        settings.remap_from_usage = 4;
+        settings.remap_to_usage = 5;
+
+        let mut frame = keyboard_input(KeyUsage(4));
+        frame.interface_id = InterfaceId(2);
+        let mut input = crate::input::InputFrame::Standard(frame);
+        runtime.transform_input_frame(&mut input);
+        let crate::input::InputFrame::Standard(frame) = input else {
+            panic!()
+        };
+        assert_eq!(frame.keyboard.unwrap().keys_down(), &[KeyUsage(5)]);
+    }
+
+    #[test]
+    fn input_setting_change_releases_held_state_and_resets_the_device() {
+        let mut runtime = BridgeRuntime::<2, 2>::new(0);
+        let mut commands = heapless::Vec::<RuntimeCommand, 16>::new();
         for event in [
-            BridgeEvent::HostConnected { host_id: HostId(2) },
+            BridgeEvent::HostConnected { host_id: HostId(1) },
             BridgeEvent::HostSecurityChanged {
-                host_id: HostId(2),
+                host_id: HostId(1),
                 encrypted: true,
                 bonded: true,
                 bond: None,
             },
             BridgeEvent::CccdChanged {
-                host_id: HostId(2),
+                host_id: HostId(1),
                 report: ReportKind::Keyboard,
                 enabled: true,
             },
-            BridgeEvent::CccdChanged {
-                host_id: HostId(2),
-                report: ReportKind::Consumer,
-                enabled: true,
-            },
+            BridgeEvent::SwitchTarget { target: HostId(1) },
         ] {
             runtime
                 .handle_event::<16, 16>(event, &mut commands)
                 .unwrap();
         }
-
+        let profile = attach_input_profile(&mut runtime, DeviceId(1), InterfaceId(1), 8, 0x02);
         runtime
-            .handle_event::<16, 16>(
-                BridgeEvent::InputFrame(crate::input::InputFrame::Standard(keyboard_input(
-                    KeyUsage(0x89),
-                ))),
+            .handle_input::<16, 16, 2>(
+                RuntimeInput::BridgeEvent(BridgeEvent::InputFrame(
+                    crate::input::InputFrame::Standard(keyboard_input(KeyUsage(4))),
+                )),
                 &mut commands,
             )
             .unwrap();
+        assert_eq!(runtime.bridge.state().input.keyboard.keys(), &[KeyUsage(4)]);
+
+        runtime
+            .handle_input::<16, 16, 2>(
+                management_request(
+                    ManagementCommand::SetSetting {
+                        id: SettingId::KeyboardLayout,
+                        target: SettingTarget::Input(profile),
+                        value: 1,
+                    },
+                    9,
+                ),
+                &mut commands,
+            )
+            .unwrap();
+
+        assert!(runtime.bridge.state().input.keyboard.keys().is_empty());
         assert!(commands.iter().any(|command| matches!(
             command,
             RuntimeCommand::BleCommand(BleTaskCommand::Notify {
                 report: BleHidReport::Keyboard(report),
-                ..
-            }) if report.as_bytes()[2] == 0x35
-        )));
-        assert_eq!(
-            runtime.bridge.state().input.keyboard.keys(),
-            &[KeyUsage(0x89)]
-        );
-
-        runtime
-            .handle_event::<16, 16>(
-                BridgeEvent::SwitchTarget { target: HostId(2) },
-                &mut commands,
-            )
-            .unwrap();
-        runtime
-            .handle_event::<16, 16>(
-                BridgeEvent::InputFrame(crate::input::InputFrame::Standard(keyboard_input(
-                    KeyUsage(0x89),
-                ))),
-                &mut commands,
-            )
-            .unwrap();
-        assert!(commands.iter().any(|command| matches!(
-            command,
-            RuntimeCommand::BleCommand(BleTaskCommand::Notify {
-                host_id: HostId(2),
-                report: BleHidReport::Keyboard(report),
+                reason: NotifyReason::UsbDeviceRemovedRelease,
                 ..
             }) if report == &BleKeyboard6KroReport::release()
         )));
-
-        let mut released = keyboard_input(KeyUsage(0x89));
-        released.keyboard = Some(KeyboardFrame::new(ModifierState::empty()));
-        runtime
-            .handle_event::<16, 16>(
-                BridgeEvent::InputFrame(crate::input::InputFrame::Standard(released)),
-                &mut commands,
-            )
-            .unwrap();
-        runtime
-            .handle_event::<16, 16>(
-                BridgeEvent::InputFrame(crate::input::InputFrame::Standard(keyboard_input(
-                    KeyUsage(0x89),
-                ))),
-                &mut commands,
-            )
-            .unwrap();
-        assert!(commands.iter().any(|command| matches!(
-            command,
-            RuntimeCommand::BleCommand(BleTaskCommand::Notify {
-                host_id: HostId(2),
-                report: BleHidReport::Keyboard(report),
-                ..
-            }) if report.as_bytes()[2] == 0x89
-        )));
-    }
-
-    #[test]
-    fn held_consumer_usage_is_suppressed_across_hosts_with_different_maps() {
-        let mut runtime = ready_runtime();
-        let mut commands = heapless::Vec::<RuntimeCommand, 16>::new();
-        runtime.host_settings[0].consumer_from_usage = 0x00e9;
-        runtime.host_settings[0].consumer_to_usage = 0x00cd;
-        for event in [
-            BridgeEvent::HostConnected { host_id: HostId(2) },
-            BridgeEvent::HostSecurityChanged {
-                host_id: HostId(2),
-                encrypted: true,
-                bonded: true,
-                bond: None,
-            },
-            BridgeEvent::CccdChanged {
-                host_id: HostId(2),
-                report: ReportKind::Consumer,
-                enabled: true,
-            },
-            BridgeEvent::CccdChanged {
-                host_id: HostId(2),
-                report: ReportKind::Keyboard,
-                enabled: true,
-            },
-        ] {
-            runtime
-                .handle_event::<16, 16>(event, &mut commands)
-                .unwrap();
-        }
-
-        runtime
-            .handle_event::<16, 16>(
-                BridgeEvent::InputFrame(crate::input::InputFrame::Standard(consumer_input(Some(
-                    0x00e9,
-                )))),
-                &mut commands,
-            )
-            .unwrap();
-        assert!(commands.iter().any(|command| matches!(
-            command,
-            RuntimeCommand::BleCommand(BleTaskCommand::Notify {
-                host_id: HostId(1),
-                report: BleHidReport::Consumer(report),
-                ..
-            }) if report.as_bytes() == &0x00cdu16.to_le_bytes()
-        )));
-
-        runtime
-            .handle_event::<16, 16>(
-                BridgeEvent::SwitchTarget { target: HostId(2) },
-                &mut commands,
-            )
-            .unwrap();
-        runtime
-            .handle_event::<16, 16>(
-                BridgeEvent::InputFrame(crate::input::InputFrame::Standard(consumer_input(Some(
-                    0x00e9,
-                )))),
-                &mut commands,
-            )
-            .unwrap();
-        assert!(!commands.iter().any(|command| matches!(
-            command,
-            RuntimeCommand::BleCommand(BleTaskCommand::Notify {
-                host_id: HostId(2),
-                report: BleHidReport::Consumer(report),
-                ..
-            }) if report.as_bytes() != &[0, 0]
-        )));
-
-        runtime
-            .handle_event::<16, 16>(
-                BridgeEvent::InputFrame(crate::input::InputFrame::Standard(consumer_input(None))),
-                &mut commands,
-            )
-            .unwrap();
-        runtime
-            .handle_event::<16, 16>(
-                BridgeEvent::InputFrame(crate::input::InputFrame::Standard(consumer_input(Some(
-                    0x00e9,
-                )))),
-                &mut commands,
-            )
-            .unwrap();
-        assert!(commands.iter().any(|command| matches!(
-            command,
-            RuntimeCommand::BleCommand(BleTaskCommand::Notify {
-                host_id: HostId(2),
-                report: BleHidReport::Consumer(report),
-                ..
-            }) if report.as_bytes() == &0x00e9u16.to_le_bytes()
-        )));
-    }
-
-    #[test]
-    fn one_hundred_fifty_percent_scaling_preserves_small_report_sum() {
-        let mut remainder = 0;
-        let output: i32 = (0..4)
-            .map(|_| i32::from(scale_axis_with_remainder(1, 150, &mut remainder)))
-            .sum();
-        assert_eq!(output, 6);
-        assert_eq!(remainder, 0);
     }
 
     #[test]
@@ -5889,18 +5718,6 @@ mod tests {
             keyboard: Some(frame),
             mouse: None,
             consumer: None,
-        }
-    }
-
-    fn consumer_input(active: Option<u16>) -> crate::input::StandardInputFrame {
-        crate::input::StandardInputFrame {
-            device_id: DeviceId(1),
-            interface_id: InterfaceId(2),
-            keyboard: None,
-            mouse: None,
-            consumer: Some(crate::input::ConsumerFrame {
-                active: active.map(crate::input::ConsumerUsage),
-            }),
         }
     }
 }

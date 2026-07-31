@@ -33,6 +33,9 @@ host info/name/timing, USB device chunks, diagnostics, history, schema, and
 setting get/set. Response payloads are explicitly tagged and never inferred
 from an opcode. Result codes distinguish invalid host, missing host, existing
 bond, invalid name, invalid setting, missing indexed item, and internal errors.
+USB device payloads include the input profile ID used as the target for
+input-scoped settings. Only connected USB devices are enumerated; profiles are
+retained independently for reconnection.
 
 When schema capability bit 0 (`dual_s3_wired`) is set, clients may also use
 `SELECT_OUTPUT_TARGET`, `GET_OUTPUT_TARGET_STATUS`, `GET_MIRROR_CANDIDATE`,
@@ -54,12 +57,10 @@ keys are not used as persistent identifiers.
 
 ## Product domains and synchronization
 
-The `experimental-domain` feature contains a host-tested future model supporting
-node (Host or Device), up to eight
-remembered destinations, four transient sessions, up to eight remembered input
-profiles, and a Wired compatibility mode of Standard or Original USB device.
-The shipping fixed-message adapter has not yet migrated its four host slots to
-this model, so production firmware deliberately does not compile or export it.
+Input profiles are part of the normal core and retain settings for up to eight
+physical USB devices. Input setting targets are profile IDs, not BLE destination
+slots. The remaining `experimental-domain` types cover future destination and
+firmware-update synchronization work.
 
 The revision codec represents changes with a domain mask and wrapping revisions
 for summary, sessions, destinations, inputs, system, wired, and support. The Web

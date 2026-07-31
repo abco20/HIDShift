@@ -388,10 +388,9 @@ async fn handle_hub_device_detected<'d>(
                     child_device_id,
                     &child_info,
                     child_config_desc,
+                    &[port + 1],
                     #[cfg(feature = "dual-s3-wired")]
                     MirrorCandidateId(port_index as u8),
-                    #[cfg(feature = "dual-s3-wired")]
-                    &[port + 1],
                     #[cfg(feature = "dual-s3-wired")]
                     mirror_capture,
                 )
@@ -847,10 +846,9 @@ pub async fn usb_input_task(
             device_id,
             &enum_info,
             config_desc,
+            &[0],
             #[cfg(feature = "dual-s3-wired")]
             MirrorCandidateId(0),
-            #[cfg(feature = "dual-s3-wired")]
-            &[0],
             #[cfg(feature = "dual-s3-wired")]
             mirror_capture,
         )
@@ -1198,13 +1196,35 @@ async fn attach_hid_interfaces_for_device<'d>(
     device_id: DeviceId,
     enum_info: &embassy_usb_host::handler::EnumerationInfo,
     config_desc: &[u8],
+    physical_port_path: &[u8],
     #[cfg(feature = "dual-s3-wired")] mirror_candidate: MirrorCandidateId,
-    #[cfg(feature = "dual-s3-wired")] mirror_port_path: &[u8],
     #[cfg(feature = "dual-s3-wired")] mirror_capture: &mut MirrorCaptureScratch,
 ) -> Result<(), ()> {
     let product_name = read_usb_product_name(bus_handle, enum_info)
         .await
         .unwrap_or_else(FixedName::empty);
+    let identity =
+        match read_usb_string_units(bus_handle, enum_info, enum_info.device_desc.serial_number)
+            .await
+        {
+            Some(serial) if !serial.is_empty() => hidshift::InputIdentity::from_serial_utf16(
+                enum_info.device_desc.vendor_id,
+                enum_info.device_desc.product_id,
+                &serial,
+            )
+            .unwrap_or_else(|| {
+                hidshift::InputIdentity::from_port_path(
+                    enum_info.device_desc.vendor_id,
+                    enum_info.device_desc.product_id,
+                    physical_port_path,
+                )
+            }),
+            _ => hidshift::InputIdentity::from_port_path(
+                enum_info.device_desc.vendor_id,
+                enum_info.device_desc.product_id,
+                physical_port_path,
+            ),
+        };
     let hid_interfaces = match find_hid_interfaces::<8>(config_desc) {
         Ok(interfaces) if !interfaces.is_empty() => interfaces,
         Ok(_) => {
@@ -1419,6 +1439,7 @@ async fn attach_hid_interfaces_for_device<'d>(
                 device_id,
                 vendor_id: enum_info.device_desc.vendor_id,
                 product_id: enum_info.device_desc.product_id,
+                instance_hash: identity.instance_hash,
                 name: product_name,
                 flags: session.device_kind_flags(),
             })
@@ -1449,7 +1470,7 @@ async fn attach_hid_interfaces_for_device<'d>(
         enum_info,
         config_desc,
         mirror_candidate,
-        mirror_port_path,
+        physical_port_path,
         mirror_capture,
     )
     .await
@@ -1460,6 +1481,7 @@ async fn attach_hid_interfaces_for_device<'d>(
                     device_id,
                     vendor_id: enum_info.device_desc.vendor_id,
                     product_id: enum_info.device_desc.product_id,
+                    instance_hash: identity.instance_hash,
                     name: product_name,
                     flags: 0x10,
                 })
@@ -1757,7 +1779,27 @@ async fn read_usb_product_name<'d>(
     bus_handle: &FirmwareBusHandle<'d>,
     enum_info: &embassy_usb_host::handler::EnumerationInfo,
 ) -> Option<FixedName> {
-    let string_index = enum_info.device_desc.product;
+    let units = read_usb_string_units(bus_handle, enum_info, enum_info.device_desc.product).await?;
+    let mut ascii = heapless::Vec::<u8, 32>::new();
+    for code in units {
+        ascii
+            .push(if (0x20..=0x7e).contains(&code) {
+                code as u8
+            } else {
+                b'?'
+            })
+            .ok()?;
+    }
+    core::str::from_utf8(&ascii)
+        .ok()
+        .and_then(FixedName::from_ascii)
+}
+
+async fn read_usb_string_units<'d>(
+    bus_handle: &FirmwareBusHandle<'d>,
+    enum_info: &embassy_usb_host::handler::EnumerationInfo,
+    string_index: u8,
+) -> Option<heapless::Vec<u16, 32>> {
     if string_index == 0 {
         return None;
     }
@@ -1815,26 +1857,15 @@ async fn read_usb_product_name<'d>(
         return None;
     }
     let descriptor_len = usize::from(descriptor[0]).min(length).min(descriptor.len());
-    let mut ascii = [0u8; hidshift::storage::MAX_HOST_NAME_LEN];
-    let mut ascii_len = 0usize;
+    let mut units = heapless::Vec::<u16, 32>::new();
     for unit in descriptor[2..descriptor_len].chunks_exact(2) {
-        if ascii_len == ascii.len() {
-            break;
-        }
         let code = u16::from_le_bytes([unit[0], unit[1]]);
         if code == 0 {
             break;
         }
-        ascii[ascii_len] = if (0x20..=0x7e).contains(&code) {
-            code as u8
-        } else {
-            b'?'
-        };
-        ascii_len += 1;
+        units.push(code).ok()?;
     }
-    core::str::from_utf8(&ascii[..ascii_len])
-        .ok()
-        .and_then(FixedName::from_ascii)
+    Some(units)
 }
 
 async fn fetch_report_descriptor_with_retries<'d>(

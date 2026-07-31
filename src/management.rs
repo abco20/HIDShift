@@ -1,6 +1,7 @@
 pub mod frame;
 
 use crate::ids::HostId;
+use crate::input_profile::InputProfileId;
 #[cfg(feature = "dual-s3-wired")]
 use crate::output_target::{OutputTarget, OutputTargetAvailability, UsbPresentation};
 use crate::settings::{SettingId, SettingTarget};
@@ -400,7 +401,8 @@ impl ManagementResponse {
                 bytes[12] = device.name_len;
                 bytes[13] = device.name_offset;
                 bytes[14] = device.name_chunk_len;
-                bytes[15..20].copy_from_slice(&device.name_chunk);
+                bytes[15] = device.input_profile_id.get();
+                bytes[16..20].copy_from_slice(&device.name_chunk);
             }
             ManagementResponsePayload::Diagnostics(diagnostics) => {
                 bytes[3] = PAYLOAD_DIAGNOSTICS;
@@ -534,9 +536,9 @@ impl ManagementResponse {
                 })
             }
             (PAYLOAD_USB_DEVICE, USB_DEVICE_PAYLOAD_LEN) => {
-                let mut name_chunk = [0; 5];
-                name_chunk.copy_from_slice(&bytes[15..20]);
-                if bytes[14] > 5 || bytes[13].saturating_add(bytes[14]) > bytes[12] {
+                let mut name_chunk = [0; 4];
+                name_chunk.copy_from_slice(&bytes[16..20]);
+                if bytes[14] > 4 || bytes[13].saturating_add(bytes[14]) > bytes[12] {
                     return Err(ManagementProtocolError::InvalidArgument);
                 }
                 ManagementResponsePayload::UsbDevice(ManagementUsbDevice {
@@ -545,6 +547,8 @@ impl ManagementResponse {
                     flags: bytes[7],
                     vendor_id: u16::from_le_bytes([bytes[8], bytes[9]]),
                     product_id: u16::from_le_bytes([bytes[10], bytes[11]]),
+                    input_profile_id: InputProfileId::new(bytes[15])
+                        .ok_or(ManagementProtocolError::InvalidArgument)?,
                     name_len: bytes[12],
                     name_offset: bytes[13],
                     name_chunk_len: bytes[14],
@@ -804,7 +808,7 @@ pub struct ManagementUsbStatus {
     pub keyboard_count: u8,
 }
 
-pub const MANAGEMENT_USB_NAME_CHUNK_LEN: usize = 5;
+pub const MANAGEMENT_USB_NAME_CHUNK_LEN: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ManagementUsbDevice {
@@ -814,6 +818,7 @@ pub struct ManagementUsbDevice {
     pub flags: u8,
     pub vendor_id: u16,
     pub product_id: u16,
+    pub input_profile_id: InputProfileId,
     pub name_len: u8,
     pub name_offset: u8,
     pub name_chunk_len: u8,
@@ -1009,9 +1014,9 @@ fn encode_setting_target(bytes: &mut [u8], target: SettingTarget) {
             bytes[0] = 0;
             bytes[1] = 0;
         }
-        SettingTarget::Host(host) => {
+        SettingTarget::Input(profile) => {
             bytes[0] = 1;
-            bytes[1] = host.0;
+            bytes[1] = profile.get();
         }
     }
 }
@@ -1019,7 +1024,9 @@ fn encode_setting_target(bytes: &mut [u8], target: SettingTarget) {
 fn decode_setting_target(scope: u8, target: u8) -> Result<SettingTarget, ManagementProtocolError> {
     match (scope, target) {
         (0, 0) => Ok(SettingTarget::Global),
-        (1, 1..=4) => Ok(SettingTarget::Host(HostId(target))),
+        (1, 1..=8) => Ok(SettingTarget::Input(
+            InputProfileId::new(target).ok_or(ManagementProtocolError::InvalidArgument)?,
+        )),
         _ => Err(ManagementProtocolError::InvalidArgument),
     }
 }
@@ -1084,7 +1091,7 @@ mod tests {
             },
             ManagementCommand::SetSetting {
                 id: SettingId::MouseSensitivityPercent,
-                target: SettingTarget::Host(HostId(2)),
+                target: SettingTarget::Input(InputProfileId::new(2).unwrap()),
                 value: 175,
             },
         ] {
@@ -1231,10 +1238,11 @@ mod tests {
                 flags: 3,
                 vendor_id: 0x1234,
                 product_id: 0xabcd,
+                input_profile_id: InputProfileId::new(2).unwrap(),
                 name_len: 8,
                 name_offset: 5,
                 name_chunk_len: 3,
-                name_chunk: *b"KBD\0\0",
+                name_chunk: *b"KBD\0",
             }),
             ManagementResponsePayload::Diagnostics(ManagementDiagnostics {
                 uptime_seconds: 123,

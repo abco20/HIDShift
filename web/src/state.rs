@@ -1,8 +1,8 @@
 use std::rc::Rc;
 
 use hidshift::{
-    HostId, MANAGEMENT_CAPABILITY_DUAL_S3_WIRED, ManagementCommand, ManagementDiagnostics,
-    ManagementHistoryEvent, ManagementHostTiming, ManagementMirrorCandidate,
+    HostId, InputProfileId, MANAGEMENT_CAPABILITY_DUAL_S3_WIRED, ManagementCommand,
+    ManagementDiagnostics, ManagementHistoryEvent, ManagementHostTiming, ManagementMirrorCandidate,
     ManagementOutputTargetStatus, ManagementResponse, ManagementResponsePayload, ManagementResult,
     ManagementSchema, ManagementStatus, MirrorCandidateId, SETTING_DESCRIPTORS, SettingDescriptor,
     SettingScope, SettingTarget,
@@ -43,6 +43,7 @@ pub(crate) struct UsbDeviceView {
     pub vendor_id: u16,
     pub product_id: u16,
     pub flags: u8,
+    pub input_profile_id: InputProfileId,
     pub name: String,
 }
 
@@ -388,11 +389,30 @@ impl AppState {
                     vendor_id: device.vendor_id,
                     product_id: device.product_id,
                     flags: device.flags,
+                    input_profile_id: device.input_profile_id,
                     name: String::from_utf8_lossy(&name).into_owned(),
                 });
             }
         }
         self.usb_devices.set(devices);
+        let mut values = Vec::new();
+        for device in self.usb_devices.get_untracked() {
+            for descriptor in SETTING_DESCRIPTORS
+                .iter()
+                .filter(|descriptor| descriptor.scope == SettingScope::Input)
+            {
+                if let Some(value) = self
+                    .get_setting(descriptor, SettingTarget::Input(device.input_profile_id))
+                    .await?
+                    && !values.iter().any(|entry: &SettingView| {
+                        entry.descriptor.id == descriptor.id && entry.target == value.target
+                    })
+                {
+                    values.push(value);
+                }
+            }
+        }
+        self.settings.set(values);
         let schema = self.load_schema().await?;
         if schema.capabilities & MANAGEMENT_CAPABILITY_DUAL_S3_WIRED != 0 {
             let mut candidates = Vec::new();
@@ -427,16 +447,7 @@ impl AppState {
                         values.push(value);
                     }
                 }
-                SettingScope::Host => {
-                    for slot in 1..=4 {
-                        if let Some(value) = self
-                            .get_setting(descriptor, SettingTarget::Host(HostId(slot)))
-                            .await?
-                        {
-                            values.push(value);
-                        }
-                    }
-                }
+                SettingScope::Input => {}
             }
         }
         self.settings.set(values);

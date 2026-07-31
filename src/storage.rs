@@ -1,20 +1,24 @@
 #[cfg(feature = "dual-s3-wired")]
 use crate::ids::HostSlot;
 use crate::ids::{HOST_SLOT_COUNT, HostId};
+use crate::input_profile::{
+    INPUT_PROFILE_CAPACITY, InputIdentity, InputProfile, InputProfileId, InputProfileRegistry,
+};
 #[cfg(feature = "dual-s3-wired")]
 use crate::output_target::{
     MIRROR_PORT_PATH_MAX_LEN, MirrorStableId, StoredMirrorTarget, StoredOutputTarget,
     StoredPresentationConfig,
 };
-use crate::settings::{GlobalSettings, HostSettings};
+use crate::settings::{GlobalSettings, InputSettings};
 
 pub const MAX_HOST_NAME_LEN: usize = 32;
 pub const STORED_HOSTS_MAX: usize = HOST_SLOT_COUNT;
 pub const STORAGE_MAGIC: [u8; 4] = *b"E32B";
 pub const STORAGE_SCHEMA_VERSION: u16 = 1;
-pub const STORAGE_IMAGE_LEN: usize = 512;
+pub const STORAGE_IMAGE_LEN: usize = 1024;
 pub const STORAGE_HEADER_LEN: usize = 16;
-pub const STORAGE_BODY_PREFIX_LEN: usize = 96;
+pub const STORAGE_BODY_PREFIX_LEN: usize = 352;
+pub const STORED_INPUT_PROFILE_LEN: usize = 36;
 pub const STORED_HOST_RECORD_LEN: usize = 88;
 pub const STORED_BOND_LEN: usize = 48;
 pub const STORAGE_FLASH_SLOT_SIZE: usize = 4096;
@@ -118,7 +122,7 @@ pub struct StorageState {
     pub generation: u32,
     pub last_active_host: Option<HostId>,
     pub global_settings: GlobalSettings,
-    pub host_settings: [HostSettings; STORED_HOSTS_MAX],
+    pub input_profiles: InputProfileRegistry,
     #[cfg(feature = "dual-s3-wired")]
     pub presentation: StoredPresentationConfig,
     hosts: heapless::Vec<StoredHostProfile, STORED_HOSTS_MAX>,
@@ -130,7 +134,7 @@ impl StorageState {
             generation,
             last_active_host: None,
             global_settings: GlobalSettings::DEFAULT,
-            host_settings: [HostSettings::DEFAULT; STORED_HOSTS_MAX],
+            input_profiles: InputProfileRegistry::new(),
             #[cfg(feature = "dual-s3-wired")]
             presentation: StoredPresentationConfig::DEFAULT,
             hosts: heapless::Vec::new(),
@@ -533,14 +537,18 @@ pub fn encode_storage_image(state: &StorageState) -> Result<[u8; STORAGE_IMAGE_L
     image[16] = state.hosts.len() as u8;
     image[17] = state.last_active_host.map_or(0xff, |host| host.0);
     encode_global_settings(state.global_settings, &mut image[18..30]);
+    image[30] = state.input_profiles.profiles().len() as u8;
     #[cfg(feature = "dual-s3-wired")]
     {
-        encode_output_target(state.presentation.output_target, &mut image[30..31]);
-        encode_mirror_target(state.presentation.mirror_target, &mut image[80..104]);
+        encode_output_target(state.presentation.output_target, &mut image[32..33]);
+        encode_mirror_target(state.presentation.mirror_target, &mut image[40..64]);
     }
-    for (index, settings) in state.host_settings.iter().copied().enumerate() {
-        let offset = 32 + index * 12;
-        encode_host_settings(settings, &mut image[offset..offset + 12]);
+    for (index, profile) in state.input_profiles.profiles().iter().enumerate() {
+        let offset = 64 + index * STORED_INPUT_PROFILE_LEN;
+        encode_input_profile(
+            profile,
+            &mut image[offset..offset + STORED_INPUT_PROFILE_LEN],
+        );
     }
 
     for (index, host) in state.hosts.iter().copied().enumerate() {
@@ -592,16 +600,24 @@ pub fn decode_storage_image(image: &[u8]) -> Result<StorageState, StorageError> 
         id => Some(HostId(id)),
     };
     state.global_settings = decode_global_settings(&image[18..30])?;
+    let input_profile_count = image[30] as usize;
+    if input_profile_count > INPUT_PROFILE_CAPACITY {
+        return Err(StorageError::InvalidLength);
+    }
     #[cfg(feature = "dual-s3-wired")]
     {
         state.presentation = StoredPresentationConfig {
-            output_target: decode_output_target(&image[30..31])?,
-            mirror_target: decode_mirror_target(&image[80..104])?,
+            output_target: decode_output_target(&image[32..33])?,
+            mirror_target: decode_mirror_target(&image[40..64])?,
         };
     }
-    for index in 0..STORED_HOSTS_MAX {
-        let offset = 32 + index * 12;
-        state.host_settings[index] = decode_host_settings(&image[offset..offset + 12])?;
+    for index in 0..input_profile_count {
+        let offset = 64 + index * STORED_INPUT_PROFILE_LEN;
+        let profile = decode_input_profile(&image[offset..offset + STORED_INPUT_PROFILE_LEN])?;
+        state
+            .input_profiles
+            .restore(profile)
+            .map_err(|_| StorageError::InvalidLength)?;
     }
 
     for index in 0..host_count {
@@ -1029,7 +1045,7 @@ fn decode_global_settings(bytes: &[u8]) -> Result<GlobalSettings, StorageError> 
     Ok(settings)
 }
 
-fn encode_host_settings(settings: HostSettings, out: &mut [u8]) {
+fn encode_input_settings(settings: InputSettings, out: &mut [u8]) {
     out.fill(0);
     out[0] = settings.keyboard_layout;
     out[1] = settings.remap_from_usage;
@@ -1040,8 +1056,8 @@ fn encode_host_settings(settings: HostSettings, out: &mut [u8]) {
     write_u16(&mut out[10..12], settings.consumer_to_usage);
 }
 
-fn decode_host_settings(bytes: &[u8]) -> Result<HostSettings, StorageError> {
-    let settings = HostSettings {
+fn decode_input_settings(bytes: &[u8]) -> Result<InputSettings, StorageError> {
+    let settings = InputSettings {
         keyboard_layout: bytes[0],
         remap_from_usage: bytes[1],
         remap_to_usage: bytes[2],
@@ -1059,6 +1075,30 @@ fn decode_host_settings(bytes: &[u8]) -> Result<HostSettings, StorageError> {
         return Err(StorageError::InvalidLength);
     }
     Ok(settings)
+}
+
+fn encode_input_profile(profile: &InputProfile, out: &mut [u8]) {
+    out.fill(0);
+    out[0] = profile.id.get();
+    write_u16(&mut out[2..4], profile.identity.vendor_id);
+    write_u16(&mut out[4..6], profile.identity.product_id);
+    write_u64(&mut out[6..14], profile.identity.instance_hash);
+    write_u64(&mut out[14..22], profile.last_seen);
+    encode_input_settings(profile.settings, &mut out[24..36]);
+}
+
+fn decode_input_profile(bytes: &[u8]) -> Result<InputProfile, StorageError> {
+    let id = InputProfileId::new(bytes[0]).ok_or(StorageError::InvalidLength)?;
+    Ok(InputProfile::restored(
+        id,
+        InputIdentity {
+            vendor_id: read_u16(&bytes[2..4]),
+            product_id: read_u16(&bytes[4..6]),
+            instance_hash: read_u64(&bytes[6..14]),
+        },
+        read_u64(&bytes[14..22]),
+        decode_input_settings(&bytes[24..36])?,
+    ))
 }
 
 fn decode_host_record(record: &[u8]) -> Result<StoredHostProfile, StorageError> {
@@ -1190,6 +1230,16 @@ fn read_u32(bytes: &[u8]) -> u32 {
     u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
+fn write_u64(out: &mut [u8], value: u64) {
+    out.copy_from_slice(&value.to_le_bytes());
+}
+
+fn read_u64(bytes: &[u8]) -> u64 {
+    u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ])
+}
+
 fn generation_is_newer_or_equal(left: u32, right: u32) -> bool {
     left.wrapping_sub(right) < 0x8000_0000
 }
@@ -1297,15 +1347,21 @@ mod tests {
     }
 
     #[test]
-    fn storage_image_round_trips_generated_global_and_host_settings() {
+    fn storage_image_round_trips_global_and_input_settings() {
         let mut state = StorageState::new(8);
         state.global_settings.auto_reconnect = false;
         state.global_settings.switch_release_delay_ms = 125;
         state.global_settings.log_level = 3;
-        state.host_settings[1].keyboard_layout = 2;
-        state.host_settings[1].mouse_sensitivity_percent = 175;
-        state.host_settings[1].consumer_from_usage = 0x0e9;
-        state.host_settings[1].consumer_to_usage = 0x0ea;
+        let id = state
+            .input_profiles
+            .observe(InputIdentity::from_port_path(0x1234, 0xabcd, &[2]), 42)
+            .unwrap();
+        let settings = &mut state.input_profiles.get_mut(id).unwrap().settings;
+        settings.keyboard_layout = 2;
+        settings.mouse_sensitivity_percent = 175;
+        settings.consumer_from_usage = 0x0e9;
+        settings.consumer_to_usage = 0x0ea;
+        state.input_profiles.disconnect(id, 43).unwrap();
 
         assert_eq!(
             decode_storage_image(&encode_storage_image(&state).unwrap()),
@@ -1360,6 +1416,15 @@ mod tests {
         assert_eq!(
             decode_storage_image(&image),
             Err(StorageError::UnsupportedVersion)
+        );
+    }
+
+    #[test]
+    fn storage_rejects_images_from_the_previous_fixed_layout() {
+        let old_image = [0u8; 512];
+        assert_eq!(
+            decode_storage_image(&old_image),
+            Err(StorageError::ImageTooShort)
         );
     }
 

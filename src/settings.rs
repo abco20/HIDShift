@@ -3,7 +3,7 @@
 //! `settings_schema!` is the single source of truth. Adding an entry generates
 //! the stable wire ID, descriptor table, defaults, validation, and lookup code.
 
-use crate::ids::HostId;
+use crate::input_profile::InputProfileId;
 
 pub const SETTINGS_SCHEMA_VERSION: u16 = 1;
 
@@ -20,7 +20,7 @@ pub enum SettingValueKind {
 #[repr(u8)]
 pub enum SettingScope {
     Global = 0,
-    Host = 1,
+    Input = 1,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -187,31 +187,31 @@ settings_schema! {
     },
     KeyboardLayout = 8 => {
         key: "keyboard_layout", label: "キーボード配列", description: "0:そのまま 1:US(Yen→Grave) 2:JIS(Grave→Yen)",
-        kind: Choice, scope: Host, default: 0, min: 0, max: 2, step: 1, unit: "", choices: KEYBOARD_LAYOUT_CHOICES, restart: false
+        kind: Choice, scope: Input, default: 0, min: 0, max: 2, step: 1, unit: "", choices: KEYBOARD_LAYOUT_CHOICES, restart: false
     },
     RemapFromUsage = 9 => {
         key: "remap_from_usage", label: "変更元キー", description: "USB HID Usage ID。0でリマップ無効です",
-        kind: HidUsage, scope: Host, default: 0, min: 0, max: 255, step: 1, unit: "", choices: NO_CHOICES, restart: false
+        kind: HidUsage, scope: Input, default: 0, min: 0, max: 255, step: 1, unit: "", choices: NO_CHOICES, restart: false
     },
     RemapToUsage = 10 => {
         key: "remap_to_usage", label: "変更先キー", description: "送信するUSB HID Usage IDです",
-        kind: HidUsage, scope: Host, default: 0, min: 0, max: 255, step: 1, unit: "", choices: NO_CHOICES, restart: false
+        kind: HidUsage, scope: Input, default: 0, min: 0, max: 255, step: 1, unit: "", choices: NO_CHOICES, restart: false
     },
     MouseSensitivityPercent = 11 => {
         key: "mouse_sensitivity_percent", label: "マウス感度", description: "移動量の倍率を百分率で指定します",
-        kind: Integer, scope: Host, default: 100, min: 10, max: 400, step: 5, unit: "%", choices: NO_CHOICES, restart: false
+        kind: Integer, scope: Input, default: 100, min: 10, max: 400, step: 5, unit: "%", choices: NO_CHOICES, restart: false
     },
     ScrollMultiplierPercent = 12 => {
         key: "scroll_multiplier_percent", label: "スクロール倍率", description: "ホイール移動量の倍率を百分率で指定します",
-        kind: Integer, scope: Host, default: 100, min: 10, max: 400, step: 5, unit: "%", choices: NO_CHOICES, restart: false
+        kind: Integer, scope: Input, default: 100, min: 10, max: 400, step: 5, unit: "%", choices: NO_CHOICES, restart: false
     },
     ConsumerFromUsage = 13 => {
         key: "consumer_from_usage", label: "Consumer変更元", description: "Consumer Control Usage ID。0で無効です",
-        kind: HidUsage, scope: Host, default: 0, min: 0, max: 1023, step: 1, unit: "", choices: NO_CHOICES, restart: false
+        kind: HidUsage, scope: Input, default: 0, min: 0, max: 1023, step: 1, unit: "", choices: NO_CHOICES, restart: false
     },
     ConsumerToUsage = 14 => {
         key: "consumer_to_usage", label: "Consumer変更先", description: "送信するConsumer Control Usage IDです",
-        kind: HidUsage, scope: Host, default: 0, min: 0, max: 1023, step: 1, unit: "", choices: NO_CHOICES, restart: false
+        kind: HidUsage, scope: Input, default: 0, min: 0, max: 1023, step: 1, unit: "", choices: NO_CHOICES, restart: false
     },
     LogLevel = 15 => {
         key: "log_level", label: "ログレベル", description: "0:error 1:warn 2:info",
@@ -338,7 +338,7 @@ impl GlobalSettings {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct HostSettings {
+pub struct InputSettings {
     pub keyboard_layout: u8,
     pub remap_from_usage: u8,
     pub remap_to_usage: u8,
@@ -348,7 +348,7 @@ pub struct HostSettings {
     pub consumer_to_usage: u16,
 }
 
-impl Default for HostSettings {
+impl Default for InputSettings {
     fn default() -> Self {
         Self {
             keyboard_layout: 0,
@@ -362,7 +362,7 @@ impl Default for HostSettings {
     }
 }
 
-impl HostSettings {
+impl InputSettings {
     pub const DEFAULT: Self = Self {
         keyboard_layout: 0,
         remap_from_usage: 0,
@@ -377,7 +377,7 @@ impl HostSettings {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SettingTarget {
     Global,
-    Host(HostId),
+    Input(InputProfileId),
 }
 
 #[cfg(test)]
