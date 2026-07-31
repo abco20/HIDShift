@@ -42,6 +42,8 @@ pub mod e2e_mirror;
 pub mod fallback;
 pub mod ids;
 pub mod input;
+#[path = "domain/input_profile.rs"]
+pub mod input_profile;
 #[cfg(feature = "dual-s3-wired")]
 pub mod interchip;
 pub mod management;
@@ -90,9 +92,7 @@ pub use bridge::{
 pub use domain::{
     ChangeSet, DESTINATION_CAPACITY, Destination, DestinationError, DestinationId,
     DestinationRegistry, DomainRevision, FirmwareNode, FirmwareUpdate, FirmwareUpdateError,
-    FirmwareUpdatePhase, INPUT_PROFILE_CAPACITY, ImageMetadata, InputIdentity, InputProfile,
-    InputProfileError, InputProfileId, InputProfileRegistry, KeyboardLayout, REMAP_RULE_CAPACITY,
-    RemapRule, Revisions, SESSION_CAPACITY, SessionId, UpdateTarget, Usage,
+    FirmwareUpdatePhase, ImageMetadata, Revisions, SESSION_CAPACITY, SessionId, UpdateTarget,
 };
 pub use ids::{
     DeviceId, HOST_SLOT_COUNT, HOST_SLOT_MAX, HOST_SLOT_MIN, HostId, HostSlot, InterfaceId,
@@ -103,6 +103,10 @@ pub use input::{
     KeyboardSuppression, Modifier, ModifierState, MouseButton, MouseButtons, MouseFrame,
     MouseInputReport, MouseMovement, PhysicalInputState, PhysicalKeyboardState, PhysicalMouseState,
     StandardInputFrame, VisibleKeyboardState,
+};
+pub use input_profile::{
+    INPUT_PROFILE_CAPACITY, InputIdentity, InputProfile, InputProfileError, InputProfileId,
+    InputProfileRegistry,
 };
 pub use management::frame::{
     FRAME_CAPACITY, FRAME_CRC_LEN, FRAME_HEADER_LEN, FRAME_PAYLOAD_CAPACITY, FRAME_VERSION, Frame,
@@ -172,7 +176,7 @@ pub use runtime::{
 #[cfg(feature = "dual-s3-wired")]
 pub use runtime::{DeviceTaskCommand, RUNTIME_DEVICE_COMMAND_QUEUE_CAPACITY};
 pub use settings::{
-    GlobalSettings, HostSettings, SETTING_COUNT, SETTING_DESCRIPTORS, SETTINGS_SCHEMA_HASH,
+    GlobalSettings, InputSettings, SETTING_COUNT, SETTING_DESCRIPTORS, SETTINGS_SCHEMA_HASH,
     SETTINGS_SCHEMA_VERSION, SettingChoice, SettingDescriptor, SettingId, SettingScope,
     SettingTarget, SettingValueKind, setting_by_key, setting_descriptor, validate_setting_value,
 };

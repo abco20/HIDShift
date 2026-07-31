@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
 use hidshift::{
-    HostId, ManagementCommand, SettingDescriptor, SettingId, SettingScope, SettingTarget,
+    InputProfileId, ManagementCommand, SettingDescriptor, SettingId, SettingScope, SettingTarget,
     SettingValueKind,
 };
 use leptos::prelude::*;
@@ -24,21 +24,56 @@ pub(crate) fn SettingsPanel(
                 <div class="setting-group-title"><h3>"本体の動作"</h3><p>"すべての接続先に共通する設定です。"</p></div>
                 <div class="settings-list">{move || settings.get().into_iter().filter(|entry| entry.descriptor.scope == SettingScope::Global).map(|entry| view! { <SettingControl entry busy send=global_send.clone()/> }).collect_view()}</div>
             </section>
-            <section class="setting-group">
-                <div class="setting-group-title"><h3>"接続先ごとの入力"</h3><p>"配列、キー割り当て、ポインター感度を機器ごとに調整します。"</p></div>
-                <div class="host-setting-groups">
-                    {(1..=4).map(|slot| {
-                        let host_send = send.clone();
-                        view! {
-                            <details>
-                                <summary><span><strong>{format!("スロット {slot}")}</strong><small>"この接続先だけに適用"</small></span><span class="chevron">"⌄"</span></summary>
-                                <div class="settings-list host-settings">{move || settings.get().into_iter().filter(move |entry| entry.target == SettingTarget::Host(HostId(slot))).map(|entry| view! { <SettingControl entry busy send=host_send.clone()/> }).collect_view()}</div>
-                            </details>
-                        }
-                    }).collect_view()}
-                </div>
-            </section>
         </div>
+    }
+}
+
+#[component]
+pub(crate) fn InputSettings(
+    settings: RwSignal<Vec<SettingView>>,
+    busy: RwSignal<bool>,
+    send: CommandSender,
+    profile_id: InputProfileId,
+    flags: u8,
+) -> impl IntoView {
+    view! {
+        <div class="settings-list input-settings">{move || settings.get().into_iter()
+            .filter(move |entry| entry.target == SettingTarget::Input(profile_id) && setting_matches_device(entry.descriptor.id, flags))
+            .map(|entry| view! { <SettingControl entry busy send=send.clone()/> })
+            .collect_view()}</div>
+    }
+}
+
+fn setting_matches_device(id: SettingId, flags: u8) -> bool {
+    match id {
+        SettingId::KeyboardLayout | SettingId::RemapFromUsage | SettingId::RemapToUsage => {
+            flags & 0x02 != 0
+        }
+        SettingId::MouseSensitivityPercent | SettingId::ScrollMultiplierPercent => {
+            flags & 0x04 != 0
+        }
+        SettingId::ConsumerFromUsage | SettingId::ConsumerToUsage => flags & 0x08 != 0,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod device_filter_tests {
+    use super::*;
+
+    #[test]
+    fn input_cards_only_show_settings_for_their_report_kinds() {
+        assert!(setting_matches_device(SettingId::KeyboardLayout, 0x02));
+        assert!(!setting_matches_device(
+            SettingId::MouseSensitivityPercent,
+            0x02
+        ));
+        assert!(setting_matches_device(
+            SettingId::MouseSensitivityPercent,
+            0x04
+        ));
+        assert!(setting_matches_device(SettingId::ConsumerFromUsage, 0x08));
+        assert!(!setting_matches_device(SettingId::KeyboardLayout, 0x08));
     }
 }
 

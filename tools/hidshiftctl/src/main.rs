@@ -99,11 +99,11 @@ enum CliCommand {
     },
     SettingGet {
         key: String,
-        slot: Option<u8>,
+        input: Option<u8>,
     },
     SettingSet {
         key: String,
-        slot: Option<u8>,
+        input: Option<u8>,
         value: i32,
     },
     Overview,
@@ -327,15 +327,15 @@ enum SettingsArgs {
     /// 設定値を表示
     Get {
         key: String,
-        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=4))]
-        slot: Option<u8>,
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=8))]
+        input: Option<u8>,
     },
     /// 設定値を変更（例: on, slot-2, jis, 125%）
     Set {
         key: String,
         value: String,
-        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=4))]
-        slot: Option<u8>,
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=8))]
+        input: Option<u8>,
     },
 }
 
@@ -376,14 +376,14 @@ async fn run() -> Result<(), Box<dyn Error>> {
             print_setting_description(&key)?;
             Ok(())
         }
-        CliCommand::SettingGet { key, slot } => {
-            let command = setting_command(&key, slot, None)?;
+        CliCommand::SettingGet { key, input } => {
+            let command = setting_command(&key, input, None)?;
             let response = request(&mut transport, command).await?;
             print_response(response);
             ensure_ok(response)
         }
-        CliCommand::SettingSet { key, slot, value } => {
-            let command = setting_command(&key, slot, Some(value))?;
+        CliCommand::SettingSet { key, input, value } => {
+            let command = setting_command(&key, input, Some(value))?;
             let response = request(&mut transport, command).await?;
             print_response(response);
             ensure_ok(response)
@@ -434,14 +434,14 @@ async fn run_json(arguments: Arguments) -> Result<(), Box<dyn Error>> {
                 "restart_required": descriptor.restart_required,
             })
         }
-        CliCommand::SettingGet { key, slot } => {
-            let response = request(&mut transport, setting_command(&key, slot, None)?).await?;
+        CliCommand::SettingGet { key, input } => {
+            let response = request(&mut transport, setting_command(&key, input, None)?).await?;
             ensure_ok(response)?;
             response_json(response)
         }
-        CliCommand::SettingSet { key, slot, value } => {
+        CliCommand::SettingSet { key, input, value } => {
             let response =
-                request(&mut transport, setting_command(&key, slot, Some(value))?).await?;
+                request(&mut transport, setting_command(&key, input, Some(value))?).await?;
             ensure_ok(response)?;
             response_json(response)
         }
@@ -515,6 +515,34 @@ async fn devices_json(
     Ok(serde_json::Value::Array(devices))
 }
 
+async fn connected_input_profiles(
+    transport: &mut ManagementTransport,
+) -> Result<Vec<hidshift::InputProfileId>, Box<dyn Error>> {
+    let response = request(transport, ManagementCommand::GetStatus).await?;
+    ensure_ok(response)?;
+    let ManagementResponsePayload::Status(status) = response.payload else {
+        return Err("status payload missing".into());
+    };
+    let mut profiles = Vec::new();
+    for index in 0..status.usb.device_count {
+        let response = request(
+            transport,
+            ManagementCommand::GetUsbDevice {
+                index,
+                name_offset: 0,
+            },
+        )
+        .await?;
+        ensure_ok(response)?;
+        if let ManagementResponsePayload::UsbDevice(device) = response.payload
+            && !profiles.contains(&device.input_profile_id)
+        {
+            profiles.push(device.input_profile_id);
+        }
+    }
+    Ok(profiles)
+}
+
 async fn history_json(
     transport: &mut ManagementTransport,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
@@ -553,10 +581,15 @@ async fn settings_json(
     transport: &mut ManagementTransport,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     let mut settings = Vec::new();
+    let input_profiles = connected_input_profiles(transport).await?;
     for descriptor in SETTING_DESCRIPTORS {
         let targets: Vec<_> = match descriptor.scope {
             SettingScope::Global => vec![SettingTarget::Global],
-            SettingScope::Host => (1..=4).map(|id| SettingTarget::Host(HostId(id))).collect(),
+            SettingScope::Input => input_profiles
+                .iter()
+                .copied()
+                .map(SettingTarget::Input)
+                .collect(),
         };
         for target in targets {
             let response = request(
@@ -615,6 +648,7 @@ fn response_json(response: ManagementResponse) -> serde_json::Value {
             "keyboard": device.flags & 2 != 0,
             "mouse": device.flags & 4 != 0,
             "consumer": device.flags & 8 != 0,
+            "input_profile_id": device.input_profile_id.get(),
             "name_chunk": String::from_utf8_lossy(device.name_chunk()),
         }),
         ManagementResponsePayload::Diagnostics(value) => serde_json::json!({
@@ -648,7 +682,7 @@ fn response_json(response: ManagementResponse) -> serde_json::Value {
             "key": hidshift::setting_descriptor(setting.id).key,
             "target": match setting.target {
                 SettingTarget::Global => serde_json::json!({"kind": "system"}),
-                SettingTarget::Host(host) => serde_json::json!({"kind": "destination", "id": host.0}),
+                SettingTarget::Input(profile) => serde_json::json!({"kind": "input", "id": profile.get()}),
             },
             "value": setting.value,
         }),
@@ -1307,6 +1341,7 @@ async fn print_settings(transport: &mut ManagementTransport) -> Result<(), Box<d
         "HIDShift settings (firmware {}.{}.{})",
         schema_info.firmware_major, schema_info.firmware_minor, schema_info.firmware_patch
     );
+    let input_profiles = connected_input_profiles(transport).await?;
     for descriptor in SETTING_DESCRIPTORS {
         match descriptor.scope {
             SettingScope::Global => print_response(
@@ -1319,14 +1354,14 @@ async fn print_settings(transport: &mut ManagementTransport) -> Result<(), Box<d
                 )
                 .await?,
             ),
-            SettingScope::Host => {
-                for slot in 1..=4 {
+            SettingScope::Input => {
+                for profile in input_profiles.iter().copied() {
                     print_response(
                         request(
                             transport,
                             ManagementCommand::GetSetting {
                                 id: descriptor.id,
-                                target: SettingTarget::Host(hidshift::HostId(slot)),
+                                target: SettingTarget::Input(profile),
                             },
                         )
                         .await?,
@@ -1347,7 +1382,7 @@ fn print_setting_description(key: &str) -> Result<(), Box<dyn Error>> {
         if descriptor.scope == SettingScope::Global {
             "本体全体"
         } else {
-            "接続先スロット（--slotが必要）"
+            "USB入力プロファイル（--inputが必要）"
         }
     );
     if descriptor.choices.is_empty() {
@@ -1520,16 +1555,20 @@ fn unknown_setting_message(key: &str) -> String {
 
 fn setting_command(
     key: &str,
-    slot: Option<u8>,
+    input: Option<u8>,
     value: Option<i32>,
 ) -> Result<ManagementCommand, Box<dyn Error>> {
     let descriptor = setting_by_key(key).ok_or("unknown setting key")?;
-    let target = match (descriptor.scope, slot) {
+    let target = match (descriptor.scope, input) {
         (SettingScope::Global, None) => SettingTarget::Global,
-        (SettingScope::Host, Some(slot @ 1..=4)) => SettingTarget::Host(hidshift::HostId(slot)),
-        (SettingScope::Global, Some(_)) => return Err("global setting does not take SLOT".into()),
-        (SettingScope::Host, None) => return Err("host setting requires SLOT".into()),
-        _ => return Err("slot must be between 1 and 4".into()),
+        (SettingScope::Input, Some(id @ 1..=8)) => {
+            SettingTarget::Input(hidshift::InputProfileId::new(id).ok_or("invalid input profile")?)
+        }
+        (SettingScope::Global, Some(_)) => {
+            return Err("global setting does not take --input".into());
+        }
+        (SettingScope::Input, None) => return Err("input setting requires --input".into()),
+        _ => return Err("input profile must be between 1 and 8".into()),
     };
     Ok(match value {
         Some(value) => ManagementCommand::SetSetting {
@@ -1547,7 +1586,7 @@ fn setting_command(
 fn display_target(target: SettingTarget) -> String {
     match target {
         SettingTarget::Global => "global".into(),
-        SettingTarget::Host(host) => format!("slot {}", host.0),
+        SettingTarget::Input(profile) => format!("input {}", profile.get()),
     }
 }
 
@@ -1702,13 +1741,13 @@ where
         CommandArgs::Settings { command } => match command {
             SettingsArgs::List => CliCommand::SettingsList,
             SettingsArgs::Describe { key } => CliCommand::SettingDescribe { key },
-            SettingsArgs::Get { key, slot } => CliCommand::SettingGet { key, slot },
-            SettingsArgs::Set { key, value, slot } => {
+            SettingsArgs::Get { key, input } => CliCommand::SettingGet { key, input },
+            SettingsArgs::Set { key, value, input } => {
                 let descriptor =
                     setting_by_key(&key).ok_or_else(|| unknown_setting_message(&key))?;
                 CliCommand::SettingSet {
                     key,
-                    slot,
+                    input,
                     value: parse_cli_setting_value(descriptor, &value)?,
                 }
             }
@@ -1868,7 +1907,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_named_setting_values_and_named_slot_option() {
+    fn parses_named_setting_values_and_input_profile_option() {
         assert_eq!(
             parse_arguments(
                 [
@@ -1878,7 +1917,7 @@ mod tests {
                     "set",
                     "keyboard_layout",
                     "jis",
-                    "--slot",
+                    "--input",
                     "2",
                 ]
                 .map(str::to_owned)
@@ -1887,7 +1926,7 @@ mod tests {
             .command,
             CliCommand::SettingSet {
                 key: "keyboard_layout".into(),
-                slot: Some(2),
+                input: Some(2),
                 value: 2,
             }
         );

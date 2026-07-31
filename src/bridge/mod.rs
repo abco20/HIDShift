@@ -183,6 +183,7 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
             BridgeEvent::UsbDeviceRemoved { interface_id } => {
                 self.usb_device_removed(interface_id, out)
             }
+            BridgeEvent::ResetInputDevice { device_id } => self.reset_input_device(device_id, out),
         }
     }
 
@@ -539,6 +540,27 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
             )?;
         }
         self.push_status(out)
+    }
+
+    fn reset_input_device<const ACTIONS: usize>(
+        &mut self,
+        device_id: DeviceId,
+        out: &mut heapless::Vec<BridgeAction, ACTIONS>,
+    ) -> Result<(), BridgeError> {
+        let previous_input = self.state.input.clone();
+        if !self.state.input_devices.remove_device(device_id) {
+            return Ok(());
+        }
+        self.state.input = self.state.input_devices.aggregate().clone();
+        if let Some(host_id) = self.state.hosts.active_target() {
+            self.emit_detach_updates(
+                host_id,
+                &previous_input,
+                NotifyReason::UsbDeviceRemovedRelease,
+                out,
+            )?;
+        }
+        Ok(())
     }
 
     fn apply_active_host_leds<const ACTIONS: usize>(
@@ -1027,6 +1049,9 @@ pub enum BridgeEvent {
     InputFrame(InputFrame),
     UsbDeviceRemoved {
         interface_id: InterfaceId,
+    },
+    ResetInputDevice {
+        device_id: DeviceId,
     },
     UsbHidInterfaceConnected {
         interface_id: InterfaceId,

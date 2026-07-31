@@ -9,8 +9,8 @@ use leptos::prelude::*;
 use send_wrapper::SendWrapper;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
-use crate::settings_ui::SettingsPanel;
-use crate::state::{AppState, Locale, Page, Theme, UsbDeviceView};
+use crate::settings_ui::{InputSettings, SettingsPanel};
+use crate::state::{AppState, Locale, Page, Theme};
 
 type CommandSender = SendWrapper<Rc<dyn Fn(ManagementCommand)>>;
 
@@ -434,7 +434,7 @@ fn inputs_page(state: AppState, send: CommandSender) -> impl IntoView {
         {page_header(locale, "入力機器", "Inputs", "USBキーボード、マウス、メディア操作機器を管理します。設定は入力機器に紐づきます。", "Manage USB keyboards, mice, and media controls. Settings belong to each input device.")}
         <section class="section">
             <div class="section-heading"><h2>{text(locale, "接続中", "Connected")}</h2><span class="count">{format!("{}", state.usb_devices.get().len())}</span></div>
-            <div class="row-list">{input_rows(state.usb_devices.get(), locale)}</div>
+            <div class="row-list">{input_rows(state.clone(), send.clone(), locale)}</div>
         </section>
         {move || (!state.mirror_candidates.get().is_empty()).then(|| view! {
             <section class="section">
@@ -465,13 +465,15 @@ fn inputs_page(state: AppState, send: CommandSender) -> impl IntoView {
     }
 }
 
-fn input_rows(devices: Vec<UsbDeviceView>, locale: Locale) -> impl IntoView {
+fn input_rows(state: AppState, send: CommandSender, locale: Locale) -> impl IntoView {
+    let devices = state.usb_devices.get();
     if devices.is_empty() {
         return view! { <div class="empty-row">{text(locale, "接続中のUSB入力機器はありません", "No connected USB input devices")}</div> }.into_any();
     }
     devices
         .into_iter()
         .map(|device| {
+            let device_send = send.clone();
             let name = if device.name.is_empty() {
                 format!("USB {}", device.index + 1)
             } else {
@@ -482,10 +484,13 @@ fn input_rows(devices: Vec<UsbDeviceView>, locale: Locale) -> impl IntoView {
             if device.flags & 0x04 != 0 { kinds.push(text(locale, "マウス", "Mouse")); }
             if device.flags & 0x08 != 0 { kinds.push(text(locale, "メディア操作", "Media control")); }
             view! {
-                <div class="row">
-                    <span class="row-icon active"><InputIcon/></span>
-                    <div class="row-copy"><strong>{name}</strong><small>{format!("{} · {:04x}:{:04x} · ID {}", kinds.join(" / "), device.vendor_id, device.product_id, device.device_id)}</small></div>
-                    <span class="state connected">{text(locale, "接続中", "Connected")}</span>
+                <div class="input-device-card">
+                    <div class="row">
+                        <span class="row-icon active"><InputIcon/></span>
+                        <div class="row-copy"><strong>{name}</strong><small>{format!("{} · {:04x}:{:04x} · ID {}", kinds.join(" / "), device.vendor_id, device.product_id, device.device_id)}</small></div>
+                        <span class="state connected">{text(locale, "接続中", "Connected")}</span>
+                    </div>
+                    <InputSettings settings=state.settings busy=state.busy send=device_send profile_id=device.input_profile_id flags=device.flags/>
                 </div>
             }
         })
