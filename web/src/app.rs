@@ -217,7 +217,7 @@ fn home_page(state: AppState, send: CommandSender) -> impl IntoView {
                         let state = state.clone();
                         move |_| state.navigate(Page::Destinations)
                     }>{text(locale, "すべて表示", "View all")}</button></div>
-                    <div class="row-list">{connected_destination_rows(status, state.names.get(), state.busy, send.clone(), locale)}</div>
+                    <div class="row-list">{connected_destination_rows(status, state.output_status.get(), state.names.get(), state.busy, send.clone(), locale)}</div>
                 </section>
                 <section class="section">
                     <div class="section-heading"><div><h2>{text(locale, "USB入力", "USB inputs")}</h2></div><button class="quiet compact" on:click={
@@ -254,9 +254,10 @@ fn destinations_page(state: AppState, send: CommandSender) -> impl IntoView {
                 <button class="secondary" disabled=move || state.busy.get() || state.status.get().and_then(|status| status.pairing_host).is_none() on:click=move |_| cancel_send(ManagementCommand::CancelPairing)>{text(locale, "中止", "Cancel")}</button>
             </div>
         </div>
+        {wired_destination_section(state.clone(), send.clone(), locale)}
         <section class="section">
             <div class="section-heading"><h2>{text(locale, "接続中", "Connected")}</h2></div>
-            <div class="row-list">{connected_destination_rows(state.status.get(), state.names.get(), state.busy, send.clone(), locale)}</div>
+            <div class="row-list">{connected_destination_rows(state.status.get(), state.output_status.get(), state.names.get(), state.busy, send.clone(), locale)}</div>
         </section>
         <section class="section">
             <div class="section-heading"><h2>{text(locale, "登録済み", "Registered")}</h2></div>
@@ -267,6 +268,7 @@ fn destinations_page(state: AppState, send: CommandSender) -> impl IntoView {
 
 fn connected_destination_rows(
     status: Option<ManagementStatus>,
+    output: Option<ManagementOutputTargetStatus>,
     names: [String; 4],
     busy: RwSignal<bool>,
     send: CommandSender,
@@ -284,6 +286,7 @@ fn connected_destination_rows(
                 index,
                 *host,
                 status,
+                output,
                 names[index].clone(),
                 None,
                 busy,
@@ -309,6 +312,7 @@ fn registered_destination_rows(
     };
     let names = state.names.get();
     let timings = state.timings.get();
+    let output = state.output_status.get();
     let rows = status.hosts[..status.host_count.min(4) as usize]
         .iter()
         .enumerate()
@@ -318,6 +322,7 @@ fn registered_destination_rows(
                 index,
                 *host,
                 status,
+                output,
                 names[index].clone(),
                 timings[index],
                 state.busy,
@@ -338,6 +343,7 @@ fn destination_row(
     index: usize,
     flags: ManagementHostStatus,
     status: ManagementStatus,
+    output: Option<ManagementOutputTargetStatus>,
     name: String,
     timing: Option<hidshift::ManagementHostTiming>,
     busy: RwSignal<bool>,
@@ -345,7 +351,16 @@ fn destination_row(
     locale: Locale,
 ) -> impl IntoView {
     let host = HostId((index + 1) as u8);
-    let active = status.active_host == Some(host);
+    let selected = output.map_or(status.active_host == Some(host), |output| {
+        output.selected == ManagementOutputTarget::Ble(host)
+    });
+    let active = output.map_or(status.active_host == Some(host), |output| {
+        output.active == Some(ManagementOutputTarget::Ble(host))
+    });
+    let ready = output.map_or(flags.connected, |output| {
+        output.ready_ble_mask & (1 << index) != 0
+    });
+    let dual_s3 = output.is_some();
     let title = if name.is_empty() {
         format!("{} {}", text(locale, "接続先", "Destination"), host.0)
     } else {
@@ -358,9 +373,9 @@ fn destination_row(
         <div class="row has-actions">
             <span class:active=active class="row-icon"><DestinationIcon/></span>
             <div class="row-copy"><strong>{title.clone()}</strong><small>{timing.map(|value| format!("{}s · 0x{:02x}", value.last_connected_seconds, value.last_disconnect_reason)).unwrap_or_else(|| format!("ID {}", host.0))}</small></div>
-            <div class="row-meta"><span class=if flags.connected { "state connected" } else { "state" }>{if flags.connected { text(locale, "接続中", "Connected") } else { text(locale, "切断中", "Disconnected") }}</span>{active.then(|| view! { <span>{text(locale, "送信先", "Selected")}</span> })}</div>
+            <div class="row-meta"><span class=if ready { "state connected" } else if flags.connected { "state waiting" } else { "state" }>{if ready { text(locale, "準備完了", "Ready") } else if flags.connected { text(locale, "準備中", "Waiting") } else { text(locale, "切断中", "Disconnected") }}</span>{selected.then(|| view! { <span>{text(locale, "選択中", "Selected")}</span> })}</div>
             <div class="row-actions">
-                <button class="secondary compact" disabled=move || busy.get() || !flags.connected || active on:click=move |_| select_send(ManagementCommand::SelectHost(host))>{if active { text(locale, "選択中", "Selected") } else { text(locale, "選択", "Select") }}</button>
+                <button class="secondary compact" disabled=move || busy.get() || !ready || selected on:click=move |_| select_send(select_destination_command(ManagementOutputTarget::Ble(host), dual_s3))>{if selected { text(locale, "選択中", "Selected") } else { text(locale, "選択", "Select") }}</button>
                 <button class="quiet compact" disabled=move || busy.get() on:click=move |_| {
                     let Some(window) = web_sys::window() else { return; };
                     if let Ok(Some(value)) = window.prompt_with_message_and_default(text(locale, "表示名", "Display name"), &title)
@@ -375,6 +390,41 @@ fn destination_row(
                 }>{text(locale, "登録解除", "Forget")}</button>
             </div>
         </div>
+    }
+}
+
+fn wired_destination_section(
+    state: AppState,
+    send: CommandSender,
+    locale: Locale,
+) -> impl IntoView {
+    view! {
+        {move || state.output_status.get().map(|output| {
+            let selected = output.selected == ManagementOutputTarget::Wired;
+            let active = output.active == Some(ManagementOutputTarget::Wired);
+            let ready = output.wired_ready;
+            let select_send = send.clone();
+            view! {
+                <section class="section">
+                    <div class="section-heading"><h2>{text(locale, "有線USB", "Wired USB")}</h2></div>
+                    <div class="row-list">
+                        <div class="row has-actions">
+                            <span class:active=active class="row-icon"><DestinationIcon/></span>
+                            <div class="row-copy"><strong>{text(locale, "有線USB", "Wired USB")}</strong><small>{text(locale, "Device S3からPCへUSB HIDとして出力", "USB HID output to the PC through Device S3")}</small></div>
+                            <div class="row-meta"><span class=if ready { "state connected" } else { "state" }>{if ready { text(locale, "準備完了", "Ready") } else { text(locale, "未接続", "Unavailable") }}</span>{selected.then(|| view! { <span>{text(locale, "選択中", "Selected")}</span> })}</div>
+                            <div class="row-actions"><button class="secondary compact" disabled=move || state.busy.get() || !ready || selected on:click=move |_| select_send(select_destination_command(ManagementOutputTarget::Wired, true))>{if selected { text(locale, "選択中", "Selected") } else { text(locale, "選択", "Select") }}</button></div>
+                        </div>
+                    </div>
+                </section>
+            }
+        })}
+    }
+}
+
+fn select_destination_command(target: ManagementOutputTarget, dual_s3: bool) -> ManagementCommand {
+    match (dual_s3, target) {
+        (false, ManagementOutputTarget::Ble(host)) => ManagementCommand::SelectHost(host),
+        (_, target) => ManagementCommand::SelectOutputTarget(target),
     }
 }
 
@@ -667,5 +717,25 @@ mod tests {
         status.hosts[0].known = true;
         status.hosts[1].known = true;
         assert_eq!(first_empty_host(status), Some(HostId(3)));
+    }
+
+    #[test]
+    fn dual_destinations_use_output_target_commands() {
+        assert_eq!(
+            select_destination_command(ManagementOutputTarget::Wired, true),
+            ManagementCommand::SelectOutputTarget(ManagementOutputTarget::Wired)
+        );
+        assert_eq!(
+            select_destination_command(ManagementOutputTarget::Ble(HostId(2)), true),
+            ManagementCommand::SelectOutputTarget(ManagementOutputTarget::Ble(HostId(2)))
+        );
+    }
+
+    #[test]
+    fn single_s3_ble_destination_keeps_legacy_select_command() {
+        assert_eq!(
+            select_destination_command(ManagementOutputTarget::Ble(HostId(3)), false),
+            ManagementCommand::SelectHost(HostId(3))
+        );
     }
 }
