@@ -1,7 +1,7 @@
 use crate::input::{MouseButtons, MouseInputReport, MouseMovement};
 
 pub const MOUSE_REPORT_ID: u8 = 2;
-pub const MOUSE_REPORT_LEN: usize = 5;
+pub const MOUSE_REPORT_LEN: usize = 7;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MouseReport {
@@ -13,11 +13,15 @@ impl MouseReport {
         Self { bytes }
     }
     pub const fn from_mouse(report: MouseInputReport) -> Self {
+        let x = report.x.to_le_bytes();
+        let y = report.y.to_le_bytes();
         Self {
             bytes: [
                 report.buttons.bits(),
-                report.x as u8,
-                report.y as u8,
+                x[0],
+                x[1],
+                y[0],
+                y[1],
                 report.wheel as u8,
                 report.pan as u8,
             ],
@@ -25,11 +29,15 @@ impl MouseReport {
     }
 
     pub fn from_frame(buttons: MouseButtons, movement: MouseMovement) -> Self {
+        let x = movement.x.to_le_bytes();
+        let y = movement.y.to_le_bytes();
         Self {
             bytes: [
                 buttons.bits(),
-                clamp_i16_to_i8(movement.x) as u8,
-                clamp_i16_to_i8(movement.y) as u8,
+                x[0],
+                x[1],
+                y[0],
+                y[1],
                 movement.wheel as u8,
                 movement.pan as u8,
             ],
@@ -44,6 +52,28 @@ impl MouseReport {
 
     pub const fn as_bytes(&self) -> &[u8; MOUSE_REPORT_LEN] {
         &self.bytes
+    }
+
+    pub const fn buttons(self) -> u8 {
+        self.bytes[0]
+    }
+
+    pub const fn movement(self) -> MouseMovement {
+        MouseMovement {
+            x: i16::from_le_bytes([self.bytes[1], self.bytes[2]]),
+            y: i16::from_le_bytes([self.bytes[3], self.bytes[4]]),
+            wheel: self.bytes[5] as i8,
+            pan: self.bytes[6] as i8,
+        }
+    }
+
+    pub const fn boot_bytes(self) -> [u8; 3] {
+        let movement = self.movement();
+        [
+            self.buttons(),
+            clamp_i16_to_i8(movement.x) as u8,
+            clamp_i16_to_i8(movement.y) as u8,
+        ]
     }
 }
 
@@ -78,11 +108,11 @@ mod tests {
             pan: -1,
         });
 
-        assert_eq!(report.as_bytes(), &[0b0001_0001, 253, 4, 1, 255]);
+        assert_eq!(report.as_bytes(), &[0b0001_0001, 253, 255, 4, 0, 1, 255]);
     }
 
     #[test]
-    fn mouse_frame_clamps_large_relative_movement() {
+    fn mouse_frame_preserves_large_relative_movement() {
         let report = BleMouseReport::from_frame(
             MouseButtons::LEFT,
             MouseMovement {
@@ -93,6 +123,7 @@ mod tests {
             },
         );
 
-        assert_eq!(report.as_bytes(), &[1, 127, 128, 2, 254]);
+        assert_eq!(report.as_bytes().as_slice(), &[1, 244, 1, 12, 254, 2, 254]);
+        assert_eq!(report.boot_bytes(), [1, 127, 128]);
     }
 }

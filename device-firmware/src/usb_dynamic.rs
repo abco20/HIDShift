@@ -3,7 +3,9 @@ use hidshift::interchip::{
     ControlStatus, MirrorControlRequest, MirrorControlResponse, StandardOutputReport,
 };
 use hidshift::mirror::{MIRROR_ENDPOINTS_MAX, MirrorControlForwarder, UsbDevicePlan};
-use hidshift::reports::{ConsumerReport, Keyboard6KroReport, MouseReport, StandardHidReport};
+use hidshift::reports::{
+    ConsumerReport, Keyboard6KroReport, MOUSE_REPORT_LEN, MouseReport, StandardHidReport,
+};
 use usb_device::UsbDirection;
 use usb_device::class_prelude::*;
 use usb_device::control::{Recipient, Request, RequestType};
@@ -185,14 +187,15 @@ impl<'a, B: UsbBus> DynamicUsb<'a, B> {
             self.drop_standard_report();
             return;
         }
+        let mouse_boot;
         let (interface, endpoint, data): (usize, u8, &[u8]) = match &report {
             StandardHidReport::Keyboard(report) => (0, 0x81, report.as_bytes()),
             StandardHidReport::Mouse(report) => {
-                let bytes = report.as_bytes();
-                let data = if self.fallback_protocol[1] == 0 {
-                    &bytes[..3]
+                let data: &[u8] = if self.fallback_protocol[1] == 0 {
+                    mouse_boot = report.boot_bytes();
+                    &mouse_boot
                 } else {
-                    bytes
+                    report.as_bytes()
                 };
                 (1, 0x82, data)
             }
@@ -407,7 +410,7 @@ impl<B: UsbBus> UsbClass<B> for DynamicUsb<'_, B> {
                         let length = match interface {
                             0 => 8,
                             1 if self.fallback_protocol[1] == 0 => 3,
-                            1 => 5,
+                            1 => MOUSE_REPORT_LEN,
                             _ => 2,
                         };
                         let _ = transfer.accept_with(&zeroes[..length]);

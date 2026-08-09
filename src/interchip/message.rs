@@ -761,7 +761,7 @@ mod tests {
     fn every_standard_report_round_trips() {
         let reports = [
             StandardHidReport::Keyboard(Keyboard6KroReport::from_bytes([1, 0, 4, 5, 0, 0, 0, 0])),
-            StandardHidReport::Mouse(MouseReport::from_bytes([1, 2, 3, 4, 5])),
+            StandardHidReport::Mouse(MouseReport::from_bytes([1, 2, 3, 4, 5, 6, 7])),
             StandardHidReport::Consumer(ConsumerReport::from_usage_id(0x00e9)),
         ];
         for report in reports {

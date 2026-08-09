@@ -94,10 +94,10 @@ impl<const INTERFACES: usize> UsbMovementCoalescer<INTERFACES> {
     pub fn take_next(&mut self) -> Option<StandardInputFrame> {
         let pending = self.pending.iter_mut().find(|pending| pending.pending)?;
         let movement = MouseMovement {
-            x: take_axis(&mut pending.x) as i16,
-            y: take_axis(&mut pending.y) as i16,
-            wheel: take_axis(&mut pending.wheel),
-            pan: take_axis(&mut pending.pan),
+            x: take_axis_i16(&mut pending.x),
+            y: take_axis_i16(&mut pending.y),
+            wheel: take_axis_i8(&mut pending.wheel),
+            pan: take_axis_i8(&mut pending.pan),
         };
         let frame = StandardInputFrame {
             device_id: pending.device_id,
@@ -132,7 +132,13 @@ fn add_axis(current: i32, delta: i32, stats: &mut UsbMovementCoalescerStats) -> 
     })
 }
 
-fn take_axis(value: &mut i32) -> i8 {
+fn take_axis_i16(value: &mut i32) -> i16 {
+    let output = (*value).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+    *value -= i32::from(output);
+    output
+}
+
+fn take_axis_i8(value: &mut i32) -> i8 {
     let output = (*value).clamp(i8::MIN as i32, i8::MAX as i32) as i8;
     *value -= i32::from(output);
     output
@@ -169,7 +175,9 @@ mod tests {
                 .unwrap();
         }
         let mut totals = [0i32; 4];
+        let mut output_reports = 0;
         while let Some(frame) = queue.take_next() {
+            output_reports += 1;
             let movement = frame.mouse.unwrap().movement;
             totals[0] += i32::from(movement.x);
             totals[1] += i32::from(movement.y);
@@ -177,6 +185,7 @@ mod tests {
             totals[3] += i32::from(movement.pan);
         }
         assert_eq!(totals, [300, -300, 10, -10]);
+        assert_eq!(output_reports, 1);
         assert_eq!(queue.stats().reports_coalesced, 9);
     }
 

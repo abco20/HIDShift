@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Preserves high-rate mouse movement with 16-bit relative X/Y reports. Existing
+  BLE hosts must forget and pair HIDShift again after installing this firmware;
+  dual-S3 installations must update both boards.
+
 ## 0.1.0 - 2026-07-10
 
 - Bridges USB HID keyboards, mice, and consumer-control devices to BLE HID.

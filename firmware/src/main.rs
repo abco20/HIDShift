@@ -948,7 +948,7 @@ impl ChannelTaskSink {
                 // here used to drop clicks and subsequent 1px movement in
                 // release builds.
                 self.flush_mouse_accumulator_ordered(host_id).await;
-                let _ = self.mouse.set_buttons(host_id, report.as_bytes()[0]);
+                let _ = self.mouse.set_buttons(host_id, report.buttons());
                 self.ble_control.send(command).await;
             }
             return Ok(());
@@ -962,7 +962,7 @@ impl ChannelTaskSink {
             // Drain movement under the old button state through the same
             // ordered lane before publishing the edge/release report.
             self.flush_mouse_accumulator_ordered(host_id).await;
-            let _ = self.mouse.set_buttons(host_id, report.as_bytes()[0]);
+            let _ = self.mouse.set_buttons(host_id, report.buttons());
         }
         match command.lane() {
             BleCommandLane::Control => match command.class() {

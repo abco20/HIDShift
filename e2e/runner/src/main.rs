@@ -1161,7 +1161,7 @@ fn run_functional_raw_tests(harness: &mut Harness) -> Result<Vec<TestResult>> {
                 pan: -1,
             },
             "mouse",
-            vec![3, 10, 249, 2, 255],
+            vec![3, 10, 0, 249, 255, 2, 255],
         ),
         (
             "raw_consumer",
@@ -1299,10 +1299,10 @@ fn run_latency_tests(
             wheel: 0,
             pan: 0,
         })?;
-        let expected_x = x as i8 as u8;
+        let expected_x = x.to_le_bytes();
         let line = match harness.await_notification(
             "mouse",
-            &[0, expected_x, 0, 0, 0],
+            &[0, expected_x[0], expected_x[1], 0, 0, 0, 0],
             Duration::from_secs(2),
         ) {
             Ok(line) => line,

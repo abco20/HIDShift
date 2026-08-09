@@ -1,6 +1,8 @@
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Sender;
 use embassy_time::Instant;
+#[cfg(feature = "hardware-e2e")]
+use embassy_time::{Duration, Timer};
 use esp_hal::Async;
 use esp_hal::peripherals::{GPIO44, UART0};
 use esp_hal::uart::{Config, RxError, Uart};
@@ -34,6 +36,60 @@ use static_cell::StaticCell;
 
 #[cfg(all(feature = "hardware-e2e", feature = "dual-s3-wired"))]
 static MIRROR_E2E_STAGING: StaticCell<[u8; HSMI_MAX_SIZE]> = StaticCell::new();
+
+#[cfg(feature = "hardware-e2e")]
+async fn enqueue_mouse_stream(
+    sender: &Sender<
+        'static,
+        CriticalSectionRawMutex,
+        RuntimeInputMessage,
+        RUNTIME_INPUT_QUEUE_CAPACITY,
+    >,
+    sequence: u32,
+    reports: u16,
+    interval_us: u16,
+    frame: &hidshift::input::InputFrame,
+) -> Result<u64, hidshift::input::UsbMovementCoalescerError> {
+    let hidshift::input::InputFrame::Standard(frame) = frame else {
+        return Err(hidshift::input::UsbMovementCoalescerError::NotMovementOnly);
+    };
+    let mut pending = hidshift::input::UsbMovementCoalescer::<1>::new();
+    let started = Instant::now();
+    for index in 0..reports {
+        crate::e2e_telemetry::record_ingress(sequence, Instant::now().as_micros());
+        while sender.free_capacity() > 0 {
+            let Some(queued) = pending.take_next() else {
+                break;
+            };
+            let message = RuntimeInputMessage::BridgeEvent(hidshift::BridgeEvent::InputFrame(
+                hidshift::input::InputFrame::Standard(queued.clone()),
+            ));
+            if sender.try_send(message).is_err() {
+                pending.push(&queued)?;
+                break;
+            }
+        }
+        let message = RuntimeInputMessage::BridgeEvent(hidshift::BridgeEvent::InputFrame(
+            hidshift::input::InputFrame::Standard(frame.clone()),
+        ));
+        if sender.try_send(message).is_err() {
+            pending.push(frame)?;
+        }
+        if index + 1 < reports {
+            let elapsed_us = u64::from(index + 1) * u64::from(interval_us);
+            Timer::at(started + Duration::from_micros(elapsed_us)).await;
+        }
+    }
+    let source_duration_us = started.elapsed().as_micros();
+    while let Some(queued) = pending.take_next() {
+        sender
+            .send(RuntimeInputMessage::BridgeEvent(
+                hidshift::BridgeEvent::InputFrame(hidshift::input::InputFrame::Standard(queued)),
+            ))
+            .await;
+    }
+    Ok(source_duration_us)
+}
 
 #[cfg(feature = "hardware-e2e")]
 const SERIAL_LINE_CAPACITY: usize = 160;
@@ -142,7 +198,19 @@ pub async fn serial_management_task(
                     Instant::now().as_micros()
                 );
             }
-            if packet.carries_input() {
+            let mouse_stream = match packet.command {
+                E2eCommand::MouseStream {
+                    reports,
+                    interval_us,
+                    ..
+                } if reports > 0 && interval_us > 0 => Some((reports, interval_us)),
+                E2eCommand::MouseStream { .. } => {
+                    log::warn!("@HIDSHIFT-E2E:ERROR,{},stream,invalid schedule", sequence);
+                    continue;
+                }
+                _ => None,
+            };
+            if packet.carries_input() && mouse_stream.is_none() {
                 crate::e2e_telemetry::record_ingress(sequence, ingress_us);
             }
             if let E2eCommand::ReadTimestamp { .. } = packet.command {
@@ -176,12 +244,32 @@ pub async fn serial_management_task(
             }
             match packet.input_frames() {
                 Ok(frames) => {
-                    for frame in frames.into_iter().flatten() {
-                        sender
-                            .send(RuntimeInputMessage::BridgeEvent(
-                                hidshift::BridgeEvent::InputFrame(frame),
-                            ))
-                            .await;
+                    if let Some((reports, interval_us)) = mouse_stream {
+                        let Some(frame) = frames.iter().flatten().next() else {
+                            log::warn!("@HIDSHIFT-E2E:ERROR,{},stream,missing frame", sequence);
+                            continue;
+                        };
+                        match enqueue_mouse_stream(&sender, sequence, reports, interval_us, frame)
+                            .await
+                        {
+                            Ok(source_duration_us) => log::info!(
+                                "@HIDSHIFT-E2E:STREAM,{},{},{}",
+                                sequence,
+                                reports,
+                                source_duration_us
+                            ),
+                            Err(error) => {
+                                log::warn!("@HIDSHIFT-E2E:ERROR,{},stream,{:?}", sequence, error)
+                            }
+                        }
+                    } else {
+                        for frame in frames.iter().flatten().cloned() {
+                            sender
+                                .send(RuntimeInputMessage::BridgeEvent(
+                                    hidshift::BridgeEvent::InputFrame(frame),
+                                ))
+                                .await;
+                        }
                     }
                     if acknowledge {
                         log::info!(

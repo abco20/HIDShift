@@ -1,6 +1,6 @@
 pub const FALLBACK_USB_VENDOR_ID: u16 = 0xCAFE;
 pub const FALLBACK_USB_PRODUCT_ID: u16 = 0x4853;
-pub const FALLBACK_USB_DEVICE_RELEASE: u16 = 0x0002;
+pub const FALLBACK_USB_DEVICE_RELEASE: u16 = 0x0003;
 pub const FALLBACK_USB_MANUFACTURER: &str = "HIDShift";
 pub const FALLBACK_USB_PRODUCT: &str = "HIDShift Wired";
 
@@ -32,8 +32,8 @@ pub const FALLBACK_CONFIGURATION_DESCRIPTOR: [u8; 91] = [
     7, 0x05, 0x81, 0x03, 8, 0, 1, // keyboard IN
     7, 0x05, 0x01, 0x03, 1, 0, 1, // keyboard OUT
     9, 0x04, 1, 0, 1, 0x03, 0x01, 0x02, 0, // boot mouse
-    9, 0x21, 0x11, 0x01, 0, 1, 0x22, 55, 0, // mouse HID
-    7, 0x05, 0x82, 0x03, 5, 0, 1, // mouse IN
+    9, 0x21, 0x11, 0x01, 0, 1, 0x22, 67, 0, // mouse HID
+    7, 0x05, 0x82, 0x03, 7, 0, 1, // mouse IN
     9, 0x04, 2, 0, 1, 0x03, 0, 0, 0, // consumer control
     9, 0x21, 0x11, 0x01, 0, 1, 0x22, 23, 0, // consumer HID
     7, 0x05, 0x83, 0x03, 2, 0, 1, // consumer IN
@@ -100,11 +100,16 @@ pub const MOUSE_REPORT_DESCRIPTOR: &[u8] = &[
     0x05, 0x01, // Usage Page (Generic Desktop)
     0x09, 0x30, // Usage (X)
     0x09, 0x31, // Usage (Y)
+    0x16, 0x00, 0x80, // Logical Minimum (-32768)
+    0x26, 0xff, 0x7f, // Logical Maximum (32767)
+    0x75, 0x10, // Report Size (16)
+    0x95, 0x02, // Report Count (2)
+    0x81, 0x06, // Input (Data, Variable, Relative)
     0x09, 0x38, // Usage (Wheel)
     0x15, 0x81, // Logical Minimum (-127)
     0x25, 0x7f, // Logical Maximum (127)
     0x75, 0x08, // Report Size (8)
-    0x95, 0x03, // Report Count (3)
+    0x95, 0x01, // Report Count (1)
     0x81, 0x06, // Input (Data, Variable, Relative)
     0x05, 0x0c, // Usage Page (Consumer)
     0x0a, 0x38, 0x02, // Usage (AC Pan)
@@ -178,7 +183,7 @@ pub fn build_fallback_mirror_image(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hidreport::ReportDescriptor;
+    use hidreport::{Report, ReportDescriptor};
 
     #[test]
     fn every_builtin_descriptor_is_valid_hid() {
@@ -216,5 +221,23 @@ mod tests {
                 .as_slice(),
             &[0x81, 0x01, 0x82, 0x83]
         );
+
+        let descriptor = ReportDescriptor::try_from(MOUSE_REPORT_DESCRIPTOR).unwrap();
+        let mouse = &descriptor.input_reports()[0];
+        for usage_id in [0x30, 0x31] {
+            let axis = mouse
+                .fields()
+                .iter()
+                .find(|field| {
+                    matches!(
+                        field,
+                        hidreport::Field::Variable(field)
+                            if field.usage.usage_page == hidreport::UsagePage::from(0x01)
+                                && field.usage.usage_id == hidreport::UsageId::from(usage_id)
+                    )
+                })
+                .unwrap();
+            assert_eq!(axis.bits().len(), 16);
+        }
     }
 }
