@@ -53,11 +53,8 @@ pub(super) fn run_suite(args: &Args, repo: &Path) -> Result<()> {
 
     let mut tests = run_linux_functional_tests(&mut harness, &mut input)?;
     input.drain();
-    let (keyboard, mouse) = run_linux_latency_tests(
-        &mut harness,
-        &mut input,
-        args.latency_samples,
-    )?;
+    let (keyboard, mouse) =
+        run_linux_latency_tests(&mut harness, &mut input, args.latency_samples)?;
     let stability = run_linux_stability_test(
         &mut harness,
         &mut input,
@@ -287,11 +284,7 @@ fn wait_for_usb_inventory_settled(harness: &mut Harness, timeout: Duration) -> R
     bail!("DUT USB inventory did not settle before Linux pairing")
 }
 
-fn wait_for_host_bond(
-    harness: &mut Harness,
-    host_id: HostId,
-    timeout: Duration,
-) -> Result<()> {
+fn wait_for_host_bond(harness: &mut Harness, host_id: HostId, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     let index = usize::from(host_id.0 - 1);
     while Instant::now() < deadline {
@@ -630,9 +623,10 @@ impl LinuxInputObserver {
                 .checked_duration_since(Instant::now())
                 .context("timed out waiting for Linux input event set")?;
             let event = self.wait_for_any(duration)?;
-            if let Some(index) = remaining.iter().position(|candidate| {
-                *candidate == (event.event_type, event.code, event.value)
-            }) {
+            if let Some(index) = remaining
+                .iter()
+                .position(|candidate| *candidate == (event.event_type, event.code, event.value))
+            {
                 remaining.swap_remove(index);
             }
         }

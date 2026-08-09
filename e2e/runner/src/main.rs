@@ -2069,11 +2069,7 @@ fn find_evdevs(name: &str, timeout: Duration) -> Result<Vec<PathBuf>> {
     find_evdevs_on_bus(name, None, timeout)
 }
 
-fn find_evdevs_on_bus(
-    name: &str,
-    bus: Option<&str>,
-    timeout: Duration,
-) -> Result<Vec<PathBuf>> {
+fn find_evdevs_on_bus(name: &str, bus: Option<&str>, timeout: Duration) -> Result<Vec<PathBuf>> {
     let deadline = Instant::now() + timeout;
     loop {
         let mut devices = Vec::new();
