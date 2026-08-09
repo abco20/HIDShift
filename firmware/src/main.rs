@@ -16,7 +16,6 @@ mod wired_management;
 use esp_hal::clock::CpuClock;
 use esp_hal::interrupt::software::SoftwareInterruptControl;
 use esp_hal::ram;
-#[cfg(not(feature = "dual-s3-wired"))]
 use esp_hal::system::Stack;
 use esp_hal::timer::timg::{MwdtStage, TimerGroup, Wdt};
 use esp32s3_platform::ble_hid_task::BleRuntimeSnapshot;
@@ -107,12 +106,31 @@ const BLE_CORE_STACK_SIZE: usize = 48 * 1024;
 static BLE_EXECUTOR: StaticCell<esp_rtos::embassy::Executor> = StaticCell::new();
 #[cfg(not(feature = "dual-s3-wired"))]
 static BLE_CORE_STACK: StaticCell<Stack<BLE_CORE_STACK_SIZE>> = StaticCell::new();
+#[cfg(feature = "dual-s3-wired")]
+// Task futures live in static pools; 24 KiB is execution stack headroom while
+// keeping Rust BSS below the radio controller's high-DRAM working region.
+const WIRED_CORE_STACK_SIZE: usize = 24 * 1024;
+#[cfg(feature = "dual-s3-wired")]
+static WIRED_EXECUTOR: StaticCell<esp_rtos::embassy::Executor> = StaticCell::new();
+#[cfg(feature = "dual-s3-wired")]
+static WIRED_CORE_STACK: StaticCell<Stack<WIRED_CORE_STACK_SIZE>> = StaticCell::new();
 static CHANNEL_TASK_SINK: StaticCell<ChannelTaskSink> = StaticCell::new();
 static PENDING_USB_COMMANDS: ConstStaticCell<
     [Option<UsbHostTaskCommand>; RUNTIME_USB_COMMAND_QUEUE_CAPACITY],
 > = ConstStaticCell::new([None; RUNTIME_USB_COMMAND_QUEUE_CAPACITY]);
 static RUNTIME_OWNER_STORAGE: ConstStaticCell<DefaultRuntimeOwner> =
     ConstStaticCell::new(DefaultRuntimeOwner::new(0));
+
+#[cfg(feature = "dual-s3-wired")]
+struct WiredCoreResources {
+    cpu_control: esp_hal::peripherals::CPU_CTRL<'static>,
+    interrupt: esp_hal::interrupt::software::SoftwareInterrupt<'static, 1>,
+    usb0: esp_hal::peripherals::USB0<'static>,
+    gpio20: esp_hal::peripherals::GPIO20<'static>,
+    gpio19: esp_hal::peripherals::GPIO19<'static>,
+    boot_session_id: u32,
+    mirror_spi: MirrorSpiResources,
+}
 
 #[cfg(feature = "dual-s3-wired")]
 struct BleTaskResources {
@@ -183,18 +201,15 @@ fn run_firmware(
     let watchdog = timg0.wdt;
     let sw_ints = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     let scheduler_interrupt = sw_ints.software_interrupt0;
-    #[cfg(not(feature = "dual-s3-wired"))]
-    let ble_core_interrupt = sw_ints.software_interrupt1;
-    #[cfg(not(feature = "dual-s3-wired"))]
+    let secondary_core_interrupt = sw_ints.software_interrupt1;
     let cpu_control = peripherals.CPU_CTRL;
     let (bt, rng, adc1) = (peripherals.BT, peripherals.RNG, peripherals.ADC1);
     esp_rtos::start(timg0.timer0, scheduler_interrupt);
-    // The one-board image reserves the second core for the routing owner and
-    // BLE delivery. The dual-S3 image keeps USB Host, fixed-rate SPI, routing,
-    // and BLE on one explicit executor; both topologies spawn the same tasks
-    // through `spawn_runtime_and_ble`.
+    // The one-board image starts routing and BLE on the second core. The
+    // dual-S3 image initializes BLE on the primary core, then starts its Wired
+    // I/O core only after the controller reports ready.
     #[cfg(not(feature = "dual-s3-wired"))]
-    start_ble_core(cpu_control, ble_core_interrupt, bt, rng, adc1);
+    start_ble_core(cpu_control, secondary_core_interrupt, bt, rng, adc1);
     #[cfg(feature = "dual-s3-wired")]
     let ble_resources = BleTaskResources { bt, rng, adc1 };
 
@@ -214,6 +229,16 @@ fn run_firmware(
         peripherals.GPIO42,
         peripherals.GPIO2,
     );
+    #[cfg(feature = "dual-s3-wired")]
+    let wired_core = WiredCoreResources {
+        cpu_control,
+        interrupt: secondary_core_interrupt,
+        usb0,
+        gpio20,
+        gpio19,
+        boot_session_id,
+        mirror_spi,
+    };
     let flash = peripherals.FLASH;
 
     let executor = EXECUTOR.init(esp_rtos::embassy::Executor::new());
@@ -227,8 +252,11 @@ fn run_firmware(
                 gpio0,
                 uart0,
                 gpio44,
+                #[cfg(not(feature = "dual-s3-wired"))]
                 usb0,
+                #[cfg(not(feature = "dual-s3-wired"))]
                 gpio20,
+                #[cfg(not(feature = "dual-s3-wired"))]
                 gpio19,
                 boot_session_id,
                 flash,
@@ -236,7 +264,7 @@ fn run_firmware(
                 #[cfg(feature = "dual-s3-wired")]
                 ble_resources,
                 #[cfg(feature = "dual-s3-wired")]
-                mirror_spi,
+                wired_core,
             ),
             "startup",
         );
@@ -260,18 +288,7 @@ fn init_channel_task_sink() -> &'static mut ChannelTaskSink {
     })
 }
 
-fn spawn_runtime_and_ble(
-    spawner: &Spawner,
-    sink: &'static mut ChannelTaskSink,
-    bt: esp_hal::peripherals::BT<'static>,
-    rng: esp_hal::peripherals::RNG<'static>,
-    adc1: esp_hal::peripherals::ADC1<'static>,
-) {
-    spawn_or_reset(
-        spawner,
-        ble_executor_heartbeat_task(),
-        "ble-executor-heartbeat",
-    );
+fn spawn_runtime(spawner: &Spawner, sink: &'static mut ChannelTaskSink) {
     spawn_or_reset(
         spawner,
         runtime_owner_task(
@@ -283,6 +300,19 @@ fn spawn_runtime_and_ble(
             sink,
         ),
         "runtime-owner",
+    );
+}
+
+fn spawn_ble(
+    spawner: &Spawner,
+    bt: esp_hal::peripherals::BT<'static>,
+    rng: esp_hal::peripherals::RNG<'static>,
+    adc1: esp_hal::peripherals::ADC1<'static>,
+) {
+    spawn_or_reset(
+        spawner,
+        ble_executor_heartbeat_task(),
+        "ble-executor-heartbeat",
     );
     spawn_or_reset(
         spawner,
@@ -306,6 +336,18 @@ fn spawn_runtime_and_ble(
         ),
         "ble-host-event",
     );
+}
+
+#[cfg(not(feature = "dual-s3-wired"))]
+fn spawn_runtime_and_ble(
+    spawner: &Spawner,
+    sink: &'static mut ChannelTaskSink,
+    bt: esp_hal::peripherals::BT<'static>,
+    rng: esp_hal::peripherals::RNG<'static>,
+    adc1: esp_hal::peripherals::ADC1<'static>,
+) {
+    spawn_runtime(spawner, sink);
+    spawn_ble(spawner, bt, rng, adc1);
 }
 
 #[embassy_executor::task]
@@ -335,6 +377,53 @@ fn start_ble_core(
     });
 }
 
+#[cfg(feature = "dual-s3-wired")]
+#[inline(never)]
+fn start_wired_core(resources: WiredCoreResources) {
+    let WiredCoreResources {
+        cpu_control,
+        interrupt,
+        usb0,
+        gpio20,
+        gpio19,
+        boot_session_id,
+        mirror_spi,
+    } = resources;
+    let sink = init_channel_task_sink();
+    let wired_stack = WIRED_CORE_STACK.init_with(Stack::new);
+    esp_rtos::start_second_core(cpu_control, interrupt, wired_stack, move || {
+        let executor = WIRED_EXECUTOR.init(esp_rtos::embassy::Executor::new());
+        executor.run(|spawner| {
+            spawn_runtime(&spawner, sink);
+            spawn_or_reset(
+                &spawner,
+                usb_input_bootstrap(
+                    spawner,
+                    RUNTIME_INPUT_CHANNEL.sender(),
+                    USB_COMMAND_CHANNEL.receiver(),
+                    usb0,
+                    gpio20,
+                    gpio19,
+                    USB_BLE_QUIESCE_REQUEST_CHANNEL.sender(),
+                    USB_BLE_QUIESCE_READY_CHANNEL.receiver(),
+                    USB_BLE_QUIESCE_DONE_CHANNEL.sender(),
+                ),
+                "usb-input-bootstrap",
+            );
+            spawn_or_reset(
+                &spawner,
+                esp32s3_platform::mirror_spi_task::mirror_spi_master_task(
+                    DEVICE_COMMAND_CHANNEL.receiver(),
+                    RUNTIME_INPUT_CHANNEL.sender(),
+                    boot_session_id,
+                    mirror_spi,
+                ),
+                "mirror-spi-master",
+            );
+        })
+    });
+}
+
 #[embassy_executor::task]
 async fn startup_task(
     spawner: Spawner,
@@ -343,32 +432,30 @@ async fn startup_task(
     gpio0: esp_hal::peripherals::GPIO0<'static>,
     uart0: esp_hal::peripherals::UART0<'static>,
     gpio44: esp_hal::peripherals::GPIO44<'static>,
-    usb0: esp_hal::peripherals::USB0<'static>,
-    gpio20: esp_hal::peripherals::GPIO20<'static>,
-    gpio19: esp_hal::peripherals::GPIO19<'static>,
+    #[cfg(not(feature = "dual-s3-wired"))] usb0: esp_hal::peripherals::USB0<'static>,
+    #[cfg(not(feature = "dual-s3-wired"))] gpio20: esp_hal::peripherals::GPIO20<'static>,
+    #[cfg(not(feature = "dual-s3-wired"))] gpio19: esp_hal::peripherals::GPIO19<'static>,
     boot_session_id: u32,
     flash: esp_hal::peripherals::FLASH<'static>,
     watchdog: Wdt<esp_hal::peripherals::TIMG0<'static>>,
     #[cfg(feature = "dual-s3-wired")] ble_resources: BleTaskResources,
-    #[cfg(feature = "dual-s3-wired")] mirror_spi: MirrorSpiResources,
+    #[cfg(feature = "dual-s3-wired")] wired_core: WiredCoreResources,
 ) {
     spawn_or_reset(&spawner, watchdog_task(watchdog), "watchdog");
     #[cfg(feature = "dual-s3-wired")]
     {
-        let sink = init_channel_task_sink();
-        spawn_runtime_and_ble(
+        spawn_ble(
             &spawner,
-            sink,
             ble_resources.bt,
             ble_resources.rng,
             ble_resources.adc1,
         );
     }
     let storage_sender = RUNTIME_INPUT_CHANNEL.sender();
+    #[cfg(not(feature = "dual-s3-wired"))]
     let usb_input_sender = RUNTIME_INPUT_CHANNEL.sender();
+    #[cfg(not(feature = "dual-s3-wired"))]
     let usb_receiver = USB_COMMAND_CHANNEL.receiver();
-    #[cfg(feature = "dual-s3-wired")]
-    let device_receiver = DEVICE_COMMAND_CHANNEL.receiver();
     let _ = RUNTIME_INPUT_CHANNEL.try_send(RuntimeInputMessage::DiagnosticsEvent(
         RuntimeDiagnosticsEvent::ResetReason(reset_reason_code),
     ));
@@ -402,6 +489,7 @@ async fn startup_task(
         ),
         "serial-management",
     );
+    #[cfg(not(feature = "dual-s3-wired"))]
     spawn_or_reset(
         &spawner,
         usb_input_bootstrap(
@@ -440,16 +528,10 @@ async fn startup_task(
         "status-command",
     );
     #[cfg(feature = "dual-s3-wired")]
-    spawn_or_reset(
-        &spawner,
-        esp32s3_platform::mirror_spi_task::mirror_spi_master_task(
-            device_receiver,
-            RUNTIME_INPUT_CHANNEL.sender(),
-            boot_session_id,
-            mirror_spi,
-        ),
-        "mirror-spi-master",
-    );
+    {
+        esp32s3_platform::ble_hid_task::wait_for_controller_ready().await;
+        start_wired_core(wired_core);
+    }
     core::future::pending::<()>().await;
 }
 
@@ -508,8 +590,6 @@ async fn runtime_owner_task(
     mut sink: &'static mut ChannelTaskSink,
 ) {
     let mut owner = RUNTIME_OWNER_STORAGE.take();
-    let mut drive_diagnostics = RuntimeDriveDiagnostics::default();
-
     log::info!("firmware: runtime owner task boot");
 
     loop {
@@ -561,40 +641,8 @@ async fn runtime_owner_task(
         if matches!(message, RuntimeInputMessage::Tick { .. }) {
             tick_pending.mark_processed();
         }
-        process_runtime_message(&mut owner, &mut sink, message, &mut drive_diagnostics).await;
+        process_runtime_message(&mut owner, &mut sink, message).await;
         RUNTIME_HEARTBEAT.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-#[derive(Default)]
-struct RuntimeDriveDiagnostics {
-    #[cfg(feature = "dual-s3-wired")]
-    device_queue_full_total: u32,
-    #[cfg(feature = "dual-s3-wired")]
-    device_queue_full_window: u32,
-    #[cfg(feature = "dual-s3-wired")]
-    last_device_queue_log_ms: u64,
-}
-
-impl RuntimeDriveDiagnostics {
-    fn report(&mut self, error: ChannelTaskSendError) {
-        #[cfg(feature = "dual-s3-wired")]
-        if error == ChannelTaskSendError::DeviceQueueFull {
-            self.device_queue_full_total = self.device_queue_full_total.saturating_add(1);
-            self.device_queue_full_window = self.device_queue_full_window.saturating_add(1);
-            let now_ms = embassy_time::Instant::now().as_millis();
-            if now_ms.saturating_sub(self.last_device_queue_log_ms) >= 1_000 {
-                log::warn!(
-                    "firmware: Device queue full count_s={} total={}",
-                    self.device_queue_full_window,
-                    self.device_queue_full_total
-                );
-                self.device_queue_full_window = 0;
-                self.last_device_queue_log_ms = now_ms;
-            }
-            return;
-        }
-        log::error!("firmware: runtime drive error {:?}", error);
     }
 }
 
@@ -665,7 +713,6 @@ async fn process_runtime_message(
     owner: &mut DefaultRuntimeOwner,
     sink: &mut ChannelTaskSink,
     message: RuntimeInputMessage,
-    drive_diagnostics: &mut RuntimeDriveDiagnostics,
 ) {
     #[cfg(feature = "hardware-e2e")]
     if matches!(
@@ -697,7 +744,7 @@ async fn process_runtime_message(
 
     if let Err(error) = sink.dispatch_runtime_queues(owner.default_queues()).await {
         owner.rollback_message(checkpoint);
-        drive_diagnostics.report(error);
+        log::error!("firmware: runtime drive error {:?}", error);
         return;
     }
     for effect in owner.default_queues().effects.iter().copied() {
@@ -877,10 +924,6 @@ impl ChannelTaskSink {
         }
         if self.storage.free_capacity() < queues.storage.len() {
             return Err(ChannelTaskSendError::StorageQueueFull);
-        }
-        #[cfg(feature = "dual-s3-wired")]
-        if self.device.free_capacity() < queues.device.len() {
-            return Err(ChannelTaskSendError::DeviceQueueFull);
         }
         let required_status = queues
             .status
@@ -1142,18 +1185,9 @@ fn apply_runtime_effect(effect: hidshift::runtime::RuntimeEffect) {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ChannelTaskSendError {
     BleQueueFull,
-    #[cfg(feature = "dual-s3-wired")]
-    DeviceQueueFull,
     UsbQueueFull,
     StorageQueueFull,
     StatusQueueFull,
-}
-
-#[cfg(feature = "dual-s3-wired")]
-impl From<TrySendError<DeviceTaskCommand>> for ChannelTaskSendError {
-    fn from(_: TrySendError<DeviceTaskCommand>) -> Self {
-        Self::DeviceQueueFull
-    }
 }
 
 impl From<TrySendError<BleTaskCommand>> for ChannelTaskSendError {

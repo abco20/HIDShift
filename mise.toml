@@ -295,3 +295,14 @@ mise exec -- cargo run --locked --manifest-path e2e/mirror-runner/Cargo.toml -- 
   --host-port "$HIDSHIFT_HOST_PORT" \
   --device-flash-port "$HIDSHIFT_DEVICE_PORT"
 """
+
+[tasks."e2e:dual-wired"]
+description = "Measure the dual-S3 Wired path without changing Device firmware"
+run = """
+set -eu
+: "${HIDSHIFT_HOST_PORT:?Set HIDSHIFT_HOST_PORT to the Host S3 serial path}"
+mise exec -- cargo run --locked --manifest-path e2e/mirror-runner/Cargo.toml -- \
+  --host-port "$HIDSHIFT_HOST_PORT" \
+  --wired-performance-only \
+  --latency-samples 200
+"""

@@ -27,6 +27,8 @@ use hidshift::output_target::{MirrorCandidateId, OutputTargetAvailability};
 use hidshift_client::{ManagementClient, SerialResponseDecoder, encode_serial_request};
 use serialport::SerialPort;
 
+mod wired_performance;
+
 #[derive(Debug, Parser)]
 struct Arguments {
     #[arg(long)]
@@ -41,6 +43,13 @@ struct Arguments {
     /// Run only the SPI link-loss/no-failover scenario against existing images.
     #[arg(long)]
     spi_loss_only: bool,
+    /// Measure the Wired path without flashing the Device S3.
+    #[arg(long, conflicts_with = "spi_loss_only")]
+    wired_performance_only: bool,
+    #[arg(long, default_value_t = 200)]
+    latency_samples: usize,
+    #[arg(long, default_value = "e2e/results")]
+    results_dir: PathBuf,
     /// Skip T15 when the Linux hidraw node is not accessible to this user.
     #[arg(long)]
     skip_hidraw: bool,
@@ -127,18 +136,23 @@ fn run() -> Result<(), Box<dyn Error>> {
         .as_deref()
         .map(|port| EspflashTarget::device(port, arguments.device_usb_jtag));
     if !arguments.skip_flash {
-        let device_target = device_target
-            .ok_or("--device-flash-port is required unless --reuse-firmware is used")?;
-        if arguments.ble_address.is_some() && arguments.linux_controller_address.is_none() {
-            return Err(
-                "--linux-controller-address is required when flashing for --ble-address E2E".into(),
-            );
+        if arguments.wired_performance_only {
+            flash_wired_performance_host(&arguments.host_port)?;
+        } else {
+            let device_target = device_target
+                .ok_or("--device-flash-port is required unless --reuse-firmware is used")?;
+            if arguments.ble_address.is_some() && arguments.linux_controller_address.is_none() {
+                return Err(
+                    "--linux-controller-address is required when flashing for --ble-address E2E"
+                        .into(),
+                );
+            }
+            flash_firmware(
+                &arguments.host_port,
+                device_target,
+                arguments.linux_controller_address.as_deref(),
+            )?;
         }
-        flash_firmware(
-            &arguments.host_port,
-            device_target,
-            arguments.linux_controller_address.as_deref(),
-        )?;
     }
     let mut serial = serialport::new(arguments.host_port.to_string_lossy(), 115_200)
         .timeout(Duration::from_millis(100))
@@ -153,6 +167,49 @@ fn run() -> Result<(), Box<dyn Error>> {
         && let Some(address) = arguments.ble_address.as_deref()
     {
         pair_linux_ble_peer(&mut *serial, &mut client, address, arguments.ble_host_slot)?;
+    }
+    if arguments.wired_performance_only {
+        if !usb_identity_present(FALLBACK_USB_VENDOR_ID, FALLBACK_USB_PRODUCT_ID)? {
+            send_management_command(
+                &mut *serial,
+                &mut client,
+                ManagementCommand::ClearMirrorTarget,
+                "CLEAR_MIRROR_TARGET",
+            )?;
+        }
+        let target = output_target_status(&mut *serial, &mut client)?;
+        if target.selected != ManagementOutputTarget::Wired {
+            send_management_command(
+                &mut *serial,
+                &mut client,
+                ManagementCommand::SelectOutputTarget(ManagementOutputTarget::Wired),
+                "SELECT_OUTPUT_TARGET(Wired)",
+            )?;
+        }
+        wait_for_usb_identity(
+            &mut *serial,
+            FALLBACK_USB_VENDOR_ID,
+            FALLBACK_USB_PRODUCT_ID,
+            Duration::from_secs(arguments.usb_timeout_seconds),
+        )?;
+        wait_for_wired_ready(
+            &mut *serial,
+            &mut client,
+            Duration::from_secs(arguments.usb_timeout_seconds),
+        )?;
+        let events = open_input_events(
+            FALLBACK_USB_VENDOR_ID,
+            FALLBACK_USB_PRODUCT_ID,
+            3,
+            Duration::from_secs(3),
+        )?;
+        wired_performance::run(
+            &mut *serial,
+            events,
+            arguments.latency_samples,
+            &arguments.results_dir,
+        )?;
+        return Ok(());
     }
     if arguments.spi_loss_only {
         send_management_command(
@@ -642,36 +699,10 @@ fn flash_firmware(
     if linux_controller_address.is_some_and(|address| !valid_bluetooth_address(address)) {
         return Err("invalid --linux-controller-address".into());
     }
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .ok_or("mirror-runner is not below the repository root")?;
-    let export_file = root.join(".mise/esp/export-esp.sh");
-    if !export_file.is_file() {
-        return Err("ESP toolchain is not installed; run `mise run esp:install`".into());
-    }
-
+    let root = repository_root()?;
     let controller = linux_controller_address.unwrap_or("");
-    let build_script = format!(
-        "source '{}' && \
-         export HIDSHIFT_E2E_LINUX_ADDRESS='{}' && \
-         cargo +esp build --locked -Zbuild-std=core,alloc --release \
-           --manifest-path firmware/Cargo.toml --bin firmware \
-           --features hardware-e2e,dual-s3-wired \
-           --target xtensa-esp32s3-none-elf && \
-         cargo +esp build --locked -Zbuild-std=core --release \
-           --manifest-path device-firmware/Cargo.toml --bin hidshift-device \
-           --features hardware-e2e \
-           --target xtensa-esp32s3-none-elf",
-        export_file.display(),
-        controller
-    );
-    run_command(
-        Command::new("bash")
-            .args(["-lc", &build_script])
-            .current_dir(root),
-        "build Host and Device S3 firmware",
-    )?;
+    build_e2e_host(root, controller)?;
+    build_e2e_device(root)?;
     let mut erase_device = device_target.command("erase-region");
     erase_device.args(["0x324000", "0x10000"]).current_dir(root);
     run_command(
@@ -689,10 +720,74 @@ fn flash_firmware(
         ])
         .current_dir(root);
     run_command(&mut flash_device, "flash Device S3")?;
+    flash_e2e_host(root, host_port, true)?;
+    Ok(())
+}
+
+fn flash_wired_performance_host(host_port: &Path) -> Result<(), Box<dyn Error>> {
+    let root = repository_root()?;
+    build_e2e_host(root, "")?;
+    flash_e2e_host(root, host_port, false)
+}
+
+fn repository_root() -> Result<&'static Path, Box<dyn Error>> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("mirror-runner is not below the repository root")?;
+    if !root.join(".mise/esp/export-esp.sh").is_file() {
+        return Err("ESP toolchain is not installed; run `mise run esp:install`".into());
+    }
+    Ok(root)
+}
+
+fn build_e2e_host(root: &Path, linux_controller_address: &str) -> Result<(), Box<dyn Error>> {
+    let build_script = format!(
+        "source '{}' && \
+         export HIDSHIFT_E2E_LINUX_ADDRESS='{}' && \
+         cargo +esp build --locked -Zbuild-std=core,alloc --release \
+           --manifest-path firmware/Cargo.toml --bin firmware \
+           --features hardware-e2e,dual-s3-wired \
+           --target xtensa-esp32s3-none-elf",
+        root.join(".mise/esp/export-esp.sh").display(),
+        linux_controller_address
+    );
+    run_command(
+        Command::new("bash")
+            .args(["-lc", &build_script])
+            .current_dir(root),
+        "build Host S3 firmware",
+    )
+}
+
+fn build_e2e_device(root: &Path) -> Result<(), Box<dyn Error>> {
+    let build_script = format!(
+        "source '{}' && \
+         cargo +esp build --locked -Zbuild-std=core --release \
+           --manifest-path device-firmware/Cargo.toml --bin hidshift-device \
+           --features hardware-e2e \
+           --target xtensa-esp32s3-none-elf",
+        root.join(".mise/esp/export-esp.sh").display()
+    );
+    run_command(
+        Command::new("bash")
+            .args(["-lc", &build_script])
+            .current_dir(root),
+        "build Device S3 firmware",
+    )
+}
+
+fn flash_e2e_host(
+    root: &Path,
+    host_port: &Path,
+    erase_settings: bool,
+) -> Result<(), Box<dyn Error>> {
     let host_target = EspflashTarget::uart(host_port);
-    let mut erase_host = host_target.command("erase-region");
-    erase_host.args(["0x320000", "0x4000"]).current_dir(root);
-    run_command(&mut erase_host, "erase Host S3 settings partition")?;
+    if erase_settings {
+        let mut erase_host = host_target.command("erase-region");
+        erase_host.args(["0x320000", "0x4000"]).current_dir(root);
+        run_command(&mut erase_host, "erase Host S3 settings partition")?;
+    }
     let mut flash_host = host_target.command("flash");
     flash_host
         .args([
@@ -1683,6 +1778,14 @@ fn wait_for_text(
     expected: &[u8],
     timeout: Duration,
 ) -> Result<(), Box<dyn Error>> {
+    wait_for_line_containing(serial, expected, timeout).map(|_| ())
+}
+
+fn wait_for_line_containing(
+    serial: &mut dyn SerialPort,
+    expected: &[u8],
+    timeout: Duration,
+) -> Result<String, Box<dyn Error>> {
     let deadline = Instant::now() + timeout;
     let mut line = Vec::new();
     let mut byte = [0; 1];
@@ -1696,7 +1799,7 @@ fn wait_for_text(
                     .windows(expected.len())
                     .any(|window| window == expected)
                 {
-                    return Ok(());
+                    return Ok(String::from_utf8_lossy(&line).into_owned());
                 }
                 line.clear();
             }

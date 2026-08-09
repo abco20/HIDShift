@@ -5,11 +5,11 @@ aggregation, routing, and management. Device S3 is a dedicated native USB HID
 Device. The default firmware does not include this path and runs on one
 ESP32-S3.
 
-Host S3 uses one executor for the dual-S3 image so the USB Host, fixed-rate SPI
-poller, routing owner, and BLE task share one explicit scheduling boundary.
-The normal one-board image instead reserves the second CPU core for routing and
-BLE delivery, where direct-radio latency is the primary constraint. Task
-behavior and message boundaries are shared between both topologies.
+Host S3 keeps BLE and management on the primary core. After the BLE controller
+is ready, a dedicated second-core executor starts USB Host, routing, and the SPI
+poller so Wired input cannot be starved by radio work. The normal one-board
+image instead runs routing and BLE together on the second core; task behavior
+and message boundaries remain shared between topologies.
 
 ## Wiring
 

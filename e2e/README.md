@@ -6,6 +6,7 @@
 | `mise run e2e:linux` | one DUT + Linux PC | primary BLE input, user-observed latency, firmware latency, and stability |
 | `mise run e2e:radio` | DUT + Probe + Linux PC | optional direct-air latency and retained two-host session |
 | `mise run e2e:dual` | Host S3 + Device S3 + Linux PC | Wired presentation, exact descriptors, SPI loss and recovery |
+| `mise run e2e:dual-wired` | Host S3 + production Device S3 + Linux PC | Wired latency and 1 kHz mouse delivery without changing Device firmware |
 
 Roles are resolved by stable USB serial and MAC identity, never by `ttyACM`
 numbering.
@@ -119,3 +120,11 @@ Use `--reuse-firmware --spi-loss-only --device-flash-port <device-s3>` for a sho
 T26 run against already loaded hardware. This mode does not read or register
 Mirror fixture files; the Device port is used only to reset the intentionally
 offline SPI slave after the no-failover assertion.
+
+`mise run e2e:dual-wired` flashes only the Host S3 hardware-E2E image. The
+Device S3 keeps its normal production firmware. It selects the Wired fallback,
+measures UART injection through SPI and USB to Linux evdev, and verifies that a
+1 kHz mouse stream preserves its total movement, source rate, delivery time,
+and interarrival tail. Add
+`--reuse-firmware` when calling `e2e/mirror-runner` directly to repeat the
+measurement without flashing either board.
