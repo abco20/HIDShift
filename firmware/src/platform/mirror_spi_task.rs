@@ -2,7 +2,9 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::{Receiver, Sender};
 use embassy_time::{Duration, Instant, Ticker};
 use esp_hal::Blocking;
+use esp_hal::delay::Delay;
 use esp_hal::dma::{DmaRxBuf, DmaTxBuf};
+use esp_hal::gpio::{DriveStrength, Event, Input, InputConfig, Level, Output, OutputConfig, Pull};
 use esp_hal::spi::Mode;
 use esp_hal::spi::master::{Config, Spi};
 use esp_hal::time::Rate;
@@ -13,17 +15,17 @@ use hidshift::interchip::message::{
     CAPABILITY_STANDARD_WIRED_HID, CAPABILITY_USB_STATE_REPORTING, RECORD_ACTIVATE_PROFILE,
     RECORD_CONTROL_REQUEST, RECORD_CONTROL_RESPONSE, RECORD_FORCE_FALLBACK, RECORD_HEARTBEAT,
     RECORD_HELLO, RECORD_HELLO_ACK, RECORD_LINK_RESET, RECORD_PROFILE_BEGIN, RECORD_PROFILE_CHUNK,
-    RECORD_PROFILE_COMMIT, RECORD_PROFILE_RESULT, RECORD_RAW_ENDPOINT_IN, RECORD_RAW_ENDPOINT_OUT,
-    RECORD_STANDARD_INPUT_REPORT, RECORD_STANDARD_OUTPUT_REPORT, RECORD_STANDARD_RELEASE_ALL,
-    RECORD_USB_STATE,
+    RECORD_PROFILE_COMMIT, RECORD_PROFILE_RESULT, RECORD_RAW_ENDPOINT_OUT,
+    RECORD_STANDARD_OUTPUT_REPORT, RECORD_STANDARD_RELEASE_ALL, RECORD_USB_STATE,
 };
 use hidshift::interchip::{
     CONTROL_FRAGMENT_LAST, ControlRequestAssembler, ControlRequestFragment,
-    ControlResponseFragment, Hello, InterchipRole, MirrorControlRequest, MirrorControlResponse,
-    ProfileResult, RawEndpointReport, ReceiveDisposition, Record, RecordIter,
-    ReliableDeliveryQueue, ReliableReceiver, ReliableSender, RetransmitAction, SPI_CELL_LEN,
-    SPI_CELL_PAYLOAD_LEN, SPI_PROTOCOL_VERSION, SPI_TX_WINDOW, SpiCell, StandardInputReport,
-    StandardOutputReport, UsbState, encode_records,
+    ControlResponseFragment, Hello, InputReport, InputReportBatch, InterchipRole,
+    MirrorControlRequest, MirrorControlResponse, ProfileResult, RawEndpointReport,
+    ReceiveDisposition, Record, RecordIter, ReliableDeliveryQueue, ReliableReceiver,
+    ReliableSender, RetransmitAction, SPI_CELL_LEN, SPI_CELL_PAYLOAD_LEN, SPI_PROTOCOL_VERSION,
+    SPI_TX_WINDOW, SpiCell, SpiLinkRecovery, SpiLinkRecoveryAction, SpiReadyAction,
+    SpiReadyHandshake, StandardInputReport, StandardOutputReport, UsbState, encode_records,
 };
 use hidshift::output_target::OutputTargetAvailability;
 use hidshift::runtime::message::RuntimeInputMessage;
@@ -31,14 +33,22 @@ use hidshift::runtime::{
     DeviceTaskCommand, RUNTIME_DEVICE_COMMAND_QUEUE_CAPACITY, RUNTIME_INPUT_QUEUE_CAPACITY,
 };
 
-// A full 128-byte cell takes about 103 us at 10 MHz. Polling every 400 us
-// leaves enough time for the Device to process and requeue DMA while giving a
-// 1 kHz mouse 2.5 transport slots per report interval.
-const SPI_POLL_INTERVAL: Duration = Duration::from_micros(400);
+// A full 128-byte cell takes about 103 us at 10 MHz. Checking READY every
+// 200 us provides up to 5,000 cells/s while leaving time for Device processing
+// and USB service.
+const SPI_FREQUENCY_MHZ: u32 = 10;
+const SPI_POLL_INTERVAL: Duration = Duration::from_micros(200);
+// ESP32-S3 SPI slave needs CS to become active before the first SCLK edge.
+// esp-hal's hardware-CS path has no configurable pre-transaction delay, so
+// GPIO-controlled CS provides a margin over the 0.1 us period at 10 MHz.
+const SPI_CS_SETUP_US: u32 = 2;
+const SPI_CS_HOLD_US: u32 = 1;
+const SPI_READY_DEASSERTION_TIMEOUT_MS: u64 = 5;
 const RETRANSMIT_TIMEOUT_MS: u64 = 5;
 const MAX_RETRANSMIT_ATTEMPTS: u8 = 8;
 const HEARTBEAT_INTERVAL_MS: u64 = 500;
 const LINK_LOSS_TIMEOUT_MS: u64 = 1_500;
+const DEVICE_RESET_QUIET_PERIOD_MS: u64 = 2_000;
 const HOST_CAPABILITIES: u32 = CAPABILITY_DYNAMIC_PROFILE
     | CAPABILITY_FALLBACK_PROFILE
     | CAPABILITY_STANDARD_WIRED_HID
@@ -54,6 +64,7 @@ pub struct MirrorSpiResources {
     mosi: esp_hal::peripherals::GPIO40<'static>,
     sclk: esp_hal::peripherals::GPIO39<'static>,
     miso: esp_hal::peripherals::GPIO42<'static>,
+    ready: esp_hal::peripherals::GPIO2<'static>,
 }
 
 impl MirrorSpiResources {
@@ -64,6 +75,7 @@ impl MirrorSpiResources {
         mosi: esp_hal::peripherals::GPIO40<'static>,
         sclk: esp_hal::peripherals::GPIO39<'static>,
         miso: esp_hal::peripherals::GPIO42<'static>,
+        ready: esp_hal::peripherals::GPIO2<'static>,
     ) -> Self {
         Self {
             spi,
@@ -72,6 +84,7 @@ impl MirrorSpiResources {
             mosi,
             sclk,
             miso,
+            ready,
         }
     }
 }
@@ -88,9 +101,10 @@ struct LinkDiagnostics {
     command_encode_errors: u32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum WireCommand {
     Command(DeviceTaskCommand),
+    InputReportBatch(InputReportBatch),
     ControlResponseFragment {
         response: MirrorControlResponse,
         offset: usize,
@@ -122,6 +136,7 @@ pub async fn mirror_spi_master_task(
         mosi,
         sclk,
         miso,
+        ready,
     } = resources;
     let (rx_buffer, rx_descriptors, tx_buffer, tx_descriptors) =
         esp_hal::dma_buffers!(SPI_CELL_LEN);
@@ -142,7 +157,7 @@ pub async fn mirror_spi_master_task(
     let spi = match Spi::new(
         spi,
         Config::default()
-            .with_frequency(Rate::from_mhz(10))
+            .with_frequency(Rate::from_mhz(SPI_FREQUENCY_MHZ))
             .with_mode(Mode::_0),
     ) {
         Ok(spi) => spi,
@@ -151,18 +166,32 @@ pub async fn mirror_spi_master_task(
             esp_hal::system::software_reset();
         }
     }
-    .with_cs(cs)
     .with_mosi(mosi)
     .with_sck(sclk)
     .with_miso(miso)
     .with_dma(dma)
     .with_buffers(dma_rx, dma_tx);
 
-    run_link(spi, command_receiver, runtime_sender, session_id).await;
+    // Long jumper wires ring badly with the ESP32-S3's default 20 mA GPIO
+    // drive. Slower 5 mA edges still have ample margin at 10 MHz and reduce
+    // false clocks and CS transitions at the Device.
+    set_output_drive_strength(39, DriveStrength::_5mA);
+    set_output_drive_strength(40, DriveStrength::_5mA);
+    let cs = Output::new(
+        cs,
+        Level::High,
+        OutputConfig::default().with_drive_strength(DriveStrength::_5mA),
+    );
+    let mut ready = Input::new(ready, InputConfig::default().with_pull(Pull::Down));
+    ready.listen(Event::FallingEdge);
+
+    run_link(spi, cs, ready, command_receiver, runtime_sender, session_id).await;
 }
 
 async fn run_link(
     mut spi: esp_hal::spi::master::SpiDmaBus<'static, Blocking>,
+    mut cs: Output<'static>,
+    mut ready: Input<'static>,
     command_receiver: Receiver<
         'static,
         CriticalSectionRawMutex,
@@ -194,7 +223,16 @@ async fn run_link(
     let mut control_request_assembler = ControlRequestAssembler::new();
     let mut delivery = ReliableDeliveryQueue::<WireCommand>::new();
     let mut expanding_control_response: Option<(MirrorControlResponse, usize)> = None;
+    let mut pending_device_command = None;
     let mut diagnostics = LinkDiagnostics::default();
+    let mut recovery_attempts = 0u32;
+    let mut recovery = SpiLinkRecovery::new(
+        Instant::now().as_millis(),
+        LINK_LOSS_TIMEOUT_MS,
+        DEVICE_RESET_QUIET_PERIOD_MS,
+    );
+    let mut ready_handshake = SpiReadyHandshake::new(SPI_READY_DEASSERTION_TIMEOUT_MS);
+    let mut ready_recoveries = 0u32;
     let mut ticker = Ticker::every(SPI_POLL_INTERVAL);
 
     loop {
@@ -213,18 +251,52 @@ async fn run_link(
         report_control_request(&runtime_sender, &mut pending_control_request);
         report_device_usb_state(&runtime_sender, &mut pending_device_usb_state);
 
-        if last_valid_cell_ms
-            .is_some_and(|last| now_ms.saturating_sub(last) >= LINK_LOSS_TIMEOUT_MS)
-        {
-            hello_confirmed = false;
-            usb_state = None;
-            last_valid_cell_ms = None;
-            session_id = nonzero_session(session_id.wrapping_add(1));
-            delivery.retry_after_session_reset();
-            sender.reset_session(session_id);
-            receiver = ReliableReceiver::new();
-            control_request_assembler.reset();
-            diagnostics.resets = diagnostics.resets.saturating_add(1);
+        match recovery.advance(now_ms) {
+            SpiLinkRecoveryAction::EnterQuiet => {
+                recovery_attempts = recovery_attempts.saturating_add(1);
+                if recovery_attempts.is_power_of_two() {
+                    log::warn!(
+                        "mirror-spi: no valid Device response; forcing reset silence attempt={}",
+                        recovery_attempts
+                    );
+                }
+                hello_confirmed = false;
+                usb_state = None;
+                last_valid_cell_ms = None;
+                reset_outbound_session(
+                    &mut session_id,
+                    &mut sender,
+                    &mut delivery,
+                    &mut control_request_assembler,
+                    &mut diagnostics,
+                );
+                receiver = ReliableReceiver::new();
+                continue;
+            }
+            SpiLinkRecoveryAction::StayQuiet => continue,
+            SpiLinkRecoveryAction::ResumePolling => {}
+            SpiLinkRecoveryAction::Poll => {}
+        }
+
+        let ready_deasserted = ready.is_interrupt_set();
+        if ready_deasserted {
+            // Manual GPIO interrupts are single-shot. Rearm the falling-edge
+            // latch before a possible transaction creates the next edge.
+            ready.clear_interrupt();
+            ready.listen(Event::FallingEdge);
+        }
+        match ready_handshake.observe(ready.is_high(), ready_deasserted, now_ms) {
+            SpiReadyAction::Wait => continue,
+            SpiReadyAction::Transfer => {}
+            SpiReadyAction::RecoverTransfer => {
+                ready_recoveries = ready_recoveries.saturating_add(1);
+                if ready_recoveries.is_power_of_two() {
+                    log::warn!(
+                        "mirror-spi: READY deassertion missed; resynchronizing recovery={}",
+                        ready_recoveries
+                    );
+                }
+            }
         }
 
         #[cfg(feature = "hardware-e2e")]
@@ -248,13 +320,15 @@ async fn run_link(
                 Some(cell)
             }
             RetransmitAction::LinkResetRequired => {
-                diagnostics.resets = diagnostics.resets.saturating_add(1);
-                delivery.retry_after_session_reset();
-                session_id = nonzero_session(session_id.wrapping_add(1));
-                sender.reset_session(session_id);
                 hello_confirmed = false;
                 usb_state = None;
-                control_request_assembler.reset();
+                reset_outbound_session(
+                    &mut session_id,
+                    &mut sender,
+                    &mut delivery,
+                    &mut control_request_assembler,
+                    &mut diagnostics,
+                );
                 // DeviceLink deliberately ignores commands from a new Host
                 // session until it sees a compatible HELLO. Sending
                 // LINK_RESET as sequence 1 therefore deadlocks recovery:
@@ -272,21 +346,49 @@ async fn run_link(
                 } else if let Some((response, offset)) = expanding_control_response {
                     Some(WireCommand::ControlResponseFragment { response, offset })
                 } else {
-                    match command_receiver.try_receive() {
-                        Ok(DeviceTaskCommand::ControlResponse(response)) => {
+                    let command = pending_device_command
+                        .take()
+                        .or_else(|| command_receiver.try_receive().ok());
+                    match command {
+                        Some(DeviceTaskCommand::ControlResponse(response)) => {
                             expanding_control_response = Some((response, 0));
                             Some(WireCommand::ControlResponseFragment {
                                 response,
                                 offset: 0,
                             })
                         }
-                        Ok(command) => Some(WireCommand::Command(command)),
-                        Err(_) => None,
+                        Some(first) => match input_report(first, report_sequence) {
+                            Some(first_report) => {
+                                advance_report_sequence(first, &mut report_sequence);
+                                let mut batch = InputReportBatch::new(first_report);
+                                loop {
+                                    match command_receiver.try_receive() {
+                                        Ok(command) => {
+                                            let Some(report) =
+                                                input_report(command, report_sequence)
+                                            else {
+                                                pending_device_command = Some(command);
+                                                break;
+                                            };
+                                            if batch.try_push(report).is_err() {
+                                                pending_device_command = Some(command);
+                                                break;
+                                            }
+                                            advance_report_sequence(command, &mut report_sequence);
+                                        }
+                                        Err(_) => break,
+                                    }
+                                }
+                                Some(WireCommand::InputReportBatch(batch))
+                            }
+                            None => Some(WireCommand::Command(first)),
+                        },
+                        None => None,
                     }
                 };
 
                 if let Some(command) = wire_command {
-                    match queue_wire_command(&mut sender, command, &mut report_sequence, now_ms) {
+                    match queue_wire_command(&mut sender, &command, now_ms) {
                         Ok((cell, control_progress)) => {
                             if !from_retry
                                 && let Some((response, next_offset, last)) = control_progress
@@ -309,7 +411,7 @@ async fn run_link(
                 } else if now_ms.saturating_sub(last_heartbeat_ms) >= HEARTBEAT_INTERVAL_MS {
                     last_heartbeat_ms = now_ms;
                     let command = WireCommand::Heartbeat;
-                    match queue_wire_command(&mut sender, command, &mut report_sequence, now_ms) {
+                    match queue_wire_command(&mut sender, &command, now_ms) {
                         Ok((cell, _)) => {
                             if delivery.record_queued(command).is_err() {
                                 diagnostics.command_encode_errors =
@@ -358,8 +460,15 @@ async fn run_link(
                 tx_cell.header.tx_sequence
             );
         }
+        ready_handshake.mark_transfer_started(now_ms);
         let mut rx = [0u8; SPI_CELL_LEN];
-        if let Err(error) = spi.transfer(&mut rx, &tx) {
+        cs.set_low();
+        Delay::new().delay_micros(SPI_CS_SETUP_US);
+        let transfer_result = spi.transfer(&mut rx, &tx);
+        Delay::new().delay_micros(SPI_CS_HOLD_US);
+        cs.set_high();
+        if let Err(error) = transfer_result {
+            ready_handshake.cancel_transfer();
             log::warn!("mirror-spi: DMA transaction failed {:?}", error);
             continue;
         }
@@ -372,8 +481,16 @@ async fn run_link(
                 continue;
             }
         };
+        if recovery_attempts > 0 {
+            log::warn!(
+                "mirror-spi: Device link recovered after {} reset-silence attempts",
+                recovery_attempts
+            );
+            recovery_attempts = 0;
+        }
         diagnostics.valid_cells = diagnostics.valid_cells.saturating_add(1);
         last_valid_cell_ms = Some(now_ms);
+        recovery.observe_valid_cell(now_ms);
         let disposition = receiver.receive(&cell);
         let remote_session_changed = matches!(
             disposition,
@@ -385,11 +502,13 @@ async fn run_link(
         if remote_session_changed {
             hello_confirmed = false;
             usb_state = None;
-            session_id = nonzero_session(session_id.wrapping_add(1));
-            delivery.retry_after_session_reset();
-            sender.reset_session(session_id);
-            control_request_assembler.reset();
-            diagnostics.resets = diagnostics.resets.saturating_add(1);
+            reset_outbound_session(
+                &mut session_id,
+                &mut sender,
+                &mut delivery,
+                &mut control_request_assembler,
+                &mut diagnostics,
+            );
         } else {
             let acknowledged = sender.acknowledge(cell.header.cumulative_ack);
             delivery.acknowledge(acknowledged);
@@ -434,13 +553,35 @@ async fn run_link(
             ReceiveDisposition::SessionChanged | ReceiveDisposition::Empty => {}
         }
         if !remote_session_changed && !hello_confirmed && delivery.has_inflight() {
-            session_id = nonzero_session(session_id.wrapping_add(1));
-            delivery.retry_after_session_reset();
-            sender.reset_session(session_id);
-            control_request_assembler.reset();
-            diagnostics.resets = diagnostics.resets.saturating_add(1);
+            reset_outbound_session(
+                &mut session_id,
+                &mut sender,
+                &mut delivery,
+                &mut control_request_assembler,
+                &mut diagnostics,
+            );
         }
     }
+}
+
+fn set_output_drive_strength(pin: usize, strength: DriveStrength) {
+    esp_hal::peripherals::IO_MUX::regs()
+        .gpio(pin)
+        .modify(|_, writer| unsafe { writer.fun_drv().bits(strength as u8) });
+}
+
+fn reset_outbound_session(
+    session_id: &mut u32,
+    sender: &mut ReliableSender,
+    delivery: &mut ReliableDeliveryQueue<WireCommand>,
+    control_request_assembler: &mut ControlRequestAssembler,
+    diagnostics: &mut LinkDiagnostics,
+) {
+    delivery.retry_after_session_reset();
+    *session_id = nonzero_session(session_id.wrapping_add(1));
+    sender.reset_session(*session_id);
+    control_request_assembler.reset();
+    diagnostics.resets = diagnostics.resets.saturating_add(1);
 }
 
 #[cfg(feature = "hardware-e2e")]
@@ -450,7 +591,8 @@ fn is_e2e_faultable_input_cell(cell: &SpiCell) -> bool {
         record.is_ok_and(|record| {
             matches!(
                 record.record_type,
-                RECORD_RAW_ENDPOINT_IN | RECORD_STANDARD_INPUT_REPORT
+                hidshift::interchip::message::RECORD_RAW_ENDPOINT_IN
+                    | hidshift::interchip::message::RECORD_STANDARD_INPUT_REPORT
             )
         })
     })
@@ -471,18 +613,24 @@ fn queue_hello(sender: &mut ReliableSender, now_ms: u64) -> Option<SpiCell> {
 
 fn queue_wire_command(
     sender: &mut ReliableSender,
-    command: WireCommand,
-    report_sequence: &mut u16,
+    command: &WireCommand,
     now_ms: u64,
 ) -> Result<(SpiCell, Option<(MirrorControlResponse, usize, bool)>), ()> {
     match command {
         WireCommand::Command(command) => {
-            queue_command(sender, command, report_sequence, now_ms).map(|cell| (cell, None))
+            queue_command(sender, *command, now_ms).map(|cell| (cell, None))
+        }
+        WireCommand::InputReportBatch(batch) => {
+            let (payload, count) = batch.encoded();
+            sender
+                .queue(payload, count, now_ms)
+                .map(|cell| (cell, None))
+                .map_err(|_| ())
         }
         WireCommand::ControlResponseFragment { response, offset } => {
             let (cell, next_offset, last) =
-                queue_control_response_fragment(sender, response, offset, now_ms)?;
-            Ok((cell, Some((response, next_offset, last))))
+                queue_control_response_fragment(sender, *response, *offset, now_ms)?;
+            Ok((cell, Some((*response, next_offset, last))))
         }
         WireCommand::Heartbeat => {
             queue_record(sender, RECORD_HEARTBEAT, &[], now_ms).map(|cell| (cell, None))
@@ -490,29 +638,33 @@ fn queue_wire_command(
     }
 }
 
+fn input_report(command: DeviceTaskCommand, report_sequence: u16) -> Option<InputReport> {
+    match command {
+        DeviceTaskCommand::StandardReport { report, reason } => {
+            Some(InputReport::Standard(StandardInputReport {
+                flags: notify_reason_flags(reason),
+                sequence: report_sequence,
+                report,
+            }))
+        }
+        DeviceTaskCommand::RawEndpointIn(report) => Some(InputReport::Raw(report)),
+        _ => None,
+    }
+}
+
+fn advance_report_sequence(command: DeviceTaskCommand, report_sequence: &mut u16) {
+    if matches!(command, DeviceTaskCommand::StandardReport { .. }) {
+        *report_sequence = next_nonzero(*report_sequence);
+    }
+}
+
 fn queue_command(
     sender: &mut ReliableSender,
     command: DeviceTaskCommand,
-    report_sequence: &mut u16,
     now_ms: u64,
 ) -> Result<SpiCell, ()> {
     match command {
-        DeviceTaskCommand::StandardReport { report, reason } => {
-            let message = StandardInputReport {
-                flags: notify_reason_flags(reason),
-                sequence: *report_sequence,
-                report,
-            };
-            *report_sequence = next_nonzero(*report_sequence);
-            let (data, length) = message.encode();
-            queue_record(
-                sender,
-                RECORD_STANDARD_INPUT_REPORT,
-                &data[..length as usize],
-                now_ms,
-            )
-            .map_err(|_| ())
-        }
+        DeviceTaskCommand::StandardReport { .. } | DeviceTaskCommand::RawEndpointIn(_) => Err(()),
         DeviceTaskCommand::ReleaseAll => {
             queue_record(sender, RECORD_STANDARD_RELEASE_ALL, &[], now_ms).map_err(|_| ())
         }
@@ -548,11 +700,6 @@ fn queue_command(
             now_ms,
         )
         .map_err(|_| ()),
-        DeviceTaskCommand::RawEndpointIn(report) => {
-            let mut data = [0; hidshift::interchip::message::RAW_ENDPOINT_MAX_WIRE_LEN];
-            let length = report.encode(&mut data).map_err(|_| ())?;
-            queue_record(sender, RECORD_RAW_ENDPOINT_IN, &data[..length], now_ms).map_err(|_| ())
-        }
         DeviceTaskCommand::ControlResponse(_) => Err(()),
     }
 }

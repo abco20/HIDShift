@@ -3,14 +3,15 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 esp_export="$repo_root/.mise/esp/export-esp.sh"
-dut_port="/dev/serial/by-id/usb-1a86_USB_Single_Serial_5C84329179-if00"
+: "${HIDSHIFT_DUT_PORT:?Set HIDSHIFT_DUT_PORT to the DUT serial path}"
+dut_port="$HIDSHIFT_DUT_PORT"
 
 if [[ ! -f "$esp_export" ]]; then
   echo "ESP toolchain is not installed. Run: mise run esp:install" >&2
   exit 1
 fi
 if [[ ! -e "$dut_port" ]]; then
-  echo "DUT USB identity is not connected: $dut_port" >&2
+  echo "DUT serial path is not connected: $dut_port" >&2
   exit 1
 fi
 

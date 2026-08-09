@@ -2,7 +2,7 @@
 
 | Task | Hardware | Purpose |
 | --- | --- | --- |
-| `mise run e2e:pc` | one DUT + Linux PC | cable management, CLI JSON, input/status/diagnostics smoke |
+| `HIDSHIFT_DUT_PORT=<path> mise run e2e:pc` | one DUT + Linux PC | cable management, CLI JSON, input/status/diagnostics smoke |
 | `mise run e2e:radio` | DUT + Probe + Linux PC | mandatory retained Linux session, synchronized BLE latency and stability |
 | `mise run e2e:dual` | Host S3 + Device S3 + Linux PC | Wired presentation, exact descriptors, SPI loss and recovery |
 
@@ -79,15 +79,15 @@ Fallback recovers.
 A normal flashing run erases the Host settings partition and Device Mirror
 profile partition first, so every run exercises fresh Profile A/B commits.
 The dual-S3 hardware-E2E Host uses volatile settings storage to keep its
-controller-less BLE test configuration from pausing the 500 µs SPI poll loop;
+controller-less BLE test configuration from pausing the READY-gated SPI loop;
 Device S3 profile flash and reboot persistence are still exercised.
 
 ```sh
 cargo run --manifest-path e2e/mirror-runner/Cargo.toml -- \
   --host-port /dev/serial/by-id/<host-s3> \
   --device-flash-port /dev/serial/by-id/<device-s3> \
-  --ble-address 6A:EE:8F:64:11:AD \
-  --linux-controller-address 4C:23:38:A6:20:44
+  --ble-address <dut-ble-address> \
+  --linux-controller-address <linux-controller-address>
 ```
 
 Use `--reuse-firmware` to reuse loaded images. Explicit ports avoid confusing the
