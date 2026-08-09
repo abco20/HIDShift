@@ -1,9 +1,9 @@
 [package]
-name = "hidshift-client"
+name = "hidshift-manager-ui"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 publish = false
 
 [dependencies]
-hidshift = { path = "../..", features = ["dual-s3-wired"] }
+hidshift = { path = ".." }

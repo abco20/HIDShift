@@ -3,8 +3,8 @@ use std::rc::Rc;
 
 use gloo_timers::future::TimeoutFuture;
 use hidshift::{
-    MANAGEMENT_REQUEST_UUID, MANAGEMENT_RESPONSE_LEN, MANAGEMENT_RESPONSE_UUID,
-    MANAGEMENT_SERVICE_UUID,
+    MANAGEMENT_EVENT_LEN, MANAGEMENT_EVENT_UUID, MANAGEMENT_REQUEST_UUID, MANAGEMENT_RESPONSE_LEN,
+    MANAGEMENT_RESPONSE_UUID, MANAGEMENT_SERVICE_UUID,
 };
 use hidshift_client::{PendingRequest, SerialResponseDecoder, encode_serial_request};
 use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array};
@@ -18,6 +18,7 @@ type BytesCallback = Rc<dyn Fn(&[u8])>;
 type DisconnectCallback = Rc<dyn Fn(String)>;
 
 pub enum BrowserTransport {
+    Tauri(TauriTransport),
     Bluetooth(BluetoothTransport),
     Serial(SerialTransport),
 }
@@ -26,9 +27,15 @@ impl BrowserTransport {
     pub async fn connect_bluetooth(
         on_bytes: BytesCallback,
         on_disconnect: DisconnectCallback,
+        on_event: BytesCallback,
     ) -> Result<Rc<Self>, String> {
+        if tauri_invoke().is_some() {
+            return Ok(Rc::new(Self::Tauri(
+                TauriTransport::connect(on_bytes).await?,
+            )));
+        }
         Ok(Rc::new(Self::Bluetooth(
-            BluetoothTransport::connect(on_bytes, on_disconnect).await?,
+            BluetoothTransport::connect(on_bytes, on_disconnect, on_event).await?,
         )))
     }
 
@@ -36,6 +43,11 @@ impl BrowserTransport {
         on_bytes: BytesCallback,
         on_disconnect: DisconnectCallback,
     ) -> Result<Rc<Self>, String> {
+        if tauri_invoke().is_some() {
+            return Ok(Rc::new(Self::Tauri(
+                TauriTransport::connect(on_bytes).await?,
+            )));
+        }
         Ok(Rc::new(Self::Serial(
             SerialTransport::connect(on_bytes, on_disconnect).await?,
         )))
@@ -43,6 +55,7 @@ impl BrowserTransport {
 
     pub async fn write(&self, request: PendingRequest) -> Result<(), String> {
         match self {
+            Self::Tauri(transport) => transport.write(request).await,
             Self::Bluetooth(transport) => transport.write(request).await,
             Self::Serial(transport) => transport.write(request).await,
         }
@@ -50,6 +63,7 @@ impl BrowserTransport {
 
     pub fn label(&self) -> String {
         match self {
+            Self::Tauri(transport) => transport.label.clone(),
             Self::Bluetooth(_) => "Bluetooth · HIDShift".into(),
             Self::Serial(_) => "有線 · Serial".into(),
         }
@@ -60,6 +74,70 @@ impl BrowserTransport {
     }
 }
 
+pub struct TauriTransport {
+    on_bytes: BytesCallback,
+    label: String,
+}
+
+impl TauriTransport {
+    async fn connect(on_bytes: BytesCallback) -> Result<Self, String> {
+        let value = tauri_call("connect_hidshift", &Object::new()).await?;
+        let label = value
+            .as_string()
+            .unwrap_or_else(|| "Companion · HIDShift".into());
+        Ok(Self { on_bytes, label })
+    }
+
+    async fn write(&self, request: PendingRequest) -> Result<(), String> {
+        let args = Object::new();
+        let request_bytes = Array::new();
+        for byte in request.encode() {
+            request_bytes.push(&JsValue::from_f64(f64::from(byte)));
+        }
+        Reflect::set(&args, &"request".into(), &request_bytes).map_err(js_error)?;
+        let value = tauri_call("management_request", &args).await?;
+        let bytes = Uint8Array::new(&value).to_vec();
+        (self.on_bytes)(&bytes);
+        Ok(())
+    }
+}
+
+fn tauri_invoke() -> Option<Function> {
+    let window: JsValue = web_sys::window()?.into();
+    let internals = Reflect::get(&window, &"__TAURI_INTERNALS__".into()).ok()?;
+    Reflect::get(&internals, &"invoke".into())
+        .ok()?
+        .dyn_into()
+        .ok()
+}
+
+pub(crate) fn is_tauri() -> bool {
+    tauri_invoke().is_some()
+}
+
+pub(crate) async fn companion_onboarding(enable_autostart: bool) -> Result<(), String> {
+    tauri_call("request_notification_permission", &Object::new()).await?;
+    let args = Object::new();
+    Reflect::set(
+        &args,
+        &"enabled".into(),
+        &JsValue::from_bool(enable_autostart),
+    )
+    .map_err(js_error)?;
+    tauri_call("set_autostart", &args).await?;
+    Ok(())
+}
+
+async fn tauri_call(command: &str, args: &Object) -> Result<JsValue, String> {
+    let invoke = tauri_invoke().ok_or("Tauri IPC is unavailable")?;
+    let promise: Promise = invoke
+        .call2(&JsValue::UNDEFINED, &command.into(), args)
+        .map_err(js_error)?
+        .dyn_into()
+        .map_err(|_| "Tauri invoke did not return a Promise")?;
+    JsFuture::from(promise).await.map_err(js_error)
+}
+
 pub struct BluetoothTransport {
     request_characteristic: JsValue,
     // Keep the notification source alive for as long as the transport. The JS
@@ -68,6 +146,8 @@ pub struct BluetoothTransport {
     response_characteristic: JsValue,
     on_bytes: BytesCallback,
     _notification: Closure<dyn FnMut(Event)>,
+    _event_characteristic: JsValue,
+    _event_notification: Closure<dyn FnMut(Event)>,
     _disconnect: Closure<dyn FnMut(Event)>,
 }
 
@@ -75,6 +155,7 @@ impl BluetoothTransport {
     async fn connect(
         on_bytes: BytesCallback,
         on_disconnect: DisconnectCallback,
+        on_event: BytesCallback,
     ) -> Result<Self, String> {
         let navigator = web_sys::window()
             .ok_or("window is unavailable")?
@@ -126,6 +207,13 @@ impl BluetoothTransport {
         )
         .await?;
         await_method(&response_characteristic, "startNotifications", &[]).await?;
+        let event_characteristic = await_method(
+            &service,
+            "getCharacteristic",
+            &[MANAGEMENT_EVENT_UUID.into()],
+        )
+        .await?;
+        await_method(&event_characteristic, "startNotifications", &[]).await?;
 
         let response_target: EventTarget = response_characteristic
             .clone()
@@ -145,6 +233,23 @@ impl BluetoothTransport {
             )
             .map_err(js_error)?;
 
+        let event_target: EventTarget = event_characteristic
+            .clone()
+            .dyn_into()
+            .map_err(|_| "Bluetooth event characteristic is not an EventTarget")?;
+        let event_notification = Closure::wrap(Box::new(move |event: Event| {
+            let bytes = bluetooth_event_bytes(&event).unwrap_or_default();
+            if bytes.len() == MANAGEMENT_EVENT_LEN {
+                on_event(&bytes);
+            }
+        }) as Box<dyn FnMut(Event)>);
+        event_target
+            .add_event_listener_with_callback(
+                "characteristicvaluechanged",
+                event_notification.as_ref().unchecked_ref(),
+            )
+            .map_err(js_error)?;
+
         let device_target: EventTarget = device
             .dyn_into()
             .map_err(|_| "Bluetooth device is not an EventTarget")?;
@@ -161,8 +266,10 @@ impl BluetoothTransport {
         Ok(Self {
             request_characteristic,
             response_characteristic,
+            _event_characteristic: event_characteristic,
             on_bytes,
             _notification: notification,
+            _event_notification: event_notification,
             _disconnect: disconnect,
         })
     }

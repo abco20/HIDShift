@@ -49,6 +49,7 @@ fn setting_matches_device(id: SettingId, flags: u8) -> bool {
         SettingId::KeyboardLayout | SettingId::RemapFromUsage | SettingId::RemapToUsage => {
             flags & 0x02 != 0
         }
+        SettingId::TargetSwitchShortcut => flags & 0x02 != 0,
         SettingId::MouseSensitivityPercent | SettingId::ScrollMultiplierPercent => {
             flags & 0x04 != 0
         }
@@ -85,6 +86,7 @@ fn SettingControl(entry: SettingView, busy: RwSignal<bool>, send: CommandSender)
         SettingValueKind::Choice => choice_control(entry, busy, send).into_any(),
         SettingValueKind::Integer => range_control(entry, busy, send).into_any(),
         SettingValueKind::HidUsage => usage_control(entry, busy, send).into_any(),
+        SettingValueKind::KeyboardShortcut => shortcut_control(entry, busy, send).into_any(),
     };
     view! {
         <article class="setting-row">
@@ -92,6 +94,70 @@ fn SettingControl(entry: SettingView, busy: RwSignal<bool>, send: CommandSender)
             <div class="setting-control">{control}</div>
         </article>
     }
+}
+
+fn shortcut_control(
+    entry: SettingView,
+    busy: RwSignal<bool>,
+    send: CommandSender,
+) -> impl IntoView {
+    let capturing = RwSignal::new(false);
+    let clear_send = send.clone();
+    let keydown = move |event: web_sys::KeyboardEvent| {
+        if !capturing.get_untracked() {
+            return;
+        }
+        event.prevent_default();
+        if event.code() == "Escape" {
+            capturing.set(false);
+            return;
+        }
+        if let Some(shortcut) = hidshift_manager_ui::shortcut_from_code(
+            &event.code(),
+            event.ctrl_key(),
+            event.shift_key(),
+            event.alt_key(),
+            event.meta_key(),
+        ) {
+            capturing.set(false);
+            send_value(&send, entry, i32::from(shortcut.packed()));
+        }
+    };
+    view! {
+        <div class="shortcut-control" on:keydown=keydown>
+            <button type="button" disabled=move || busy.get() on:click=move |_| capturing.set(true)>
+                {move || if capturing.get() { "キーを入力… (Escで中止)".into() } else { shortcut_label(entry.value as u16) }}
+            </button>
+            <button type="button" class="text-button" disabled=move || busy.get() || entry.value == 0 on:click=move |_| send_value(&clear_send, entry, 0)>
+                "クリア"
+            </button>
+        </div>
+    }
+}
+
+fn shortcut_label(packed: u16) -> String {
+    let Some(shortcut) = hidshift::KeyboardShortcut::from_packed(packed) else {
+        return "未設定".into();
+    };
+    if !shortcut.is_enabled() {
+        return "未設定".into();
+    }
+    let mut parts = Vec::new();
+    let bits = shortcut.modifiers;
+    if bits.intersects(hidshift::ModifierState::LEFT_CTRL | hidshift::ModifierState::RIGHT_CTRL) {
+        parts.push("Ctrl".to_string());
+    }
+    if bits.intersects(hidshift::ModifierState::LEFT_SHIFT | hidshift::ModifierState::RIGHT_SHIFT) {
+        parts.push("Shift".to_string());
+    }
+    if bits.intersects(hidshift::ModifierState::LEFT_ALT | hidshift::ModifierState::RIGHT_ALT) {
+        parts.push("Alt".to_string());
+    }
+    if bits.intersects(hidshift::ModifierState::LEFT_GUI | hidshift::ModifierState::RIGHT_GUI) {
+        parts.push("Meta".to_string());
+    }
+    parts.push(format!("Usage 0x{:02X}", shortcut.key.0));
+    parts.join(" + ")
 }
 
 fn bool_control(entry: SettingView, busy: RwSignal<bool>, send: CommandSender) -> impl IntoView {
@@ -172,6 +238,7 @@ fn friendly_description(descriptor: &SettingDescriptor) -> &'static str {
             "置き換えたい音量・再生などの操作です。「変更しない」で無効になります。"
         }
         SettingId::ConsumerToUsage => "置き換え後に送るメディア操作です。",
+        SettingId::TargetSwitchShortcut => "このキーボードから次の利用可能な接続先へ切り替えます。",
         _ => descriptor.description,
     }
 }

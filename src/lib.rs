@@ -113,19 +113,20 @@ pub use management::frame::{
     FrameError, FrameKind, NodeId as ManagementNodeId, STREAM_FRAME_CAPACITY, decode_stream,
     encode_stream,
 };
+pub use management::{
+    MANAGEMENT_CAPABILITY_COMPANION_EVENTS, MANAGEMENT_EVENT_LEN, MANAGEMENT_EVENT_UUID,
+    MANAGEMENT_PROTOCOL_VERSION, MANAGEMENT_REQUEST_LEN, MANAGEMENT_REQUEST_UUID,
+    MANAGEMENT_RESPONSE_LEN, MANAGEMENT_RESPONSE_UUID, MANAGEMENT_SERVICE_UUID,
+    ManagementClientSession, ManagementCommand, ManagementDestination, ManagementDiagnostics,
+    ManagementEvent, ManagementHistoryEvent, ManagementHostInfo, ManagementHostName,
+    ManagementHostStatus, ManagementHostTiming, ManagementProtocolError, ManagementRequest,
+    ManagementResponse, ManagementResponsePayload, ManagementResult, ManagementSchema,
+    ManagementSetting, ManagementStatus, ManagementUsbDevice, ManagementUsbStatus,
+};
 #[cfg(feature = "dual-s3-wired")]
 pub use management::{
     MANAGEMENT_CAPABILITY_DUAL_S3_WIRED, ManagementMirrorCandidate, ManagementOutputTarget,
     ManagementOutputTargetStatus, ManagementUsbPresentationKind,
-};
-pub use management::{
-    MANAGEMENT_PROTOCOL_VERSION, MANAGEMENT_REQUEST_LEN, MANAGEMENT_REQUEST_UUID,
-    MANAGEMENT_RESPONSE_LEN, MANAGEMENT_RESPONSE_UUID, MANAGEMENT_SERVICE_UUID, ManagementCommand,
-    ManagementDestination, ManagementDiagnostics, ManagementHistoryEvent, ManagementHostInfo,
-    ManagementHostName, ManagementHostStatus, ManagementHostTiming, ManagementProtocolError,
-    ManagementRequest, ManagementResponse, ManagementResponsePayload, ManagementResult,
-    ManagementSchema, ManagementSetting, ManagementStatus, ManagementUsbDevice,
-    ManagementUsbStatus,
 };
 #[cfg(feature = "dual-s3-wired")]
 pub use mirror::{
@@ -176,9 +177,10 @@ pub use runtime::{
 #[cfg(feature = "dual-s3-wired")]
 pub use runtime::{DeviceTaskCommand, RUNTIME_DEVICE_COMMAND_QUEUE_CAPACITY};
 pub use settings::{
-    GlobalSettings, InputSettings, SETTING_COUNT, SETTING_DESCRIPTORS, SETTINGS_SCHEMA_HASH,
-    SETTINGS_SCHEMA_VERSION, SettingChoice, SettingDescriptor, SettingId, SettingScope,
-    SettingTarget, SettingValueKind, setting_by_key, setting_descriptor, validate_setting_value,
+    GlobalSettings, InputSettings, KeyboardShortcut, SETTING_COUNT, SETTING_DESCRIPTORS,
+    SETTINGS_SCHEMA_HASH, SETTINGS_SCHEMA_VERSION, SettingChoice, SettingDescriptor, SettingId,
+    SettingScope, SettingTarget, SettingValueKind, setting_by_key, setting_descriptor,
+    validate_setting_value,
 };
 pub use storage::{
     FixedName, NorFlashStorageBackend, STORAGE_FLASH_LEN, STORAGE_FLASH_SLOT_COUNT,

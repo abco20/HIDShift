@@ -18,7 +18,8 @@ use hidshift::ble_runtime::{
 };
 use hidshift::ids::HostId;
 use hidshift::management::{
-    MANAGEMENT_REQUEST_LEN, MANAGEMENT_RESPONSE_LEN, ManagementDestination, ManagementRequest,
+    MANAGEMENT_EVENT_LEN, MANAGEMENT_REQUEST_LEN, MANAGEMENT_RESPONSE_LEN, ManagementDestination,
+    ManagementRequest,
 };
 use hidshift::reports::{
     CONSUMER_REPORT_ID, HID_INFORMATION, INPUT_REPORT_TYPE, KEYBOARD_REPORT_ID, MOUSE_REPORT_ID,
@@ -46,7 +47,7 @@ const BLE_CONNECTIONS_MAX: usize = RUNTIME_HOSTS_MAX;
 const BLE_CONTROLLER_ACTIVITIES_MAX: u8 = BLE_CONNECTIONS_MAX as u8 + 1;
 // One ATT bearer plus one spare control/data lane per connection.
 const BLE_L2CAP_CHANNELS_MAX: usize = BLE_CONNECTIONS_MAX * 2;
-const BLE_ATTRIBUTE_TABLE_SIZE: usize = 72;
+const BLE_ATTRIBUTE_TABLE_SIZE: usize = 76;
 const BLE_NOTIFY_TIMEOUT_MS: u64 = 30;
 const MANAGEMENT_NOTIFY_TIMEOUT_MS: u64 = 1_000;
 const RUNTIME_BARRIER_TIMEOUT_MS: u64 = 2_000;
@@ -107,6 +108,13 @@ struct ManagementService {
         value = [0; MANAGEMENT_RESPONSE_LEN]
     )]
     response: [u8; MANAGEMENT_RESPONSE_LEN],
+    #[characteristic(
+        uuid = "7f510003-1b15-4f0d-9f4b-5b6d4f3a0001",
+        notify,
+        permissions(encrypted),
+        value = [0; MANAGEMENT_EVENT_LEN]
+    )]
+    event: [u8; MANAGEMENT_EVENT_LEN],
 }
 
 #[gatt_service(uuid = "1812")]
@@ -465,7 +473,9 @@ impl<'backoff> BleControlState<'backoff> {
                     hidshift::NotifyReason::TargetSwitchRelease | hidshift::NotifyReason::SafetyRelease,
                 ..
             } => self.input_gate.block(host_id),
-            BleTaskCommand::Notify { .. } | BleTaskCommand::ManagementResponse { .. } => {}
+            BleTaskCommand::Notify { .. }
+            | BleTaskCommand::ManagementResponse { .. }
+            | BleTaskCommand::ManagementEvent { .. } => {}
             BleTaskCommand::ActivateInput { host_id } => self.input_gate.activate(host_id),
             BleTaskCommand::AllowPairing { host_id } => {
                 self.pairing_backoff.clear();
@@ -1368,6 +1378,9 @@ async fn dispatch_ble_command_to_connected_slot<C>(
                 ));
             }
         }
+        BleTaskCommand::ManagementEvent { .. } => {
+            let _ = dispatch_ble_command_to_slot(stack, server, conn, command).await;
+        }
     }
 }
 
@@ -1382,7 +1395,8 @@ fn ble_command_host_id(command: BleTaskCommand) -> HostId {
         | BleTaskCommand::RejectPairing { host_id }
         | BleTaskCommand::ClearBond { host_id, .. }
         | BleTaskCommand::ActivateInput { host_id }
-        | BleTaskCommand::ManagementResponse { host_id, .. } => host_id,
+        | BleTaskCommand::ManagementResponse { host_id, .. }
+        | BleTaskCommand::ManagementEvent { host_id, .. } => host_id,
     }
 }
 
@@ -1421,6 +1435,7 @@ fn log_ble_command_without_connection(command: BleTaskCommand) {
                 host_id.0
             );
         }
+        BleTaskCommand::ManagementEvent { .. } => {}
     }
 }
 
@@ -1568,19 +1583,15 @@ where
     FixedName::from_ascii(name.as_str())
 }
 
-fn observe_ble_hci_tx(stage: TxObserverStage, _pdu: &[u8]) {
+fn observe_ble_hci_tx(stage: TxObserverStage, pdu: &[u8]) {
     #[cfg(feature = "hardware-e2e")]
     {
         let now_us = Instant::now().as_micros();
         match stage {
-            TxObserverStage::Prepared => crate::e2e_telemetry::record_notify_done(now_us),
-            TxObserverStage::Dequeued => crate::e2e_telemetry::record_hci_dequeue(now_us),
-            TxObserverStage::CreditGranted => crate::e2e_telemetry::record_hci_credit(now_us),
-            TxObserverStage::Submitted => {
-                // During an isolated E2E input the notification is the only
-                // outbound payload before telemetry is queried.
-                crate::e2e_telemetry::record_hci_submit(now_us)
-            }
+            TxObserverStage::Prepared => crate::e2e_telemetry::record_tx_prepared(pdu, now_us),
+            TxObserverStage::Dequeued => crate::e2e_telemetry::record_hci_dequeue(pdu, now_us),
+            TxObserverStage::CreditGranted => crate::e2e_telemetry::record_hci_credit(pdu, now_us),
+            TxObserverStage::Submitted => crate::e2e_telemetry::record_hci_submit(pdu, now_us),
         }
     }
     #[cfg(not(feature = "hardware-e2e"))]
@@ -2021,6 +2032,12 @@ where
             }
             success
         }
+        BleTaskCommand::ManagementEvent { event, .. } => server
+            .management
+            .event
+            .notify(conn, &event.encode())
+            .await
+            .is_ok(),
     }
 }
 

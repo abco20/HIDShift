@@ -708,6 +708,12 @@ async fn status_command_task(
                 }
             }
         } else {
+            let event = hidshift::ManagementEvent::StatusChanged {
+                sequence: command.snapshot.sequence as u16,
+            };
+            command.snapshot.for_each_connected_host(|host_id| {
+                let _ = ble_sender.try_send(BleTaskCommand::ManagementEvent { host_id, event });
+            });
             log::debug!("firmware: status_command {:?}", command);
         }
     }

@@ -5,8 +5,9 @@
 //! and Web Serial do not each grow their own protocol implementation.
 
 use hidshift::{
-    MANAGEMENT_REQUEST_LEN, MANAGEMENT_RESPONSE_LEN, ManagementCommand, ManagementProtocolError,
-    ManagementRequest, ManagementResponse,
+    HostId, MANAGEMENT_REQUEST_LEN, MANAGEMENT_RESPONSE_LEN, ManagementCommand, ManagementEvent,
+    ManagementOutputTarget, ManagementOutputTargetStatus, ManagementProtocolError,
+    ManagementRequest, ManagementResponse, ManagementStatus,
 };
 
 pub const SERIAL_PREFIX: &[u8] = b"@HIDSHIFT:";
@@ -18,6 +19,102 @@ pub enum ClientError {
     UnexpectedRequestId { expected: u8, actual: u8 },
     RequestAlreadyPending,
     NoPendingRequest,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActiveTargetNotification {
+    ThisComputer,
+    OtherComputer(HostId),
+    Wired,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClientTarget {
+    Wired,
+    Ble(HostId),
+}
+
+/// Tracks an event stream against authoritative status snapshots. Connection
+/// setup deliberately establishes a baseline without producing stale desktop
+/// notifications.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ClientSessionTracker {
+    local_host: Option<HostId>,
+    active_target: Option<ClientTarget>,
+    last_event_sequence: Option<u16>,
+    synchronized: bool,
+    refresh_pending: bool,
+}
+
+impl ClientSessionTracker {
+    pub const fn new(local_host: Option<HostId>) -> Self {
+        Self {
+            local_host,
+            active_target: None,
+            last_event_sequence: None,
+            synchronized: false,
+            refresh_pending: false,
+        }
+    }
+
+    pub fn disconnected(&mut self) {
+        self.synchronized = false;
+        self.refresh_pending = false;
+        self.last_event_sequence = None;
+    }
+
+    pub fn set_local_host(&mut self, host_id: Option<HostId>) {
+        self.local_host = host_id;
+    }
+
+    pub fn accept_event(&mut self, bytes: &[u8]) -> Result<bool, ClientError> {
+        let ManagementEvent::StatusChanged { sequence } =
+            ManagementEvent::decode(bytes).map_err(ClientError::Protocol)?;
+        if self.last_event_sequence == Some(sequence) {
+            return Ok(false);
+        }
+        self.last_event_sequence = Some(sequence);
+        self.refresh_pending = true;
+        Ok(true)
+    }
+
+    pub const fn refresh_pending(&self) -> bool {
+        self.refresh_pending
+    }
+
+    pub fn observe_status(&mut self, status: ManagementStatus) -> Option<ActiveTargetNotification> {
+        self.observe_target(status.active_host.map(ClientTarget::Ble))
+    }
+
+    pub fn observe_output_status(
+        &mut self,
+        status: ManagementOutputTargetStatus,
+    ) -> Option<ActiveTargetNotification> {
+        self.observe_target(status.active.map(|target| match target {
+            ManagementOutputTarget::Wired => ClientTarget::Wired,
+            ManagementOutputTarget::Ble(host) => ClientTarget::Ble(host),
+        }))
+    }
+
+    fn observe_target(&mut self, target: Option<ClientTarget>) -> Option<ActiveTargetNotification> {
+        self.refresh_pending = false;
+        let previous = self.active_target;
+        self.active_target = target;
+        if !self.synchronized {
+            self.synchronized = true;
+            return None;
+        }
+        if previous == self.active_target {
+            return None;
+        }
+        self.active_target.map(|target| match target {
+            ClientTarget::Wired => ActiveTargetNotification::Wired,
+            ClientTarget::Ble(host) if self.local_host == Some(host) => {
+                ActiveTargetNotification::ThisComputer
+            }
+            ClientTarget::Ble(host) => ActiveTargetNotification::OtherComputer(host),
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -312,6 +409,75 @@ mod tests {
                 )
                 .as_bytes()
             )
+        );
+    }
+
+    #[test]
+    fn event_refreshes_authoritative_status_without_notifying_initial_sync() {
+        let mut tracker = ClientSessionTracker::new(Some(HostId(2)));
+        let mut status = ManagementStatus::empty(4);
+        status.active_host = Some(HostId(1));
+        assert_eq!(tracker.observe_status(status), None);
+
+        assert!(
+            tracker
+                .accept_event(&ManagementEvent::StatusChanged { sequence: u16::MAX }.encode())
+                .unwrap()
+        );
+        assert!(tracker.refresh_pending());
+        status.active_host = Some(HostId(2));
+        assert_eq!(
+            tracker.observe_status(status),
+            Some(ActiveTargetNotification::ThisComputer)
+        );
+
+        assert!(
+            !tracker
+                .accept_event(&ManagementEvent::StatusChanged { sequence: u16::MAX }.encode())
+                .unwrap()
+        );
+        assert!(
+            tracker
+                .accept_event(&ManagementEvent::StatusChanged { sequence: 0 }.encode())
+                .unwrap()
+        );
+        status.active_host = Some(HostId(3));
+        assert_eq!(
+            tracker.observe_status(status),
+            Some(ActiveTargetNotification::OtherComputer(HostId(3)))
+        );
+    }
+
+    #[test]
+    fn reconnect_uses_a_new_silent_baseline() {
+        let mut tracker = ClientSessionTracker::new(Some(HostId(1)));
+        let mut status = ManagementStatus::empty(4);
+        status.active_host = Some(HostId(1));
+        tracker.observe_status(status);
+        tracker.disconnected();
+        status.active_host = Some(HostId(2));
+        assert_eq!(tracker.observe_status(status), None);
+    }
+
+    #[test]
+    fn dual_s3_tracker_distinguishes_wired_from_ble_destinations() {
+        let mut tracker = ClientSessionTracker::new(Some(HostId(1)));
+        let mut status = hidshift::ManagementOutputTargetStatus {
+            selected: hidshift::ManagementOutputTarget::Ble(HostId(1)),
+            active: Some(hidshift::ManagementOutputTarget::Ble(HostId(1))),
+            availability: hidshift::OutputTargetAvailability::Ready,
+            wired_ready: true,
+            ready_ble_mask: 1,
+            effective_presentation: hidshift::ManagementUsbPresentationKind::Fallback,
+            mirror_configured: false,
+            operation_id: 0,
+        };
+        assert_eq!(tracker.observe_output_status(status), None);
+        status.selected = hidshift::ManagementOutputTarget::Wired;
+        status.active = Some(hidshift::ManagementOutputTarget::Wired);
+        assert_eq!(
+            tracker.observe_output_status(status),
+            Some(ActiveTargetNotification::Wired)
         );
     }
 }

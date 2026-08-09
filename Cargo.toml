@@ -19,6 +19,8 @@ exclude = [
     "e2e/mirror-runner",
     "tools/hidshift-client",
     "tools/hidshiftctl",
+    "manager-ui",
+    "companion/src-tauri",
     "vendor/trouble-host-0.6.0",
     "vendor/usb-device-0.3.2",
     "web",
