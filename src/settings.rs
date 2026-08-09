@@ -3,6 +3,7 @@
 //! `settings_schema!` is the single source of truth. Adding an entry generates
 //! the stable wire ID, descriptor table, defaults, validation, and lookup code.
 
+use crate::input::{KeyUsage, ModifierState};
 use crate::input_profile::InputProfileId;
 
 pub const SETTINGS_SCHEMA_VERSION: u16 = 1;
@@ -14,6 +15,51 @@ pub enum SettingValueKind {
     Integer = 1,
     Choice = 2,
     HidUsage = 3,
+    KeyboardShortcut = 4,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KeyboardShortcut {
+    pub modifiers: ModifierState,
+    pub key: KeyUsage,
+}
+
+impl Default for KeyboardShortcut {
+    fn default() -> Self {
+        Self::DISABLED
+    }
+}
+
+impl KeyboardShortcut {
+    pub const DISABLED: Self = Self {
+        modifiers: ModifierState::empty(),
+        key: KeyUsage(0),
+    };
+
+    pub const fn new(modifiers: ModifierState, key: KeyUsage) -> Option<Self> {
+        if key.0 == 0 || (key.0 >= 0xe0 && key.0 <= 0xe7) {
+            None
+        } else {
+            Some(Self { modifiers, key })
+        }
+    }
+
+    pub const fn from_packed(value: u16) -> Option<Self> {
+        let key = KeyUsage(value as u8);
+        if key.0 == 0 {
+            Some(Self::DISABLED)
+        } else {
+            Self::new(ModifierState::from_bits_retain((value >> 8) as u8), key)
+        }
+    }
+
+    pub const fn packed(self) -> u16 {
+        u16::from_le_bytes([self.key.0, self.modifiers.bits()])
+    }
+
+    pub const fn is_enabled(self) -> bool {
+        self.key.0 != 0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -217,6 +263,10 @@ settings_schema! {
         key: "log_level", label: "ログレベル", description: "0:error 1:warn 2:info",
         kind: Choice, scope: Global, default: 2, min: 0, max: 2, step: 1, unit: "", choices: LOG_LEVEL_CHOICES, restart: false
     },
+    TargetSwitchShortcut = 16 => {
+        key: "target_switch_shortcut", label: "接続先切替ショートカット", description: "物理キーボードごとに次の接続先へ切り替えます",
+        kind: KeyboardShortcut, scope: Input, default: 0, min: 0, max: 65535, step: 1, unit: "", choices: NO_CHOICES, restart: false
+    },
 }
 
 pub const SETTING_COUNT: usize = SETTING_DESCRIPTORS.len();
@@ -346,6 +396,7 @@ pub struct InputSettings {
     pub scroll_multiplier_percent: u16,
     pub consumer_from_usage: u16,
     pub consumer_to_usage: u16,
+    pub target_switch_shortcut: KeyboardShortcut,
 }
 
 impl Default for InputSettings {
@@ -358,6 +409,7 @@ impl Default for InputSettings {
             scroll_multiplier_percent: 100,
             consumer_from_usage: 0,
             consumer_to_usage: 0,
+            target_switch_shortcut: KeyboardShortcut::DISABLED,
         }
     }
 }
@@ -371,6 +423,7 @@ impl InputSettings {
         scroll_multiplier_percent: 100,
         consumer_from_usage: 0,
         consumer_to_usage: 0,
+        target_switch_shortcut: KeyboardShortcut::DISABLED,
     };
 }
 
@@ -386,7 +439,7 @@ mod tests {
 
     #[test]
     fn generated_schema_has_stable_unique_ids_and_keys() {
-        assert_eq!(SETTING_COUNT, 15);
+        assert_eq!(SETTING_COUNT, 16);
         for (index, left) in SETTING_DESCRIPTORS.iter().enumerate() {
             assert_eq!(SettingId::from_u16(left.id as u16), Some(left.id));
             assert!(!left.key.is_empty());
@@ -489,5 +542,23 @@ mod tests {
             stable,
             settings_schema_hash(SETTINGS_SCHEMA_VERSION, &changed)
         );
+    }
+
+    #[test]
+    fn keyboard_shortcut_codec_rejects_modifier_usages_and_preserves_modifier_mask() {
+        let shortcut = KeyboardShortcut::new(
+            ModifierState::LEFT_CTRL | ModifierState::RIGHT_SHIFT,
+            KeyUsage(0x0e),
+        )
+        .unwrap();
+        assert_eq!(
+            KeyboardShortcut::from_packed(shortcut.packed()),
+            Some(shortcut)
+        );
+        assert_eq!(
+            KeyboardShortcut::from_packed(0),
+            Some(KeyboardShortcut::DISABLED)
+        );
+        assert_eq!(KeyboardShortcut::from_packed(0x00e0), None);
     }
 }

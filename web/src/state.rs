@@ -2,10 +2,11 @@ use std::rc::Rc;
 
 use hidshift::{
     HostId, InputProfileId, MANAGEMENT_CAPABILITY_DUAL_S3_WIRED, ManagementCommand,
-    ManagementDiagnostics, ManagementHistoryEvent, ManagementHostTiming, ManagementMirrorCandidate,
-    ManagementOutputTargetStatus, ManagementResponse, ManagementResponsePayload, ManagementResult,
-    ManagementSchema, ManagementStatus, MirrorCandidateId, SETTING_DESCRIPTORS, SettingDescriptor,
-    SettingScope, SettingTarget,
+    ManagementDiagnostics, ManagementEvent, ManagementHistoryEvent, ManagementHostTiming,
+    ManagementMirrorCandidate, ManagementOutputTarget, ManagementOutputTargetStatus,
+    ManagementResponse, ManagementResponsePayload, ManagementResult, ManagementSchema,
+    ManagementStatus, MirrorCandidateId, SETTING_DESCRIPTORS, SettingDescriptor, SettingScope,
+    SettingTarget,
 };
 use leptos::prelude::*;
 use send_wrapper::SendWrapper;
@@ -77,6 +78,7 @@ pub(crate) struct AppState {
     pub message: RwSignal<String>,
     pub is_error: RwSignal<bool>,
     pub undo: RwSignal<Option<ManagementCommand>>,
+    pub last_event_sequence: RwSignal<Option<u16>>,
 }
 
 impl AppState {
@@ -103,6 +105,7 @@ impl AppState {
             message: RwSignal::new(String::new()),
             is_error: RwSignal::new(false),
             undo: RwSignal::new(None),
+            last_event_sequence: RwSignal::new(None),
         }
     }
 
@@ -190,6 +193,8 @@ impl AppState {
         let disconnect_state = self.clone();
         spawn_local(async move {
             let on_bytes = Rc::new(move |bytes: &[u8]| bytes_client.receive(bytes));
+            let event_state = state.clone();
+            let on_event = Rc::new(move |bytes: &[u8]| event_state.handle_management_event(bytes));
             let on_disconnect = Rc::new(move |reason: String| {
                 disconnect_state.client.detach();
                 disconnect_state.connected.set(false);
@@ -200,7 +205,7 @@ impl AppState {
                 disconnect_state.busy.set(false);
             });
             let transport = if bluetooth {
-                BrowserTransport::connect_bluetooth(on_bytes, on_disconnect).await
+                BrowserTransport::connect_bluetooth(on_bytes, on_disconnect, on_event).await
             } else {
                 BrowserTransport::connect_serial(on_bytes, on_disconnect).await
             };
@@ -229,6 +234,53 @@ impl AppState {
                     Option::<(&str, &str)>::None,
                 ),
             }
+        });
+    }
+
+    fn handle_management_event(&self, bytes: &[u8]) {
+        let Ok(ManagementEvent::StatusChanged { sequence }) = ManagementEvent::decode(bytes) else {
+            return;
+        };
+        if self.last_event_sequence.get_untracked() == Some(sequence)
+            || self.busy.get_untracked()
+            || !self.connected.get_untracked()
+        {
+            return;
+        }
+        self.last_event_sequence.set(Some(sequence));
+        self.busy.set(true);
+        let state = self.clone();
+        spawn_local(async move {
+            let result = state.load_summary().await;
+            if result.is_ok() {
+                let destination = match state
+                    .output_status
+                    .get_untracked()
+                    .and_then(|status| status.active)
+                {
+                    Some(ManagementOutputTarget::Wired) => "USB".to_string(),
+                    Some(ManagementOutputTarget::Ble(host)) => state
+                        .names
+                        .get_untracked()
+                        .get(host.0.saturating_sub(1) as usize)
+                        .filter(|name| !name.is_empty())
+                        .cloned()
+                        .unwrap_or_else(|| format!("スロット {}", host.0)),
+                    None => state
+                        .status
+                        .get_untracked()
+                        .and_then(|status| status.active_host)
+                        .map(|host| {
+                            state.names.get_untracked()[host.0.saturating_sub(1) as usize].clone()
+                        })
+                        .unwrap_or_else(|| "未選択".into()),
+                };
+                state
+                    .message
+                    .set(format!("入力先を「{destination}」へ切り替えました"));
+                state.is_error.set(false);
+            }
+            state.busy.set(false);
         });
     }
 

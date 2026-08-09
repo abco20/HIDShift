@@ -60,7 +60,8 @@ where
         | BleTaskCommand::RejectPairing { .. }
         | BleTaskCommand::ClearBond { .. }
         | BleTaskCommand::ActivateInput { .. }
-        | BleTaskCommand::ManagementResponse { .. } => Ok(()),
+        | BleTaskCommand::ManagementResponse { .. }
+        | BleTaskCommand::ManagementEvent { .. } => Ok(()),
     }
 }
 

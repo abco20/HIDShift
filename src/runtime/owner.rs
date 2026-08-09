@@ -185,6 +185,15 @@ impl<
         if let RuntimeInputMessage::BridgeEvent(crate::bridge::BridgeEvent::InputFrame(frame)) =
             message
         {
+            if self.runtime.input_frame_would_trigger_shortcut(frame) {
+                self.runtime
+                    .handle_input_in_place::<COMMANDS, ACTIONS, EVENTS>(
+                        message.as_runtime_input(),
+                        &mut self.commands,
+                    )?;
+                self.queues.dispatch_from(self.commands.as_slice())?;
+                return Ok(());
+            }
             self.queues.clear();
             #[cfg(not(feature = "dual-s3-wired"))]
             self.runtime

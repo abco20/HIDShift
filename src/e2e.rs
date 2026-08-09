@@ -15,6 +15,19 @@ pub const E2E_LINE_LEN: usize = E2E_LINE_PREFIX.len() + E2E_PACKET_LEN * 2;
 /// Raw little-endian HCI address used by the dedicated test probe.
 pub const E2E_PROBE_BLE_ADDRESS_RAW: [u8; 6] = [0x01, 0xe2, 0xe2, 0xe2, 0xe2, 0xc2];
 
+/// Compact identity for correlating the stages of one measured outbound PDU.
+/// Zero is reserved for the unarmed state used by firmware telemetry.
+pub fn tx_pdu_fingerprint(pdu: &[u8]) -> u32 {
+    let att_opcode = pdu.get(4).copied().unwrap_or(0);
+    let handle_low = pdu.get(5).copied().unwrap_or(0);
+    let handle_high = pdu.get(6).copied().unwrap_or(0);
+    let fingerprint = ((pdu.len() as u32) << 24)
+        | (u32::from(att_opcode) << 16)
+        | (u32::from(handle_high) << 8)
+        | u32::from(handle_low);
+    if fingerprint == 0 { 1 } else { fingerprint }
+}
+
 const OP_HELLO: u8 = 0x01;
 const OP_RELEASE_ALL: u8 = 0x02;
 const OP_READ_TIMESTAMP: u8 = 0x03;
@@ -395,5 +408,18 @@ mod tests {
         .input_frames()
         .unwrap();
         assert!(frames.iter().all(Option::is_some));
+    }
+
+    #[test]
+    fn tx_fingerprint_correlates_one_pdu_without_using_zero_sentinel() {
+        let keyboard = [11, 0, 4, 0, 0x1b, 0x12, 0, 0, 0, 4, 0, 0, 0, 0, 0];
+        let management = [7, 0, 4, 0, 0x1b, 0x20, 0, 3, 0, 0, 0];
+
+        assert_ne!(tx_pdu_fingerprint(&keyboard), 0);
+        assert_ne!(
+            tx_pdu_fingerprint(&keyboard),
+            tx_pdu_fingerprint(&management)
+        );
+        assert_eq!(tx_pdu_fingerprint(&keyboard), tx_pdu_fingerprint(&keyboard));
     }
 }

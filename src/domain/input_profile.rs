@@ -109,6 +109,7 @@ pub struct InputProfile {
     pub last_seen: u64,
     pub settings: InputSettings,
     mouse_remainders: MouseScaleRemainders,
+    shortcut_armed: bool,
 }
 
 impl InputProfile {
@@ -125,6 +126,7 @@ impl InputProfile {
             last_seen,
             settings,
             mouse_remainders: MouseScaleRemainders::ZERO,
+            shortcut_armed: true,
         }
     }
 
@@ -180,8 +182,57 @@ impl InputProfile {
         }
     }
 
+    /// Detects and removes the device-owned target-switch chord before layout
+    /// and remap transforms. Returns true once per complete press/release cycle.
+    pub fn capture_target_switch_shortcut(&mut self, frame: &mut StandardInputFrame) -> bool {
+        let shortcut = self.settings.target_switch_shortcut;
+        let Some(keyboard) = frame.keyboard.as_mut() else {
+            return false;
+        };
+        if !shortcut.is_enabled() {
+            self.shortcut_armed = true;
+            return false;
+        }
+
+        let key_down = keyboard.keys_down().contains(&shortcut.key);
+        let components_released = !key_down && !(keyboard.modifiers.intersects(shortcut.modifiers));
+        if components_released {
+            self.shortcut_armed = true;
+        }
+        let triggered = self.shortcut_armed
+            && key_down
+            && keyboard.modifiers == shortcut.modifiers
+            && keyboard.keys_down().len() == 1;
+        if triggered {
+            self.shortcut_armed = false;
+        }
+
+        if triggered || !self.shortcut_armed {
+            let mut filtered = KeyboardFrame::new(keyboard.modifiers & !shortcut.modifiers);
+            for key in keyboard.keys_down().iter().copied() {
+                if key != shortcut.key {
+                    let _ = filtered.push_key(key);
+                }
+            }
+            *keyboard = filtered;
+        }
+        triggered
+    }
+
+    pub fn target_switch_shortcut_would_trigger(&self, frame: &StandardInputFrame) -> bool {
+        let shortcut = self.settings.target_switch_shortcut;
+        let Some(keyboard) = frame.keyboard.as_ref() else {
+            return false;
+        };
+        self.shortcut_armed
+            && shortcut.is_enabled()
+            && keyboard.modifiers == shortcut.modifiers
+            && keyboard.keys_down() == [shortcut.key]
+    }
+
     pub fn reset_transform_state(&mut self) {
         self.mouse_remainders = MouseScaleRemainders::ZERO;
+        self.shortcut_armed = true;
     }
 }
 
@@ -320,7 +371,8 @@ impl InputProfileRegistry {
 mod tests {
     use super::*;
     use crate::ids::{DeviceId, InterfaceId};
-    use crate::input::{MouseButtons, MouseFrame, MouseMovement};
+    use crate::input::{ModifierState, MouseButtons, MouseFrame, MouseMovement};
+    use crate::settings::KeyboardShortcut;
 
     fn identity(value: u16) -> InputIdentity {
         InputIdentity::from_port_path(value, value, &[value as u8])
@@ -403,5 +455,86 @@ mod tests {
         profile.transform(&mut frame);
         assert_eq!(frame.mouse.unwrap().movement.x, 1);
         assert_eq!(frame.mouse.unwrap().movement.y, -1);
+    }
+
+    fn shortcut_frame(modifiers: ModifierState, keys: &[u8]) -> StandardInputFrame {
+        let mut keyboard = KeyboardFrame::new(modifiers);
+        for key in keys {
+            keyboard.push_key(KeyUsage(*key)).unwrap();
+        }
+        StandardInputFrame {
+            device_id: DeviceId(1),
+            interface_id: InterfaceId(1),
+            keyboard: Some(keyboard),
+            mouse: None,
+            consumer: None,
+        }
+    }
+
+    #[test]
+    fn shortcut_requires_exact_modifiers_and_only_one_non_modifier_key() {
+        let id = InputProfileId::new(1).unwrap();
+        let mut profile = InputProfile::restored(id, identity(1), 0, InputSettings::DEFAULT);
+        profile.settings.target_switch_shortcut = KeyboardShortcut::new(
+            ModifierState::LEFT_CTRL | ModifierState::LEFT_SHIFT,
+            KeyUsage(0x0e),
+        )
+        .unwrap();
+
+        let mut missing = shortcut_frame(ModifierState::LEFT_CTRL, &[0x0e]);
+        assert!(!profile.capture_target_switch_shortcut(&mut missing));
+        let mut extra_modifier = shortcut_frame(
+            ModifierState::LEFT_CTRL | ModifierState::LEFT_SHIFT | ModifierState::LEFT_ALT,
+            &[0x0e],
+        );
+        assert!(!profile.capture_target_switch_shortcut(&mut extra_modifier));
+        let mut extra_key = shortcut_frame(
+            ModifierState::LEFT_CTRL | ModifierState::LEFT_SHIFT,
+            &[0x0e, 0x04],
+        );
+        assert!(!profile.capture_target_switch_shortcut(&mut extra_key));
+        let mut exact = shortcut_frame(
+            ModifierState::LEFT_CTRL | ModifierState::LEFT_SHIFT,
+            &[0x0e],
+        );
+        assert!(profile.capture_target_switch_shortcut(&mut exact));
+        let keyboard = exact.keyboard.unwrap();
+        assert!(keyboard.modifiers.is_empty());
+        assert!(keyboard.keys_down().is_empty());
+    }
+
+    #[test]
+    fn shortcut_repeat_is_suppressed_until_all_components_are_released() {
+        let id = InputProfileId::new(1).unwrap();
+        let mut profile = InputProfile::restored(id, identity(1), 0, InputSettings::DEFAULT);
+        profile.settings.target_switch_shortcut =
+            KeyboardShortcut::new(ModifierState::LEFT_CTRL, KeyUsage(0x0e)).unwrap();
+        let mut press = shortcut_frame(ModifierState::LEFT_CTRL, &[0x0e]);
+        assert!(profile.capture_target_switch_shortcut(&mut press));
+        let mut repeat = shortcut_frame(ModifierState::LEFT_CTRL, &[0x0e]);
+        assert!(!profile.capture_target_switch_shortcut(&mut repeat));
+        assert!(repeat.keyboard.unwrap().keys_down().is_empty());
+        let mut key_release = shortcut_frame(ModifierState::LEFT_CTRL, &[]);
+        assert!(!profile.capture_target_switch_shortcut(&mut key_release));
+        let mut press_before_modifier_release = shortcut_frame(ModifierState::LEFT_CTRL, &[0x0e]);
+        assert!(!profile.capture_target_switch_shortcut(&mut press_before_modifier_release));
+        let mut all_released = shortcut_frame(ModifierState::empty(), &[]);
+        assert!(!profile.capture_target_switch_shortcut(&mut all_released));
+        let mut next_press = shortcut_frame(ModifierState::LEFT_CTRL, &[0x0e]);
+        assert!(profile.capture_target_switch_shortcut(&mut next_press));
+    }
+
+    #[test]
+    fn shortcut_is_detected_before_remap() {
+        let id = InputProfileId::new(1).unwrap();
+        let mut profile = InputProfile::restored(id, identity(1), 0, InputSettings::DEFAULT);
+        profile.settings.target_switch_shortcut =
+            KeyboardShortcut::new(ModifierState::empty(), KeyUsage(0x04)).unwrap();
+        profile.settings.remap_from_usage = 0x04;
+        profile.settings.remap_to_usage = 0x05;
+        let mut frame = shortcut_frame(ModifierState::empty(), &[0x04]);
+        assert!(profile.capture_target_switch_shortcut(&mut frame));
+        profile.transform(&mut frame);
+        assert!(frame.keyboard.unwrap().keys_down().is_empty());
     }
 }

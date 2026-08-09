@@ -10,12 +10,15 @@ use crate::storage::StorageHealth;
 pub const MANAGEMENT_PROTOCOL_VERSION: u8 = 3;
 pub const MANAGEMENT_REQUEST_LEN: usize = 20;
 pub const MANAGEMENT_RESPONSE_LEN: usize = 20;
+pub const MANAGEMENT_EVENT_LEN: usize = 4;
 pub const MANAGEMENT_HOST_NAME_LEN: usize = 12;
 pub const MANAGEMENT_CAPABILITY_DUAL_S3_WIRED: u8 = 1 << 0;
+pub const MANAGEMENT_CAPABILITY_COMPANION_EVENTS: u8 = 1 << 1;
 
 pub const MANAGEMENT_SERVICE_UUID: &str = "7f510000-1b15-4f0d-9f4b-5b6d4f3a0001";
 pub const MANAGEMENT_REQUEST_UUID: &str = "7f510001-1b15-4f0d-9f4b-5b6d4f3a0001";
 pub const MANAGEMENT_RESPONSE_UUID: &str = "7f510002-1b15-4f0d-9f4b-5b6d4f3a0001";
+pub const MANAGEMENT_EVENT_UUID: &str = "7f510003-1b15-4f0d-9f4b-5b6d4f3a0001";
 
 const OP_GET_STATUS: u8 = 0x01;
 const OP_SELECT_HOST: u8 = 0x02;
@@ -31,6 +34,7 @@ const OP_GET_SCHEMA: u8 = 0x0b;
 const OP_GET_SETTING: u8 = 0x0c;
 const OP_SET_SETTING: u8 = 0x0d;
 const OP_GET_HOST_TIMING: u8 = 0x0e;
+const OP_GET_CLIENT_SESSION: u8 = 0x12;
 #[cfg(feature = "dual-s3-wired")]
 const OP_SELECT_OUTPUT_TARGET: u8 = 0x0f;
 #[cfg(feature = "dual-s3-wired")]
@@ -51,6 +55,7 @@ const PAYLOAD_HISTORY: u8 = 5;
 const PAYLOAD_SCHEMA: u8 = 6;
 const PAYLOAD_SETTING: u8 = 7;
 const PAYLOAD_HOST_TIMING: u8 = 8;
+const PAYLOAD_CLIENT_SESSION: u8 = 11;
 #[cfg(feature = "dual-s3-wired")]
 const PAYLOAD_OUTPUT_TARGET_STATUS: u8 = 9;
 #[cfg(feature = "dual-s3-wired")]
@@ -63,6 +68,38 @@ const HISTORY_PAYLOAD_LEN: u8 = 15;
 const SCHEMA_PAYLOAD_LEN: u8 = 8;
 const SETTING_PAYLOAD_LEN: u8 = 8;
 const HOST_TIMING_PAYLOAD_LEN: u8 = 10;
+const CLIENT_SESSION_PAYLOAD_LEN: u8 = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagementEvent {
+    StatusChanged { sequence: u16 },
+}
+
+impl ManagementEvent {
+    pub const fn encode(self) -> [u8; MANAGEMENT_EVENT_LEN] {
+        match self {
+            Self::StatusChanged { sequence } => {
+                let [low, high] = sequence.to_le_bytes();
+                [MANAGEMENT_PROTOCOL_VERSION, 1, low, high]
+            }
+        }
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, ManagementProtocolError> {
+        if bytes.len() != MANAGEMENT_EVENT_LEN {
+            return Err(ManagementProtocolError::InvalidLength);
+        }
+        if bytes[0] != MANAGEMENT_PROTOCOL_VERSION {
+            return Err(ManagementProtocolError::UnsupportedVersion);
+        }
+        match bytes[1] {
+            1 => Ok(Self::StatusChanged {
+                sequence: u16::from_le_bytes([bytes[2], bytes[3]]),
+            }),
+            _ => Err(ManagementProtocolError::UnknownCommand),
+        }
+    }
+}
 #[cfg(feature = "dual-s3-wired")]
 const OUTPUT_TARGET_STATUS_PAYLOAD_LEN: u8 = 14;
 #[cfg(feature = "dual-s3-wired")]
@@ -100,6 +137,7 @@ impl ManagementRequest {
             },
             (OP_GET_DIAGNOSTICS, []) => ManagementCommand::GetDiagnostics,
             (OP_GET_HOST_TIMING, [host]) => ManagementCommand::GetHostTiming(HostId(*host)),
+            (OP_GET_CLIENT_SESSION, []) => ManagementCommand::GetClientSession,
             #[cfg(feature = "dual-s3-wired")]
             (OP_SELECT_OUTPUT_TARGET, [kind, id]) => {
                 ManagementCommand::SelectOutputTarget(ManagementOutputTarget::decode(*kind, *id)?)
@@ -145,10 +183,21 @@ impl ManagementRequest {
                 }
             }
             (
-                OP_GET_STATUS | OP_SELECT_HOST | OP_START_PAIRING | OP_FORGET_HOST
-                | OP_GET_HOST_INFO | OP_SET_HOST_NAME | OP_CANCEL_PAIRING | OP_GET_USB_DEVICE
-                | OP_GET_DIAGNOSTICS | OP_GET_HISTORY | OP_GET_SCHEMA | OP_GET_SETTING
-                | OP_SET_SETTING | OP_GET_HOST_TIMING,
+                OP_GET_STATUS
+                | OP_SELECT_HOST
+                | OP_START_PAIRING
+                | OP_FORGET_HOST
+                | OP_GET_HOST_INFO
+                | OP_SET_HOST_NAME
+                | OP_CANCEL_PAIRING
+                | OP_GET_USB_DEVICE
+                | OP_GET_DIAGNOSTICS
+                | OP_GET_HISTORY
+                | OP_GET_SCHEMA
+                | OP_GET_SETTING
+                | OP_SET_SETTING
+                | OP_GET_HOST_TIMING
+                | OP_GET_CLIENT_SESSION,
                 _,
             ) => {
                 return Err(ManagementProtocolError::InvalidArgument);
@@ -201,6 +250,7 @@ impl ManagementRequest {
             ManagementCommand::GetHostTiming(host_id) => {
                 encode_host_command(&mut bytes, OP_GET_HOST_TIMING, host_id)
             }
+            ManagementCommand::GetClientSession => bytes[2] = OP_GET_CLIENT_SESSION,
             #[cfg(feature = "dual-s3-wired")]
             ManagementCommand::SelectOutputTarget(target) => {
                 bytes[2] = OP_SELECT_OUTPUT_TARGET;
@@ -280,6 +330,7 @@ pub enum ManagementCommand {
     },
     GetDiagnostics,
     GetHostTiming(HostId),
+    GetClientSession,
     GetHistory {
         index: u8,
     },
@@ -455,6 +506,11 @@ impl ManagementResponse {
                 bytes[10..14].copy_from_slice(&timing.last_disconnected_seconds.to_le_bytes());
                 bytes[14] = timing.last_disconnect_reason;
             }
+            ManagementResponsePayload::ClientSession(session) => {
+                bytes[3] = PAYLOAD_CLIENT_SESSION;
+                bytes[4] = CLIENT_SESSION_PAYLOAD_LEN;
+                bytes[5] = option_host_id(session.host_id);
+            }
             #[cfg(feature = "dual-s3-wired")]
             ManagementResponsePayload::OutputTargetStatus(status) => {
                 bytes[3] = PAYLOAD_OUTPUT_TARGET_STATUS;
@@ -614,6 +670,11 @@ impl ManagementResponse {
                     last_disconnect_reason: bytes[14],
                 })
             }
+            (PAYLOAD_CLIENT_SESSION, CLIENT_SESSION_PAYLOAD_LEN) => {
+                ManagementResponsePayload::ClientSession(ManagementClientSession {
+                    host_id: decode_optional_host(bytes[5]),
+                })
+            }
             #[cfg(feature = "dual-s3-wired")]
             (PAYLOAD_OUTPUT_TARGET_STATUS, OUTPUT_TARGET_STATUS_PAYLOAD_LEN) => {
                 let selected = ManagementOutputTarget::decode(bytes[5], bytes[6])?;
@@ -671,6 +732,7 @@ pub enum ManagementResponsePayload {
     Schema(ManagementSchema),
     Setting(ManagementSetting),
     HostTiming(ManagementHostTiming),
+    ClientSession(ManagementClientSession),
     #[cfg(feature = "dual-s3-wired")]
     OutputTargetStatus(ManagementOutputTargetStatus),
     #[cfg(feature = "dual-s3-wired")]
@@ -902,6 +964,11 @@ pub struct ManagementHostTiming {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ManagementClientSession {
+    pub host_id: Option<HostId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ManagementHostName {
     len: u8,
     bytes: [u8; MANAGEMENT_HOST_NAME_LEN],
@@ -1083,6 +1150,7 @@ mod tests {
             },
             ManagementCommand::GetDiagnostics,
             ManagementCommand::GetHostTiming(HostId(4)),
+            ManagementCommand::GetClientSession,
             ManagementCommand::GetHistory { index: 3 },
             ManagementCommand::GetSchema,
             ManagementCommand::GetSetting {
@@ -1103,6 +1171,23 @@ mod tests {
         }
         assert_eq!(MANAGEMENT_REQUEST_LEN, 20);
         assert_eq!(MANAGEMENT_RESPONSE_LEN, 20);
+    }
+
+    #[test]
+    fn companion_event_and_client_session_round_trip() {
+        for sequence in [0, 1, u16::MAX] {
+            let event = ManagementEvent::StatusChanged { sequence };
+            assert_eq!(ManagementEvent::decode(&event.encode()), Ok(event));
+        }
+        let response = ManagementResponse {
+            request_id: 3,
+            result: ManagementResult::Ok,
+            payload: ManagementResponsePayload::ClientSession(ManagementClientSession {
+                host_id: Some(HostId(2)),
+            }),
+        };
+        assert_eq!(ManagementResponse::decode(&response.encode()), Ok(response));
+        assert_eq!(MANAGEMENT_EVENT_LEN, 4);
     }
 
     #[test]

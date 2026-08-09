@@ -748,7 +748,11 @@ pub fn persist_storage_state<B: StorageSlotBackend>(
     let image = encode_storage_image(state)?;
     backend.write_slot(target, image)?;
     let verified = backend.slot(target);
-    if verified != &image || decode_storage_image(verified).as_ref() != Ok(state) {
+    // Runtime-only profile state (for example connection and transform state)
+    // is intentionally normalized by the storage codec. Verify the durable
+    // representation rather than requiring the decoded projection to equal
+    // the live runtime snapshot.
+    if verified != &image || decode_storage_image(verified).is_err() {
         return Err(StorageError::FlashVerify);
     }
 
@@ -1065,6 +1069,7 @@ fn decode_input_settings(bytes: &[u8]) -> Result<InputSettings, StorageError> {
         scroll_multiplier_percent: read_u16(&bytes[6..8]),
         consumer_from_usage: read_u16(&bytes[8..10]),
         consumer_to_usage: read_u16(&bytes[10..12]),
+        target_switch_shortcut: crate::settings::KeyboardShortcut::DISABLED,
     };
     if settings.keyboard_layout > 2
         || !(10..=400).contains(&settings.mouse_sensitivity_percent)
@@ -1084,6 +1089,10 @@ fn encode_input_profile(profile: &InputProfile, out: &mut [u8]) {
     write_u16(&mut out[4..6], profile.identity.product_id);
     write_u64(&mut out[6..14], profile.identity.instance_hash);
     write_u64(&mut out[14..22], profile.last_seen);
+    write_u16(
+        &mut out[22..24],
+        profile.settings.target_switch_shortcut.packed(),
+    );
     encode_input_settings(profile.settings, &mut out[24..36]);
 }
 
@@ -1097,7 +1106,13 @@ fn decode_input_profile(bytes: &[u8]) -> Result<InputProfile, StorageError> {
             instance_hash: read_u64(&bytes[6..14]),
         },
         read_u64(&bytes[14..22]),
-        decode_input_settings(&bytes[24..36])?,
+        {
+            let mut settings = decode_input_settings(&bytes[24..36])?;
+            settings.target_switch_shortcut =
+                crate::settings::KeyboardShortcut::from_packed(read_u16(&bytes[22..24]))
+                    .ok_or(StorageError::InvalidLength)?;
+            settings
+        },
     ))
 }
 
@@ -1319,6 +1334,22 @@ mod tests {
         assert_eq!(&image[0..4], &STORAGE_MAGIC);
     }
 
+    #[test]
+    fn persistence_verifies_durable_profile_projection_not_live_connection_state() {
+        let mut backend = TestBackend::empty();
+        let mut state = StorageState::new(1);
+        let profile_id = state
+            .input_profiles
+            .observe(InputIdentity::from_port_path(1, 2, &[3]), 10)
+            .unwrap();
+        assert!(state.input_profiles.get(profile_id).unwrap().connected);
+
+        persist_storage_state(&mut backend, &state).unwrap();
+
+        let restored = restore_latest_storage_state(&backend).unwrap();
+        assert!(!restored.input_profiles.get(profile_id).unwrap().connected);
+    }
+
     #[cfg(feature = "dual-s3-wired")]
     #[test]
     fn storage_image_round_trips_output_and_mirror_independently() {
@@ -1361,11 +1392,38 @@ mod tests {
         settings.mouse_sensitivity_percent = 175;
         settings.consumer_from_usage = 0x0e9;
         settings.consumer_to_usage = 0x0ea;
+        settings.target_switch_shortcut = crate::settings::KeyboardShortcut::new(
+            crate::input::ModifierState::LEFT_CTRL,
+            crate::input::KeyUsage(0x0e),
+        )
+        .unwrap();
         state.input_profiles.disconnect(id, 43).unwrap();
 
         assert_eq!(
             decode_storage_image(&encode_storage_image(&state).unwrap()),
             Ok(state)
+        );
+    }
+
+    #[test]
+    fn zeroed_reserved_shortcut_bytes_decode_as_disabled_without_schema_bump() {
+        let mut state = StorageState::new(1);
+        let id = state
+            .input_profiles
+            .observe(InputIdentity::from_port_path(1, 2, &[3]), 1)
+            .unwrap();
+        state.input_profiles.disconnect(id, 2).unwrap();
+        let image = encode_storage_image(&state).unwrap();
+        let decoded = decode_storage_image(&image).unwrap();
+        assert_eq!(STORAGE_SCHEMA_VERSION, 1);
+        assert_eq!(
+            decoded
+                .input_profiles
+                .get(id)
+                .unwrap()
+                .settings
+                .target_switch_shortcut,
+            crate::settings::KeyboardShortcut::DISABLED
         );
     }
 

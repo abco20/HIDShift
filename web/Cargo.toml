@@ -11,6 +11,7 @@ futures-util = "0.3"
 gloo-timers = { version = "0.3", features = ["futures"] }
 hidshift = { path = "..", features = ["dual-s3-wired"] }
 hidshift-client = { path = "../tools/hidshift-client" }
+hidshift-manager-ui = { path = "../manager-ui" }
 js-sys = "0.3"
 leptos = { version = "0.8.20", features = ["csr"] }
 send_wrapper = "0.6"
@@ -21,6 +22,7 @@ web-sys = { version = "0.3", features = [
   "EventTarget",
   "Clipboard",
   "MouseEvent",
+  "KeyboardEvent",
   "Navigator",
   "Document",
   "Element",

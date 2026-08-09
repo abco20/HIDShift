@@ -692,6 +692,9 @@ fn response_json(response: ManagementResponse) -> serde_json::Value {
             "last_disconnected_seconds": value.last_disconnected_seconds,
             "last_disconnect_reason": value.last_disconnect_reason,
         }),
+        ManagementResponsePayload::ClientSession(value) => serde_json::json!({
+            "host_id": value.host_id.map(|host| host.0),
+        }),
         ManagementResponsePayload::OutputTargetStatus(value) => serde_json::json!({
             "selected": output_target_json(value.selected),
             "active": value.active.map(output_target_json),
@@ -862,10 +865,6 @@ impl SerialManagementSession {
             .timeout(Duration::from_millis(200))
             .open()?;
         let _ = port.set_flow_control(FlowControl::None);
-        // CH340 auto-reset wiring can otherwise leave EN/BOOT asserted for the
-        // lifetime of the process or after an interrupted management command.
-        let _ = port.write_data_terminal_ready(false);
-        let _ = port.write_request_to_send(false);
         Ok(Self {
             port,
             decoder: SerialResponseDecoder::default(),
@@ -1212,6 +1211,15 @@ fn print_response(response: ManagementResponse) {
                 } else {
                     ""
                 },
+            );
+        }
+        ManagementResponsePayload::ClientSession(session) => {
+            println!(
+                "client session: {}",
+                session
+                    .host_id
+                    .map(|host| host.0.to_string())
+                    .unwrap_or_else(|| "wired".into())
             );
         }
         ManagementResponsePayload::None => {}

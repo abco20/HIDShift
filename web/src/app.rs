@@ -1,5 +1,6 @@
 use std::rc::Rc;
 
+use gloo_timers::callback::Interval;
 use hidshift::{
     HostId, ManagementCommand, ManagementDiagnostics, ManagementHistoryEvent, ManagementHostName,
     ManagementHostStatus, ManagementOutputTarget, ManagementOutputTargetStatus, ManagementStatus,
@@ -38,9 +39,42 @@ pub fn App() -> impl IntoView {
     let connect_locale = state.locale;
     let page_state = state.clone();
     let page_send = send.clone();
+    let show_companion_onboarding = RwSignal::new(
+        crate::transport::is_tauri()
+            && web_sys::window()
+                .and_then(|window| window.local_storage().ok().flatten())
+                .and_then(|storage| {
+                    storage
+                        .get_item("hidshift-companion-onboarded")
+                        .ok()
+                        .flatten()
+                })
+                .is_none(),
+    );
+    if crate::transport::is_tauri() {
+        state.connect(true);
+        let reconnect_state = state.clone();
+        let reconnect = Interval::new(2_000, move || {
+            if !reconnect_state.connected.get_untracked() && !reconnect_state.busy.get_untracked() {
+                reconnect_state.connect(true);
+            }
+        });
+        // App is the root component, so this interval intentionally lives for
+        // the full WebView lifetime.
+        reconnect.forget();
+    }
 
     view! {
         <div class="app-shell">
+            {move || show_companion_onboarding.get().then(|| view! {
+                <div class="notice" role="dialog" aria-label="Companion setup">
+                    <span>"切替通知を許可し、ログイン時にHIDShift Companionを起動しますか？"</span>
+                    <span>
+                        <button class="quiet compact" on:click=move |_| finish_companion_onboarding(show_companion_onboarding, false)>"後で"</button>
+                        <button class="compact" on:click=move |_| finish_companion_onboarding(show_companion_onboarding, true)>"有効にする"</button>
+                    </span>
+                </div>
+            })}
             <aside class="sidebar">
                 <div class="brand">
                     <span class="brand-mark" aria-hidden="true">"H"</span>
@@ -138,6 +172,20 @@ pub fn App() -> impl IntoView {
                 <NavButton state=state.clone() page=Page::Settings label_ja="設定" label_en="Settings" icon="settings"/>
             </nav>
         </div>
+    }
+}
+
+fn finish_companion_onboarding(visible: RwSignal<bool>, enable: bool) {
+    visible.set(false);
+    if let Some(storage) =
+        web_sys::window().and_then(|window| window.local_storage().ok().flatten())
+    {
+        let _ = storage.set_item("hidshift-companion-onboarded", "1");
+    }
+    if enable {
+        spawn_local(async move {
+            let _ = crate::transport::companion_onboarding(true).await;
+        });
     }
 }
 

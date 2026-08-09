@@ -542,8 +542,9 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
     ) -> Result<(), RuntimeError> {
         match input {
             RuntimeInput::BridgeEvent(mut event) => {
+                let mut shortcut_triggered = false;
                 if let BridgeEvent::InputFrame(frame) = &mut event {
-                    self.transform_input_frame(frame);
+                    shortcut_triggered = self.transform_input_frame(frame);
                 }
                 #[cfg(feature = "dual-s3-wired")]
                 let event = match event {
@@ -556,7 +557,11 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                     }
                     event => event,
                 };
-                self.handle_bridge_event::<COMMANDS, ACTIONS>(event, commands)
+                self.handle_bridge_event::<COMMANDS, ACTIONS>(event, commands)?;
+                if shortcut_triggered {
+                    self.handle_shortcut_target_switch::<COMMANDS, ACTIONS>(self.now_ms, commands)?;
+                }
+                Ok(())
             }
             RuntimeInput::ButtonIntent { intent, now_ms } => {
                 self.handle_button_intent::<COMMANDS, ACTIONS>(intent, now_ms, commands)
@@ -1223,6 +1228,32 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         }
     }
 
+    fn handle_shortcut_target_switch<const COMMANDS: usize, const ACTIONS: usize>(
+        &mut self,
+        now_ms: u64,
+        commands: &mut heapless::Vec<RuntimeCommand, COMMANDS>,
+    ) -> Result<(), RuntimeError> {
+        #[cfg(feature = "dual-s3-wired")]
+        {
+            let _ = now_ms;
+            let Some(target) = self.next_ready_output_target() else {
+                return Ok(());
+            };
+            self.pending_target_switch = None;
+            self.handle_bridge_event_append::<COMMANDS, ACTIONS>(
+                BridgeEvent::SelectOutputTarget { target },
+                commands,
+            )
+        }
+        #[cfg(not(feature = "dual-s3-wired"))]
+        {
+            let Some(target) = self.bridge.state().hosts.next_connected_target() else {
+                return Ok(());
+            };
+            self.request_target_switch::<COMMANDS, ACTIONS>(target, now_ms, commands)
+        }
+    }
+
     #[cfg(feature = "dual-s3-wired")]
     fn next_ready_output_target(&self) -> Option<OutputTarget> {
         let selected = self.bridge.state().output_target.selected;
@@ -1365,7 +1396,8 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                 }
                 ManagementCommand::GetDiagnostics
                 | ManagementCommand::GetHistory { .. }
-                | ManagementCommand::GetSchema => ManagementResult::Ok,
+                | ManagementCommand::GetSchema
+                | ManagementCommand::GetClientSession => ManagementResult::Ok,
                 ManagementCommand::GetHostTiming(host_id) => {
                     if valid_management_host::<HOSTS>(host_id) {
                         ManagementResult::Ok
@@ -1506,12 +1538,21 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                 firmware_major: crate::FIRMWARE_VERSION_MAJOR,
                 firmware_minor: crate::FIRMWARE_VERSION_MINOR,
                 firmware_patch: crate::FIRMWARE_VERSION_PATCH,
-                capabilities: if cfg!(feature = "dual-s3-wired") {
-                    crate::management::MANAGEMENT_CAPABILITY_DUAL_S3_WIRED
-                } else {
-                    0
-                },
+                capabilities: crate::management::MANAGEMENT_CAPABILITY_COMPANION_EVENTS
+                    | if cfg!(feature = "dual-s3-wired") {
+                        crate::management::MANAGEMENT_CAPABILITY_DUAL_S3_WIRED
+                    } else {
+                        0
+                    },
             }),
+            ManagementCommand::GetClientSession => ManagementResponsePayload::ClientSession(
+                crate::management::ManagementClientSession {
+                    host_id: match destination {
+                        ManagementDestination::Ble(host_id) => Some(host_id),
+                        ManagementDestination::Wired => None,
+                    },
+                },
+            ),
             ManagementCommand::GetSetting { id, target }
             | ManagementCommand::SetSetting { id, target, .. }
                 if result == ManagementResult::Ok =>
@@ -1765,6 +1806,9 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                     SettingId::ScrollMultiplierPercent => settings.scroll_multiplier_percent as i32,
                     SettingId::ConsumerFromUsage => settings.consumer_from_usage as i32,
                     SettingId::ConsumerToUsage => settings.consumer_to_usage as i32,
+                    SettingId::TargetSwitchShortcut => {
+                        settings.target_switch_shortcut.packed() as i32
+                    }
                     _ => return None,
                 }
             }
@@ -1818,6 +1862,14 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                     }
                     SettingId::ConsumerFromUsage => settings.consumer_from_usage = value as u16,
                     SettingId::ConsumerToUsage => settings.consumer_to_usage = value as u16,
+                    SettingId::TargetSwitchShortcut => {
+                        let Some(shortcut) =
+                            crate::settings::KeyboardShortcut::from_packed(value as u16)
+                        else {
+                            return false;
+                        };
+                        settings.target_switch_shortcut = shortcut;
+                    }
                     _ => return false,
                 }
             }
@@ -2297,16 +2349,31 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         Ok(())
     }
 
-    fn transform_input_frame(&mut self, frame: &mut crate::input::InputFrame) {
+    fn transform_input_frame(&mut self, frame: &mut crate::input::InputFrame) -> bool {
         let crate::input::InputFrame::Standard(frame) = frame else {
-            return;
+            return false;
         };
         let Some(profile_id) = self.input_profile_for_device(frame.device_id) else {
-            return;
+            return false;
         };
         if let Some(profile) = self.input_profiles.get_mut(profile_id) {
+            let triggered = profile.capture_target_switch_shortcut(frame);
             profile.transform(frame);
+            return triggered;
         }
+        false
+    }
+
+    pub(crate) fn input_frame_would_trigger_shortcut(
+        &self,
+        frame: &crate::input::InputFrame,
+    ) -> bool {
+        let crate::input::InputFrame::Standard(frame) = frame else {
+            return false;
+        };
+        self.input_profile_for_device(frame.device_id)
+            .and_then(|id| self.input_profiles.get(id))
+            .is_some_and(|profile| profile.target_switch_shortcut_would_trigger(frame))
     }
 }
 
@@ -2374,6 +2441,14 @@ impl StatusSnapshot {
         BridgeStatus {
             active_target: self.active_host,
             pairable_host: self.pairing_host,
+        }
+    }
+
+    pub fn for_each_connected_host(self, mut visit: impl FnMut(HostId)) {
+        for slot in 0..RUNTIME_HOSTS_MAX {
+            if self.connected_hosts & (1 << slot) != 0 {
+                visit(HostId((slot + 1) as u8));
+            }
         }
     }
 }
@@ -2468,6 +2543,10 @@ pub enum BleTaskCommand {
         host_id: HostId,
         response: ManagementResponse,
     },
+    ManagementEvent {
+        host_id: HostId,
+        event: crate::management::ManagementEvent,
+    },
 }
 
 #[cfg(feature = "dual-s3-wired")]
@@ -2550,7 +2629,8 @@ impl BleTaskCommand {
             | Self::RejectPairing { .. }
             | Self::ClearBond { .. }
             | Self::ActivateInput { .. }
-            | Self::ManagementResponse { .. } => BleCommandLane::Control,
+            | Self::ManagementResponse { .. }
+            | Self::ManagementEvent { .. } => BleCommandLane::Control,
         }
     }
 
@@ -2569,6 +2649,7 @@ impl BleTaskCommand {
             | Self::ClearBond { .. }
             | Self::ActivateInput { .. }
             | Self::ManagementResponse { .. } => CommandClass::Critical,
+            Self::ManagementEvent { .. } => CommandClass::BestEffort,
         }
     }
 }
@@ -5063,6 +5144,88 @@ mod tests {
             panic!()
         };
         assert_eq!(frame.keyboard.unwrap().keys_down(), &[KeyUsage(5)]);
+    }
+
+    #[cfg(not(feature = "dual-s3-wired"))]
+    #[test]
+    fn keyboard_shortcut_releases_old_target_and_never_forwards_trigger_chord() {
+        let mut runtime = BridgeRuntime::<2, 2>::new(0);
+        let mut commands = heapless::Vec::<RuntimeCommand, 16>::new();
+        for host_id in [HostId(1), HostId(2)] {
+            for event in [
+                BridgeEvent::HostConnected { host_id },
+                BridgeEvent::HostSecurityChanged {
+                    host_id,
+                    encrypted: true,
+                    bonded: true,
+                    bond: None,
+                },
+                BridgeEvent::CccdChanged {
+                    host_id,
+                    report: ReportKind::Keyboard,
+                    enabled: true,
+                },
+            ] {
+                runtime
+                    .handle_event::<16, 16>(event, &mut commands)
+                    .unwrap();
+            }
+        }
+        runtime
+            .handle_event::<16, 16>(
+                BridgeEvent::SwitchTarget { target: HostId(1) },
+                &mut commands,
+            )
+            .unwrap();
+        let profile = attach_input_profile(&mut runtime, DeviceId(1), InterfaceId(1), 9, 0x02);
+        runtime
+            .input_profiles
+            .get_mut(profile)
+            .unwrap()
+            .settings
+            .target_switch_shortcut = crate::settings::KeyboardShortcut::new(
+            crate::input::ModifierState::LEFT_CTRL,
+            KeyUsage(0x0e),
+        )
+        .unwrap();
+
+        let mut keyboard = crate::input::KeyboardFrame::new(crate::input::ModifierState::LEFT_CTRL);
+        keyboard.push_key(KeyUsage(0x0e)).unwrap();
+        let mut frame = keyboard_input(KeyUsage(0x0e));
+        frame.keyboard = Some(keyboard);
+        runtime
+            .handle_input::<16, 16, 2>(
+                RuntimeInput::BridgeEvent(BridgeEvent::InputFrame(
+                    crate::input::InputFrame::Standard(frame),
+                )),
+                &mut commands,
+            )
+            .unwrap();
+
+        assert!(commands.iter().all(|command| !matches!(
+            command,
+            RuntimeCommand::BleCommand(BleTaskCommand::Notify {
+                report: BleHidReport::Keyboard(report),
+                ..
+            }) if *report != BleKeyboard6KroReport::release()
+        )));
+        runtime
+            .handle_input::<16, 16, 2>(RuntimeInput::Tick { now_ms: 20 }, &mut commands)
+            .unwrap();
+        assert_eq!(
+            runtime.bridge.state().hosts.active_target(),
+            Some(HostId(2))
+        );
+        assert!(runtime.bridge.state().input.keyboard.keys().is_empty());
+    }
+
+    #[test]
+    fn management_status_events_fan_out_to_every_connected_host() {
+        let mut snapshot = StatusSnapshot::empty();
+        snapshot.connected_hosts = 0b1011;
+        let mut hosts = heapless::Vec::<HostId, 4>::new();
+        snapshot.for_each_connected_host(|host| hosts.push(host).unwrap());
+        assert_eq!(hosts.as_slice(), &[HostId(1), HostId(2), HostId(4)]);
     }
 
     #[test]

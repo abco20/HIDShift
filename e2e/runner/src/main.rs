@@ -296,6 +296,12 @@ fn main() -> Result<()> {
     // When Linux integration is enabled, host 2 remains connected while host
     // 1 (the Probe) is active. The primary latency and stability results thus
     // exercise the retained multi-host session rather than a single link.
+    // Keep reconnection/CCCD restoration and the explicit host-2 -> host-1
+    // switch tail out of the steady-state latency gate. Switch-tail behavior
+    // is exercised by the functional test immediately above.
+    if !args.skip_linux {
+        drain_for(&harness.lines, Duration::from_secs(3));
+    }
     let clock_sync = synchronize_probe_clock(&mut harness, 20)?;
     let dut_clock_sync = synchronize_dut_clock(&mut harness, 20)?;
     let (measurement, mouse_measurement) = run_latency_tests(
@@ -575,15 +581,6 @@ fn build_and_flash(repo: &Path, dut: &Path, probe: &Path, probe_chip: ProbeChip)
         probe_chip.cargo_target()
     );
     run(Command::new("sh").arg("-c").arg(build_probe), repo)?;
-    // Clear the DUT storage only after both images are ready. The runner opens
-    // the host-1 pairing window explicitly once both serial paths are live.
-    run(
-        Command::new("espflash")
-            .args(["erase-parts", "--chip", DUT_CHIP, "--port"])
-            .arg(dut)
-            .args(["--partition-table", "partitions/bridge.csv", "bridge"]),
-        repo,
-    )?;
     run(
         Command::new("espflash")
             .args(["flash", "--chip", probe_chip.espflash_name(), "--port"])
@@ -593,6 +590,17 @@ fn build_and_flash(repo: &Path, dut: &Path, probe: &Path, probe_chip: ProbeChip)
                     .join(probe_chip.cargo_target())
                     .join("release/hidshift-e2e-probe"),
             ),
+        repo,
+    )?;
+    // Reset the DUT storage only after the Probe image is ready. Returning to
+    // the harness immediately after this reset lets it open host-1 pairing
+    // before physical USB profile persistence reaches its five-second flash
+    // deadline or the scanning Probe repeatedly connects as an unknown peer.
+    run(
+        Command::new("espflash")
+            .args(["erase-parts", "--chip", DUT_CHIP, "--port"])
+            .arg(dut)
+            .args(["--partition-table", "partitions/bridge.csv", "bridge"]),
         repo,
     )?;
     Ok(())
@@ -818,11 +826,20 @@ impl Harness {
         let deadline = Instant::now() + timeout;
         while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
             let line = self.lines.recv_timeout(remaining)?;
-            if line.source == Source::Dut
-                && let Some(response) = parse_management_response(&line.text)
-                && response.request_id == request_id
-            {
-                return Ok(response);
+            let response = (line.source == Source::Dut)
+                .then(|| parse_management_response(&line.text))
+                .flatten();
+            if let Some(response) = response {
+                if response.request_id == request_id {
+                    return Ok(response);
+                }
+            } else {
+                println!("{:?}: {}", line.source, line.text);
+                if line.source == Source::Probe
+                    && let Some(notification) = parse_probe_notification(&line.text)
+                {
+                    self.observe_probe_notification(&notification);
+                }
             }
         }
         bail!("timed out waiting for management response {request_id}")
@@ -1693,22 +1710,47 @@ impl ManagementHarness for Harness {
 }
 
 fn start_pairing<H: ManagementHarness>(harness: &mut H, host_id: HostId) -> Result<()> {
-    let request_id = harness.send_management(ManagementCommand::StartPairing(host_id))?;
-    let response = harness.wait_management_response(request_id, Duration::from_secs(3))?;
-    ensure!(
-        response.result == ManagementResult::Ok,
-        "DUT rejected pairing request for host {host_id:?}: {:?}",
-        response.result
-    );
-    ensure!(
-        matches!(
-            response.payload,
-            ManagementResponsePayload::Status(status)
-                if status.pairing_host == Some(host_id)
-        ),
-        "DUT did not enter pairing mode for host {host_id:?}"
-    );
-    Ok(())
+    // Opening the CH340 can reset the DUT. USB re-enumeration and storage
+    // restore may outlive the serial Hello response, but normal profile
+    // persistence does not begin until five seconds after the last update.
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let mut last_storage_health = None;
+    let mut last_error = None;
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        let request_id = harness.send_management(ManagementCommand::StartPairing(host_id))?;
+        match harness.wait_management_response(request_id, remaining.min(Duration::from_secs(1))) {
+            Ok(ManagementResponse {
+                result: ManagementResult::Ok,
+                payload: ManagementResponsePayload::Status(status),
+                ..
+            }) => {
+                ensure!(
+                    status.pairing_host == Some(host_id),
+                    "DUT did not enter pairing mode for host {host_id:?}"
+                );
+                return Ok(());
+            }
+            Ok(ManagementResponse {
+                result: ManagementResult::Unavailable,
+                payload,
+                ..
+            }) => {
+                if let ManagementResponsePayload::Status(status) = payload {
+                    last_storage_health = Some(status.storage_health);
+                }
+            }
+            Ok(response) => bail!(
+                "DUT rejected pairing request for host {host_id:?}: {:?}",
+                response.result
+            ),
+            Err(error) => last_error = Some(error.to_string()),
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    bail!(
+        "DUT did not enter pairing for host {host_id:?}: health={last_storage_health:?}, last_error={}",
+        last_error.as_deref().unwrap_or("none")
+    )
 }
 
 fn pair_linux_host<F>(address: &str, mut reopen_pairing: F) -> Result<()>
@@ -2099,6 +2141,35 @@ fn drain_for(receiver: &Receiver<SerialLine>, duration: Duration) {
 mod tests {
     use super::*;
 
+    struct PairingRetryHarness {
+        responses: Mutex<std::collections::VecDeque<ManagementResponse>>,
+        response_failures: Mutex<usize>,
+        requests: usize,
+    }
+
+    impl ManagementHarness for PairingRetryHarness {
+        fn send_management(&mut self, command: ManagementCommand) -> Result<u8> {
+            assert_eq!(command, ManagementCommand::StartPairing(HostId(1)));
+            self.requests += 1;
+            Ok(self.requests as u8)
+        }
+
+        fn wait_management_response(
+            &self,
+            request_id: u8,
+            _timeout: Duration,
+        ) -> Result<ManagementResponse> {
+            let mut failures = self.response_failures.lock().unwrap();
+            if *failures > 0 {
+                *failures -= 1;
+                bail!("serial response not ready");
+            }
+            let mut response = self.responses.lock().unwrap().pop_front().unwrap();
+            response.request_id = request_id;
+            Ok(response)
+        }
+    }
+
     struct ResettingDut {
         attempts: usize,
         failures_remaining: usize,
@@ -2128,6 +2199,36 @@ mod tests {
         wait_for_dut_readiness(&mut dut, Duration::from_secs(1)).unwrap();
 
         assert_eq!(dut.attempts, 3);
+    }
+
+    #[test]
+    fn pairing_retries_transient_storage_initialization() {
+        let mut ready = hidshift::ManagementStatus::empty(4);
+        ready.pairing_host = Some(HostId(1));
+        let mut dut = PairingRetryHarness {
+            responses: Mutex::new(
+                [
+                    ManagementResponse {
+                        request_id: 0,
+                        result: ManagementResult::Unavailable,
+                        payload: ManagementResponsePayload::None,
+                    },
+                    ManagementResponse {
+                        request_id: 0,
+                        result: ManagementResult::Ok,
+                        payload: ManagementResponsePayload::Status(ready),
+                    },
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            response_failures: Mutex::new(1),
+            requests: 0,
+        };
+
+        start_pairing(&mut dut, HostId(1)).unwrap();
+
+        assert_eq!(dut.requests, 3);
     }
 
     #[test]

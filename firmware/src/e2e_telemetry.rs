@@ -19,6 +19,7 @@ static NOTIFY_DONE_US: AtomicU32 = AtomicU32::new(0);
 static HCI_SUBMIT_US: AtomicU32 = AtomicU32::new(0);
 static HCI_DEQUEUE_US: AtomicU32 = AtomicU32::new(0);
 static HCI_CREDIT_US: AtomicU32 = AtomicU32::new(0);
+static MEASURED_TX_FINGERPRINT: AtomicU32 = AtomicU32::new(0);
 static INPUT_COUNT: AtomicU32 = AtomicU32::new(0);
 static BLE_QUEUED_COUNT: AtomicU32 = AtomicU32::new(0);
 static NOTIFY_DONE_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -69,6 +70,7 @@ pub fn record_ingress(sequence: u32, now_us: u64) {
     HCI_SUBMIT_US.store(0, Ordering::Relaxed);
     HCI_DEQUEUE_US.store(0, Ordering::Relaxed);
     HCI_CREDIT_US.store(0, Ordering::Relaxed);
+    MEASURED_TX_FINGERPRINT.store(0, Ordering::Release);
     INPUT_SEQUENCE.store(sequence, Ordering::Release);
 }
 
@@ -93,21 +95,39 @@ pub fn record_notify_start(now_us: u64) {
     NOTIFY_START_US.store(timestamp32(now_us), Ordering::Relaxed);
 }
 
-pub fn record_notify_done(now_us: u64) {
+pub fn record_tx_prepared(pdu: &[u8], now_us: u64) {
+    MEASURED_TX_FINGERPRINT.store(hidshift::e2e::tx_pdu_fingerprint(pdu), Ordering::Release);
     NOTIFY_DONE_COUNT.fetch_add(1, Ordering::Relaxed);
     NOTIFY_DONE_US.store(timestamp32(now_us), Ordering::Relaxed);
 }
 
-pub fn record_hci_submit(now_us: u64) {
-    HCI_SUBMIT_US.store(timestamp32(now_us), Ordering::Release);
+pub fn record_hci_submit(pdu: &[u8], now_us: u64) {
+    let fingerprint = hidshift::e2e::tx_pdu_fingerprint(pdu);
+    if measured_tx_matches(fingerprint) {
+        HCI_SUBMIT_US.store(timestamp32(now_us), Ordering::Release);
+        let _ = MEASURED_TX_FINGERPRINT.compare_exchange(
+            fingerprint,
+            0,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
+    }
 }
 
-pub fn record_hci_dequeue(now_us: u64) {
-    HCI_DEQUEUE_US.store(timestamp32(now_us), Ordering::Relaxed);
+pub fn record_hci_dequeue(pdu: &[u8], now_us: u64) {
+    if measured_tx_matches(hidshift::e2e::tx_pdu_fingerprint(pdu)) {
+        HCI_DEQUEUE_US.store(timestamp32(now_us), Ordering::Relaxed);
+    }
 }
 
-pub fn record_hci_credit(now_us: u64) {
-    HCI_CREDIT_US.store(timestamp32(now_us), Ordering::Relaxed);
+pub fn record_hci_credit(pdu: &[u8], now_us: u64) {
+    if measured_tx_matches(hidshift::e2e::tx_pdu_fingerprint(pdu)) {
+        HCI_CREDIT_US.store(timestamp32(now_us), Ordering::Relaxed);
+    }
+}
+
+fn measured_tx_matches(fingerprint: u32) -> bool {
+    MEASURED_TX_FINGERPRINT.load(Ordering::Acquire) == fingerprint
 }
 
 pub fn record_ble_connected(
