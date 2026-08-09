@@ -158,9 +158,7 @@ impl InputObserver {
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             let event = self.wait_for_any(remaining).map_err(|error| {
-                format!(
-                    "{error}: observed relative movement {total}/{expected}"
-                )
+                format!("{error}: observed relative movement {total}/{expected}")
             })?;
             if (event.raw.event_type, event.raw.code) != (EV_REL, code) {
                 continue;
@@ -358,7 +356,11 @@ fn measure_mouse_stream(
         .map(|event| event.received.duration_since(started))
         .unwrap_or_default();
     let marker = format!("@HIDSHIFT-E2E:STREAM,{stream_sequence},");
-    let line = wait_for_line_containing(&mut *serial_reader, marker.as_bytes(), Duration::from_secs(5))?;
+    let line = wait_for_line_containing(
+        &mut *serial_reader,
+        marker.as_bytes(),
+        Duration::from_secs(5),
+    )?;
     let source_duration_us = parse_stream_duration(&line, stream_sequence)?;
     let interarrival = events
         .windows(2)
