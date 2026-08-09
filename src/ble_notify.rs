@@ -1,6 +1,6 @@
 use crate::reports::{
     BLE_HID_NOTIFICATIONS_PER_REPORT_MAX, BleHidCharacteristic, BleHidNotification,
-    BleHidNotificationError, BleHidReport, notifications_for_input_report,
+    BleHidNotificationError, BleHidReport, MOUSE_REPORT_LEN, notifications_for_input_report,
 };
 use crate::runtime::BleTaskCommand;
 
@@ -17,7 +17,7 @@ pub trait BleNotificationSink {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BleTypedNotification {
     KeyboardInputReport([u8; 8]),
-    MouseInputReport([u8; 5]),
+    MouseInputReport([u8; MOUSE_REPORT_LEN]),
     ConsumerInputReport([u8; 2]),
 }
 

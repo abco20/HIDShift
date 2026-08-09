@@ -104,6 +104,7 @@ const fn align4(value: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::{MouseButtons, MouseMovement};
     use crate::interchip::RecordIter;
     use crate::reports::{MouseReport, StandardHidReport};
 
@@ -111,7 +112,15 @@ mod tests {
         StandardInputReport {
             flags: 0,
             sequence,
-            report: StandardHidReport::Mouse(MouseReport::from_bytes([0, x as u8, 0, 0, 0])),
+            report: StandardHidReport::Mouse(MouseReport::from_frame(
+                MouseButtons::empty(),
+                MouseMovement {
+                    x: i16::from(x),
+                    y: 0,
+                    wheel: 0,
+                    pan: 0,
+                },
+            )),
         }
     }
 

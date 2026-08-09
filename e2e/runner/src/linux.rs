@@ -2,6 +2,10 @@ use std::collections::VecDeque;
 
 use super::*;
 
+const MIN_MOUSE_STREAM_SOURCE_RATE_HZ: f64 = 900.0;
+const MOUSE_STREAM_BATCH_INTERVAL_MS: f64 = 0.5;
+const TRANSPORT_COUNTER_QUIET_MS: u64 = 250;
+
 #[derive(Debug, Serialize)]
 struct LinuxReport {
     schema_version: u8,
@@ -12,6 +16,7 @@ struct LinuxReport {
     keyboard_firmware: LatencyStats,
     mouse_linux_observed: LatencyStats,
     mouse_firmware: LatencyStats,
+    mouse_stream: LinuxMouseStreamStats,
     stability: LinuxStabilityStats,
     keyboard_baseline_comparison: Option<BaselineComparison>,
     mouse_baseline_comparison: Option<BaselineComparison>,
@@ -36,6 +41,20 @@ struct LinuxStabilityStats {
     dut_counter_reset: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct LinuxMouseStreamStats {
+    requested_reports: u16,
+    received_events: usize,
+    expected_x: i64,
+    observed_x: i64,
+    firmware_duration_ms: f64,
+    firmware_input_rate_hz: f64,
+    linux_delivery_duration_ms: f64,
+    linux_effective_input_rate_hz: f64,
+    evdev_interarrival: LatencyStats,
+    batched_events: usize,
+}
+
 pub(super) fn run_suite(args: &Args, repo: &Path) -> Result<()> {
     let dut = resolve_linux_dut(args, repo)?;
     println!("DUT   {} ({DUT_CHIP})", dut.display());
@@ -55,6 +74,7 @@ pub(super) fn run_suite(args: &Args, repo: &Path) -> Result<()> {
     input.drain();
     let (keyboard, mouse) =
         run_linux_latency_tests(&mut harness, &mut input, args.latency_samples)?;
+    let mouse_stream = run_linux_mouse_stream_test(&mut harness, &mut input)?;
     let stability = run_linux_stability_test(
         &mut harness,
         &mut input,
@@ -89,13 +109,30 @@ pub(super) fn run_suite(args: &Args, repo: &Path) -> Result<()> {
         });
     }
     tests.push(TestResult {
+        name: "linux_mouse_stream_integrity".into(),
+        passed: mouse_stream.observed_x == mouse_stream.expected_x
+            && mouse_stream.firmware_input_rate_hz >= MIN_MOUSE_STREAM_SOURCE_RATE_HZ,
+        detail: format!(
+            "{}/{} evdev events, x={}/{}, source={:.1} Hz, Linux={:.1} reports/s, batched={}",
+            mouse_stream.received_events,
+            mouse_stream.requested_reports,
+            mouse_stream.observed_x,
+            mouse_stream.expected_x,
+            mouse_stream.firmware_input_rate_hz,
+            mouse_stream.linux_effective_input_rate_hz,
+            mouse_stream.batched_events
+        ),
+    });
+    // Firmware ingress telemetry counts only injected E2E commands, while BLE
+    // transport counters also include reports from physical USB devices.
+    tests.push(TestResult {
         name: "linux_short_stability".into(),
         passed: stability.mismatches == 0
             && stability.timeouts == 0
             && !stability.dut_counter_reset
             && stability.dut_inputs == stability.reports_sent as u32
-            && stability.dut_ble_queued == stability.reports_sent as u32
-            && stability.dut_notify_done == stability.reports_sent as u32,
+            && stability.dut_ble_queued >= stability.reports_sent as u32
+            && stability.dut_notify_done == stability.dut_ble_queued,
         detail: format!(
             "{}/{} events, mismatches={}, timeouts={}, counters={}/{}/{}",
             stability.reports_received,
@@ -125,7 +162,7 @@ pub(super) fn run_suite(args: &Args, repo: &Path) -> Result<()> {
     });
 
     let report = LinuxReport {
-        schema_version: 1,
+        schema_version: 2,
         unix_time_seconds: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
         dut_port: dut.display().to_string(),
         tests,
@@ -133,6 +170,7 @@ pub(super) fn run_suite(args: &Args, repo: &Path) -> Result<()> {
         keyboard_firmware: keyboard.firmware,
         mouse_linux_observed: mouse.observed,
         mouse_firmware: mouse.firmware,
+        mouse_stream,
         stability,
         keyboard_baseline_comparison,
         mouse_baseline_comparison,
@@ -491,6 +529,79 @@ fn record_linux_latency(
     Ok(())
 }
 
+fn run_linux_mouse_stream_test(
+    harness: &mut Harness,
+    input: &mut LinuxInputObserver,
+) -> Result<LinuxMouseStreamStats> {
+    const REPORTS: u16 = 1_000;
+    const INTERVAL_US: u16 = 1_000;
+    const X_PER_REPORT: i16 = 200;
+
+    input.drain();
+    let expected_x = i64::from(REPORTS) * i64::from(X_PER_REPORT);
+    let started = Instant::now();
+    let (sequence, _) = harness.send(E2eCommand::MouseStream {
+        reports: REPORTS,
+        interval_us: INTERVAL_US,
+        x: X_PER_REPORT,
+        y: 0,
+    })?;
+    let events = input.collect_relative_sum(REL_X, expected_x, Duration::from_secs(10))?;
+    let linux_delivery_duration_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    let marker = format!("@HIDSHIFT-E2E:STREAM,{sequence},");
+    let completion = harness.wait_marker(Source::Dut, &marker, Duration::from_secs(5))?;
+    let firmware_duration_us = parse_mouse_stream_completion(&completion.text, sequence, REPORTS)?;
+    let interarrival = events
+        .windows(2)
+        .map(|pair| (pair[1].kernel_time_us - pair[0].kernel_time_us).max(0) as f64 / 1_000.0)
+        .collect::<Vec<_>>();
+    let batched_events = interarrival
+        .iter()
+        .filter(|duration| **duration < MOUSE_STREAM_BATCH_INTERVAL_MS)
+        .count();
+    let observed_x = events.iter().map(|event| i64::from(event.value)).sum();
+    let firmware_duration_ms = firmware_duration_us as f64 / 1_000.0;
+    Ok(LinuxMouseStreamStats {
+        requested_reports: REPORTS,
+        received_events: events.len(),
+        expected_x,
+        observed_x,
+        firmware_duration_ms,
+        firmware_input_rate_hz: f64::from(REPORTS) * 1_000_000.0 / firmware_duration_us as f64,
+        linux_delivery_duration_ms,
+        linux_effective_input_rate_hz: f64::from(REPORTS) * 1_000.0 / linux_delivery_duration_ms,
+        evdev_interarrival: latency_stats(interarrival),
+        batched_events,
+    })
+}
+
+fn parse_mouse_stream_completion(line: &str, sequence: u32, expected_reports: u16) -> Result<u64> {
+    let marker = format!("@HIDSHIFT-E2E:STREAM,{sequence},");
+    let body = line
+        .split_once(&marker)
+        .map(|(_, body)| body)
+        .context("DUT mouse stream completion did not match its sequence")?;
+    let mut fields = body.trim().split(',');
+    let reports = fields
+        .next()
+        .context("DUT mouse stream completion omitted report count")?
+        .parse::<u16>()?;
+    ensure!(
+        reports == expected_reports,
+        "DUT mouse stream completed {reports}/{expected_reports} reports"
+    );
+    let duration_us = fields
+        .next()
+        .context("DUT mouse stream completion omitted duration")?
+        .parse::<u64>()?;
+    ensure!(duration_us > 0, "DUT mouse stream duration was zero");
+    ensure!(
+        fields.next().is_none(),
+        "DUT mouse stream completion had trailing fields"
+    );
+    Ok(duration_us)
+}
+
 fn run_linux_stability_test(
     harness: &mut Harness,
     input: &mut LinuxInputObserver,
@@ -498,7 +609,7 @@ fn run_linux_stability_test(
 ) -> Result<LinuxStabilityStats> {
     input.drain();
     let started = Instant::now();
-    let dut_before = read_dut_snapshot(harness)?;
+    let dut_before = read_settled_dut_snapshot(harness, Duration::from_secs(3))?;
     let mut sent = 0u64;
     let mut received = 0u64;
     let mut timeouts = 0u64;
@@ -523,7 +634,7 @@ fn run_linux_stability_test(
             }
         }
     }
-    let dut_after = read_dut_snapshot(harness)?;
+    let dut_after = read_settled_dut_snapshot(harness, Duration::from_secs(3))?;
     let dut_counter_reset = dut_after.input_count < dut_before.input_count
         || dut_after.ble_queued_count < dut_before.ble_queued_count
         || dut_after.notify_done_count < dut_before.notify_done_count;
@@ -545,11 +656,40 @@ fn run_linux_stability_test(
     })
 }
 
+fn read_settled_dut_snapshot(
+    harness: &mut Harness,
+    timeout: Duration,
+) -> Result<DutInputTimestamps> {
+    let deadline = Instant::now() + timeout;
+    let mut previous = read_dut_snapshot(harness)?;
+    let mut stable_since = Instant::now();
+    loop {
+        thread::sleep(Duration::from_millis(20));
+        let current = read_dut_snapshot(harness)?;
+        if current.input_count == previous.input_count
+            && current.ble_queued_count == previous.ble_queued_count
+            && current.notify_done_count == previous.notify_done_count
+        {
+            if stable_since.elapsed() >= Duration::from_millis(TRANSPORT_COUNTER_QUIET_MS) {
+                return Ok(current);
+            }
+        } else {
+            stable_since = Instant::now();
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "DUT transport counters did not settle"
+        );
+        previous = current;
+    }
+}
+
 struct ObservedInputEvent {
     event_type: u16,
     code: u16,
     value: i32,
     received: Instant,
+    kernel_time_us: i64,
 }
 
 struct LinuxInputFile {
@@ -649,6 +789,38 @@ impl LinuxInputObserver {
         }
     }
 
+    fn collect_relative_sum(
+        &mut self,
+        code: u16,
+        expected: i64,
+        timeout: Duration,
+    ) -> Result<Vec<ObservedInputEvent>> {
+        let deadline = Instant::now() + timeout;
+        let mut total = 0i64;
+        let mut events = Vec::new();
+        while total != expected {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .context("timed out waiting for Linux relative movement sum")?;
+            let event = self.wait_for_any(remaining)?;
+            if (event.event_type, event.code) != (EV_REL, code) {
+                continue;
+            }
+            total += i64::from(event.value);
+            events.push(event);
+            let exceeded = if expected >= 0 {
+                total > expected
+            } else {
+                total < expected
+            };
+            ensure!(
+                !exceeded,
+                "Linux relative movement passed expected sum: {total} vs {expected}"
+            );
+        }
+        Ok(events)
+    }
+
     fn read_available(&mut self) -> Result<()> {
         for input in &mut self.inputs {
             let mut buffer = [0; 256];
@@ -686,10 +858,19 @@ fn parse_input_events(pending: &mut Vec<u8>, received: Instant) -> Vec<ObservedI
                 event[offset + 7],
             ]),
             received,
+            kernel_time_us: input_event_time_us(event),
         });
     }
     pending.drain(..complete * event_len);
     events
+}
+
+fn input_event_time_us(event: &[u8]) -> i64 {
+    // SAFETY: parse_input_events calls this only with one complete Linux
+    // input_event, whose first bytes are an initialized timeval. Unaligned
+    // access is required because the bytes came from a compact read buffer.
+    let timestamp = unsafe { std::ptr::read_unaligned(event.as_ptr().cast::<libc::timeval>()) };
+    timestamp.tv_sec.saturating_mul(1_000_000) + timestamp.tv_usec
 }
 
 fn firmware_latency_ms(timestamps: DutInputTimestamps) -> Result<f64> {
@@ -741,5 +922,22 @@ mod tests {
         .unwrap();
 
         assert_eq!(firmware_latency_ms(timestamps).unwrap(), 2.25);
+    }
+
+    #[test]
+    fn mouse_stream_completion_uses_matching_sequence_and_duration() {
+        assert_eq!(
+            parse_mouse_stream_completion("INFO - @HIDSHIFT-E2E:STREAM,42,1000,1234567", 42, 1000,)
+                .unwrap(),
+            1_234_567
+        );
+        assert!(
+            parse_mouse_stream_completion("INFO - @HIDSHIFT-E2E:STREAM,41,1000,1234567", 42, 1000,)
+                .is_err()
+        );
+        assert!(
+            parse_mouse_stream_completion("INFO - @HIDSHIFT-E2E:STREAM,42,999,1234567", 42, 1000,)
+                .is_err()
+        );
     }
 }

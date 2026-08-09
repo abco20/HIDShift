@@ -22,8 +22,9 @@ use hidshift::management::{
     ManagementRequest,
 };
 use hidshift::reports::{
-    CONSUMER_REPORT_ID, HID_INFORMATION, INPUT_REPORT_TYPE, KEYBOARD_REPORT_ID, MOUSE_REPORT_ID,
-    OUTPUT_REPORT_TYPE, V1_COMBINED_REPORT_MAP,
+    CONSUMER_REPORT_ID, CONSUMER_REPORT_LEN, HID_INFORMATION, INPUT_REPORT_TYPE,
+    KEYBOARD_REPORT_ID, KEYBOARD_REPORT_LEN, MOUSE_REPORT_ID, MOUSE_REPORT_LEN, OUTPUT_REPORT_TYPE,
+    V1_COMBINED_REPORT_MAP,
 };
 use hidshift::runtime::message::RuntimeInputMessage;
 use hidshift::runtime::{
@@ -131,8 +132,8 @@ struct HidService {
     )]
     control_point: u8,
     #[descriptor(uuid = "2908", read, value = [KEYBOARD_REPORT_ID, INPUT_REPORT_TYPE])]
-    #[characteristic(uuid = "2a4d", read, notify, permissions(encrypted), value = [0; 8])]
-    keyboard_input_report: [u8; 8],
+    #[characteristic(uuid = "2a4d", read, notify, permissions(encrypted), value = [0; KEYBOARD_REPORT_LEN])]
+    keyboard_input_report: [u8; KEYBOARD_REPORT_LEN],
     #[descriptor(uuid = "2908", read, value = [KEYBOARD_REPORT_ID, OUTPUT_REPORT_TYPE])]
     #[characteristic(
         uuid = "2a4d",
@@ -144,11 +145,11 @@ struct HidService {
     )]
     keyboard_output_report: [u8; 1],
     #[descriptor(uuid = "2908", read, value = [MOUSE_REPORT_ID, INPUT_REPORT_TYPE])]
-    #[characteristic(uuid = "2a4d", read, notify, permissions(encrypted), value = [0; 5])]
-    mouse_input_report: [u8; 5],
+    #[characteristic(uuid = "2a4d", read, notify, permissions(encrypted), value = [0; MOUSE_REPORT_LEN])]
+    mouse_input_report: [u8; MOUSE_REPORT_LEN],
     #[descriptor(uuid = "2908", read, value = [CONSUMER_REPORT_ID, INPUT_REPORT_TYPE])]
-    #[characteristic(uuid = "2a4d", read, notify, permissions(encrypted), value = [0; 2])]
-    consumer_input_report: [u8; 2],
+    #[characteristic(uuid = "2a4d", read, notify, permissions(encrypted), value = [0; CONSUMER_REPORT_LEN])]
+    consumer_input_report: [u8; CONSUMER_REPORT_LEN],
 }
 
 #[gatt_service(uuid = "180a")]

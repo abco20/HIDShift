@@ -94,6 +94,7 @@ pub enum ReportKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::{MouseButtons, MouseMovement};
 
     #[test]
     fn neutral_and_release_reports_are_not_user_activity() {
@@ -108,7 +109,18 @@ mod tests {
             StandardHidReport::Keyboard(Keyboard6KroReport::from_bytes([0, 0, 4, 0, 0, 0, 0, 0]))
                 .has_activity()
         );
-        assert!(StandardHidReport::Mouse(MouseReport::from_bytes([0, 1, 0, 0, 0])).has_activity());
+        assert!(
+            StandardHidReport::Mouse(MouseReport::from_frame(
+                MouseButtons::empty(),
+                MouseMovement {
+                    x: 1,
+                    y: 0,
+                    wheel: 0,
+                    pan: 0,
+                },
+            ))
+            .has_activity()
+        );
         assert!(StandardHidReport::Consumer(ConsumerReport::from_usage_id(0x00e9)).has_activity());
     }
 }

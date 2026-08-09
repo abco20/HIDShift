@@ -389,7 +389,10 @@ where
                 .characteristic_by_uuid::<[u8; 8]>(keyboard_service, &REPORT_UUID)
                 .await?;
             let mouse = client
-                .characteristic_by_uuid::<[u8; 5]>(mouse_service, &REPORT_UUID)
+                .characteristic_by_uuid::<[u8; hidshift::reports::MOUSE_REPORT_LEN]>(
+                    mouse_service,
+                    &REPORT_UUID,
+                )
                 .await?;
             let consumer = client
                 .characteristic_by_uuid::<[u8; 2]>(consumer_service, &REPORT_UUID)

@@ -48,6 +48,7 @@ const OP_READ_TIMESTAMP: u8 = 0x03;
 const OP_KEYBOARD: u8 = 0x10;
 const OP_MOUSE: u8 = 0x11;
 const OP_CONSUMER: u8 = 0x12;
+const OP_MOUSE_STREAM: u8 = 0x13;
 
 const TEST_DEVICE_ID: DeviceId = DeviceId(0xfe);
 const TEST_INTERFACE_ID: InterfaceId = InterfaceId(0xfe);
@@ -75,6 +76,12 @@ pub enum E2eCommand {
         y: i16,
         wheel: i8,
         pan: i8,
+    },
+    MouseStream {
+        reports: u16,
+        interval_us: u16,
+        x: i16,
+        y: i16,
     },
     Consumer {
         usage: u16,
@@ -107,6 +114,7 @@ impl E2ePacket {
             E2eCommand::ReleaseAll
                 | E2eCommand::Keyboard { .. }
                 | E2eCommand::Mouse { .. }
+                | E2eCommand::MouseStream { .. }
                 | E2eCommand::Consumer { .. }
         )
     }
@@ -144,6 +152,18 @@ impl E2ePacket {
             E2eCommand::Consumer { usage } => {
                 bytes[1] = OP_CONSUMER;
                 bytes[6..8].copy_from_slice(&usage.to_le_bytes());
+            }
+            E2eCommand::MouseStream {
+                reports,
+                interval_us,
+                x,
+                y,
+            } => {
+                bytes[1] = OP_MOUSE_STREAM;
+                bytes[6..8].copy_from_slice(&reports.to_le_bytes());
+                bytes[8..10].copy_from_slice(&interval_us.to_le_bytes());
+                bytes[10..12].copy_from_slice(&x.to_le_bytes());
+                bytes[12..14].copy_from_slice(&y.to_le_bytes());
             }
         }
         let checksum = crc16_ccitt_false(&bytes[..E2E_PACKET_LEN - 2]);
@@ -184,6 +204,12 @@ impl E2ePacket {
             },
             OP_CONSUMER => E2eCommand::Consumer {
                 usage: u16::from_le_bytes([bytes[6], bytes[7]]),
+            },
+            OP_MOUSE_STREAM => E2eCommand::MouseStream {
+                reports: u16::from_le_bytes([bytes[6], bytes[7]]),
+                interval_us: u16::from_le_bytes([bytes[8], bytes[9]]),
+                x: i16::from_le_bytes([bytes[10], bytes[11]]),
+                y: i16::from_le_bytes([bytes[12], bytes[13]]),
             },
             _ => return Err(E2eProtocolError::UnknownCommand),
         };
@@ -272,6 +298,23 @@ impl E2ePacket {
                 None,
                 None,
             ]),
+            E2eCommand::MouseStream { x, y, .. } => Ok([
+                Some(standard(
+                    None,
+                    Some(MouseFrame {
+                        buttons: MouseButtons::empty(),
+                        movement: MouseMovement {
+                            x,
+                            y,
+                            wheel: 0,
+                            pan: 0,
+                        },
+                    }),
+                    None,
+                )),
+                None,
+                None,
+            ]),
             E2eCommand::Consumer { usage } => Ok([
                 Some(standard(
                     None,
@@ -312,7 +355,7 @@ pub fn crc16_ccitt_false(bytes: &[u8]) -> u16 {
 mod tests {
     use super::*;
 
-    fn commands() -> [E2eCommand; 6] {
+    fn commands() -> [E2eCommand; 7] {
         [
             E2eCommand::Hello,
             E2eCommand::ReadTimestamp {
@@ -331,6 +374,12 @@ mod tests {
                 pan: 3,
             },
             E2eCommand::Consumer { usage: 0x00e9 },
+            E2eCommand::MouseStream {
+                reports: 1_000,
+                interval_us: 1_000,
+                x: 200,
+                y: -200,
+            },
         ]
     }
 

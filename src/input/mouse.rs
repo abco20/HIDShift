@@ -43,8 +43,8 @@ impl MouseMovement {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MouseInputReport {
     pub buttons: MouseButtons,
-    pub x: i8,
-    pub y: i8,
+    pub x: i16,
+    pub y: i16,
     pub wheel: i8,
     pub pan: i8,
 }

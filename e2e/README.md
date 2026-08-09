@@ -17,7 +17,8 @@ latency, and continuous delivery through BlueZ evdev without a Probe board. It
 records both DUT ingress-to-HCI-submit firmware latency and Linux-observed
 UART-injection-to-evdev latency. The latter deliberately includes the Linux
 Bluetooth and HID paths and uses its own baseline rather than the direct-air
-latency gate.
+latency gate. A 1 kHz mouse burst additionally checks that coalescing preserves
+total movement and records the evdev delivery cadence.
 
 ## Direct BLE radio suite
 
