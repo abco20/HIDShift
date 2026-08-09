@@ -8,6 +8,8 @@ use embassy_futures::join::join;
 use embassy_futures::select::{Either, Either3, Either4, select, select3, select4};
 use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
 use embassy_sync::channel::{Receiver, Sender};
+#[cfg(feature = "dual-s3-wired")]
+use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant, Timer, with_timeout};
 use esp_hal::rng::{Trng, TrngSource};
 use esp_radio::ble::Config as BleControllerConfig;
@@ -69,6 +71,13 @@ pub fn ble_controller_config() -> BleControllerConfig {
 
 static BLE_ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 static BLE_ACTIVE_HOST_MASK: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "dual-s3-wired")]
+static BLE_CONTROLLER_READY: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+#[cfg(feature = "dual-s3-wired")]
+pub async fn wait_for_controller_ready() {
+    BLE_CONTROLLER_READY.wait().await;
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BleRuntimeSnapshot {
@@ -252,6 +261,8 @@ pub async fn ble_host_event_task(
             }
         };
         let controller: ExternalController<_, 20> = ExternalController::new(connector);
+        #[cfg(feature = "dual-s3-wired")]
+        BLE_CONTROLLER_READY.signal(());
 
         match select3(
             run_ble_host_events(

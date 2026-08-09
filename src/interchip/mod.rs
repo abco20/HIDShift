@@ -5,6 +5,7 @@ pub mod handshake;
 pub mod input_batch;
 pub mod message;
 pub mod profile_transfer;
+pub mod rate_budget;
 pub mod record;
 pub mod recovery;
 pub mod reliable;
@@ -37,6 +38,7 @@ pub use profile_transfer::{
     CommittedProfile, ProfileChunkDisposition, ProfileCommitCache, ProfileTransferCommand,
     ProfileTransferEncoder, ProfileTransferError, ProfileTransferReceiver,
 };
+pub use rate_budget::FixedIntervalBudget;
 pub use record::{Record, RecordCodecError, RecordIter, RecordRef, encode_records};
 pub use recovery::{SpiLinkRecovery, SpiLinkRecoveryAction, SpiTransactionWatchdog};
 pub use reliable::{

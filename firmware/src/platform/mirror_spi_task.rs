@@ -20,8 +20,8 @@ use hidshift::interchip::message::{
 };
 use hidshift::interchip::{
     CONTROL_FRAGMENT_LAST, ControlRequestAssembler, ControlRequestFragment,
-    ControlResponseFragment, Hello, InputReport, InputReportBatch, InterchipRole,
-    MirrorControlRequest, MirrorControlResponse, ProfileResult, RawEndpointReport,
+    ControlResponseFragment, FixedIntervalBudget, Hello, InputReport, InputReportBatch,
+    InterchipRole, MirrorControlRequest, MirrorControlResponse, ProfileResult, RawEndpointReport,
     ReceiveDisposition, Record, RecordIter, ReliableDeliveryQueue, ReliableReceiver,
     ReliableSender, RetransmitAction, SPI_CELL_LEN, SPI_CELL_PAYLOAD_LEN, SPI_PROTOCOL_VERSION,
     SPI_TX_WINDOW, SpiCell, SpiLinkRecovery, SpiLinkRecoveryAction, SpiReadyAction,
@@ -44,6 +44,11 @@ const SPI_POLL_INTERVAL: Duration = Duration::from_micros(200);
 const SPI_CS_SETUP_US: u32 = 2;
 const SPI_CS_HOLD_US: u32 = 1;
 const SPI_READY_DEASSERTION_TIMEOUT_MS: u64 = 5;
+// The production Device drains its shared USB IN queue at roughly one packet
+// per millisecond. Stay slightly below that aggregate rate so SPI batching
+// cannot overflow the fixed 16-packet queue during sustained input.
+const DEVICE_USB_INPUT_INTERVAL_US: u64 = 1_053;
+const DEVICE_USB_INPUT_MAX_BURST: u8 = 4;
 const RETRANSMIT_TIMEOUT_MS: u64 = 5;
 const MAX_RETRANSMIT_ATTEMPTS: u8 = 8;
 const HEARTBEAT_INTERVAL_MS: u64 = 500;
@@ -234,10 +239,21 @@ async fn run_link(
     let mut ready_handshake = SpiReadyHandshake::new(SPI_READY_DEASSERTION_TIMEOUT_MS);
     let mut ready_recoveries = 0u32;
     let mut ticker = Ticker::every(SPI_POLL_INTERVAL);
+    let mut input_budget = FixedIntervalBudget::new(
+        Instant::now().as_micros(),
+        DEVICE_USB_INPUT_INTERVAL_US,
+        DEVICE_USB_INPUT_MAX_BURST,
+    );
 
     loop {
         ticker.next().await;
-        let now_ms = Instant::now().as_millis();
+        // A transfer can take longer than the polling period. In that case
+        // `Ticker::next` is immediately ready on every iteration, so yield
+        // explicitly to keep USB input and runtime routing schedulable.
+        embassy_futures::yield_now().await;
+        let now = Instant::now();
+        let now_ms = now.as_millis();
+        let now_us = now.as_micros();
         let desired_availability =
             availability(hello_confirmed, usb_state, last_valid_cell_ms, now_ms);
         report_availability(
@@ -357,6 +373,12 @@ async fn run_link(
                                 offset: 0,
                             })
                         }
+                        Some(first)
+                            if is_input_command(first) && !input_budget.try_take(now_us) =>
+                        {
+                            pending_device_command = Some(first);
+                            None
+                        }
                         Some(first) => match input_report(first, report_sequence) {
                             Some(first_report) => {
                                 advance_report_sequence(first, &mut report_sequence);
@@ -370,6 +392,10 @@ async fn run_link(
                                                 pending_device_command = Some(command);
                                                 break;
                                             };
+                                            if !input_budget.try_take(now_us) {
+                                                pending_device_command = Some(command);
+                                                break;
+                                            }
                                             if batch.try_push(report).is_err() {
                                                 pending_device_command = Some(command);
                                                 break;
@@ -650,6 +676,13 @@ fn input_report(command: DeviceTaskCommand, report_sequence: u16) -> Option<Inpu
         DeviceTaskCommand::RawEndpointIn(report) => Some(InputReport::Raw(report)),
         _ => None,
     }
+}
+
+fn is_input_command(command: DeviceTaskCommand) -> bool {
+    matches!(
+        command,
+        DeviceTaskCommand::StandardReport { .. } | DeviceTaskCommand::RawEndpointIn(_)
+    )
 }
 
 fn advance_report_sequence(command: DeviceTaskCommand, report_sequence: &mut u16) {
