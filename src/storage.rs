@@ -252,55 +252,6 @@ pub struct StorageWriteResult {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StorageDebouncer {
-    delay_ms: u64,
-    deadline_ms: Option<u64>,
-    pending: Option<StorageState>,
-}
-
-impl StorageDebouncer {
-    pub const fn new(delay_ms: u64) -> Self {
-        Self {
-            delay_ms,
-            deadline_ms: None,
-            pending: None,
-        }
-    }
-
-    pub fn stage(&mut self, state: StorageState, now_ms: u64) {
-        self.pending = Some(state);
-        self.deadline_ms = Some(now_ms.saturating_add(self.delay_ms));
-    }
-
-    pub fn is_pending(&self) -> bool {
-        self.pending.is_some()
-    }
-
-    pub fn deadline_ms(&self) -> Option<u64> {
-        self.deadline_ms
-    }
-
-    pub fn remaining_ms(&self, now_ms: u64) -> Option<u64> {
-        self.deadline_ms
-            .map(|deadline| deadline.saturating_sub(now_ms))
-    }
-
-    pub fn take_due(&mut self, now_ms: u64) -> Option<StorageState> {
-        let deadline = self.deadline_ms?;
-        if now_ms < deadline {
-            return None;
-        }
-        self.deadline_ms = None;
-        self.pending.take()
-    }
-
-    pub fn flush(&mut self) -> Option<StorageState> {
-        self.deadline_ms = None;
-        self.pending.take()
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoragePersistence {
     normal_delay_ms: u64,
     lazy_delay_ms: u64,
@@ -1690,48 +1641,6 @@ mod tests {
         let restored = restore_latest_storage_state(&backend).unwrap();
 
         assert_eq!(restored.generation, 12);
-    }
-
-    #[test]
-    fn storage_debouncer_does_not_flush_before_deadline() {
-        let mut debouncer = StorageDebouncer::new(250);
-        debouncer.stage(StorageState::new(1), 1_000);
-
-        assert!(debouncer.is_pending());
-        assert_eq!(debouncer.deadline_ms(), Some(1_250));
-        assert_eq!(debouncer.remaining_ms(1_100), Some(150));
-        assert_eq!(debouncer.take_due(1_249), None);
-
-        let due = debouncer.take_due(1_250).unwrap();
-        assert_eq!(due.generation, 1);
-        assert!(!debouncer.is_pending());
-    }
-
-    #[test]
-    fn storage_debouncer_coalesces_updates_to_latest_state() {
-        let mut debouncer = StorageDebouncer::new(500);
-        debouncer.stage(StorageState::new(1), 1_000);
-        debouncer.stage(StorageState::new(2), 1_100);
-        debouncer.stage(StorageState::new(3), 1_200);
-
-        assert_eq!(debouncer.deadline_ms(), Some(1_700));
-        assert_eq!(debouncer.take_due(1_699), None);
-
-        let due = debouncer.take_due(1_700).unwrap();
-        assert_eq!(due.generation, 3);
-        assert_eq!(debouncer.take_due(2_000), None);
-    }
-
-    #[test]
-    fn storage_debouncer_flush_takes_pending_state_immediately() {
-        let mut debouncer = StorageDebouncer::new(10_000);
-        debouncer.stage(StorageState::new(9), 1);
-
-        let flushed = debouncer.flush().unwrap();
-
-        assert_eq!(flushed.generation, 9);
-        assert!(!debouncer.is_pending());
-        assert_eq!(debouncer.deadline_ms(), None);
     }
 
     #[test]
