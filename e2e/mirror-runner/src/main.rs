@@ -677,9 +677,7 @@ fn flash_firmware(
         "build Host and Device S3 firmware",
     )?;
     let mut erase_device = device_target.command("erase-region");
-    erase_device
-        .args(["0x324000", "0x10000"])
-        .current_dir(root);
+    erase_device.args(["0x324000", "0x10000"]).current_dir(root);
     run_command(
         &mut erase_device,
         "erase Device S3 Mirror profile partition",
@@ -697,9 +695,7 @@ fn flash_firmware(
     run_command(&mut flash_device, "flash Device S3")?;
     let host_target = EspflashTarget::uart(host_port);
     let mut erase_host = host_target.command("erase-region");
-    erase_host
-        .args(["0x320000", "0x4000"])
-        .current_dir(root);
+    erase_host.args(["0x320000", "0x4000"]).current_dir(root);
     run_command(&mut erase_host, "erase Host S3 settings partition")?;
     let mut flash_host = host_target.command("flash");
     flash_host
