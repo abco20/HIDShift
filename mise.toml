@@ -268,8 +268,17 @@ target/xtensa-esp32s3-none-elf/release/firmware
 description = "Run the one-DUT plus Linux PC management smoke suite"
 run = "e2e/pc-smoke.sh"
 
+[tasks."e2e:linux"]
+description = "Run the primary one-DUT Linux BLE input, latency, and stability suite"
+run = """
+mise exec -- cargo run --locked --manifest-path e2e/runner/Cargo.toml -- \
+  --linux-only \
+  --latency-samples 200 \
+  --stability-seconds 120
+"""
+
 [tasks."e2e:radio"]
-description = "Run DUT plus Probe radio/latency suite with mandatory Linux retained connection"
+description = "Run the optional DUT plus Probe direct-radio and retained-session suite"
 run = """
 mise exec -- cargo run --locked --manifest-path e2e/runner/Cargo.toml -- \
   --latency-samples 200 \

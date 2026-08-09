@@ -3,11 +3,21 @@
 | Task | Hardware | Purpose |
 | --- | --- | --- |
 | `HIDSHIFT_DUT_PORT=<path> mise run e2e:pc` | one DUT + Linux PC | cable management, CLI JSON, input/status/diagnostics smoke |
-| `mise run e2e:radio` | DUT + Probe + Linux PC | mandatory retained Linux session, synchronized BLE latency and stability |
+| `mise run e2e:linux` | one DUT + Linux PC | primary BLE input, user-observed latency, firmware latency, and stability |
+| `mise run e2e:radio` | DUT + Probe + Linux PC | optional direct-air latency and retained two-host session |
 | `mise run e2e:dual` | Host S3 + Device S3 + Linux PC | Wired presentation, exact descriptors, SPI loss and recovery |
 
 Roles are resolved by stable USB serial and MAC identity, never by `ttyACM`
 numbering.
+
+## Primary Linux BLE suite
+
+`e2e:linux` pairs Linux as host 1 and verifies keyboard, mouse, consumer,
+latency, and continuous delivery through BlueZ evdev without a Probe board. It
+records both DUT ingress-to-HCI-submit firmware latency and Linux-observed
+UART-injection-to-evdev latency. The latter deliberately includes the Linux
+Bluetooth and HID paths and uses its own baseline rather than the direct-air
+latency gate.
 
 ## Direct BLE radio suite
 
