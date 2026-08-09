@@ -185,12 +185,12 @@ pub use settings::{
 pub use storage::{
     FixedName, NorFlashStorageBackend, STORAGE_FLASH_LEN, STORAGE_FLASH_SLOT_COUNT,
     STORAGE_FLASH_SLOT_SIZE, STORAGE_IMAGE_LEN, STORAGE_MAGIC, STORAGE_SCHEMA_VERSION,
-    STORED_BOND_LEN, STORED_HOSTS_MAX, StorageDebouncer, StorageError, StorageFlashLayout,
-    StorageHeader, StorageHealth, StoragePersistPriority, StoragePersistence, StorageSlot,
-    StorageSlotBackend, StorageSlotIndex, StorageState, StorageTaskAction, StorageTaskPolicy,
-    StorageWriteResult, StoredAddressKind, StoredBond, StoredHostProfile, StoredSecurityLevel,
-    decode_storage_image, encode_storage_image, persist_storage_state,
-    restore_latest_storage_state, select_newest_valid_storage_image,
+    STORED_BOND_LEN, STORED_HOSTS_MAX, StorageError, StorageFlashLayout, StorageHeader,
+    StorageHealth, StoragePersistPriority, StoragePersistence, StorageSlot, StorageSlotBackend,
+    StorageSlotIndex, StorageState, StorageTaskAction, StorageTaskPolicy, StorageWriteResult,
+    StoredAddressKind, StoredBond, StoredHostProfile, StoredSecurityLevel, decode_storage_image,
+    encode_storage_image, persist_storage_state, restore_latest_storage_state,
+    select_newest_valid_storage_image,
 };
 pub use support::{
     LOG_MESSAGE_CAPACITY, LOG_RING_BYTE_BUDGET, LOG_RING_CAPACITY, LogEntry, LogLevel, LogRing,
