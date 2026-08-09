@@ -6,7 +6,7 @@ use core::marker::PhantomData;
 use core::task::Poll;
 
 use embassy_sync::waitqueue::AtomicWaker;
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::{Duration, Instant, Timer, with_timeout};
 use embassy_usb_driver::host::{
     DeviceEvent, HostError, PipeError, SplitInfo, SplitSpeed, UsbHostAllocator, UsbHostController,
     UsbPipe, pipe,
@@ -41,6 +41,10 @@ enum ChannelEvent {
 
 /// HCINT.NYET bit (not exposed by the PAC struct).
 const HCINT_NYET_MASK: u32 = 1 << 6;
+// Once a periodic channel is enabled, the target or hub must answer with data,
+// NAK, or an error in the scheduled frame. A missing host-channel interrupt is
+// therefore a controller/ISR synchronization failure, not an idle endpoint.
+const PERIODIC_TRANSACTION_TIMEOUT: Duration = Duration::from_millis(20);
 
 // Port event bitflags (OR'd together, not mutually exclusive).
 const PORT_EVENT_CONNECTED: u8 = 1 << 0;
@@ -598,6 +602,7 @@ impl<'d> UsbHostAllocator<'d> for OtgHostAllocator<'d> {
                     interval_ms,
                     next_periodic_poll: Instant::from_ticks(0),
                     periodic_error_count: 0,
+                    periodic_recovery_count: 0,
                     is_low_speed,
                     split,
                     data_toggle: false,
@@ -825,6 +830,7 @@ pub struct Channel<'d, T: pipe::Type, D: pipe::Direction> {
     interval_ms: u8,
     next_periodic_poll: Instant,
     periodic_error_count: u8,
+    periodic_recovery_count: u32,
     is_low_speed: bool,
     split: Option<SplitInfo>,
     data_toggle: bool,
@@ -1212,7 +1218,30 @@ impl<T: pipe::Type, D: pipe::Direction> Channel<'_, T, D> {
             self.enable_channel();
 
             let mut cancellation = TransferCancellation::new(self);
-            let events = self.wait_for_result().await;
+            let events = if is_periodic {
+                match with_timeout(PERIODIC_TRANSACTION_TIMEOUT, self.wait_for_result()).await {
+                    Ok(events) => events,
+                    Err(_) => {
+                        // Cancelling halts and clears the channel before the
+                        // next loop iteration re-arms the same endpoint.
+                        drop(cancellation);
+                        self.periodic_recovery_count = self.periodic_recovery_count.saturating_add(1);
+                        if self.periodic_recovery_count.is_power_of_two() {
+                            warn!(
+                                "otg-host: periodic IN interrupt lost ch={} addr={} ep={} recoveries={}",
+                                self.index,
+                                self.device_address,
+                                self.ep_number,
+                                self.periodic_recovery_count
+                            );
+                        }
+                        yield_now().await;
+                        continue;
+                    }
+                }
+            } else {
+                self.wait_for_result().await
+            };
             cancellation.disarm();
             drop(cancellation);
             let count = self.rx_count();

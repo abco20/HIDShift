@@ -416,10 +416,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     )?;
 
     activate_candidate_zero(&mut *serial, &mut client)?;
-    wait_for_usb_identity(
+    wait_for_usb_plan(
         &mut *serial,
-        vid_a,
-        pid_a,
+        &plan_a,
         Duration::from_secs(arguments.usb_timeout_seconds),
     )?;
     wait_for_wired_ready(
@@ -499,10 +498,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             "SELECT_OUTPUT_TARGET(Wired)",
         )?;
     }
-    wait_for_usb_identity(
+    wait_for_usb_plan(
         &mut *serial,
-        vid_a,
-        pid_a,
+        &plan_a,
         Duration::from_secs(arguments.usb_timeout_seconds),
     )?;
     wait_for_wired_ready(
@@ -595,10 +593,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         Duration::from_secs(5),
     )?;
     activate_candidate_zero(&mut *serial, &mut client)?;
-    wait_for_usb_identity(
+    wait_for_usb_plan(
         &mut *serial,
-        vid_b,
-        pid_b,
+        &plan_b,
         Duration::from_secs(arguments.usb_timeout_seconds),
     )?;
     wait_for_wired_ready(
@@ -613,17 +610,16 @@ fn run() -> Result<(), Box<dyn Error>> {
     println!("T18 passed: switched without reflashing to {vid_b:04x}:{pid_b:04x}");
 
     register_profile(&mut *serial, &invalid_profile, 3, &mut sequence, false)?;
-    if !usb_identity_present(vid_b, pid_b)? {
+    if find_usb_device_matching_plan(&plan_b)?.is_none() {
         return Err("invalid Profile replaced the active presentation".into());
     }
     println!("T19 passed: invalid Profile rejected and Profile B preserved");
 
     if let Some(device_target) = device_target {
         reset_device_s3(device_target)?;
-        wait_for_usb_identity(
+        wait_for_usb_plan(
             &mut *serial,
-            vid_b,
-            pid_b,
+            &plan_b,
             Duration::from_secs(arguments.usb_timeout_seconds),
         )?;
         wait_for_wired_ready(
@@ -775,20 +771,33 @@ fn set_control_response(
     payload[0] = status;
     payload[1..1 + data.len()].copy_from_slice(data);
     let sent_sequence = *sequence;
-    send_mirror(
-        serial,
-        MirrorE2ePacket::new(
-            OPCODE_SET_CONTROL_RESPONSE,
-            sent_sequence,
-            0,
-            0,
-            &payload[..1 + data.len()],
-        )
-        .map_err(|error| format!("SET_CONTROL_RESPONSE packet: {error:?}"))?,
-    )?;
-    *sequence = sequence.wrapping_add(1);
     let expected = format!("@HIDSHIFT-MIRROR:CONTROL_RESPONSE_SET,{sent_sequence}");
-    wait_for_text(serial, expected.as_bytes(), Duration::from_secs(3))
+    for attempt in 1..=3 {
+        send_mirror(
+            serial,
+            MirrorE2ePacket::new(
+                OPCODE_SET_CONTROL_RESPONSE,
+                sent_sequence,
+                0,
+                0,
+                &payload[..1 + data.len()],
+            )
+            .map_err(|error| format!("SET_CONTROL_RESPONSE packet: {error:?}"))?,
+        )?;
+        match wait_for_text(serial, expected.as_bytes(), Duration::from_secs(3)) {
+            Ok(()) => {
+                *sequence = sequence.wrapping_add(1);
+                return Ok(());
+            }
+            Err(error) if attempt < 3 => {
+                eprintln!(
+                    "SET_CONTROL_RESPONSE {sent_sequence} acknowledgement attempt {attempt} failed: {error}; retrying"
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!()
 }
 
 fn reset_mock_status(
@@ -1367,11 +1376,28 @@ fn register_profile(
     wait_for_text(serial, b"@HIDSHIFT-MIRROR:BEGIN", Duration::from_secs(3))?;
     for (index, chunk) in image.chunks(47).enumerate() {
         let offset = (index * 47) as u32;
-        send_mirror(
-            serial,
-            MirrorE2ePacket::new(OPCODE_REGISTER_CHUNK, *sequence, transfer_id, offset, chunk)
+        let chunk_sequence = *sequence;
+        let expected = format!("@HIDSHIFT-MIRROR:CHUNK,{chunk_sequence},{offset}");
+        for attempt in 1..=3 {
+            send_mirror(
+                serial,
+                MirrorE2ePacket::new(
+                    OPCODE_REGISTER_CHUNK,
+                    chunk_sequence,
+                    transfer_id,
+                    offset,
+                    chunk,
+                )
                 .map_err(|error| format!("REGISTER_CHUNK packet: {error:?}"))?,
-        )?;
+            )?;
+            match wait_for_text(serial, expected.as_bytes(), Duration::from_secs(3)) {
+                Ok(()) => break,
+                Err(error) if attempt < 3 => eprintln!(
+                    "REGISTER_CHUNK {chunk_sequence} acknowledgement attempt {attempt} failed: {error}; retrying"
+                ),
+                Err(error) => return Err(error),
+            }
+        }
         *sequence = sequence.wrapping_add(1);
     }
     send_mirror(
@@ -1600,7 +1626,13 @@ fn wait_for_wired_ready(
 }
 
 fn send_mirror(serial: &mut dyn SerialPort, packet: MirrorE2ePacket) -> Result<(), Box<dyn Error>> {
-    serial.write_all(&packet.encode_line())?;
+    // Hardware-E2E packets can be much longer than ordinary management
+    // requests. Pace them below the ESP32-S3 UART FIFO size so simultaneous
+    // USB and log traffic cannot turn one burst into FifoOverflowed.
+    for chunk in packet.encode_line().chunks(8) {
+        serial.write_all(chunk)?;
+        std::thread::sleep(Duration::from_millis(2));
+    }
     serial.write_all(b"\n")?;
     Ok(())
 }
@@ -1732,15 +1764,40 @@ fn wait_for_usb_identity(
     Err(format!("USB identity {vid:04x}:{pid:04x} did not enumerate").into())
 }
 
+fn wait_for_usb_plan(
+    serial: &mut dyn SerialPort,
+    plan: &UsbDevicePlan<'_>,
+    timeout: Duration,
+) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + timeout;
+    let mut uart = [0; 256];
+    while Instant::now() < deadline {
+        match serial.read(&mut uart) {
+            Ok(length) => eprint!("{}", String::from_utf8_lossy(&uart[..length])),
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(error) => return Err(error.into()),
+        }
+        if find_usb_device_matching_plan(plan)?.is_some() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let (vid, pid) = plan_identity(&plan.device_descriptor);
+    Err(
+        format!("USB presentation {vid:04x}:{pid:04x} did not enumerate with matching descriptors")
+            .into(),
+    )
+}
+
 fn verify_usb_plan(plan: &UsbDevicePlan<'_>) -> Result<(), Box<dyn Error>> {
     let (vid, pid) = plan_identity(&plan.device_descriptor);
-    let path = find_usb_device(vid, pid)?.ok_or_else(|| {
-        format!("USB identity {vid:04x}:{pid:04x} disappeared before descriptor verification")
+    let path = find_usb_device_matching_plan(plan)?.ok_or_else(|| {
+        format!("USB presentation {vid:04x}:{pid:04x} disappeared before descriptor verification")
     })?;
     let raw = fs::read(path.join("descriptors"))?;
     verify_raw_descriptors(plan, &raw)?;
     if !plan.bos_descriptor.is_empty() {
-        let actual_bos = read_usb_bos_descriptor(vid, pid)?;
+        let actual_bos = read_usb_bos_descriptor(&path)?;
         match actual_bos {
             Some(actual) if actual == plan.bos_descriptor => {}
             None => {
@@ -1789,20 +1846,18 @@ fn verify_raw_descriptors(plan: &UsbDevicePlan<'_>, raw: &[u8]) -> Result<(), Bo
     Ok(())
 }
 
-fn read_usb_bos_descriptor(vid: u16, pid: u16) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
+fn read_usb_bos_descriptor(path: &Path) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
     const GET_DESCRIPTOR: u8 = 0x06;
     const BOS_DESCRIPTOR: u16 = 0x0f00;
     const DEVICE_TO_HOST_STANDARD_DEVICE: u8 = 0x80;
 
+    let bus = read_decimal(path.join("busnum")).ok_or("USB sysfs bus number is missing")?;
+    let address = read_decimal(path.join("devnum")).ok_or("USB sysfs device number is missing")?;
     let devices = rusb::devices()?;
     let device = devices
         .iter()
-        .find(|device| {
-            device.device_descriptor().is_ok_and(|descriptor| {
-                descriptor.vendor_id() == vid && descriptor.product_id() == pid
-            })
-        })
-        .ok_or_else(|| format!("libusb could not find {vid:04x}:{pid:04x}"))?;
+        .find(|device| device.bus_number() == bus && device.address() == address)
+        .ok_or_else(|| format!("libusb could not find USB bus {bus} address {address}"))?;
     let handle = device.open()?;
     let mut header = [0u8; 5];
     let header_length = match handle.read_control(
@@ -1884,12 +1939,21 @@ fn decode_usb_string(descriptor: &[u8]) -> Option<String> {
         .ok()
 }
 
-fn find_usb_device(vid: u16, pid: u16) -> Result<Option<PathBuf>, Box<dyn Error>> {
+fn find_usb_device_matching_plan(
+    plan: &UsbDevicePlan<'_>,
+) -> Result<Option<PathBuf>, Box<dyn Error>> {
+    let (vid, pid) = plan_identity(&plan.device_descriptor);
     for entry in fs::read_dir("/sys/bus/usb/devices")? {
         let path = entry?.path();
-        if read_hex(path.join("idVendor")) == Some(vid)
-            && read_hex(path.join("idProduct")) == Some(pid)
+        if read_hex(path.join("idVendor")) != Some(vid)
+            || read_hex(path.join("idProduct")) != Some(pid)
         {
+            continue;
+        }
+        let Ok(raw) = fs::read(path.join("descriptors")) else {
+            continue;
+        };
+        if verify_raw_descriptors(plan, &raw).is_ok() {
             return Ok(Some(path));
         }
     }
@@ -1920,6 +1984,10 @@ fn find_named_file(
 
 fn read_hex(path: impl AsRef<Path>) -> Option<u16> {
     u16::from_str_radix(fs::read_to_string(path).ok()?.trim(), 16).ok()
+}
+
+fn read_decimal(path: impl AsRef<Path>) -> Option<u8> {
+    fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 fn usb_identity_present(vid: u16, pid: u16) -> Result<bool, Box<dyn Error>> {

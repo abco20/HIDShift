@@ -31,8 +31,8 @@ use metrics::{
 const DUT_BAUD_RATE: u32 = 115_200;
 const PROBE_BAUD_RATE: u32 = 115_200;
 const DUT_CHIP: &str = "esp32s3";
-const DUT_MAC: &str = "68:ee:8f:64:11:ac";
-const S3_PROBE_MAC: &str = "68:ee:8f:63:94:a0";
+const DUT_MAC: &str = "68:ee:8f:63:94:a0";
+const S3_PROBE_MAC: &str = "e0:72:a1:e8:b0:98";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum ProbeChip {
@@ -268,12 +268,23 @@ fn main() -> Result<()> {
     // commands without replaying any input or management mutation.
     wait_for_dut_readiness(&mut harness, Duration::from_secs(12))?;
     if !args.skip_flash {
-        start_pairing(&mut harness, HostId(1))?;
-        harness.wait_marker(
-            Source::Probe,
-            "@HIDSHIFT-PROBE:SUBSCRIBED",
-            Duration::from_secs(35),
-        )?;
+        for attempt in 1..=3 {
+            start_pairing(&mut harness, HostId(1))?;
+            match harness.wait_marker(
+                Source::Probe,
+                "@HIDSHIFT-PROBE:SUBSCRIBED",
+                Duration::from_secs(35),
+            ) {
+                Ok(_) => break,
+                Err(error) if attempt < 3 => {
+                    println!(
+                        "Probe pairing attempt {attempt} did not reach subscriptions: {error}; retrying"
+                    );
+                    thread::sleep(Duration::from_secs(2));
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
     // Fresh pairing performs a planned BLE restart for the critical bond
     // write. A restored bond does not. Wait past that window, then prove the
@@ -283,6 +294,10 @@ fn main() -> Result<()> {
     harness.wait_transport_ready(Duration::from_secs(45))?;
 
     let mut tests = run_functional_raw_tests(&mut harness)?;
+    // The functional suite ends with ReleaseAll, whose notification can still
+    // be queued on the Probe serial stream. Do not let that tail satisfy the
+    // first latency sample, which intentionally starts with the same key.
+    drain_for(&harness.lines, Duration::from_millis(250));
     if args.skip_linux {
         tests.push(TestResult {
             name: "linux_evdev".into(),
@@ -1331,9 +1346,12 @@ fn record_latency_sample(
         .host_time(dut.hci_submit_us)
         .context("DUT HCI submit timestamp is out of range")?;
     let cross_device_uncertainty = probe_clock_sync.round_trip / 2 + dut_clock_sync.round_trip / 2;
-    let synchronized = probe_received
-        .checked_duration_since(dut_ingress)
-        .context("cross-device clock synchronization produced a negative latency")?;
+    let synchronized = duration_between_synchronized_devices(
+        probe_received,
+        dut_ingress,
+        cross_device_uncertainty,
+    )
+    .context("cross-device clock synchronization exceeded its uncertainty")?;
     samples
         .synchronized
         .push(synchronized.as_secs_f64() * 1_000.0);

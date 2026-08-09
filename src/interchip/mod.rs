@@ -1,9 +1,12 @@
 pub mod cell;
 pub mod control_fragment;
 pub mod device;
+pub mod handshake;
+pub mod input_batch;
 pub mod message;
 pub mod profile_transfer;
 pub mod record;
+pub mod recovery;
 pub mod reliable;
 
 pub use cell::{
@@ -18,6 +21,8 @@ pub use control_fragment::{
     ControlResponseAssembler, ControlResponseFragment,
 };
 pub use device::{DeviceLink, DeviceLinkDiagnostics, DeviceLinkEvent};
+pub use handshake::{SpiReadyAction, SpiReadyHandshake};
+pub use input_batch::{INPUT_REPORT_BATCH_MAX_REPORTS, InputReport, InputReportBatch};
 pub use message::{
     ACTIVATE_PROFILE_WIRE_LEN, ActivateProfile, CAPABILITY_CONTROL_FORWARDING,
     CAPABILITY_DYNAMIC_PROFILE, CAPABILITY_ENDPOINT_IN, CAPABILITY_ENDPOINT_OUT,
@@ -33,6 +38,7 @@ pub use profile_transfer::{
     ProfileTransferEncoder, ProfileTransferError, ProfileTransferReceiver,
 };
 pub use record::{Record, RecordCodecError, RecordIter, RecordRef, encode_records};
+pub use recovery::{SpiLinkRecovery, SpiLinkRecoveryAction, SpiTransactionWatchdog};
 pub use reliable::{
     ReceiveDisposition, ReliableDeliveryQueue, ReliableReceiver, ReliableSender, RetransmitAction,
     SPI_TX_WINDOW, SenderError,

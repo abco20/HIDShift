@@ -15,12 +15,18 @@ use embassy_futures::join::join3;
 use embassy_futures::select::{Either, Either3, select, select3};
 use embassy_time::{Duration, Instant, Timer, with_timeout};
 use esp_backtrace as _;
+#[cfg(feature = "esp32")]
 use esp_hal::Async;
+#[cfg(feature = "esp32s3")]
+use esp_hal::Blocking;
 use esp_hal::clock::CpuClock;
 use esp_hal::interrupt::software::SoftwareInterruptControl;
 use esp_hal::rng::{Trng, TrngSource};
 use esp_hal::timer::timg::TimerGroup;
+#[cfg(feature = "esp32")]
 use esp_hal::uart::{Config as UartConfig, UartRx};
+#[cfg(feature = "esp32s3")]
+use esp_hal::usb_serial_jtag::{UsbSerialJtag, UsbSerialJtagRx};
 use esp_radio::ble::controller::BleConnector;
 use static_cell::StaticCell;
 use trouble_host::prelude::*;
@@ -43,12 +49,18 @@ fn main() -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
     #[cfg(feature = "esp32")]
-    let telemetry_pin = peripherals.GPIO3;
+    let telemetry_rx = {
+        let telemetry_pin = peripherals.GPIO3;
+        match UartRx::new(peripherals.UART0, UartConfig::default()) {
+            Ok(rx) => rx.with_rx(telemetry_pin).into_async(),
+            Err(_) => esp_hal::system::software_reset(),
+        }
+    };
     #[cfg(feature = "esp32s3")]
-    let telemetry_pin = peripherals.GPIO44;
-    let telemetry_rx = match UartRx::new(peripherals.UART0, UartConfig::default()) {
-        Ok(rx) => rx.with_rx(telemetry_pin).into_async(),
-        Err(_) => esp_hal::system::software_reset(),
+    let telemetry_rx = {
+        let usb_serial = UsbSerialJtag::new(peripherals.USB_DEVICE);
+        let (rx, _tx) = usb_serial.split();
+        rx
     };
     let timer = TimerGroup::new(peripherals.TIMG0);
     let software_interrupts = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
@@ -74,27 +86,47 @@ fn main() -> ! {
 }
 
 #[embassy_executor::task]
+#[cfg(feature = "esp32")]
 async fn telemetry_task(mut rx: UartRx<'static, Async>) {
     let mut line = [0u8; 16];
     let mut len = 0usize;
     let mut byte = [0u8; 1];
     loop {
         match rx.read_async(&mut byte).await {
-            Ok(1) if matches!(byte[0], b'\r' | b'\n') => {
-                if let Some(sequence) = decode_clock_request(&line[..len]) {
-                    let now_us = Instant::now().as_micros();
-                    esp_println::println!("@T:{:08x}:{:016x}", sequence, now_us);
-                }
-                len = 0;
-            }
-            Ok(1) if len < line.len() => {
-                line[len] = byte[0];
-                len += 1;
-            }
-            Ok(1) => len = 0,
+            Ok(1) => process_telemetry_byte(byte[0], &mut line, &mut len),
             Ok(_) => {}
             Err(_) => len = 0,
         }
+    }
+}
+
+#[embassy_executor::task]
+#[cfg(feature = "esp32s3")]
+async fn telemetry_task(mut rx: UsbSerialJtagRx<'static, Blocking>) {
+    let mut line = [0u8; 16];
+    let mut len = 0usize;
+    loop {
+        match rx.read_byte() {
+            Ok(byte) => process_telemetry_byte(byte, &mut line, &mut len),
+            Err(_) => Timer::after_millis(1).await,
+        }
+    }
+}
+
+fn process_telemetry_byte(byte: u8, line: &mut [u8; 16], len: &mut usize) {
+    match byte {
+        b'\r' | b'\n' => {
+            if let Some(sequence) = decode_clock_request(&line[..*len]) {
+                let now_us = Instant::now().as_micros();
+                esp_println::println!("@T:{:08x}:{:016x}", sequence, now_us);
+            }
+            *len = 0;
+        }
+        byte if *len < line.len() => {
+            line[*len] = byte;
+            *len += 1;
+        }
+        _ => *len = 0,
     }
 }
 

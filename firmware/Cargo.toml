@@ -24,7 +24,7 @@ embassy-time = "0.5.1"
 embassy-usb = "0.6.0"
 embassy-usb-driver = "0.2.2"
 embassy-usb-host = "0.1.0"
-embassy-usb-synopsys-otg = { version = "0.4.0", features = ["host"] }
+embassy-usb-synopsys-otg = { version = "0.4.0", features = ["host", "log"] }
 esp-alloc = { version = "0.10.0", default-features = false, features = ["compat", "esp32s3", "global-allocator"] }
 esp-backtrace = { version = "0.19.0", default-features = false, features = ["esp32s3", "panic-handler", "println"] }
 esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32s3"] }

@@ -272,8 +272,6 @@ run = "e2e/pc-smoke.sh"
 description = "Run DUT plus Probe radio/latency suite with mandatory Linux retained connection"
 run = """
 mise exec -- cargo run --locked --manifest-path e2e/runner/Cargo.toml -- \
-  --dut-port /dev/serial/by-id/usb-1a86_USB_Single_Serial_5C84329179-if00 \
-  --probe-port /dev/serial/by-id/usb-1a86_USB_Single_Serial_5C84329358-if00 \
   --latency-samples 200 \
   --stability-seconds 120
 """
@@ -282,9 +280,9 @@ mise exec -- cargo run --locked --manifest-path e2e/runner/Cargo.toml -- \
 description = "Run the dual-S3 exact USB presentation and SPI suite"
 run = """
 set -eu
-host_port="/dev/serial/by-id/usb-1a86_USB_Single_Serial_5C84329179-if00"
-device_port="/dev/serial/by-id/usb-1a86_USB_Single_Serial_5C84329358-if00"
+: "${HIDSHIFT_HOST_PORT:?Set HIDSHIFT_HOST_PORT to the Host S3 serial path}"
+: "${HIDSHIFT_DEVICE_PORT:?Set HIDSHIFT_DEVICE_PORT to the Device S3 serial path}"
 mise exec -- cargo run --locked --manifest-path e2e/mirror-runner/Cargo.toml -- \
-  --host-port "$host_port" \
-  --device-flash-port "$device_port"
+  --host-port "$HIDSHIFT_HOST_PORT" \
+  --device-flash-port "$HIDSHIFT_DEVICE_PORT"
 """

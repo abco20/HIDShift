@@ -9,12 +9,14 @@ mod usb_signaling;
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::dma::{DmaRxBuf, DmaTxBuf};
+use esp_hal::gpio::{Level, Output, OutputConfig};
 use esp_hal::spi::Mode;
 use esp_hal::spi::slave::Spi;
 use hidshift::fallback::build_fallback_mirror_image;
 use hidshift::interchip::{
     DeviceLink, DeviceLinkEvent, ProfileCommitCache, ProfileResult, ProfileResultStatus,
-    ProfileTransferError, ProfileTransferReceiver, SPI_CELL_LEN, StandardOutputReport, UsbState,
+    ProfileTransferError, ProfileTransferReceiver, SPI_CELL_LEN, SpiTransactionWatchdog,
+    StandardOutputReport, UsbState,
 };
 use hidshift::mirror::{
     HSMI_MAX_SIZE, MirrorRejectReason, ProfileCommitOutcome, UsbDevicePlan, validate_mirror_image,
@@ -74,6 +76,7 @@ fn main() -> ! {
         .with_sck(peripherals.GPIO12)
         .with_miso(peripherals.GPIO9)
         .with_dma(peripherals.DMA_CH0);
+    let ready = Output::new(peripherals.GPIO8, Level::Low, OutputConfig::default());
 
     let dynamic = match DynamicUsb::new(&usb_bus, dynamic_plan, fallback) {
         Ok(dynamic) => dynamic,
@@ -90,6 +93,7 @@ fn main() -> ! {
         profile_store,
         profile_receiver,
         presentation_profile_hash,
+        ready,
     )
 }
 
@@ -281,6 +285,7 @@ fn run<'a, B: UsbBus, P: PresentationRuntime<B>>(
     mut profile_store: Option<profile_store::DeviceProfileStore>,
     mut profile_receiver: ProfileTransferReceiver<'static>,
     presentation_profile_hash: u32,
+    mut ready: Output<'static>,
 ) -> ! {
     let mut current_usb_state = presentation.usb_state(false, presentation_profile_hash);
     let mut link = if profile_store.is_some() {
@@ -292,8 +297,7 @@ fn run<'a, B: UsbBus, P: PresentationRuntime<B>>(
     } else {
         DeviceLink::new(session_id, current_usb_state)
     };
-    let mut ever_linked = false;
-    let mut last_valid_spi_ms = now_ms();
+    let mut spi_watchdog = SpiTransactionWatchdog::new(SPI_LINK_LOSS_TIMEOUT_MS);
     let initial_tx = link.next_transaction(now_ms());
     dma_tx.as_mut_slice().copy_from_slice(&initial_tx);
     dma_rx.as_mut_slice().fill(0);
@@ -301,6 +305,7 @@ fn run<'a, B: UsbBus, P: PresentationRuntime<B>>(
         Ok(transfer) => transfer,
         Err((error, _, _, _)) => fatal("initial slave DMA queue", error),
     };
+    ready.set_high();
     let mut pending_profile_result = None;
     let mut profile_commit_cache = ProfileCommitCache::new();
     let mut raw_output_sequence = 1u16;
@@ -316,15 +321,16 @@ fn run<'a, B: UsbBus, P: PresentationRuntime<B>>(
                 &mut raw_output_sequence,
                 &mut remote_wakeup,
             );
-            if ever_linked && now_ms().saturating_sub(last_valid_spi_ms) >= SPI_LINK_LOSS_TIMEOUT_MS
-            {
+            if spi_watchdog.timed_out(now_ms()) {
                 log::warn!("device-spi: link lost; restarting in fallback");
                 soft_disconnect_usb();
                 esp_hal::system::software_reset();
             }
         }
+        ready.set_low();
         let (spi, (mut dma_rx, mut dma_tx)) = transfer.wait();
         let transaction_ms = now_ms();
+        spi_watchdog.observe_transaction(transaction_ms);
         let mut received = [0u8; SPI_CELL_LEN];
         received.copy_from_slice(dma_rx.as_slice());
         let mut events = heapless::Vec::<DeviceLinkEvent, 4>::new();
@@ -339,7 +345,6 @@ fn run<'a, B: UsbBus, P: PresentationRuntime<B>>(
             profile_receiver.cancel();
             pending_profile_result = None;
         }
-        ever_linked |= link.host_compatible();
         for event in events {
             match event {
                 DeviceLinkEvent::ProfileBegin(begin) => {
@@ -453,7 +458,7 @@ fn run<'a, B: UsbBus, P: PresentationRuntime<B>>(
         // from the start of the valid transaction that requested it.
         let now_ms = now_ms();
         if received_valid_cell {
-            last_valid_spi_ms = now_ms;
+            spi_watchdog.observe_valid_cell(now_ms);
         }
         if let Some(result) = pending_profile_result
             && link.queue_profile_result(result, now_ms)
@@ -461,8 +466,8 @@ fn run<'a, B: UsbBus, P: PresentationRuntime<B>>(
             pending_profile_result = None;
         }
 
-        // Queue the next transaction before servicing USB. The slave remains
-        // ready while the master follows its fixed 400 us polling schedule.
+        // Queue the next transaction before servicing USB. READY stays low
+        // until the slave DMA transaction is fully armed.
         let tx = link.next_transaction(now_ms);
         dma_tx.as_mut_slice().copy_from_slice(&tx);
         dma_rx.as_mut_slice().fill(0);
@@ -470,6 +475,7 @@ fn run<'a, B: UsbBus, P: PresentationRuntime<B>>(
             Ok(transfer) => transfer,
             Err((error, _, _, _)) => fatal("slave DMA requeue", error),
         };
+        ready.set_high();
 
         service_usb(
             &mut usb_device,

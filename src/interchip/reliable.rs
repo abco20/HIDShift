@@ -448,4 +448,34 @@ mod tests {
         );
         assert_eq!(sender.queue(&[2], 1, 0).unwrap().header.tx_sequence, 1);
     }
+
+    #[test]
+    fn pipelined_delivery_remains_acknowledgeable_across_sequence_wrap() {
+        let mut sender = ReliableSender::new(1);
+        let mut receiver = ReliableReceiver::new();
+        let mut delivered = 0u32;
+
+        while delivered < 70_000 {
+            let mut queued = heapless::Vec::<SpiCell, SPI_TX_WINDOW>::new();
+            while sender.pending_len() < SPI_TX_WINDOW && delivered + (queued.len() as u32) < 70_000
+            {
+                queued
+                    .push(sender.queue(&[0x5a], 1, u64::from(delivered)).unwrap())
+                    .unwrap();
+            }
+
+            for cell in queued {
+                assert!(matches!(
+                    receiver.receive(&cell),
+                    ReceiveDisposition::Accepted { .. }
+                ));
+            }
+            let acknowledged = sender.acknowledge(receiver.cumulative_ack());
+            delivered += acknowledged as u32;
+            assert!(acknowledged > 0);
+        }
+
+        assert_eq!(delivered, 70_000);
+        assert_eq!(sender.pending_len(), 0);
+    }
 }

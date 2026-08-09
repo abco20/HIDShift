@@ -212,6 +212,7 @@ fn run_firmware(
         peripherals.GPIO40,
         peripherals.GPIO39,
         peripherals.GPIO42,
+        peripherals.GPIO2,
     );
     let flash = peripherals.FLASH;
 
@@ -507,6 +508,7 @@ async fn runtime_owner_task(
     mut sink: &'static mut ChannelTaskSink,
 ) {
     let mut owner = RUNTIME_OWNER_STORAGE.take();
+    let mut drive_diagnostics = RuntimeDriveDiagnostics::default();
 
     log::info!("firmware: runtime owner task boot");
 
@@ -559,8 +561,40 @@ async fn runtime_owner_task(
         if matches!(message, RuntimeInputMessage::Tick { .. }) {
             tick_pending.mark_processed();
         }
-        process_runtime_message(&mut owner, &mut sink, message).await;
+        process_runtime_message(&mut owner, &mut sink, message, &mut drive_diagnostics).await;
         RUNTIME_HEARTBEAT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Default)]
+struct RuntimeDriveDiagnostics {
+    #[cfg(feature = "dual-s3-wired")]
+    device_queue_full_total: u32,
+    #[cfg(feature = "dual-s3-wired")]
+    device_queue_full_window: u32,
+    #[cfg(feature = "dual-s3-wired")]
+    last_device_queue_log_ms: u64,
+}
+
+impl RuntimeDriveDiagnostics {
+    fn report(&mut self, error: ChannelTaskSendError) {
+        #[cfg(feature = "dual-s3-wired")]
+        if error == ChannelTaskSendError::DeviceQueueFull {
+            self.device_queue_full_total = self.device_queue_full_total.saturating_add(1);
+            self.device_queue_full_window = self.device_queue_full_window.saturating_add(1);
+            let now_ms = embassy_time::Instant::now().as_millis();
+            if now_ms.saturating_sub(self.last_device_queue_log_ms) >= 1_000 {
+                log::warn!(
+                    "firmware: Device queue full count_s={} total={}",
+                    self.device_queue_full_window,
+                    self.device_queue_full_total
+                );
+                self.device_queue_full_window = 0;
+                self.last_device_queue_log_ms = now_ms;
+            }
+            return;
+        }
+        log::error!("firmware: runtime drive error {:?}", error);
     }
 }
 
@@ -631,6 +665,7 @@ async fn process_runtime_message(
     owner: &mut DefaultRuntimeOwner,
     sink: &mut ChannelTaskSink,
     message: RuntimeInputMessage,
+    drive_diagnostics: &mut RuntimeDriveDiagnostics,
 ) {
     #[cfg(feature = "hardware-e2e")]
     if matches!(
@@ -662,7 +697,7 @@ async fn process_runtime_message(
 
     if let Err(error) = sink.dispatch_runtime_queues(owner.default_queues()).await {
         owner.rollback_message(checkpoint);
-        log::error!("firmware: runtime drive error {:?}", error);
+        drive_diagnostics.report(error);
         return;
     }
     for effect in owner.default_queues().effects.iter().copied() {

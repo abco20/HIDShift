@@ -716,6 +716,7 @@ dependencies = [
  "embassy-sync 0.8.0",
  "embassy-time",
  "embassy-usb-driver",
+ "log",
  "portable-atomic",
 ]
 

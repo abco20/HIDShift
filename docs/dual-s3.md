@@ -13,7 +13,7 @@ behavior and message boundaries are shared between both topologies.
 
 ## Wiring
 
-Connect a common ground and only these four SPI signals:
+Connect a common ground, the four SPI signals, and READY:
 
 | Signal | Host S3 | Device S3 |
 | --- | --- | --- |
@@ -21,10 +21,17 @@ Connect a common ground and only these four SPI signals:
 | MOSI | GPIO40 output | GPIO11 input |
 | SCLK | GPIO39 output | GPIO12 input |
 | MISO | GPIO42 input | GPIO9 output |
+| READY | GPIO2 input | GPIO8 output |
 
 The link uses SPI2, mode 0, MSB first, 10 MHz, DMA, and fixed 128-byte
-transactions. Host S3 is master and polls every 400 µs. No READY, IRQ, or reset
-wire is used. Device S3 native USB uses GPIO19 D- and GPIO20 D+.
+transactions. Device S3 asserts READY only after its next DMA transaction is
+armed. Host S3 checks it every 200 µs and requires a latched deassertion before
+starting another transaction. A still-high READY recovers a missed edge after
+5 ms instead of wedging the link. Host S3 drives CS in software, asserting it
+2 µs before SCLK and holding it 1 µs after the final edge so the ESP32-S3 slave
+cannot miss the transaction boundary. Host S3 uses 5 mA drive strength for
+SCLK, MOSI, and CS; the default 20 mA setting causes ringing and corrupt cells
+on jumper wiring. Device S3 native USB uses GPIO19 D- and GPIO20 D+.
 
 ## Output and presentation
 
@@ -62,7 +69,7 @@ SET/CLEAR_FEATURE and GET_STATUS state. Fallback also advertises Remote
 Wakeup. While USB is suspended, Device S3 emits one 10 ms resume signal for
 the first standard or mirrored input only when the PC has enabled Remote
 Wakeup. The pulse is advanced by the normal main loop instead of a blocking
-delay, so the fixed 400 us SPI polling schedule remains serviced.
+delay, so the READY-gated SPI service remains responsive.
 
 ## Build and flash
 
