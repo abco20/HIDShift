@@ -15,12 +15,15 @@ mod platform;
 mod wired_management;
 use esp_hal::clock::CpuClock;
 use esp_hal::interrupt::software::SoftwareInterruptControl;
+use esp_hal::ram;
 #[cfg(not(feature = "dual-s3-wired"))]
 use esp_hal::system::Stack;
 use esp_hal::timer::timg::{MwdtStage, TimerGroup, Wdt};
 use esp32s3_platform::ble_hid_task::BleRuntimeSnapshot;
 use esp32s3_platform::ble_hid_task::active_ble_connections;
 use esp32s3_platform::button_task::control_task;
+#[cfg(feature = "dual-s3-wired")]
+use esp32s3_platform::mirror_spi_task::MirrorSpiResources;
 use esp32s3_platform::storage_task::storage_command_task;
 use esp32s3_platform::usb_host_task::usb_input_task;
 use hidshift::DefaultRuntimeOwner;
@@ -140,7 +143,9 @@ fn spawn_or_reset<S>(
 fn main() -> ! {
     esp_println::logger::init_logger_from_env();
 
-    esp_alloc::heap_allocator!(size: 72 * 1024);
+    // Keep the heap in the bootloader-reclaimed DRAM2 region so the regular
+    // DRAM segment retains enough headroom for the dual-S3 executor stack.
+    esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 72 * 1024);
 
     let reset_reason = esp_hal::system::reset_reason();
     let reset_reason_code = reset_reason.map_or(0, |reason| reason as u8);
@@ -150,6 +155,7 @@ fn main() -> ! {
     );
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
+    esp32s3_platform::usb_host_task::bind_interrupt_handler();
     let boot_session_id = esp_hal::rng::Rng::new().random();
     #[cfg(feature = "hardware-e2e")]
     log::info!(
@@ -199,13 +205,13 @@ fn run_firmware(
     let gpio20 = peripherals.GPIO20;
     let gpio19 = peripherals.GPIO19;
     #[cfg(feature = "dual-s3-wired")]
-    let mirror_spi = (
+    let mirror_spi = MirrorSpiResources::new(
         peripherals.SPI2,
         peripherals.DMA_CH0,
-        peripherals.GPIO10,
-        peripherals.GPIO11,
-        peripherals.GPIO12,
-        peripherals.GPIO13,
+        peripherals.GPIO41,
+        peripherals.GPIO40,
+        peripherals.GPIO39,
+        peripherals.GPIO42,
     );
     let flash = peripherals.FLASH;
 
@@ -343,14 +349,7 @@ async fn startup_task(
     flash: esp_hal::peripherals::FLASH<'static>,
     watchdog: Wdt<esp_hal::peripherals::TIMG0<'static>>,
     #[cfg(feature = "dual-s3-wired")] ble_resources: BleTaskResources,
-    #[cfg(feature = "dual-s3-wired")] mirror_spi: (
-        esp_hal::peripherals::SPI2<'static>,
-        esp_hal::peripherals::DMA_CH0<'static>,
-        esp_hal::peripherals::GPIO10<'static>,
-        esp_hal::peripherals::GPIO11<'static>,
-        esp_hal::peripherals::GPIO12<'static>,
-        esp_hal::peripherals::GPIO13<'static>,
-    ),
+    #[cfg(feature = "dual-s3-wired")] mirror_spi: MirrorSpiResources,
 ) {
     spawn_or_reset(&spawner, watchdog_task(watchdog), "watchdog");
     #[cfg(feature = "dual-s3-wired")]
@@ -446,12 +445,7 @@ async fn startup_task(
             device_receiver,
             RUNTIME_INPUT_CHANNEL.sender(),
             boot_session_id,
-            mirror_spi.0,
-            mirror_spi.1,
-            mirror_spi.2,
-            mirror_spi.3,
-            mirror_spi.4,
-            mirror_spi.5,
+            mirror_spi,
         ),
         "mirror-spi-master",
     );
@@ -483,6 +477,7 @@ async fn usb_input_bootstrap(
     spawn_or_reset(
         &spawner,
         usb_input_task(
+            spawner,
             sender,
             receiver,
             usb0,

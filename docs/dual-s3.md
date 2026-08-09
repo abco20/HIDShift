@@ -17,13 +17,13 @@ Connect a common ground and only these four SPI signals:
 
 | Signal | Host S3 | Device S3 |
 | --- | --- | --- |
-| CS | GPIO10 output | GPIO10 input |
-| MOSI | GPIO11 output | GPIO11 input |
-| SCLK | GPIO12 output | GPIO12 input |
-| MISO | GPIO13 input | GPIO13 output |
+| CS | GPIO41 output | GPIO10 input |
+| MOSI | GPIO40 output | GPIO11 input |
+| SCLK | GPIO39 output | GPIO12 input |
+| MISO | GPIO42 input | GPIO9 output |
 
 The link uses SPI2, mode 0, MSB first, 10 MHz, DMA, and fixed 128-byte
-transactions. Host S3 is master and polls every 500 µs. No READY, IRQ, or reset
+transactions. Host S3 is master and polls every 400 µs. No READY, IRQ, or reset
 wire is used. Device S3 native USB uses GPIO19 D- and GPIO20 D+.
 
 ## Output and presentation
@@ -62,7 +62,7 @@ SET/CLEAR_FEATURE and GET_STATUS state. Fallback also advertises Remote
 Wakeup. While USB is suspended, Device S3 emits one 10 ms resume signal for
 the first standard or mirrored input only when the PC has enabled Remote
 Wakeup. The pulse is advanced by the normal main loop instead of a blocking
-delay, so the fixed 500 us SPI polling schedule remains serviced.
+delay, so the fixed 400 us SPI polling schedule remains serviced.
 
 ## Build and flash
 

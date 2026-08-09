@@ -1,11 +1,12 @@
-use core::future::pending;
+use core::marker::PhantomData;
 
-use embassy_futures::select::{Either, Either3, Either4, select, select3, select4};
+use embassy_executor::Spawner;
+use embassy_futures::select::{Either3, Either4, select3, select4};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::channel::{Receiver, Sender};
+use embassy_sync::channel::{Channel, Receiver, Sender};
 use embassy_time::{Duration, Timer, with_timeout};
-use embassy_usb_driver::host::{PipeError, UsbHostAllocator, UsbPipe, pipe};
-use embassy_usb_driver::{Direction, EndpointAddress, EndpointInfo, EndpointType};
+use embassy_usb_driver::host::{DeviceEvent, PipeError, UsbHostAllocator, UsbPipe, pipe};
+use embassy_usb_driver::{Direction, EndpointAddress, EndpointInfo, EndpointType, Speed};
 use embassy_usb_host::class::hid::{HidError, PROTOCOL_REPORT, ReportDescriptor};
 use embassy_usb_host::class::hub::{HubEvent, HubHandler};
 use embassy_usb_host::control::{ControlType, Recipient, RequestType, SetupPacket};
@@ -53,12 +54,15 @@ const REPORT_DESCRIPTOR_BUF_LEN: usize = hidshift::USB_HID_REPORT_DESCRIPTOR_MAX
 const REPORT_BUF_LEN: usize = hidshift::USB_HID_REPORT_MAX_LEN;
 const MAX_REPORT_FIELDS: usize = 48;
 const MAX_REPORT_EVENTS: usize = 32;
-const MAX_ACTIVE_USB_INTERFACES: usize = 8;
+// ESP32-S3 exposes eight host channels. HubHandler permanently owns its
+// interrupt and control pipes, so at most five HID readers are kept active and
+// the final channel remains available for LED, control, and optional OUT work.
+const MAX_ACTIVE_USB_INTERFACES: usize = 5;
+const USB_READER_QUEUE_CAPACITY: usize = 32;
 const MAX_HUB_PORTS: usize = 4;
 const HUB_CHILD_ENUMERATION_TIMEOUT_MS: u64 = 5_000;
-const HUB_ENUMERATION_TOTAL_TIMEOUT_MS: u64 = 8_000;
-const HUB_QUIESCED_EVENT_DRAIN_MS: u64 = 750;
 const HID_REPORT_DESCRIPTOR_TIMEOUT_MS: u64 = 2_000;
+const USB_CONTROL_REQUEST_TIMEOUT_MS: u64 = 500;
 const USB_LED_WRITE_TIMEOUT_MS: u64 = 20;
 const BLE_QUIESCE_HANDSHAKE_TIMEOUT_MS: u64 = 2_000;
 
@@ -69,16 +73,13 @@ type FirmwareBusHandle<'d> = embassy_usb_host::BusHandle<'d, OtgHostAllocator<'d
 
 struct ActiveUsbInterfaceSlot<'d> {
     interface_id: InterfaceId,
-    reader: UsbHidReader<'d, FirmwareBusHandle<'d>>,
     led_output: bool,
     hid_info: HidInterfaceInfo,
     enum_info: embassy_usb_host::handler::EnumerationInfo,
     session: UsbHidInterfaceRuntimeSession<MAX_REPORT_FIELDS, MAX_REPORT_EVENTS>,
-    report_buf: [u8; REPORT_BUF_LEN],
     last_mouse_buttons: hidshift::input::MouseButtons,
     last_led_bytes: Option<hidshift::usb_hid::output::KeyboardLedOutputBytes>,
-    #[cfg(feature = "dual-s3-wired")]
-    raw_out: Option<UsbRawOutWriter<'d, FirmwareBusHandle<'d>>>,
+    _lifetime: PhantomData<&'d ()>,
     #[cfg(feature = "dual-s3-wired")]
     raw_in_sequence: u16,
 }
@@ -148,15 +149,25 @@ impl MirrorCaptureScratch {
 static MIRROR_CAPTURE_STORAGE: ConstStaticCell<MirrorCaptureScratch> =
     ConstStaticCell::new(MirrorCaptureScratch::new());
 
-enum UsbSlotReadResult {
-    Input {
-        message: Option<RuntimeInputMessage>,
-        movement_only: bool,
-        #[cfg(feature = "dual-s3-wired")]
-        raw: hidshift::interchip::RawEndpointReport,
-        #[cfg(feature = "dual-s3-wired")]
-        device_id: DeviceId,
-    },
+struct UsbDecodedInput {
+    standard: Option<hidshift::input::InputFrame>,
+    movement_only: bool,
+    #[cfg(feature = "dual-s3-wired")]
+    raw: hidshift::interchip::RawEndpointReport,
+    #[cfg(feature = "dual-s3-wired")]
+    device_id: DeviceId,
+}
+
+#[derive(Clone, Copy)]
+struct UsbReaderReport {
+    device_id: DeviceId,
+    interface_id: InterfaceId,
+    len: usize,
+    data: [u8; REPORT_BUF_LEN],
+}
+
+enum UsbReaderEvent {
+    Report(UsbReaderReport),
     Fatal {
         device_id: DeviceId,
         interface_id: InterfaceId,
@@ -164,90 +175,209 @@ enum UsbSlotReadResult {
     },
 }
 
-impl<'d> ActiveUsbInterfaceSlot<'d> {
-    async fn next_result(&mut self) -> UsbSlotReadResult {
-        loop {
-            match self.reader.read(&mut self.report_buf).await {
-                Ok(n) => {
-                    #[cfg(feature = "dual-s3-wired")]
-                    let raw = {
-                        self.raw_in_sequence = self.raw_in_sequence.wrapping_add(1);
-                        if self.raw_in_sequence == 0 {
-                            self.raw_in_sequence = 1;
-                        }
-                        match hidshift::interchip::RawEndpointReport::new(
-                            self.hid_info.interrupt_in_ep,
-                            self.raw_in_sequence,
-                            &self.report_buf[..n],
-                        ) {
-                            Ok(report) => report,
-                            Err(error) => {
-                                log::warn!(
-                                    "firmware: raw mirror IN rejected interface={} err={:?}",
-                                    self.interface_id.0,
-                                    error
-                                );
-                                continue;
-                            }
-                        }
-                    };
-                    let decoded = self
-                        .session
-                        .capture_input_report(&self.report_buf[..n])
-                        .map_err(
-                            hidshift::usb_hid::host_runtime::UsbHidInterfaceRuntimeInputError::from,
-                        )
-                        .and_then(|report| self.session.input_message(report));
-                    let (message, movement_only) = match decoded {
-                        Ok(message) => {
-                            let movement_only =
-                                movement_only_message(&message, &mut self.last_mouse_buttons);
-                            (Some(message), movement_only)
-                        }
-                        Err(error) => {
-                            log::debug!(
-                                "firmware: usb input frame decode failed interface={} err={:?}",
-                                self.interface_id.0,
-                                error
-                            );
-                            (None, false)
-                        }
-                    };
-                    #[cfg(feature = "dual-s3-wired")]
-                    return UsbSlotReadResult::Input {
-                        message,
-                        movement_only,
-                        raw,
-                        device_id: self.session.device_id(),
-                    };
-                    #[cfg(not(feature = "dual-s3-wired"))]
-                    if let Some(message) = message {
-                        return UsbSlotReadResult::Input {
-                            message: Some(message),
-                            movement_only,
-                        };
+static USB_READER_QUEUE: Channel<
+    CriticalSectionRawMutex,
+    UsbReaderEvent,
+    USB_READER_QUEUE_CAPACITY,
+> = Channel::new();
+
+enum UsbHubTaskEvent {
+    DeviceEnumerated {
+        port: u8,
+        enum_info: embassy_usb_host::handler::EnumerationInfo,
+        config_len: usize,
+        config: [u8; CONFIG_DESCRIPTOR_BUF_LEN],
+    },
+    DeviceRemoved {
+        port: u8,
+    },
+    Failed,
+}
+
+static USB_HUB_EVENT_QUEUE: Channel<CriticalSectionRawMutex, UsbHubTaskEvent, 2> = Channel::new();
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UsbRootTaskEvent {
+    Connected(Speed),
+    Disconnected,
+}
+
+static USB_ROOT_EVENT_QUEUE: Channel<CriticalSectionRawMutex, UsbRootTaskEvent, 4> = Channel::new();
+
+#[embassy_executor::task]
+async fn usb_root_event_task(
+    mut controller: embassy_usb_host::BusController<'static, OtgHost<'static>>,
+    events: Sender<'static, CriticalSectionRawMutex, UsbRootTaskEvent, 4>,
+) {
+    loop {
+        match controller.wait_for_device_event().await {
+            DeviceEvent::Connected(speed) => {
+                events.send(UsbRootTaskEvent::Connected(speed)).await;
+            }
+            DeviceEvent::Disconnected => {
+                events.send(UsbRootTaskEvent::Disconnected).await;
+            }
+            DeviceEvent::Overcurrent => {
+                log::warn!("firmware: USB root port overcurrent");
+                events.send(UsbRootTaskEvent::Disconnected).await;
+            }
+            _ => {}
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn usb_hub_task(
+    mut hub: HubHandler<'static, OtgHostAllocator<'static>, MAX_HUB_PORTS>,
+    events: Sender<'static, CriticalSectionRawMutex, UsbHubTaskEvent, 2>,
+    ble_quiesce_request: Sender<'static, CriticalSectionRawMutex, (), 1>,
+    ble_quiesce_ready: Receiver<'static, CriticalSectionRawMutex, (), 1>,
+    ble_quiesce_done: Sender<'static, CriticalSectionRawMutex, (), 1>,
+) {
+    let mut config = [0; CONFIG_DESCRIPTOR_BUF_LEN];
+    loop {
+        match hub.wait_for_event().await {
+            Ok(HandlerEvent::HandlerEvent(HubEvent::DeviceDetected { port, speed })) => {
+                log::info!(
+                    "firmware: hub device detected port={} speed={:?}",
+                    port,
+                    speed
+                );
+                quiesce_ble_for_usb_enumeration(ble_quiesce_request, ble_quiesce_ready).await;
+                let result =
+                    enumerate_hub_port_with_retries(&mut hub, &mut config, port, speed).await;
+                resume_ble_after_usb_enumeration(ble_quiesce_done).await;
+                match result {
+                    Ok((enum_info, config_len)) => {
+                        events
+                            .send(UsbHubTaskEvent::DeviceEnumerated {
+                                port,
+                                enum_info,
+                                config_len,
+                                config,
+                            })
+                            .await;
                     }
+                    Err(error) => log::warn!(
+                        "firmware: hub child enumerate failed port={} err={:?}",
+                        port,
+                        error
+                    ),
                 }
-                Err(error) => {
-                    return UsbSlotReadResult::Fatal {
-                        device_id: self.session.device_id(),
-                        interface_id: self.interface_id,
-                        error,
-                    };
-                }
+            }
+            Ok(HandlerEvent::HandlerEvent(HubEvent::DeviceRemoved { port, .. })) => {
+                events.send(UsbHubTaskEvent::DeviceRemoved { port }).await;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                log::warn!("firmware: hub event task failed: {:?}", error);
+                events.send(UsbHubTaskEvent::Failed).await;
+                return;
             }
         }
     }
 }
 
-fn movement_only_message(
-    message: &RuntimeInputMessage,
+#[embassy_executor::task(pool_size = 5)]
+async fn usb_interface_reader_task(
+    mut reader: UsbHidReader<'static, FirmwareBusHandle<'static>>,
+    device_id: DeviceId,
+    interface_id: InterfaceId,
+    sender: Sender<'static, CriticalSectionRawMutex, UsbReaderEvent, USB_READER_QUEUE_CAPACITY>,
+) {
+    let mut report_buf = [0u8; REPORT_BUF_LEN];
+    loop {
+        match reader.read(&mut report_buf).await {
+            Ok(len) => {
+                let mut data = [0u8; REPORT_BUF_LEN];
+                data[..len].copy_from_slice(&report_buf[..len]);
+                sender
+                    .send(UsbReaderEvent::Report(UsbReaderReport {
+                        device_id,
+                        interface_id,
+                        len,
+                        data,
+                    }))
+                    .await;
+            }
+            Err(error) => {
+                sender
+                    .send(UsbReaderEvent::Fatal {
+                        device_id,
+                        interface_id,
+                        error,
+                    })
+                    .await;
+                return;
+            }
+        }
+    }
+}
+
+impl<'d> ActiveUsbInterfaceSlot<'d> {
+    fn handle_report(&mut self, report: &[u8]) -> Option<UsbDecodedInput> {
+        #[cfg(feature = "dual-s3-wired")]
+        let raw = {
+            self.raw_in_sequence = self.raw_in_sequence.wrapping_add(1);
+            if self.raw_in_sequence == 0 {
+                self.raw_in_sequence = 1;
+            }
+            match hidshift::interchip::RawEndpointReport::new(
+                self.hid_info.interrupt_in_ep,
+                self.raw_in_sequence,
+                report,
+            ) {
+                Ok(report) => report,
+                Err(error) => {
+                    log::warn!(
+                        "firmware: raw mirror IN rejected interface={} err={:?}",
+                        self.interface_id.0,
+                        error
+                    );
+                    return None;
+                }
+            }
+        };
+        let decoded = self
+            .session
+            .capture_input_report(report)
+            .map_err(hidshift::usb_hid::host_runtime::UsbHidInterfaceRuntimeInputError::from)
+            .and_then(|report| self.session.input_message(report));
+        let (standard, movement_only) = match decoded {
+            Ok(RuntimeInputMessage::BridgeEvent(hidshift::BridgeEvent::InputFrame(frame))) => {
+                let movement_only = movement_only_frame(&frame, &mut self.last_mouse_buttons);
+                (Some(frame), movement_only)
+            }
+            Ok(_) => (None, false),
+            Err(error) => {
+                log::debug!(
+                    "firmware: usb input frame decode failed interface={} err={:?}",
+                    self.interface_id.0,
+                    error
+                );
+                (None, false)
+            }
+        };
+        #[cfg(feature = "dual-s3-wired")]
+        return Some(UsbDecodedInput {
+            standard,
+            movement_only,
+            raw,
+            device_id: self.session.device_id(),
+        });
+        #[cfg(not(feature = "dual-s3-wired"))]
+        standard.map(|standard| UsbDecodedInput {
+            standard: Some(standard),
+            movement_only,
+        })
+    }
+}
+
+fn movement_only_frame(
+    frame: &hidshift::input::InputFrame,
     previous_buttons: &mut hidshift::input::MouseButtons,
 ) -> bool {
-    let RuntimeInputMessage::BridgeEvent(hidshift::BridgeEvent::InputFrame(
-        hidshift::input::InputFrame::Standard(frame),
-    )) = message
-    else {
+    let hidshift::input::InputFrame::Standard(frame) = frame else {
         return false;
     };
     let Some(mouse) = frame.mouse else {
@@ -269,65 +399,153 @@ async fn forward_usb_input(
         RUNTIME_INPUT_QUEUE_CAPACITY,
     >,
     movement_queue: &mut hidshift::input::UsbMovementCoalescer<MAX_ACTIVE_USB_INTERFACES>,
-    message: Option<RuntimeInputMessage>,
+    standard: Option<hidshift::input::InputFrame>,
     movement_only: bool,
     #[cfg(feature = "dual-s3-wired")] raw: hidshift::interchip::RawEndpointReport,
     #[cfg(feature = "dual-s3-wired")] device_id: DeviceId,
 ) {
     #[cfg(feature = "dual-s3-wired")]
-    sender
-        .send(RuntimeInputMessage::MirrorEndpointIn {
-            device_id,
-            report: raw,
-        })
-        .await;
-    let Some(message) = message else {
-        return;
-    };
-    while sender.free_capacity() > 0 {
-        let Some(frame) = movement_queue.take_next() else {
-            break;
-        };
-        if sender
-            .try_send(RuntimeInputMessage::BridgeEvent(
-                hidshift::BridgeEvent::InputFrame(hidshift::input::InputFrame::Standard(
-                    frame.clone(),
-                )),
-            ))
-            .is_err()
-        {
-            let _ = movement_queue.push(&frame);
-            break;
-        }
+    {
+        let _ = (movement_queue, movement_only);
+        sender
+            .send(RuntimeInputMessage::UsbEndpointIn {
+                device_id,
+                report: raw,
+                standard,
+            })
+            .await;
     }
-    if movement_only {
-        if sender.try_send(message.clone()).is_err() {
-            let RuntimeInputMessage::BridgeEvent(hidshift::BridgeEvent::InputFrame(
-                hidshift::input::InputFrame::Standard(frame),
-            )) = &message
-            else {
-                return;
+    #[cfg(not(feature = "dual-s3-wired"))]
+    {
+        let Some(standard) = standard else {
+            return;
+        };
+        let message = RuntimeInputMessage::BridgeEvent(hidshift::BridgeEvent::InputFrame(standard));
+        while sender.free_capacity() > 0 {
+            let Some(frame) = movement_queue.take_next() else {
+                break;
             };
-            if let Err(error) = movement_queue.push(frame) {
-                log::warn!(
-                    "firmware: mouse movement coalescer rejected input: {:?}",
-                    error
-                );
+            if sender
+                .try_send(RuntimeInputMessage::BridgeEvent(
+                    hidshift::BridgeEvent::InputFrame(hidshift::input::InputFrame::Standard(
+                        frame.clone(),
+                    )),
+                ))
+                .is_err()
+            {
+                let _ = movement_queue.push(&frame);
+                break;
             }
         }
-    } else {
-        while let Some(frame) = movement_queue.take_next() {
-            sender
-                .send(RuntimeInputMessage::BridgeEvent(
-                    hidshift::BridgeEvent::InputFrame(hidshift::input::InputFrame::Standard(frame)),
-                ))
-                .await;
+        if movement_only {
+            if sender.try_send(message.clone()).is_err() {
+                let RuntimeInputMessage::BridgeEvent(hidshift::BridgeEvent::InputFrame(
+                    hidshift::input::InputFrame::Standard(frame),
+                )) = &message
+                else {
+                    return;
+                };
+                if let Err(error) = movement_queue.push(frame) {
+                    log::warn!(
+                        "firmware: mouse movement coalescer rejected input: {:?}",
+                        error
+                    );
+                }
+            }
+        } else {
+            while let Some(frame) = movement_queue.take_next() {
+                sender
+                    .send(RuntimeInputMessage::BridgeEvent(
+                        hidshift::BridgeEvent::InputFrame(hidshift::input::InputFrame::Standard(
+                            frame,
+                        )),
+                    ))
+                    .await;
+            }
+            sender.send(message).await;
         }
-        sender.send(message).await;
     }
 }
 
-async fn handle_hub_device_detected<'d>(
+async fn handle_usb_reader_event<'d>(
+    sender: &Sender<
+        'static,
+        CriticalSectionRawMutex,
+        RuntimeInputMessage,
+        RUNTIME_INPUT_QUEUE_CAPACITY,
+    >,
+    movement_queue: &mut hidshift::input::UsbMovementCoalescer<MAX_ACTIVE_USB_INTERFACES>,
+    topology: &mut DefaultUsbTopologyManager,
+    active_slots: &mut [Option<ActiveUsbInterfaceSlot<'d>>; MAX_ACTIVE_USB_INTERFACES],
+    event: UsbReaderEvent,
+) -> Option<DeviceId> {
+    match event {
+        UsbReaderEvent::Report(report) => {
+            let Some(slot) = active_slots.iter_mut().find_map(|slot| {
+                slot.as_mut().filter(|slot| {
+                    slot.interface_id == report.interface_id
+                        && slot.session.device_id() == report.device_id
+                })
+            }) else {
+                return None;
+            };
+            let Some(UsbDecodedInput {
+                standard,
+                movement_only,
+                #[cfg(feature = "dual-s3-wired")]
+                raw,
+                #[cfg(feature = "dual-s3-wired")]
+                device_id,
+            }) = slot.handle_report(&report.data[..report.len])
+            else {
+                return None;
+            };
+            forward_usb_input(
+                sender,
+                movement_queue,
+                standard,
+                movement_only,
+                #[cfg(feature = "dual-s3-wired")]
+                raw,
+                #[cfg(feature = "dual-s3-wired")]
+                device_id,
+            )
+            .await;
+            None
+        }
+        UsbReaderEvent::Fatal {
+            device_id,
+            interface_id,
+            error,
+        } => {
+            if !active_slots.iter().flatten().any(|slot| {
+                slot.interface_id == interface_id && slot.session.device_id() == device_id
+            }) {
+                return None;
+            }
+            log::warn!(
+                "firmware: usb read failed device={} interface={} err={:?}",
+                device_id.0,
+                interface_id.0,
+                error
+            );
+            sender
+                .send(RuntimeInputMessage::DiagnosticsEvent(
+                    RuntimeDiagnosticsEvent::UsbError,
+                ))
+                .await;
+            remove_interface_and_notify(sender, topology, active_slots, interface_id).await;
+            (!active_slots
+                .iter()
+                .flatten()
+                .any(|slot| slot.session.device_id() == device_id))
+            .then_some(device_id)
+        }
+    }
+}
+
+async fn handle_hub_device_enumerated<'d>(
+    spawner: Spawner,
     sender: &Sender<
         'static,
         CriticalSectionRawMutex,
@@ -338,13 +556,14 @@ async fn handle_hub_device_detected<'d>(
     topology: &mut DefaultUsbTopologyManager,
     active_slots: &mut [Option<ActiveUsbInterfaceSlot<'d>>; MAX_ACTIVE_USB_INTERFACES],
     hub_port_devices: &mut [Option<DeviceId>; MAX_HUB_PORTS],
-    hub: &mut HubHandler<'d, OtgHostAllocator<'d>, MAX_HUB_PORTS>,
-    config_buf: &mut [u8],
     hub_device_id: DeviceId,
     port: u8,
-    speed: embassy_usb_driver::Speed,
+    child_info: embassy_usb_host::handler::EnumerationInfo,
+    child_config_desc: &[u8],
     #[cfg(feature = "dual-s3-wired")] mirror_capture: &mut MirrorCaptureScratch,
-) {
+) where
+    'd: 'static,
+{
     let Some(port_index) =
         hidshift::usb_hid::topology::tracked_hub_port_index::<MAX_HUB_PORTS>(port)
     else {
@@ -355,84 +574,47 @@ async fn handle_hub_device_detected<'d>(
         );
         return;
     };
-    const ATTACH_ATTEMPTS: usize = 2;
-    let mut attach_attempt = 0usize;
-    loop {
-        attach_attempt += 1;
-        let enumerate_result = enumerate_hub_port_with_retries(hub, config_buf, port, speed).await;
-        match enumerate_result {
-            Ok((child_info, child_config_len)) => {
-                let child_device_id = match topology.connect_device(
-                    child_info.device_address,
-                    UsbDeviceRoute::Downstream {
-                        hub_device_id,
-                        port,
-                    },
-                ) {
-                    Ok(device_id) => device_id,
-                    Err(error) => {
-                        log::warn!(
-                            "firmware: usb topology downstream device register failed: {:?}",
-                            error
-                        );
-                        bus_handle.free_address(child_info.device_address);
-                        return;
-                    }
-                };
-                let child_config_desc = &config_buf[..child_config_len];
-                if attach_hid_interfaces_for_device(
-                    sender,
-                    bus_handle,
-                    topology,
-                    active_slots,
-                    child_device_id,
-                    &child_info,
-                    child_config_desc,
-                    &[port + 1],
-                    #[cfg(feature = "dual-s3-wired")]
-                    MirrorCandidateId(port_index as u8),
-                    #[cfg(feature = "dual-s3-wired")]
-                    mirror_capture,
-                )
-                .await
-                .is_ok()
-                {
-                    if (port as usize) < MAX_HUB_PORTS {
-                        hub_port_devices[port_index] = Some(child_device_id);
-                    }
-                    Timer::after_millis(500).await;
-                    return;
-                }
-
-                let _ = remove_device_and_notify(
-                    sender,
-                    bus_handle,
-                    topology,
-                    active_slots,
-                    child_device_id,
-                )
-                .await;
-                if attach_attempt < ATTACH_ATTEMPTS {
-                    log::debug!(
-                        "firmware: hub child attach retry port={} attempt={}",
-                        port,
-                        attach_attempt
-                    );
-                    Timer::after_millis(250).await;
-                    continue;
-                }
-                return;
-            }
-            Err(error) => {
-                log::warn!(
-                    "firmware: hub child enumerate failed port={} err={:?}",
-                    port,
-                    error
-                );
-                return;
-            }
+    let child_device_id = match topology.connect_device(
+        child_info.device_address,
+        UsbDeviceRoute::Downstream {
+            hub_device_id,
+            port,
+        },
+    ) {
+        Ok(device_id) => device_id,
+        Err(error) => {
+            log::warn!(
+                "firmware: usb topology downstream device register failed: {:?}",
+                error
+            );
+            bus_handle.free_address(child_info.device_address);
+            return;
         }
+    };
+    if attach_hid_interfaces_for_device(
+        spawner,
+        sender,
+        bus_handle,
+        topology,
+        active_slots,
+        child_device_id,
+        &child_info,
+        child_config_desc,
+        &[port + 1],
+        #[cfg(feature = "dual-s3-wired")]
+        MirrorCandidateId(port_index as u8),
+        #[cfg(feature = "dual-s3-wired")]
+        mirror_capture,
+    )
+    .await
+    .is_ok()
+    {
+        hub_port_devices[port_index] = Some(child_device_id);
+        return;
     }
+
+    let _ =
+        remove_device_and_notify(sender, bus_handle, topology, active_slots, child_device_id).await;
 }
 
 async fn handle_hub_device_removed<'d>(
@@ -465,90 +647,9 @@ async fn handle_hub_device_removed<'d>(
     }
 }
 
-async fn poll_active_slots<'a, 'd>(
-    active_slots: &'a mut [Option<ActiveUsbInterfaceSlot<'d>>; MAX_ACTIVE_USB_INTERFACES],
-) -> UsbSlotReadResult {
-    let (slot0_ref, rest) = active_slots.split_at_mut(1);
-    let (slot1_ref, rest) = rest.split_at_mut(1);
-    let (slot2_ref, rest) = rest.split_at_mut(1);
-    let (slot3_ref, rest) = rest.split_at_mut(1);
-    let (slot4_ref, rest) = rest.split_at_mut(1);
-    let (slot5_ref, rest) = rest.split_at_mut(1);
-    let (slot6_ref, slot7_ref) = rest.split_at_mut(1);
-
-    let slot0 = async {
-        match slot0_ref[0].as_mut() {
-            Some(slot) => slot.next_result().await,
-            None => pending().await,
-        }
-    };
-    let slot1 = async {
-        match slot1_ref[0].as_mut() {
-            Some(slot) => slot.next_result().await,
-            None => pending().await,
-        }
-    };
-    let slot2 = async {
-        match slot2_ref[0].as_mut() {
-            Some(slot) => slot.next_result().await,
-            None => pending().await,
-        }
-    };
-    let slot3 = async {
-        match slot3_ref[0].as_mut() {
-            Some(slot) => slot.next_result().await,
-            None => pending().await,
-        }
-    };
-    let slot4 = async {
-        match slot4_ref[0].as_mut() {
-            Some(slot) => slot.next_result().await,
-            None => pending().await,
-        }
-    };
-    let slot5 = async {
-        match slot5_ref[0].as_mut() {
-            Some(slot) => slot.next_result().await,
-            None => pending().await,
-        }
-    };
-    let slot6 = async {
-        match slot6_ref[0].as_mut() {
-            Some(slot) => slot.next_result().await,
-            None => pending().await,
-        }
-    };
-    let slot7 = async {
-        match slot7_ref[0].as_mut() {
-            Some(slot) => slot.next_result().await,
-            None => pending().await,
-        }
-    };
-
-    let slot_group0 = async {
-        match select4(slot0, slot1, slot2, slot3).await {
-            Either4::First(result)
-            | Either4::Second(result)
-            | Either4::Third(result)
-            | Either4::Fourth(result) => result,
-        }
-    };
-    let slot_group1 = async {
-        match select4(slot4, slot5, slot6, slot7).await {
-            Either4::First(result)
-            | Either4::Second(result)
-            | Either4::Third(result)
-            | Either4::Fourth(result) => result,
-        }
-    };
-
-    match select(slot_group0, slot_group1).await {
-        Either::First(result) | Either::Second(result) => result,
-    }
-}
-
 #[embassy_executor::task]
 pub async fn usb_input_task(
+    spawner: Spawner,
     sender: Sender<
         'static,
         CriticalSectionRawMutex,
@@ -573,18 +674,33 @@ pub async fn usb_input_task(
 
     let usb = Usb::new(usb0, usb_dp, usb_dm);
     let host = new_otg_host(usb);
-    esp_hal::interrupt::bind_handler(Interrupt::USB, usb_interrupt_handler);
 
-    let (mut bus_controller, bus_handle) = embassy_usb_host::bus(host, &BUS_STATE);
+    let (bus_controller, bus_handle) = embassy_usb_host::bus(host, &BUS_STATE);
     let config_buf = CONFIG_DESCRIPTOR_STORAGE.take();
     let mut topology = TOPOLOGY_STORAGE.take();
     let mut movement_queue = MOVEMENT_QUEUE_STORAGE.take();
     let mut active_slots = ACTIVE_SLOTS_STORAGE.take();
+    let reader_receiver = USB_READER_QUEUE.receiver();
     #[cfg(feature = "dual-s3-wired")]
     let mirror_capture = MIRROR_CAPTURE_STORAGE.take();
+    let root_event_receiver = USB_ROOT_EVENT_QUEUE.receiver();
+    while root_event_receiver.try_receive().is_ok() {}
+    let root_task = match usb_root_event_task(bus_controller, USB_ROOT_EVENT_QUEUE.sender()) {
+        Ok(task) => task,
+        Err(_) => {
+            log::error!("firmware: USB root event task capacity exceeded");
+            esp_hal::system::software_reset();
+        }
+    };
+    spawner.spawn(root_task);
 
     loop {
-        let speed = bus_controller.wait_for_connection().await;
+        let speed = loop {
+            match root_event_receiver.receive().await {
+                UsbRootTaskEvent::Connected(speed) => break speed,
+                UsbRootTaskEvent::Disconnected => {}
+            }
+        };
         log::info!("firmware: usb connected speed={:?}", speed);
 
         // All slots should have been detached on the previous disconnect, but
@@ -629,7 +745,7 @@ pub async fn usb_input_task(
             };
         let config_desc = &config_buf[..config_len];
         if config_descriptor_has_interface_class(config_desc, 0x09) {
-            let Ok(mut hub) =
+            let Ok(hub) =
                 HubHandler::<_, MAX_HUB_PORTS>::try_register(&bus_handle, &enum_info).await
             else {
                 log::warn!("firmware: root hub registration failed");
@@ -639,130 +755,56 @@ pub async fn usb_input_task(
             };
             log::info!("firmware: root hub registered ports_max={}", MAX_HUB_PORTS);
             let mut hub_port_devices = [None; MAX_HUB_PORTS];
+            let hub_event_receiver = USB_HUB_EVENT_QUEUE.receiver();
+            while hub_event_receiver.try_receive().is_ok() {}
+            let hub_task = match usb_hub_task(
+                hub,
+                USB_HUB_EVENT_QUEUE.sender(),
+                ble_quiesce_request,
+                ble_quiesce_ready,
+                ble_quiesce_done,
+            ) {
+                Ok(task) => task,
+                Err(_) => {
+                    log::warn!("firmware: usb hub task capacity exceeded");
+                    let _ = topology.remove_device(device_id);
+                    bus_handle.free_address(enum_info.device_address);
+                    continue;
+                }
+            };
+            spawner.spawn(hub_task);
             loop {
-                match select3(
-                    hub.wait_for_event(),
-                    poll_active_slots(&mut active_slots),
+                match select4(
+                    hub_event_receiver.receive(),
+                    reader_receiver.receive(),
                     receiver.receive(),
+                    root_event_receiver.receive(),
                 )
                 .await
                 {
-                    Either3::First(Ok(HandlerEvent::HandlerEvent(HubEvent::DeviceDetected {
+                    Either4::First(UsbHubTaskEvent::DeviceEnumerated {
                         port,
-                        speed,
-                    }))) => {
-                        log::info!(
-                            "firmware: hub device detected port={} speed={:?}",
+                        enum_info: child_info,
+                        config_len: child_config_len,
+                        config: child_config,
+                    }) => {
+                        handle_hub_device_enumerated(
+                            spawner,
+                            &sender,
+                            &bus_handle,
+                            &mut topology,
+                            &mut active_slots,
+                            &mut hub_port_devices,
+                            device_id,
                             port,
-                            speed
-                        );
-                        quiesce_ble_for_usb_enumeration(ble_quiesce_request, ble_quiesce_ready)
-                            .await;
-                        if with_timeout(
-                            Duration::from_millis(HUB_ENUMERATION_TOTAL_TIMEOUT_MS),
-                            handle_hub_device_detected(
-                                &sender,
-                                &bus_handle,
-                                &mut topology,
-                                &mut active_slots,
-                                &mut hub_port_devices,
-                                &mut hub,
-                                &mut config_buf[..],
-                                device_id,
-                                port,
-                                speed,
-                                #[cfg(feature = "dual-s3-wired")]
-                                mirror_capture,
-                            ),
+                            child_info,
+                            &child_config[..child_config_len],
+                            #[cfg(feature = "dual-s3-wired")]
+                            mirror_capture,
                         )
-                        .await
-                        .is_err()
-                        {
-                            log::warn!("firmware: hub child attach total timeout port={}", port);
-                        }
-                        let mut hub_failed = false;
-                        loop {
-                            match with_timeout(
-                                Duration::from_millis(HUB_QUIESCED_EVENT_DRAIN_MS),
-                                hub.wait_for_event(),
-                            )
-                            .await
-                            {
-                                Ok(Ok(HandlerEvent::HandlerEvent(HubEvent::DeviceDetected {
-                                    port,
-                                    speed,
-                                }))) => {
-                                    log::info!(
-                                        "firmware: hub device detected port={} speed={:?}",
-                                        port,
-                                        speed
-                                    );
-                                    if with_timeout(
-                                        Duration::from_millis(HUB_ENUMERATION_TOTAL_TIMEOUT_MS),
-                                        handle_hub_device_detected(
-                                            &sender,
-                                            &bus_handle,
-                                            &mut topology,
-                                            &mut active_slots,
-                                            &mut hub_port_devices,
-                                            &mut hub,
-                                            &mut config_buf[..],
-                                            device_id,
-                                            port,
-                                            speed,
-                                            #[cfg(feature = "dual-s3-wired")]
-                                            mirror_capture,
-                                        ),
-                                    )
-                                    .await
-                                    .is_err()
-                                    {
-                                        log::warn!(
-                                            "firmware: hub child attach total timeout port={}",
-                                            port
-                                        );
-                                    }
-                                }
-                                Ok(Ok(HandlerEvent::HandlerEvent(HubEvent::DeviceRemoved {
-                                    port,
-                                    ..
-                                }))) => {
-                                    handle_hub_device_removed(
-                                        &sender,
-                                        &bus_handle,
-                                        &mut topology,
-                                        &mut active_slots,
-                                        &mut hub_port_devices,
-                                        port,
-                                    )
-                                    .await;
-                                }
-                                Ok(Ok(_)) => {}
-                                Ok(Err(error)) => {
-                                    log::warn!("firmware: hub event loop failed: {:?}", error);
-                                    let _ = remove_device_and_notify(
-                                        &sender,
-                                        &bus_handle,
-                                        &mut topology,
-                                        &mut active_slots,
-                                        device_id,
-                                    )
-                                    .await;
-                                    hub_failed = true;
-                                    break;
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                        resume_ble_after_usb_enumeration(ble_quiesce_done).await;
-                        if hub_failed {
-                            break;
-                        }
+                        .await;
                     }
-                    Either3::First(Ok(HandlerEvent::HandlerEvent(HubEvent::DeviceRemoved {
-                        port,
-                        ..
-                    }))) => {
+                    Either4::First(UsbHubTaskEvent::DeviceRemoved { port }) => {
                         handle_hub_device_removed(
                             &sender,
                             &bus_handle,
@@ -773,9 +815,7 @@ pub async fn usb_input_task(
                         )
                         .await;
                     }
-                    Either3::First(Ok(_)) => {}
-                    Either3::First(Err(error)) => {
-                        log::warn!("firmware: hub event loop failed: {:?}", error);
+                    Either4::First(UsbHubTaskEvent::Failed) => {
                         let _ = remove_device_and_notify(
                             &sender,
                             &bus_handle,
@@ -786,52 +826,45 @@ pub async fn usb_input_task(
                         .await;
                         break;
                     }
-                    Either3::Second(UsbSlotReadResult::Input {
-                        message,
-                        movement_only,
-                        #[cfg(feature = "dual-s3-wired")]
-                        raw,
-                        #[cfg(feature = "dual-s3-wired")]
-                        device_id,
-                    }) => {
-                        forward_usb_input(
+                    Either4::Second(event) => {
+                        if let Some(failed_device_id) = handle_usb_reader_event(
                             &sender,
                             &mut movement_queue,
-                            message,
-                            movement_only,
-                            #[cfg(feature = "dual-s3-wired")]
-                            raw,
-                            #[cfg(feature = "dual-s3-wired")]
-                            device_id,
+                            &mut topology,
+                            &mut active_slots,
+                            event,
                         )
-                        .await;
-                    }
-                    Either3::Second(UsbSlotReadResult::Fatal {
-                        device_id: failed_device_id,
-                        interface_id,
-                        error,
-                    }) => {
-                        log::warn!(
-                            "firmware: usb read failed interface={} err={:?}",
-                            interface_id.0,
-                            error
-                        );
-                        sender
-                            .send(RuntimeInputMessage::DiagnosticsEvent(
-                                RuntimeDiagnosticsEvent::UsbError,
-                            ))
+                        .await
+                        {
+                            for child_device_id in hub_port_devices.iter_mut() {
+                                if *child_device_id == Some(failed_device_id) {
+                                    *child_device_id = None;
+                                }
+                            }
+                            let _ = remove_device_and_notify(
+                                &sender,
+                                &bus_handle,
+                                &mut topology,
+                                &mut active_slots,
+                                failed_device_id,
+                            )
                             .await;
+                        }
+                    }
+                    Either4::Third(command) => {
+                        handle_usb_command(&sender, &bus_handle, &mut active_slots, command).await;
+                    }
+                    Either4::Fourth(root_event) => {
+                        log::info!("firmware: USB root session ended: {:?}", root_event);
                         let _ = remove_device_and_notify(
                             &sender,
                             &bus_handle,
                             &mut topology,
                             &mut active_slots,
-                            failed_device_id,
+                            device_id,
                         )
                         .await;
-                    }
-                    Either3::Third(command) => {
-                        handle_usb_command(&sender, &bus_handle, &mut active_slots, command).await;
+                        break;
                     }
                 }
             }
@@ -839,6 +872,7 @@ pub async fn usb_input_task(
         }
 
         if attach_hid_interfaces_for_device(
+            spawner,
             &sender,
             &bus_handle,
             &mut topology,
@@ -867,54 +901,48 @@ pub async fn usb_input_task(
         }
 
         loop {
-            match select(poll_active_slots(&mut active_slots), receiver.receive()).await {
-                Either::First(UsbSlotReadResult::Input {
-                    message,
-                    movement_only,
-                    #[cfg(feature = "dual-s3-wired")]
-                    raw,
-                    #[cfg(feature = "dual-s3-wired")]
-                    device_id,
-                }) => {
-                    forward_usb_input(
+            match select3(
+                reader_receiver.receive(),
+                receiver.receive(),
+                root_event_receiver.receive(),
+            )
+            .await
+            {
+                Either3::First(event) => {
+                    if let Some(failed_device_id) = handle_usb_reader_event(
                         &sender,
                         &mut movement_queue,
-                        message,
-                        movement_only,
-                        #[cfg(feature = "dual-s3-wired")]
-                        raw,
-                        #[cfg(feature = "dual-s3-wired")]
-                        device_id,
+                        &mut topology,
+                        &mut active_slots,
+                        event,
                     )
-                    .await;
-                }
-                Either::First(UsbSlotReadResult::Fatal {
-                    device_id: failed_device_id,
-                    interface_id,
-                    error,
-                }) => {
-                    log::warn!(
-                        "firmware: usb read failed interface={} err={:?}",
-                        interface_id.0,
-                        error
-                    );
-                    sender
-                        .send(RuntimeInputMessage::DiagnosticsEvent(
-                            RuntimeDiagnosticsEvent::UsbError,
-                        ))
+                    .await
+                    {
+                        let _ = remove_device_and_notify(
+                            &sender,
+                            &bus_handle,
+                            &mut topology,
+                            &mut active_slots,
+                            failed_device_id,
+                        )
                         .await;
+                        break;
+                    }
+                }
+                Either3::Second(command) => {
+                    handle_usb_command(&sender, &bus_handle, &mut active_slots, command).await;
+                }
+                Either3::Third(root_event) => {
+                    log::info!("firmware: USB root session ended: {:?}", root_event);
                     let _ = remove_device_and_notify(
                         &sender,
                         &bus_handle,
                         &mut topology,
                         &mut active_slots,
-                        failed_device_id,
+                        device_id,
                     )
                     .await;
                     break;
-                }
-                Either::Second(command) => {
-                    handle_usb_command(&sender, &bus_handle, &mut active_slots, command).await;
                 }
             }
         }
@@ -996,8 +1024,8 @@ async fn handle_usb_command<'d>(
         }
         #[cfg(feature = "dual-s3-wired")]
         UsbHostTaskCommand::MirrorEndpointOut { device_id, report } => {
-            let Some(slot) = active_slots.iter_mut().find_map(|slot| {
-                slot.as_mut().filter(|slot| {
+            let Some(slot) = active_slots.iter().find_map(|slot| {
+                slot.as_ref().filter(|slot| {
                     slot.session.device_id() == device_id
                         && slot.hid_info.interrupt_out_ep == report.endpoint_address
                 })
@@ -1009,12 +1037,16 @@ async fn handle_usb_command<'d>(
                 );
                 return;
             };
-            let Some(writer) = slot.raw_out.as_mut() else {
-                log::warn!(
-                    "firmware: mirror OUT pipe missing endpoint=0x{:02x}",
-                    report.endpoint_address
-                );
-                return;
+            let mut writer = match UsbRawOutWriter::new(bus_handle, slot.hid_info, &slot.enum_info)
+            {
+                Ok(Some(writer)) => writer,
+                Ok(None) | Err(_) => {
+                    log::warn!(
+                        "firmware: mirror OUT pipe unavailable endpoint=0x{:02x}",
+                        report.endpoint_address
+                    );
+                    return;
+                }
             };
             match with_timeout(Duration::from_millis(250), writer.write(report.data())).await {
                 Ok(Ok(())) => {}
@@ -1184,6 +1216,7 @@ async fn enumerate_hub_port_with_retries<'d, A: embassy_usb_driver::host::UsbHos
 }
 
 async fn attach_hid_interfaces_for_device<'d>(
+    spawner: Spawner,
     sender: &Sender<
         'static,
         CriticalSectionRawMutex,
@@ -1199,7 +1232,19 @@ async fn attach_hid_interfaces_for_device<'d>(
     physical_port_path: &[u8],
     #[cfg(feature = "dual-s3-wired")] mirror_candidate: MirrorCandidateId,
     #[cfg(feature = "dual-s3-wired")] mirror_capture: &mut MirrorCaptureScratch,
-) -> Result<(), ()> {
+) -> Result<(), ()>
+where
+    'd: 'static,
+{
+    let mut pending_readers = heapless::Vec::<
+        (
+            usize,
+            UsbHidReader<'d, FirmwareBusHandle<'d>>,
+            DeviceId,
+            InterfaceId,
+        ),
+        MAX_ACTIVE_USB_INTERFACES,
+    >::new();
     let product_name = read_usb_product_name(bus_handle, enum_info)
         .await
         .unwrap_or_else(FixedName::empty);
@@ -1244,6 +1289,13 @@ async fn attach_hid_interfaces_for_device<'d>(
     }
 
     for hid_info in hid_interfaces.iter().copied() {
+        let Some(slot_index) = active_slots.iter().position(Option::is_none) else {
+            log::warn!(
+                "firmware: skipping USB HID interface={} to preserve host control channel",
+                hid_info.interface_number
+            );
+            continue;
+        };
         let interface_id = match topology.register_interface(device_id, hid_info.interface_number) {
             Ok(interface_id) => interface_id,
             Err(error) => {
@@ -1253,10 +1305,6 @@ async fn attach_hid_interfaces_for_device<'d>(
                 );
                 return Err(());
             }
-        };
-        let Some(slot_index) = active_slots.iter().position(Option::is_none) else {
-            log::warn!("firmware: usb active interface capacity exceeded");
-            return Err(());
         };
         let mut control = match UsbHidControl::new(bus_handle, hid_info, enum_info) {
             Ok(control) => control,
@@ -1405,16 +1453,16 @@ async fn attach_hid_interfaces_for_device<'d>(
 
         let reader = match UsbHidReader::new(bus_handle, hid_info, enum_info) {
             Ok(reader) => reader,
+            Err(HidError::NoPipe) => {
+                log::warn!(
+                    "firmware: skipping USB HID interface={} because no host channel is available",
+                    hid_info.interface_number
+                );
+                let _ = topology.remove_interface(interface_id);
+                continue;
+            }
             Err(error) => {
                 log::warn!("firmware: usb hid reader unsupported: {:?}", error);
-                return Err(());
-            }
-        };
-        #[cfg(feature = "dual-s3-wired")]
-        let raw_out = match UsbRawOutWriter::new(bus_handle, hid_info, enum_info) {
-            Ok(writer) => writer,
-            Err(error) => {
-                log::warn!("firmware: usb mirror OUT pipe unavailable: {:?}", error);
                 return Err(());
             }
         };
@@ -1446,19 +1494,24 @@ async fn attach_hid_interfaces_for_device<'d>(
             .await;
         active_slots[slot_index] = Some(ActiveUsbInterfaceSlot {
             interface_id,
-            reader,
             led_output,
             hid_info,
             enum_info: *enum_info,
             session,
-            report_buf: [0u8; REPORT_BUF_LEN],
             last_mouse_buttons: hidshift::input::MouseButtons::empty(),
             last_led_bytes: None,
-            #[cfg(feature = "dual-s3-wired")]
-            raw_out,
+            _lifetime: PhantomData,
             #[cfg(feature = "dual-s3-wired")]
             raw_in_sequence: 0,
         });
+        pending_readers
+            .push((slot_index, reader, device_id, interface_id))
+            .map_err(|_| ())?;
+    }
+
+    if pending_readers.is_empty() {
+        log::warn!("firmware: usb device has no serviceable HID interfaces");
+        return Err(());
     }
 
     #[cfg(feature = "dual-s3-wired")]
@@ -1494,6 +1547,29 @@ async fn attach_hid_interfaces_for_device<'d>(
                 error
             );
         }
+    }
+
+    // Start interrupt polling only after every control request and mirror
+    // profile transfer has completed. Otherwise a 1 kHz mouse fills the reader
+    // queue while this task is still attaching the remaining interfaces.
+    for (_slot_index, reader, device_id, interface_id) in pending_readers {
+        let reader_task = match usb_interface_reader_task(
+            reader,
+            device_id,
+            interface_id,
+            USB_READER_QUEUE.sender(),
+        ) {
+            Ok(token) => token,
+            Err(_) => {
+                log::warn!(
+                    "firmware: usb reader task capacity exceeded device={} interface={}",
+                    device_id.0,
+                    interface_id.0
+                );
+                return Err(());
+            }
+        };
+        spawner.spawn(reader_task);
     }
 
     Ok(())
@@ -1538,18 +1614,22 @@ async fn capture_and_forward_mirror_profile<'d>(
     let mut bos_len = 0usize;
     if enum_info.device_desc.bcd_usb >= 0x0201 {
         let setup = get_descriptor_setup(15, 0, 0, 5);
-        if let Ok(length) = control
-            .control_in(&setup.to_bytes(), &mut scratch.bos[..5])
-            .await
+        if let Ok(Ok(length)) = with_timeout(
+            Duration::from_millis(USB_CONTROL_REQUEST_TIMEOUT_MS),
+            control.control_in(&setup.to_bytes(), &mut scratch.bos[..5]),
+        )
+        .await
             && length >= 5
             && scratch.bos[1] == 15
         {
             let total = usize::from(u16::from_le_bytes([scratch.bos[2], scratch.bos[3]]))
                 .min(scratch.bos.len());
             let setup = get_descriptor_setup(15, 0, 0, total as u16);
-            if let Ok(length) = control
-                .control_in(&setup.to_bytes(), &mut scratch.bos[..total])
-                .await
+            if let Ok(Ok(length)) = with_timeout(
+                Duration::from_millis(USB_CONTROL_REQUEST_TIMEOUT_MS),
+                control.control_in(&setup.to_bytes(), &mut scratch.bos[..total]),
+            )
+            .await
             {
                 bos_len = length.min(total);
             }
@@ -1559,11 +1639,13 @@ async fn capture_and_forward_mirror_profile<'d>(
     scratch.string_lengths.fill(0);
     let language_setup = get_descriptor_setup(3, 0, 0, MIRROR_STRING_DESCRIPTOR_MAX_LEN as u16);
     let mut string_count = 0usize;
-    let language_id = match control
-        .control_in(&language_setup.to_bytes(), &mut scratch.strings[0])
-        .await
+    let language_id = match with_timeout(
+        Duration::from_millis(USB_CONTROL_REQUEST_TIMEOUT_MS),
+        control.control_in(&language_setup.to_bytes(), &mut scratch.strings[0]),
+    )
+    .await
     {
-        Ok(length) if length >= 4 && scratch.strings[0][1] == 3 => {
+        Ok(Ok(length)) if length >= 4 && scratch.strings[0][1] == 3 => {
             let length = usize::from(scratch.strings[0][0])
                 .min(length)
                 .min(MIRROR_STRING_DESCRIPTOR_MAX_LEN);
@@ -1594,9 +1676,11 @@ async fn capture_and_forward_mirror_profile<'d>(
             language_id,
             MIRROR_STRING_DESCRIPTOR_MAX_LEN as u16,
         );
-        if let Ok(length) = control
-            .control_in(&setup.to_bytes(), &mut scratch.strings[string_count][..])
-            .await
+        if let Ok(Ok(length)) = with_timeout(
+            Duration::from_millis(USB_CONTROL_REQUEST_TIMEOUT_MS),
+            control.control_in(&setup.to_bytes(), &mut scratch.strings[string_count][..]),
+        )
+        .await
             && length >= 2
             && scratch.strings[string_count][1] == 3
         {
@@ -1828,11 +1912,13 @@ async fn read_usb_string_units<'d>(
         length: 4,
     };
     let mut language = [0u8; 4];
-    let language_id = match control
-        .control_in(&language_request.to_bytes(), &mut language)
-        .await
+    let language_id = match with_timeout(
+        Duration::from_millis(USB_CONTROL_REQUEST_TIMEOUT_MS),
+        control.control_in(&language_request.to_bytes(), &mut language),
+    )
+    .await
     {
-        Ok(length) if length >= 4 && language[1] == 3 => {
+        Ok(Ok(length)) if length >= 4 && language[1] == 3 => {
             u16::from_le_bytes([language[2], language[3]])
         }
         _ => 0x0409,
@@ -1849,10 +1935,13 @@ async fn read_usb_string_units<'d>(
         length: 66,
     };
     let mut descriptor = [0u8; 66];
-    let length = control
-        .control_in(&request.to_bytes(), &mut descriptor)
-        .await
-        .ok()?;
+    let length = with_timeout(
+        Duration::from_millis(USB_CONTROL_REQUEST_TIMEOUT_MS),
+        control.control_in(&request.to_bytes(), &mut descriptor),
+    )
+    .await
+    .ok()?
+    .ok()?;
     if length < 2 || descriptor[1] != 3 {
         return None;
     }
@@ -1922,6 +2011,11 @@ async fn remove_device_and_notify<'d>(
     let mut disconnected = heapless::Vec::<InterfaceId, MAX_ACTIVE_USB_INTERFACES>::new();
     let mut result = Ok(());
 
+    #[cfg(feature = "dual-s3-wired")]
+    sender
+        .send(RuntimeInputMessage::MirrorSourceDisconnected { device_id })
+        .await;
+
     match topology.remove_device(device_id) {
         Ok(removal) => {
             for interface in removal.interfaces() {
@@ -1953,6 +2047,34 @@ async fn remove_device_and_notify<'d>(
     }
 
     result
+}
+
+async fn remove_interface_and_notify<'d>(
+    sender: &Sender<
+        'static,
+        CriticalSectionRawMutex,
+        RuntimeInputMessage,
+        RUNTIME_INPUT_QUEUE_CAPACITY,
+    >,
+    topology: &mut DefaultUsbTopologyManager,
+    active_slots: &mut [Option<ActiveUsbInterfaceSlot<'d>>; MAX_ACTIVE_USB_INTERFACES],
+    interface_id: InterfaceId,
+) {
+    if let Err(error) = topology.remove_interface(interface_id) {
+        log::warn!(
+            "firmware: usb topology interface remove failed interface={} err={:?}",
+            interface_id.0,
+            error
+        );
+    }
+
+    let mut disconnected = heapless::Vec::<InterfaceId, MAX_ACTIVE_USB_INTERFACES>::new();
+    detach_active_slot_by_interface(active_slots, interface_id, &mut disconnected);
+    for interface_id in disconnected {
+        sender
+            .send(RuntimeInputMessage::UsbHidInterfaceDisconnected { interface_id })
+            .await;
+    }
 }
 
 fn detach_active_slot_by_interface<'d>(
@@ -2012,6 +2134,10 @@ fn new_otg_host(usb: Usb<'static>) -> OtgHost<'static> {
 
     core::mem::forget(usb);
     OtgHost::new(instance)
+}
+
+pub fn bind_interrupt_handler() {
+    esp_hal::interrupt::bind_handler(Interrupt::USB, usb_interrupt_handler);
 }
 
 #[esp_hal::handler(priority = esp_hal::interrupt::Priority::max())]

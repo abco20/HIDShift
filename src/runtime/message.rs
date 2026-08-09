@@ -58,9 +58,10 @@ pub enum RuntimeInputMessage {
     #[cfg(feature = "dual-s3-wired")]
     MirrorEndpointOut(crate::interchip::RawEndpointReport),
     #[cfg(feature = "dual-s3-wired")]
-    MirrorEndpointIn {
+    UsbEndpointIn {
         device_id: DeviceId,
         report: crate::interchip::RawEndpointReport,
+        standard: Option<crate::input::InputFrame>,
     },
     #[cfg(feature = "dual-s3-wired")]
     MirrorControlRequest(crate::interchip::MirrorControlRequest),
@@ -77,6 +78,10 @@ pub enum RuntimeInputMessage {
         profile_hash: Option<u32>,
         synthetic: bool,
         source_device: Option<DeviceId>,
+    },
+    #[cfg(feature = "dual-s3-wired")]
+    MirrorSourceDisconnected {
+        device_id: DeviceId,
     },
     RestoreStorage(StorageState),
 }
@@ -145,9 +150,14 @@ impl RuntimeInputMessage {
             #[cfg(feature = "dual-s3-wired")]
             Self::MirrorEndpointOut(report) => RuntimeInput::MirrorEndpointOut(*report),
             #[cfg(feature = "dual-s3-wired")]
-            Self::MirrorEndpointIn { device_id, report } => RuntimeInput::MirrorEndpointIn {
+            Self::UsbEndpointIn {
+                device_id,
+                report,
+                standard,
+            } => RuntimeInput::UsbEndpointIn {
                 device_id: *device_id,
                 report: *report,
+                standard: standard.clone(),
             },
             #[cfg(feature = "dual-s3-wired")]
             Self::MirrorControlRequest(request) => RuntimeInput::MirrorControlRequest(*request),
@@ -175,6 +185,12 @@ impl RuntimeInputMessage {
                 synthetic: *synthetic,
                 source_device: *source_device,
             },
+            #[cfg(feature = "dual-s3-wired")]
+            Self::MirrorSourceDisconnected { device_id } => {
+                RuntimeInput::MirrorSourceDisconnected {
+                    device_id: *device_id,
+                }
+            }
             Self::RestoreStorage(storage) => RuntimeInput::RestoreStorage(storage),
         }
     }
@@ -244,9 +260,15 @@ impl TryFrom<RuntimeInput<'_>> for RuntimeInputMessage {
             #[cfg(feature = "dual-s3-wired")]
             RuntimeInput::MirrorEndpointOut(report) => Ok(Self::MirrorEndpointOut(report)),
             #[cfg(feature = "dual-s3-wired")]
-            RuntimeInput::MirrorEndpointIn { device_id, report } => {
-                Ok(Self::MirrorEndpointIn { device_id, report })
-            }
+            RuntimeInput::UsbEndpointIn {
+                device_id,
+                report,
+                standard,
+            } => Ok(Self::UsbEndpointIn {
+                device_id,
+                report,
+                standard,
+            }),
             #[cfg(feature = "dual-s3-wired")]
             RuntimeInput::MirrorControlRequest(request) => Ok(Self::MirrorControlRequest(request)),
             #[cfg(feature = "dual-s3-wired")]
@@ -273,6 +295,10 @@ impl TryFrom<RuntimeInput<'_>> for RuntimeInputMessage {
                 synthetic,
                 source_device,
             }),
+            #[cfg(feature = "dual-s3-wired")]
+            RuntimeInput::MirrorSourceDisconnected { device_id } => {
+                Ok(Self::MirrorSourceDisconnected { device_id })
+            }
             RuntimeInput::RestoreStorage(storage) => Ok(Self::RestoreStorage(storage.clone())),
         }
     }

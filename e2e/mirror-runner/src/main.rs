@@ -33,6 +33,9 @@ struct Arguments {
     host_port: PathBuf,
     #[arg(long)]
     device_flash_port: Option<PathBuf>,
+    /// Use the USB-JTAG reset sequence for the Device S3 flash port.
+    #[arg(long, requires = "device_flash_port")]
+    device_usb_jtag: bool,
     #[arg(long = "reuse-firmware", alias = "skip-flash")]
     skip_flash: bool,
     /// Run only the SPI link-loss/no-failover scenario against existing images.
@@ -67,6 +70,49 @@ struct Arguments {
     usb_timeout_seconds: u64,
 }
 
+#[derive(Clone, Copy)]
+enum EspflashReset {
+    Default,
+    UsbJtag,
+}
+
+#[derive(Clone, Copy)]
+struct EspflashTarget<'a> {
+    port: &'a Path,
+    reset: EspflashReset,
+}
+
+impl<'a> EspflashTarget<'a> {
+    fn uart(port: &'a Path) -> Self {
+        Self {
+            port,
+            reset: EspflashReset::Default,
+        }
+    }
+
+    fn device(port: &'a Path, usb_jtag: bool) -> Self {
+        Self {
+            port,
+            reset: if usb_jtag {
+                EspflashReset::UsbJtag
+            } else {
+                EspflashReset::Default
+            },
+        }
+    }
+
+    fn command(self, operation: &str) -> Command {
+        let mut command = Command::new("espflash");
+        command
+            .args([operation, "--chip", "esp32s3", "--port"])
+            .arg(self.port);
+        if matches!(self.reset, EspflashReset::UsbJtag) {
+            command.args(["--before", "usb-reset"]);
+        }
+        command
+    }
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("mirror-e2e: {error}");
@@ -76,10 +122,12 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn Error>> {
     let arguments = Arguments::parse();
+    let device_target = arguments
+        .device_flash_port
+        .as_deref()
+        .map(|port| EspflashTarget::device(port, arguments.device_usb_jtag));
     if !arguments.skip_flash {
-        let device_port = arguments
-            .device_flash_port
-            .as_deref()
+        let device_target = device_target
             .ok_or("--device-flash-port is required unless --reuse-firmware is used")?;
         if arguments.ble_address.is_some() && arguments.linux_controller_address.is_none() {
             return Err(
@@ -88,12 +136,13 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         flash_firmware(
             &arguments.host_port,
-            device_port,
+            device_target,
             arguments.linux_controller_address.as_deref(),
         )?;
     }
     let mut serial = serialport::new(arguments.host_port.to_string_lossy(), 115_200)
         .timeout(Duration::from_millis(100))
+        .preserve_dtr_on_open()
         .open()?;
     wait_for_mirror_ready(&mut *serial)?;
 
@@ -129,15 +178,13 @@ fn run() -> Result<(), Box<dyn Error>> {
             &mut client,
             Duration::from_secs(arguments.usb_timeout_seconds),
         )?;
-        let device_port = arguments
-            .device_flash_port
-            .as_deref()
+        let device_target = device_target
             .ok_or("--device-flash-port is required with --spi-loss-only to restore the link")?;
         verify_spi_loss(
             &mut *serial,
             &mut sequence,
             &mut client,
-            device_port,
+            device_target,
             arguments.usb_timeout_seconds,
         )?;
         return Ok(());
@@ -343,12 +390,12 @@ fn run() -> Result<(), Box<dyn Error>> {
         println!("T06-T08 skipped: pass --ble-address for bonded BlueZ Management E2E");
     }
 
-    if let Some(device_port) = arguments.device_flash_port.as_deref() {
+    if let Some(device_target) = device_target {
         verify_spi_loss(
             &mut *serial,
             &mut sequence,
             &mut client,
-            device_port,
+            device_target,
             arguments.usb_timeout_seconds,
         )?;
     } else {
@@ -571,8 +618,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     println!("T19 passed: invalid Profile rejected and Profile B preserved");
 
-    if let Some(device_port) = &arguments.device_flash_port {
-        reset_device_s3(device_port)?;
+    if let Some(device_target) = device_target {
+        reset_device_s3(device_target)?;
         wait_for_usb_identity(
             &mut *serial,
             vid_b,
@@ -593,7 +640,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 
 fn flash_firmware(
     host_port: &Path,
-    device_port: &Path,
+    device_target: EspflashTarget<'_>,
     linux_controller_address: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     if linux_controller_address.is_some_and(|address| !valid_bluetooth_address(address)) {
@@ -629,50 +676,38 @@ fn flash_firmware(
             .current_dir(root),
         "build Host and Device S3 firmware",
     )?;
+    let mut erase_device = device_target.command("erase-region");
+    erase_device.args(["0x324000", "0x10000"]).current_dir(root);
     run_command(
-        Command::new("espflash")
-            .args(["erase-region", "--chip", "esp32s3", "--port"])
-            .arg(device_port)
-            .args(["0x324000", "0x10000"])
-            .current_dir(root),
+        &mut erase_device,
         "erase Device S3 Mirror profile partition",
     )?;
-    run_command(
-        Command::new("espflash")
-            .args(["flash", "--chip", "esp32s3", "--port"])
-            .arg(device_port)
-            .args([
-                "--partition-table",
-                "partitions/bridge.csv",
-                "--target-app-partition",
-                "ota_0",
-                "device-firmware/target/xtensa-esp32s3-none-elf/release/hidshift-device",
-            ])
-            .current_dir(root),
-        "flash Device S3",
-    )?;
-    run_command(
-        Command::new("espflash")
-            .args(["erase-region", "--chip", "esp32s3", "--port"])
-            .arg(host_port)
-            .args(["0x320000", "0x4000"])
-            .current_dir(root),
-        "erase Host S3 settings partition",
-    )?;
-    run_command(
-        Command::new("espflash")
-            .args(["flash", "--chip", "esp32s3", "--port"])
-            .arg(host_port)
-            .args([
-                "--partition-table",
-                "partitions/bridge.csv",
-                "--target-app-partition",
-                "ota_0",
-                "target/xtensa-esp32s3-none-elf/release/firmware",
-            ])
-            .current_dir(root),
-        "flash Host S3",
-    )?;
+    let mut flash_device = device_target.command("flash");
+    flash_device
+        .args([
+            "--partition-table",
+            "partitions/bridge.csv",
+            "--target-app-partition",
+            "ota_0",
+            "device-firmware/target/xtensa-esp32s3-none-elf/release/hidshift-device",
+        ])
+        .current_dir(root);
+    run_command(&mut flash_device, "flash Device S3")?;
+    let host_target = EspflashTarget::uart(host_port);
+    let mut erase_host = host_target.command("erase-region");
+    erase_host.args(["0x320000", "0x4000"]).current_dir(root);
+    run_command(&mut erase_host, "erase Host S3 settings partition")?;
+    let mut flash_host = host_target.command("flash");
+    flash_host
+        .args([
+            "--partition-table",
+            "partitions/bridge.csv",
+            "--target-app-partition",
+            "ota_0",
+            "target/xtensa-esp32s3-none-elf/release/firmware",
+        ])
+        .current_dir(root);
+    run_command(&mut flash_host, "flash Host S3")?;
     Ok(())
 }
 
@@ -806,7 +841,7 @@ fn verify_spi_loss(
     serial: &mut dyn SerialPort,
     sequence: &mut u32,
     client: &mut ManagementClient,
-    device_port: &Path,
+    device_target: EspflashTarget<'_>,
     usb_timeout_seconds: u64,
 ) -> Result<(), Box<dyn Error>> {
     arm_spi_cell_drop(serial, sequence, 5_000)?;
@@ -827,7 +862,7 @@ fn verify_spi_loss(
     // T26 models an unavailable inter-chip link. Reset the Device S3 after
     // observing that terminal state so the remaining suite starts from a
     // deterministic SPI slave DMA transaction.
-    reset_device_s3(device_port)?;
+    reset_device_s3(device_target)?;
     wait_for_wired_ready(serial, client, Duration::from_secs(10))?;
     wait_for_usb_identity(
         serial,
@@ -1594,17 +1629,19 @@ fn send_normalized(serial: &mut dyn SerialPort, packet: E2ePacket) -> Result<(),
     Ok(())
 }
 
-fn reset_device_s3(port: &Path) -> Result<(), Box<dyn Error>> {
-    let status = Command::new("espflash")
-        .args(["board-info", "--port"])
-        .arg(port)
-        .args(["--chip", "esp32s3"])
+fn reset_device_s3(target: EspflashTarget<'_>) -> Result<(), Box<dyn Error>> {
+    let mut command = target.command("board-info");
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
+        .stderr(Stdio::null());
+    let status = command.status()?;
     if !status.success() {
-        return Err(format!("espflash failed to reset Device S3 on {}", port.display()).into());
+        return Err(format!(
+            "espflash failed to reset Device S3 on {}",
+            target.port.display()
+        )
+        .into());
     }
     Ok(())
 }
@@ -1947,5 +1984,36 @@ mod tests {
         assert!(valid_bluetooth_address("4C:23:38:A6:20:44"));
         assert!(!valid_bluetooth_address("4C:23:38:A6:20"));
         assert!(!valid_bluetooth_address("4C:23:38:A6:20:'"));
+    }
+
+    #[test]
+    fn device_usb_jtag_reset_is_scoped_to_its_espflash_target() {
+        let usb_jtag = EspflashTarget::device(Path::new("/dev/device"), true)
+            .command("board-info")
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let uart = EspflashTarget::uart(Path::new("/dev/host"))
+            .command("board-info")
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            usb_jtag,
+            [
+                "board-info",
+                "--chip",
+                "esp32s3",
+                "--port",
+                "/dev/device",
+                "--before",
+                "usb-reset",
+            ]
+        );
+        assert_eq!(
+            uart,
+            ["board-info", "--chip", "esp32s3", "--port", "/dev/host"]
+        );
     }
 }
