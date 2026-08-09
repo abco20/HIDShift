@@ -72,7 +72,7 @@ fn main() -> ! {
         .with_cs(peripherals.GPIO10)
         .with_mosi(peripherals.GPIO11)
         .with_sck(peripherals.GPIO12)
-        .with_miso(peripherals.GPIO13)
+        .with_miso(peripherals.GPIO9)
         .with_dma(peripherals.DMA_CH0);
 
     let dynamic = match DynamicUsb::new(&usb_bus, dynamic_plan, fallback) {
@@ -462,7 +462,7 @@ fn run<'a, B: UsbBus, P: PresentationRuntime<B>>(
         }
 
         // Queue the next transaction before servicing USB. The slave remains
-        // ready while the master follows its fixed 500 us polling schedule.
+        // ready while the master follows its fixed 400 us polling schedule.
         let tx = link.next_transaction(now_ms);
         dma_tx.as_mut_slice().copy_from_slice(&tx);
         dma_rx.as_mut_slice().fill(0);

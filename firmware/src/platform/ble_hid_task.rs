@@ -1595,7 +1595,7 @@ fn observe_ble_hci_tx(stage: TxObserverStage, pdu: &[u8]) {
         }
     }
     #[cfg(not(feature = "hardware-e2e"))]
-    let _ = stage;
+    let _ = (stage, pdu);
 }
 
 async fn ble_runner_task<C, P>(mut runner: Runner<'_, C, P>)

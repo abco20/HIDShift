@@ -91,7 +91,9 @@ cargo run --manifest-path e2e/mirror-runner/Cargo.toml -- \
 ```
 
 Use `--reuse-firmware` to reuse loaded images. Explicit ports avoid confusing the
-two ESP32-S3 roles after Device S3 changes its native USB identity.
+two ESP32-S3 roles after Device S3 changes its native USB identity. Pass
+`--device-usb-jtag` when the Device S3 is flashed through its native USB-JTAG
+serial port.
 `--ble-address` enables the BlueZ BLE Management, HID release/suppression and
 no-broadcast cases in `--ble-host-slot` (default 2). Build `tools/hidshiftctl`
 in release mode first or override `--hidshiftctl`. A flashing BLE run also

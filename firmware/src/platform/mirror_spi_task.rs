@@ -31,7 +31,10 @@ use hidshift::runtime::{
     DeviceTaskCommand, RUNTIME_DEVICE_COMMAND_QUEUE_CAPACITY, RUNTIME_INPUT_QUEUE_CAPACITY,
 };
 
-const SPI_POLL_INTERVAL: Duration = Duration::from_micros(500);
+// A full 128-byte cell takes about 103 us at 10 MHz. Polling every 400 us
+// leaves enough time for the Device to process and requeue DMA while giving a
+// 1 kHz mouse 2.5 transport slots per report interval.
+const SPI_POLL_INTERVAL: Duration = Duration::from_micros(400);
 const RETRANSMIT_TIMEOUT_MS: u64 = 5;
 const MAX_RETRANSMIT_ATTEMPTS: u8 = 8;
 const HEARTBEAT_INTERVAL_MS: u64 = 500;
@@ -43,6 +46,35 @@ const HOST_CAPABILITIES: u32 = CAPABILITY_DYNAMIC_PROFILE
     | CAPABILITY_CONTROL_FORWARDING;
 const REQUIRED_DEVICE_CAPABILITIES: u32 =
     CAPABILITY_FALLBACK_PROFILE | CAPABILITY_STANDARD_WIRED_HID | CAPABILITY_USB_STATE_REPORTING;
+
+pub struct MirrorSpiResources {
+    spi: esp_hal::peripherals::SPI2<'static>,
+    dma: esp_hal::peripherals::DMA_CH0<'static>,
+    cs: esp_hal::peripherals::GPIO41<'static>,
+    mosi: esp_hal::peripherals::GPIO40<'static>,
+    sclk: esp_hal::peripherals::GPIO39<'static>,
+    miso: esp_hal::peripherals::GPIO42<'static>,
+}
+
+impl MirrorSpiResources {
+    pub fn new(
+        spi: esp_hal::peripherals::SPI2<'static>,
+        dma: esp_hal::peripherals::DMA_CH0<'static>,
+        cs: esp_hal::peripherals::GPIO41<'static>,
+        mosi: esp_hal::peripherals::GPIO40<'static>,
+        sclk: esp_hal::peripherals::GPIO39<'static>,
+        miso: esp_hal::peripherals::GPIO42<'static>,
+    ) -> Self {
+        Self {
+            spi,
+            dma,
+            cs,
+            mosi,
+            sclk,
+            miso,
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 struct LinkDiagnostics {
@@ -81,13 +113,16 @@ pub async fn mirror_spi_master_task(
         RUNTIME_INPUT_QUEUE_CAPACITY,
     >,
     session_id: u32,
-    spi2: esp_hal::peripherals::SPI2<'static>,
-    dma_channel: esp_hal::peripherals::DMA_CH0<'static>,
-    cs: esp_hal::peripherals::GPIO10<'static>,
-    mosi: esp_hal::peripherals::GPIO11<'static>,
-    sclk: esp_hal::peripherals::GPIO12<'static>,
-    miso: esp_hal::peripherals::GPIO13<'static>,
+    resources: MirrorSpiResources,
 ) {
+    let MirrorSpiResources {
+        spi,
+        dma,
+        cs,
+        mosi,
+        sclk,
+        miso,
+    } = resources;
     let (rx_buffer, rx_descriptors, tx_buffer, tx_descriptors) =
         esp_hal::dma_buffers!(SPI_CELL_LEN);
     let dma_rx = match DmaRxBuf::new(rx_descriptors, rx_buffer) {
@@ -105,7 +140,7 @@ pub async fn mirror_spi_master_task(
         }
     };
     let spi = match Spi::new(
-        spi2,
+        spi,
         Config::default()
             .with_frequency(Rate::from_mhz(10))
             .with_mode(Mode::_0),
@@ -120,7 +155,7 @@ pub async fn mirror_spi_master_task(
     .with_mosi(mosi)
     .with_sck(sclk)
     .with_miso(miso)
-    .with_dma(dma_channel)
+    .with_dma(dma)
     .with_buffers(dma_rx, dma_tx);
 
     run_link(spi, command_receiver, runtime_sender, session_id).await;

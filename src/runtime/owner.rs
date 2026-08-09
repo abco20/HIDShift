@@ -1,3 +1,5 @@
+#[cfg(feature = "dual-s3-wired")]
+use super::DeviceTaskCommand;
 use super::{
     BridgeRuntime, DEFAULT_RUNTIME_CAPACITIES, DefaultRuntimeCommandQueues,
     RUNTIME_BLE_COMMAND_QUEUE_CAPACITY, RUNTIME_BLE_EVENT_CAPACITY, RUNTIME_BRIDGE_ACTION_CAPACITY,
@@ -182,29 +184,30 @@ impl<
         message: &RuntimeInputMessage,
     ) -> Result<(), RuntimeOwnerError> {
         self.commands.clear();
+        #[cfg(feature = "dual-s3-wired")]
+        if let RuntimeInputMessage::UsbEndpointIn {
+            device_id,
+            report,
+            standard,
+        } = message
+        {
+            self.queues.clear();
+            if self.runtime.active_physical_mirror_source() == Some(*device_id) {
+                self.queues
+                    .device
+                    .push(DeviceTaskCommand::RawEndpointIn(*report))
+                    .map_err(|_| RuntimeDispatchError::DeviceQueueCapacity)?;
+                return Ok(());
+            }
+            let Some(frame) = standard else {
+                return Ok(());
+            };
+            return self.process_realtime_frame_in_place(frame);
+        }
         if let RuntimeInputMessage::BridgeEvent(crate::bridge::BridgeEvent::InputFrame(frame)) =
             message
         {
-            if self.runtime.input_frame_would_trigger_shortcut(frame) {
-                self.runtime
-                    .handle_input_in_place::<COMMANDS, ACTIONS, EVENTS>(
-                        message.as_runtime_input(),
-                        &mut self.commands,
-                    )?;
-                self.queues.dispatch_from(self.commands.as_slice())?;
-                return Ok(());
-            }
-            self.queues.clear();
-            #[cfg(not(feature = "dual-s3-wired"))]
-            self.runtime
-                .handle_realtime_input_frame_in_place(frame.clone(), &mut self.queues.ble)?;
-            #[cfg(feature = "dual-s3-wired")]
-            self.runtime.handle_realtime_input_frame_in_place(
-                frame.clone(),
-                &mut self.queues.ble,
-                &mut self.queues.device,
-            )?;
-            return Ok(());
+            return self.process_realtime_frame_in_place(frame);
         }
         self.runtime
             .handle_input_in_place::<COMMANDS, ACTIONS, EVENTS>(
@@ -212,6 +215,34 @@ impl<
                 &mut self.commands,
             )?;
         self.queues.dispatch_from(self.commands.as_slice())?;
+        Ok(())
+    }
+
+    fn process_realtime_frame_in_place(
+        &mut self,
+        frame: &crate::input::InputFrame,
+    ) -> Result<(), RuntimeOwnerError> {
+        if self.runtime.input_frame_would_trigger_shortcut(frame) {
+            self.runtime
+                .handle_input_in_place::<COMMANDS, ACTIONS, EVENTS>(
+                    RuntimeInput::BridgeEvent(crate::bridge::BridgeEvent::InputFrame(
+                        frame.clone(),
+                    )),
+                    &mut self.commands,
+                )?;
+            self.queues.dispatch_from(self.commands.as_slice())?;
+            return Ok(());
+        }
+        self.queues.clear();
+        #[cfg(not(feature = "dual-s3-wired"))]
+        self.runtime
+            .handle_realtime_input_frame_in_place(frame.clone(), &mut self.queues.ble)?;
+        #[cfg(feature = "dual-s3-wired")]
+        self.runtime.handle_realtime_input_frame_in_place(
+            frame.clone(),
+            &mut self.queues.ble,
+            &mut self.queues.device,
+        )?;
         Ok(())
     }
 

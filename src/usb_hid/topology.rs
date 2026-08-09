@@ -36,6 +36,7 @@ pub enum UsbTopologyError {
     DeviceCapacity,
     InterfaceCapacity,
     UnknownDevice,
+    UnknownInterface,
     OccupiedRoute,
     HubParentMissing,
     HubDepthExceeded,
@@ -184,6 +185,26 @@ impl<const DEVICES: usize, const INTERFACES: usize> UsbTopologyManager<DEVICES, 
             self.remove_device_entry(next_device, &mut removal);
         }
         Ok(removal)
+    }
+
+    pub fn remove_interface(
+        &mut self,
+        interface_id: InterfaceId,
+    ) -> Result<UsbInterfaceTopologyEntry, UsbTopologyError> {
+        let Some(index) = self
+            .interfaces
+            .iter()
+            .position(|entry| entry.is_some_and(|entry| entry.interface_id == interface_id))
+        else {
+            return Err(UsbTopologyError::UnknownInterface);
+        };
+        let Some(entry) = self.interfaces[index].take() else {
+            return Err(UsbTopologyError::UnknownInterface);
+        };
+        self.interfaces[index] = self.interfaces[self.interface_count - 1];
+        self.interfaces[self.interface_count - 1] = None;
+        self.interface_count -= 1;
+        Ok(entry)
     }
 
     fn validate_route(&self, route: UsbDeviceRoute) -> Result<(), UsbTopologyError> {
@@ -415,6 +436,26 @@ mod tests {
                 },
             ),
             Ok(child)
+        );
+    }
+
+    #[test]
+    fn removing_one_interface_keeps_device_and_other_interfaces() {
+        let mut topology = UsbTopologyManager::<4, 8>::new();
+        let device = topology.connect_device(1, UsbDeviceRoute::Direct).unwrap();
+        let mouse = topology.register_interface(device, 0).unwrap();
+        let vendor = topology.register_interface(device, 2).unwrap();
+
+        assert_eq!(
+            topology.remove_interface(vendor).unwrap().interface_id,
+            vendor
+        );
+        assert_eq!(topology.device_count(), 1);
+        assert_eq!(topology.interface_count(), 1);
+        assert_eq!(topology.interfaces().next().unwrap().interface_id, mouse);
+        assert_eq!(
+            topology.remove_interface(vendor),
+            Err(UsbTopologyError::UnknownInterface)
         );
     }
 
