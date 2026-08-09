@@ -2049,9 +2049,9 @@ mod tests {
 
     #[test]
     fn bluetooth_build_address_accepts_only_canonical_mac_text() {
-        assert!(valid_bluetooth_address("4C:23:38:A6:20:44"));
-        assert!(!valid_bluetooth_address("4C:23:38:A6:20"));
-        assert!(!valid_bluetooth_address("4C:23:38:A6:20:'"));
+        assert!(valid_bluetooth_address("02:00:00:00:00:01"));
+        assert!(!valid_bluetooth_address("02:00:00:00:00"));
+        assert!(!valid_bluetooth_address("02:00:00:00:00:'"));
     }
 
     #[test]

@@ -86,8 +86,8 @@ Device S3 profile flash and reboot persistence are still exercised.
 cargo run --manifest-path e2e/mirror-runner/Cargo.toml -- \
   --host-port /dev/serial/by-id/<host-s3> \
   --device-flash-port /dev/serial/by-id/<device-s3> \
-  --ble-address 6A:EE:8F:64:11:AD \
-  --linux-controller-address 4C:23:38:A6:20:44
+  --ble-address <dut-ble-address> \
+  --linux-controller-address <linux-controller-address>
 ```
 
 Use `--reuse-firmware` to reuse loaded images. Explicit ports avoid confusing the
