@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use serialport::{FlowControl, SerialPort};
 
 mod board;
+mod linux;
 use board::{parse_chip_type, parse_mac_address, serial_by_path_candidates};
 mod metrics;
 use metrics::{
@@ -74,6 +75,9 @@ impl ProbeChip {
 #[derive(Parser, Debug)]
 #[command(about = "HIDShift BLE hardware E2E runner")]
 struct Args {
+    /// Run the primary E2E against Linux evdev without a Probe board.
+    #[arg(long, conflicts_with_all = ["probe_port", "probe_chip", "skip_linux"])]
+    linux_only: bool,
     #[arg(long)]
     dut_port: Option<PathBuf>,
     #[arg(long)]
@@ -95,6 +99,10 @@ struct Args {
     write_baseline: bool,
     #[arg(long, default_value = "e2e/results")]
     results_dir: PathBuf,
+    #[arg(long, default_value = "e2e/linux-baseline.json")]
+    linux_baseline: PathBuf,
+    #[arg(long)]
+    write_linux_baseline: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -233,7 +241,7 @@ struct DeviceClockSync {
 
 struct Harness {
     writer: Box<dyn SerialPort>,
-    probe_writer: Box<dyn SerialPort>,
+    probe_writer: Option<Box<dyn SerialPort>>,
     lines: Receiver<SerialLine>,
     sequence: u32,
     probe_diagnostics: Mutex<ProbeDiagnostics>,
@@ -252,6 +260,9 @@ fn main() -> Result<()> {
         .and_then(Path::parent)
         .context("runner must live below the repository root")?
         .to_path_buf();
+    if args.linux_only {
+        return linux::run_suite(&args, &repo);
+    }
     let (dut, probe, probe_chip) = resolve_ports(&args, &repo)?;
 
     println!("DUT   {} ({DUT_CHIP})", dut.display());
@@ -711,7 +722,21 @@ fn open_harness(dut: &Path, probe: &Path) -> Result<Harness> {
     spawn_line_reader(Source::Probe, probe_port, sender);
     Ok(Harness {
         writer,
-        probe_writer,
+        probe_writer: Some(probe_writer),
+        lines: receiver,
+        sequence: 1,
+        probe_diagnostics: Mutex::new(ProbeDiagnostics::default()),
+    })
+}
+
+fn open_dut_harness(dut: &Path) -> Result<Harness> {
+    let dut_port = open_serial(dut, DUT_BAUD_RATE)?;
+    let writer = dut_port.try_clone()?;
+    let (sender, receiver) = mpsc::channel();
+    spawn_line_reader(Source::Dut, dut_port, sender);
+    Ok(Harness {
+        writer,
+        probe_writer: None,
         lines: receiver,
         sequence: 1,
         probe_diagnostics: Mutex::new(ProbeDiagnostics::default()),
@@ -1419,8 +1444,12 @@ fn synchronize_probe_clock(harness: &mut Harness, samples: usize) -> Result<Devi
     let mut best = None;
     for sequence in 0..samples as u32 {
         let started = Instant::now();
-        writeln!(harness.probe_writer, "@T:{sequence:08x}")?;
-        harness.probe_writer.flush()?;
+        let writer = harness
+            .probe_writer
+            .as_mut()
+            .context("probe clock synchronization requires a Probe serial port")?;
+        writeln!(writer, "@T:{sequence:08x}")?;
+        writer.flush()?;
         let deadline = Instant::now() + Duration::from_secs(1);
         let response = loop {
             let remaining = deadline
@@ -2037,6 +2066,10 @@ fn bluetoothctl(args: &[&str], timeout_seconds: u64) -> Result<String> {
 }
 
 fn find_evdevs(name: &str, timeout: Duration) -> Result<Vec<PathBuf>> {
+    find_evdevs_on_bus(name, None, timeout)
+}
+
+fn find_evdevs_on_bus(name: &str, bus: Option<&str>, timeout: Duration) -> Result<Vec<PathBuf>> {
     let deadline = Instant::now() + timeout;
     loop {
         let mut devices = Vec::new();
@@ -2049,7 +2082,11 @@ fn find_evdevs(name: &str, timeout: Duration) -> Result<Vec<PathBuf>> {
             }
             let device_name =
                 fs::read_to_string(entry.path().join("device/name")).unwrap_or_default();
-            if device_name.contains(name) {
+            let bus_matches = bus.is_none_or(|expected| {
+                fs::read_to_string(entry.path().join("device/id/bustype"))
+                    .is_ok_and(|actual| actual.trim().eq_ignore_ascii_case(expected))
+            });
+            if device_name.contains(name) && bus_matches {
                 devices.push(Path::new("/dev/input").join(filename.as_ref()));
             }
         }
@@ -2058,7 +2095,7 @@ fn find_evdevs(name: &str, timeout: Duration) -> Result<Vec<PathBuf>> {
             return Ok(devices);
         }
         if Instant::now() >= deadline {
-            bail!("no evdev device containing {name}")
+            bail!("no evdev device containing {name} on bus {bus:?}")
         }
         thread::sleep(Duration::from_millis(100));
     }
@@ -2432,7 +2469,6 @@ mod tests {
             })
         );
     }
-
     #[test]
     fn wired_management_response_parser_checks_protocol_bytes() {
         let expected = ManagementResponse {

@@ -608,10 +608,16 @@ where
 {
     let peer = connection_peer_identity(conn);
     #[cfg(feature = "hardware-e2e")]
-    if control.pairing_host() == Some(HostId(1))
-        && conn.raw().peer_address().into_inner() != hidshift::e2e::E2E_PROBE_BLE_ADDRESS_RAW
-    {
-        return BleConnectionAdmission::RejectUnknown;
+    if control.pairing_host() == Some(HostId(1)) {
+        let peer_address = conn.raw().peer_address().into_inner();
+        let linux_address = e2e_linux_address().map(|address| address.into_inner());
+        if !hidshift::e2e::primary_pairing_peer_allowed(
+            option_env!("HIDSHIFT_E2E_LINUX_ONLY") == Some("1"),
+            peer_address,
+            linux_address,
+        ) {
+            return BleConnectionAdmission::RejectUnknown;
+        }
     }
 
     let peer_matches_stored_bond = resolve_ble_host_id(restored_state, peer, None).is_some();

@@ -1,0 +1,20 @@
+{
+  "schema_version": 2,
+  "metric": "linux_uart_injection_to_evdev",
+  "keyboard": {
+    "samples": 400,
+    "mean_ms": 19.05754554,
+    "p50_ms": 19.100529,
+    "p95_ms": 23.299901000000002,
+    "p99_ms": 24.373202,
+    "max_ms": 24.392734
+  },
+  "mouse": {
+    "samples": 200,
+    "mean_ms": 18.495888819999998,
+    "p50_ms": 18.063996999999997,
+    "p95_ms": 22.27655,
+    "p99_ms": 23.342314,
+    "max_ms": 24.392032
+  }
+}

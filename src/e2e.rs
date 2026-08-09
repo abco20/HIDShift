@@ -15,6 +15,20 @@ pub const E2E_LINE_LEN: usize = E2E_LINE_PREFIX.len() + E2E_PACKET_LEN * 2;
 /// Raw little-endian HCI address used by the dedicated test probe.
 pub const E2E_PROBE_BLE_ADDRESS_RAW: [u8; 6] = [0x01, 0xe2, 0xe2, 0xe2, 0xe2, 0xc2];
 
+/// Restricts fresh host-1 pairing to the receiver selected by the E2E image.
+/// Production firmware never calls this policy.
+pub fn primary_pairing_peer_allowed(
+    linux_only: bool,
+    peer_address: [u8; 6],
+    linux_address: Option<[u8; 6]>,
+) -> bool {
+    if linux_only {
+        matches!(linux_address, Some(address) if address == peer_address)
+    } else {
+        peer_address == E2E_PROBE_BLE_ADDRESS_RAW
+    }
+}
+
 /// Compact identity for correlating the stages of one measured outbound PDU.
 /// Zero is reserved for the unarmed state used by firmware telemetry.
 pub fn tx_pdu_fingerprint(pdu: &[u8]) -> u32 {
@@ -421,5 +435,21 @@ mod tests {
             tx_pdu_fingerprint(&management)
         );
         assert_eq!(tx_pdu_fingerprint(&keyboard), tx_pdu_fingerprint(&keyboard));
+    }
+
+    #[test]
+    fn primary_pairing_selects_probe_or_linux_without_accepting_another_peer() {
+        let linux = [1, 0, 0, 0, 0, 2];
+        let other = [1, 2, 3, 4, 5, 6];
+
+        assert!(primary_pairing_peer_allowed(
+            false,
+            E2E_PROBE_BLE_ADDRESS_RAW,
+            Some(linux)
+        ));
+        assert!(!primary_pairing_peer_allowed(false, linux, Some(linux)));
+        assert!(primary_pairing_peer_allowed(true, linux, Some(linux)));
+        assert!(!primary_pairing_peer_allowed(true, other, Some(linux)));
+        assert!(!primary_pairing_peer_allowed(true, linux, None));
     }
 }
