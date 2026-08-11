@@ -25,6 +25,7 @@ use crate::output_target::OutputTarget;
 #[cfg(feature = "dual-s3-wired")]
 use crate::output_target::{
     MirrorCandidateId, MirrorStableId, OutputTargetAvailability, StoredMirrorTarget,
+    next_ready_computer_target,
 };
 use crate::settings::{
     GlobalSettings, SETTING_COUNT, SETTINGS_SCHEMA_HASH, SETTINGS_SCHEMA_VERSION, SettingId,
@@ -1323,29 +1324,20 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
     #[cfg(feature = "dual-s3-wired")]
     fn next_ready_output_target(&self) -> Option<OutputTarget> {
         let selected = self.bridge.state().output_target.selected;
-        let selected_index = match selected {
-            OutputTarget::Wired => 0,
-            OutputTarget::Ble(host_id) => usize::from(host_id.0.min(4)),
-        };
-        for offset in 1..=5 {
-            let index = (selected_index + offset) % 5;
-            let target = if index == 0 {
-                OutputTarget::Wired
-            } else {
-                OutputTarget::Ble(HostId(index as u8))
-            };
-            let ready = match target {
-                OutputTarget::Wired => {
-                    self.bridge.state().wired_availability
-                        == crate::output_target::OutputTargetAvailability::Ready
-                }
-                OutputTarget::Ble(host_id) => self.bridge.ble_target_ready(host_id),
-            };
-            if ready {
-                return Some(target);
+        let wired_ready = self.bridge.state().wired_availability
+            == crate::output_target::OutputTargetAvailability::Ready;
+        let mut ready_ble_mask = 0;
+        for index in 0..HOSTS.min(4) {
+            if self.bridge.ble_target_ready(HostId((index + 1) as u8)) {
+                ready_ble_mask |= 1 << index;
             }
         }
-        None
+        next_ready_computer_target(
+            selected,
+            wired_ready,
+            ready_ble_mask,
+            self.bridge.state().wired_ble_host,
+        )
     }
 
     fn handle_management_request<const COMMANDS: usize, const ACTIONS: usize>(
@@ -1559,6 +1551,21 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                     }
                     ManagementResult::Ok
                 }
+                #[cfg(feature = "dual-s3-wired")]
+                ManagementCommand::SetWiredHostLink { ble_host } => {
+                    if ble_host.is_some_and(|host| {
+                        !valid_management_host::<HOSTS>(host)
+                            || self.bridge.state().hosts.host(host).is_none()
+                    }) {
+                        ManagementResult::HostNotFound
+                    } else {
+                        if self.bridge.state().wired_ble_host != ble_host {
+                            self.bridge.set_wired_host_link(ble_host);
+                            self.push_storage_snapshot(commands, StoragePersistPriority::Critical)?;
+                        }
+                        ManagementResult::Ok
+                    }
+                }
             }
         };
 
@@ -1610,6 +1617,7 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                 capabilities: crate::management::MANAGEMENT_CAPABILITY_COMPANION_EVENTS
                     | if cfg!(feature = "dual-s3-wired") {
                         crate::management::MANAGEMENT_CAPABILITY_DUAL_S3_WIRED
+                            | crate::management::MANAGEMENT_CAPABILITY_COMPUTER_TARGET_LINKS
                     } else {
                         0
                     },
@@ -1618,7 +1626,9 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                 crate::management::ManagementClientSession {
                     host_id: match destination {
                         ManagementDestination::Ble(host_id) => Some(host_id),
-                        ManagementDestination::Wired => None,
+                        ManagementDestination::WiredHid | ManagementDestination::DebugSerial => {
+                            None
+                        }
                     },
                 },
             ),
@@ -1636,7 +1646,8 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             ManagementCommand::SelectOutputTarget(_)
             | ManagementCommand::GetOutputTargetStatus
             | ManagementCommand::SetMirrorTarget(_)
-            | ManagementCommand::ClearMirrorTarget => {
+            | ManagementCommand::ClearMirrorTarget
+            | ManagementCommand::SetWiredHostLink { .. } => {
                 ManagementResponsePayload::OutputTargetStatus(
                     self.management_output_target_status(),
                 )
@@ -2621,8 +2632,19 @@ impl<const BLE: usize, const USB_HOST: usize, const STORAGE: usize, const STATUS
                 RuntimeCommand::UsbMirrorEndpointOut { .. }
                 | RuntimeCommand::UsbMirrorControlRequest { .. } => usb += 1,
                 RuntimeCommand::PersistStorage { .. } => storage += 1,
-                RuntimeCommand::StatusChanged(_) | RuntimeCommand::ManagementResponse { .. } => {
-                    status += 1;
+                RuntimeCommand::StatusChanged(_) => status += 1,
+                RuntimeCommand::ManagementResponse { destination, .. } => {
+                    #[cfg(feature = "dual-s3-wired")]
+                    if matches!(destination, ManagementDestination::WiredHid) {
+                        device += 1;
+                    } else {
+                        status += 1;
+                    }
+                    #[cfg(not(feature = "dual-s3-wired"))]
+                    {
+                        let _ = destination;
+                        status += 1;
+                    }
                 }
                 RuntimeCommand::ApplyEffect(_) => effects += 1,
             }
@@ -2706,26 +2728,37 @@ impl<const BLE: usize, const USB_HOST: usize, const STORAGE: usize, const STATUS
             RuntimeCommand::ManagementResponse {
                 destination,
                 response,
-            } => self
-                .status
-                .push(StatusTaskCommand {
-                    status: match response.payload {
-                        ManagementResponsePayload::Status(status) => BridgeStatus {
-                            active_target: status.active_host,
-                            pairable_host: status.pairing_host,
+            } => {
+                #[cfg(feature = "dual-s3-wired")]
+                if matches!(destination, ManagementDestination::WiredHid) {
+                    // A management command can intentionally change the USB
+                    // presentation. Deliver its response before any queued
+                    // activation command invalidates this HID connection.
+                    return self
+                        .device
+                        .insert(0, DeviceTaskCommand::ManagementResponse(*response))
+                        .map_err(|_| RuntimeDispatchError::DeviceQueueCapacity);
+                }
+                self.status
+                    .push(StatusTaskCommand {
+                        status: match response.payload {
+                            ManagementResponsePayload::Status(status) => BridgeStatus {
+                                active_target: status.active_host,
+                                pairable_host: status.pairing_host,
+                            },
+                            _ => BridgeStatus {
+                                active_target: None,
+                                pairable_host: None,
+                            },
                         },
-                        _ => BridgeStatus {
-                            active_target: None,
-                            pairable_host: None,
-                        },
-                    },
-                    snapshot: StatusSnapshot::empty(),
-                    management: Some(ManagementTaskResponse {
-                        destination: *destination,
-                        response: *response,
-                    }),
-                })
-                .map_err(|_| RuntimeDispatchError::StatusQueueCapacity),
+                        snapshot: StatusSnapshot::empty(),
+                        management: Some(ManagementTaskResponse {
+                            destination: *destination,
+                            response: *response,
+                        }),
+                    })
+                    .map_err(|_| RuntimeDispatchError::StatusQueueCapacity)
+            }
             RuntimeCommand::ApplyEffect(effect) => self
                 .effects
                 .push(*effect)
@@ -2826,7 +2859,8 @@ const fn management_command_requires_storage(command: &ManagementCommand) -> boo
         #[cfg(feature = "dual-s3-wired")]
         ManagementCommand::SelectOutputTarget(_)
         | ManagementCommand::SetMirrorTarget(_)
-        | ManagementCommand::ClearMirrorTarget => true,
+        | ManagementCommand::ClearMirrorTarget
+        | ManagementCommand::SetWiredHostLink { .. } => true,
         _ => false,
     }
 }
@@ -2842,7 +2876,7 @@ mod tests {
 
     fn management_request(command: ManagementCommand, request_id: u8) -> RuntimeInput<'static> {
         RuntimeInput::ManagementRequest {
-            destination: ManagementDestination::Wired,
+            destination: ManagementDestination::WiredHid,
             request: ManagementRequest {
                 request_id,
                 command,
@@ -3316,12 +3350,45 @@ mod tests {
         assert_eq!(management_status(&commands).pairing_host, Some(HostId(3)));
 
         runtime
+            .handle_event::<12, 12>(
+                BridgeEvent::HostConnected { host_id: HostId(3) },
+                &mut commands,
+            )
+            .unwrap();
+        runtime
+            .handle_event::<12, 12>(
+                BridgeEvent::HostSecurityChanged {
+                    host_id: HostId(3),
+                    encrypted: true,
+                    bonded: true,
+                    bond: None,
+                },
+                &mut commands,
+            )
+            .unwrap();
+
+        runtime
             .handle_input::<12, 12, 2>(
                 management_request(ManagementCommand::SelectHost(HostId(3)), 2),
                 &mut commands,
             )
             .unwrap();
-        assert_eq!(management_status(&commands).active_host, Some(HostId(3)));
+        assert_eq!(management_status(&commands).active_host, None);
+        assert_eq!(
+            runtime.pending_target_switch,
+            Some(PendingTargetSwitch {
+                target: HostId(3),
+                deadline_ms: 1_020,
+            })
+        );
+
+        runtime
+            .handle_input::<12, 12, 2>(RuntimeInput::Tick { now_ms: 1_100 }, &mut commands)
+            .unwrap();
+        assert_eq!(
+            runtime.bridge.state().hosts.active_target(),
+            Some(HostId(3))
+        );
 
         runtime
             .handle_input::<12, 12, 2>(
@@ -3414,6 +3481,7 @@ mod tests {
         let mut storage = StorageState::new(1);
         storage.presentation = crate::output_target::StoredPresentationConfig {
             output_target: crate::output_target::StoredOutputTarget::Wired,
+            wired_ble_host: None,
             mirror_target: Some(StoredMirrorTarget(
                 MirrorStableId::new(0x046d, 0xc547, None, 0x1122_3344, &[1]).unwrap(),
             )),
@@ -5147,6 +5215,70 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "dual-s3-wired")]
+    #[test]
+    fn button_intent_cycles_linked_wired_and_ble_routes_as_one_computer() {
+        let mut runtime = BridgeRuntime::<4, 1>::new(0);
+        let mut commands = heapless::Vec::<RuntimeCommand, 16>::new();
+        runtime
+            .handle_event::<16, 16>(
+                BridgeEvent::WiredAvailabilityChanged {
+                    availability: crate::output_target::OutputTargetAvailability::Ready,
+                },
+                &mut commands,
+            )
+            .unwrap();
+        for host_id in [HostId(1), HostId(2)] {
+            for event in [
+                BridgeEvent::HostConnected { host_id },
+                BridgeEvent::HostSecurityChanged {
+                    host_id,
+                    encrypted: true,
+                    bonded: true,
+                    bond: None,
+                },
+                BridgeEvent::CccdChanged {
+                    host_id,
+                    report: ReportKind::Keyboard,
+                    enabled: true,
+                },
+            ] {
+                runtime
+                    .handle_event::<16, 16>(event, &mut commands)
+                    .unwrap();
+            }
+        }
+        runtime
+            .handle_input::<16, 16, 2>(
+                management_request(
+                    ManagementCommand::SetWiredHostLink {
+                        ble_host: Some(HostId(1)),
+                    },
+                    1,
+                ),
+                &mut commands,
+            )
+            .unwrap();
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            RuntimeCommand::PersistStorage { state, .. }
+                if state.presentation.wired_ble_host.map(|slot| slot.get()) == Some(1)
+        )));
+
+        for expected in [OutputTarget::Ble(HostId(2)), OutputTarget::Wired] {
+            runtime
+                .handle_input::<16, 16, 2>(
+                    RuntimeInput::ButtonIntent {
+                        intent: ButtonIntent::NextConnectedTarget,
+                        now_ms: 100,
+                    },
+                    &mut commands,
+                )
+                .unwrap();
+            assert_eq!(runtime.bridge().state().output_target.selected, expected);
+        }
+    }
+
     fn attach_input_profile(
         runtime: &mut BridgeRuntime<2, 2>,
         device_id: DeviceId,
@@ -5697,6 +5829,34 @@ mod tests {
             .unwrap();
         assert!(disconnected.sequence > connected.sequence);
         assert_eq!(disconnected.connected_hosts, 0);
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    #[test]
+    fn wired_hid_response_precedes_a_usb_presentation_change_on_the_device_lane() {
+        let response = ManagementResponse {
+            request_id: 7,
+            result: ManagementResult::Ok,
+            payload: ManagementResponsePayload::Status(ManagementStatus::empty(4)),
+        };
+        let commands = [
+            RuntimeCommand::DeviceCommand(DeviceTaskCommand::ActivateFallback { operation_id: 9 }),
+            RuntimeCommand::ManagementResponse {
+                destination: ManagementDestination::WiredHid,
+                response,
+            },
+        ];
+        let mut queues = DefaultRuntimeCommandQueues::new();
+        queues.dispatch_from(&commands).unwrap();
+
+        assert_eq!(
+            queues.device.as_slice(),
+            &[
+                DeviceTaskCommand::ManagementResponse(response),
+                DeviceTaskCommand::ActivateFallback { operation_id: 9 },
+            ]
+        );
+        assert!(queues.status.is_empty());
     }
 
     #[test]

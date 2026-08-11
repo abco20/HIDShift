@@ -524,6 +524,8 @@ async fn startup_task(
         status_command_task(
             STATUS_COMMAND_CHANNEL.receiver(),
             BLE_CONTROL_COMMAND_CHANNEL.sender(),
+            #[cfg(feature = "dual-s3-wired")]
+            DEVICE_COMMAND_CHANNEL.sender(),
         ),
         "status-command",
     );
@@ -766,14 +768,25 @@ async fn status_command_task(
         BleTaskCommand,
         RUNTIME_BLE_CONTROL_COMMAND_QUEUE_CAPACITY,
     >,
+    #[cfg(feature = "dual-s3-wired")] device_sender: Sender<
+        'static,
+        CriticalSectionRawMutex,
+        DeviceTaskCommand,
+        RUNTIME_DEVICE_COMMAND_QUEUE_CAPACITY,
+    >,
 ) {
     log::info!("firmware: status command task boot");
     loop {
         let command = receiver.receive().await;
         if let Some(management) = command.management {
             match management.destination {
-                hidshift::ManagementDestination::Wired => {
+                hidshift::ManagementDestination::DebugSerial => {
                     print_wired_management_response(management.response);
+                }
+                hidshift::ManagementDestination::WiredHid => {
+                    // dual-S3 dispatch routes this directly to the Device lane
+                    // so a USB presentation change cannot overtake its reply.
+                    log::warn!("firmware: wired HID response reached status lane");
                 }
                 hidshift::ManagementDestination::Ble(host_id) => {
                     ble_sender
@@ -788,6 +801,9 @@ async fn status_command_task(
             let event = hidshift::ManagementEvent::StatusChanged {
                 sequence: command.snapshot.sequence as u16,
             };
+            wired_management::print_event(event);
+            #[cfg(feature = "dual-s3-wired")]
+            let _ = device_sender.try_send(DeviceTaskCommand::ManagementEvent(event));
             command.snapshot.for_each_connected_host(|host_id| {
                 let _ = ble_sender.try_send(BleTaskCommand::ManagementEvent { host_id, event });
             });

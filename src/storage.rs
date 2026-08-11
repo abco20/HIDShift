@@ -283,6 +283,60 @@ pub enum StorageTaskAction {
     QuiesceAndPersist { forced: bool },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuiescedPersistCompletionAction {
+    /// Let the runtime consume input again before sending anything to its
+    /// bounded queue. Otherwise a full queue creates a circular wait between
+    /// storage, the quiesced runtime, and the transport owner.
+    ReleaseQuiesce,
+    ReportStorageHealth(StorageHealth),
+    ReportFlashWrite {
+        success: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QuiescedPersistCompletion {
+    next_health: Option<StorageHealth>,
+    write_succeeded: bool,
+    phase: u8,
+}
+
+impl QuiescedPersistCompletion {
+    pub const fn new(next_health: Option<StorageHealth>, write_succeeded: bool) -> Self {
+        Self {
+            next_health,
+            write_succeeded,
+            phase: 0,
+        }
+    }
+}
+
+impl Iterator for QuiescedPersistCompletion {
+    type Item = QuiescedPersistCompletionAction;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let action = match self.phase {
+            0 => QuiescedPersistCompletionAction::ReleaseQuiesce,
+            1 => match self.next_health {
+                Some(health) => QuiescedPersistCompletionAction::ReportStorageHealth(health),
+                None => QuiescedPersistCompletionAction::ReportFlashWrite {
+                    success: self.write_succeeded,
+                },
+            },
+            2 if self.next_health.is_some() => QuiescedPersistCompletionAction::ReportFlashWrite {
+                success: self.write_succeeded,
+            },
+            _ => return None,
+        };
+        self.phase = self.phase.saturating_add(1);
+        if self.phase == 2 && self.next_health.is_none() {
+            self.phase = 3;
+        }
+        Some(action)
+    }
+}
+
 impl StoragePersistence {
     pub const fn new(normal_delay_ms: u64, lazy_delay_ms: u64) -> Self {
         Self {
@@ -492,6 +546,7 @@ pub fn encode_storage_image(state: &StorageState) -> Result<[u8; STORAGE_IMAGE_L
     #[cfg(feature = "dual-s3-wired")]
     {
         encode_output_target(state.presentation.output_target, &mut image[32..33]);
+        encode_wired_ble_host(state.presentation.wired_ble_host, &mut image[33..34]);
         encode_mirror_target(state.presentation.mirror_target, &mut image[40..64]);
     }
     for (index, profile) in state.input_profiles.profiles().iter().enumerate() {
@@ -559,6 +614,7 @@ pub fn decode_storage_image(image: &[u8]) -> Result<StorageState, StorageError> 
     {
         state.presentation = StoredPresentationConfig {
             output_target: decode_output_target(&image[32..33])?,
+            wired_ble_host: decode_wired_ble_host(&image[33..34])?,
             mirror_target: decode_mirror_target(&image[40..64])?,
         };
     }
@@ -600,6 +656,22 @@ fn decode_output_target(bytes: &[u8]) -> Result<StoredOutputTarget, StorageError
         ),
         _ => return Err(StorageError::InvalidOutputTarget),
     })
+}
+
+#[cfg(feature = "dual-s3-wired")]
+fn encode_wired_ble_host(host: Option<HostSlot>, out: &mut [u8]) {
+    out[0] = host.map_or(0, HostSlot::get);
+}
+
+#[cfg(feature = "dual-s3-wired")]
+fn decode_wired_ble_host(bytes: &[u8]) -> Result<Option<HostSlot>, StorageError> {
+    match bytes[0] {
+        0 => Ok(None),
+        slot @ 1..=4 => HostSlot::try_from(slot)
+            .map(Some)
+            .map_err(|_| StorageError::InvalidOutputTarget),
+        _ => Err(StorageError::InvalidOutputTarget),
+    }
 }
 
 #[cfg(feature = "dual-s3-wired")]
@@ -1307,6 +1379,7 @@ mod tests {
         let mut state = StorageState::new(43);
         state.presentation = StoredPresentationConfig {
             output_target: StoredOutputTarget::Ble(HostSlot::try_from(3).unwrap()),
+            wired_ble_host: Some(HostSlot::try_from(1).unwrap()),
             mirror_target: Some(StoredMirrorTarget(
                 crate::output_target::MirrorStableId::new(
                     0x046d,
@@ -1924,6 +1997,34 @@ mod tests {
         assert_eq!(
             policy.evaluate(&persistence, 3_000, 1),
             StorageTaskAction::QuiesceAndPersist { forced: true }
+        );
+    }
+
+    #[test]
+    fn quiesced_persist_completion_releases_runtime_before_reporting_success() {
+        let actions = QuiescedPersistCompletion::new(None, true).collect::<heapless::Vec<_, 3>>();
+
+        assert_eq!(
+            actions.as_slice(),
+            [
+                QuiescedPersistCompletionAction::ReleaseQuiesce,
+                QuiescedPersistCompletionAction::ReportFlashWrite { success: true },
+            ]
+        );
+    }
+
+    #[test]
+    fn quiesced_persist_completion_reports_health_only_after_release() {
+        let actions = QuiescedPersistCompletion::new(Some(StorageHealth::Degraded), false)
+            .collect::<heapless::Vec<_, 3>>();
+
+        assert_eq!(
+            actions.as_slice(),
+            [
+                QuiescedPersistCompletionAction::ReleaseQuiesce,
+                QuiescedPersistCompletionAction::ReportStorageHealth(StorageHealth::Degraded),
+                QuiescedPersistCompletionAction::ReportFlashWrite { success: false },
+            ]
         );
     }
 

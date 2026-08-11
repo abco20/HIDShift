@@ -146,6 +146,10 @@ button.icon-button { display: grid; width: 40px; padding: 0; place-items: center
 .row-copy { min-width: 0; flex: 1; }
 .row-copy strong { display: block; overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .row-copy small { display: block; margin-top: 3px; overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.route-icons { display: flex !important; flex-wrap: wrap; gap: 8px; white-space: normal !important; }
+.route-kind { display: inline-flex; align-items: center; gap: 3px; opacity: .55; }
+.route-kind.active { color: var(--accent); opacity: 1; }
+.route-kind svg { width: 12px; height: 12px; fill: none; stroke: currentColor; stroke-width: 1.8; }
 .row-meta { display: flex; flex: 0 0 auto; align-items: center; gap: 8px; color: var(--muted); font-size: 10px; }
 .state { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); }
 .state::before { width: 6px; height: 6px; border-radius: 50%; background: currentColor; content: ""; }

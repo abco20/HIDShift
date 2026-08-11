@@ -537,4 +537,17 @@ mod tests {
         profile.transform(&mut frame);
         assert!(frame.keyboard.unwrap().keys_down().is_empty());
     }
+
+    #[test]
+    fn shortcut_accepts_any_non_modifier_keyboard_usage() {
+        let id = InputProfileId::new(1).unwrap();
+        let mut profile = InputProfile::restored(id, identity(1), 0, InputSettings::DEFAULT);
+        profile.settings.target_switch_shortcut =
+            KeyboardShortcut::new(ModifierState::empty(), KeyUsage(0xa3)).unwrap();
+
+        let mut frame = shortcut_frame(ModifierState::empty(), &[0xa3]);
+
+        assert!(profile.capture_target_switch_shortcut(&mut frame));
+        assert!(frame.keyboard.unwrap().keys_down().is_empty());
+    }
 }

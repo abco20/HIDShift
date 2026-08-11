@@ -7,13 +7,23 @@ use crate::output_target::{OutputTarget, OutputTargetAvailability, UsbPresentati
 use crate::settings::{SettingId, SettingTarget};
 use crate::storage::StorageHealth;
 
-pub const MANAGEMENT_PROTOCOL_VERSION: u8 = 3;
+pub const MANAGEMENT_PROTOCOL_VERSION: u8 = 1;
 pub const MANAGEMENT_REQUEST_LEN: usize = 20;
 pub const MANAGEMENT_RESPONSE_LEN: usize = 20;
 pub const MANAGEMENT_EVENT_LEN: usize = 4;
+pub const MANAGEMENT_SERIAL_EVENT_PREFIX: &str = "@HIDSHIFT-EVENT:";
+pub const MANAGEMENT_HID_USAGE_PAGE: u16 = 0xff60;
+pub const MANAGEMENT_HID_USAGE: u16 = 0x0061;
+pub const MANAGEMENT_HID_REQUEST_REPORT_ID: u8 = 0x10;
+pub const MANAGEMENT_HID_RESPONSE_REPORT_ID: u8 = 0x11;
+pub const MANAGEMENT_HID_EVENT_REPORT_ID: u8 = 0x12;
+pub const MANAGEMENT_HID_REQUEST_PACKET_LEN: usize = MANAGEMENT_REQUEST_LEN + 1;
+pub const MANAGEMENT_HID_RESPONSE_PACKET_LEN: usize = MANAGEMENT_RESPONSE_LEN + 1;
+pub const MANAGEMENT_HID_EVENT_PACKET_LEN: usize = MANAGEMENT_EVENT_LEN + 1;
 pub const MANAGEMENT_HOST_NAME_LEN: usize = 12;
 pub const MANAGEMENT_CAPABILITY_DUAL_S3_WIRED: u8 = 1 << 0;
 pub const MANAGEMENT_CAPABILITY_COMPANION_EVENTS: u8 = 1 << 1;
+pub const MANAGEMENT_CAPABILITY_COMPUTER_TARGET_LINKS: u8 = 1 << 2;
 
 pub const MANAGEMENT_SERVICE_UUID: &str = "7f510000-1b15-4f0d-9f4b-5b6d4f3a0001";
 pub const MANAGEMENT_REQUEST_UUID: &str = "7f510001-1b15-4f0d-9f4b-5b6d4f3a0001";
@@ -45,6 +55,8 @@ const OP_GET_MIRROR_CANDIDATE: u8 = 0x11;
 const OP_SET_MIRROR_TARGET: u8 = 0x13;
 #[cfg(feature = "dual-s3-wired")]
 const OP_CLEAR_MIRROR_TARGET: u8 = 0x14;
+#[cfg(feature = "dual-s3-wired")]
+const OP_SET_WIRED_HOST_LINK: u8 = 0x15;
 
 const PAYLOAD_NONE: u8 = 0;
 const PAYLOAD_STATUS: u8 = 1;
@@ -154,6 +166,14 @@ impl ManagementRequest {
             ),
             #[cfg(feature = "dual-s3-wired")]
             (OP_CLEAR_MIRROR_TARGET, []) => ManagementCommand::ClearMirrorTarget,
+            #[cfg(feature = "dual-s3-wired")]
+            (OP_SET_WIRED_HOST_LINK, [host]) => ManagementCommand::SetWiredHostLink {
+                ble_host: match *host {
+                    0 => None,
+                    id @ 1..=4 => Some(HostId(id)),
+                    _ => return Err(ManagementProtocolError::InvalidArgument),
+                },
+            },
             (OP_GET_HISTORY, [index]) => ManagementCommand::GetHistory { index: *index },
             (OP_GET_SCHEMA, []) => ManagementCommand::GetSchema,
             (OP_GET_SETTING, [id_low, id_high, scope, target]) => ManagementCommand::GetSetting {
@@ -208,6 +228,7 @@ impl ManagementRequest {
                 | OP_GET_OUTPUT_TARGET_STATUS
                 | OP_GET_MIRROR_CANDIDATE
                 | OP_SET_MIRROR_TARGET
+                | OP_SET_WIRED_HOST_LINK
                 | OP_CLEAR_MIRROR_TARGET,
                 _,
             ) => {
@@ -275,6 +296,12 @@ impl ManagementRequest {
             }
             #[cfg(feature = "dual-s3-wired")]
             ManagementCommand::ClearMirrorTarget => bytes[2] = OP_CLEAR_MIRROR_TARGET,
+            #[cfg(feature = "dual-s3-wired")]
+            ManagementCommand::SetWiredHostLink { ble_host } => {
+                bytes[2] = OP_SET_WIRED_HOST_LINK;
+                bytes[3] = 1;
+                bytes[4] = ble_host.map_or(0, |host| host.0);
+            }
             ManagementCommand::GetHistory { index } => {
                 bytes[2] = OP_GET_HISTORY;
                 bytes[3] = 1;
@@ -354,6 +381,10 @@ pub enum ManagementCommand {
     SetMirrorTarget(crate::output_target::MirrorCandidateId),
     #[cfg(feature = "dual-s3-wired")]
     ClearMirrorTarget,
+    #[cfg(feature = "dual-s3-wired")]
+    SetWiredHostLink {
+        ble_host: Option<HostId>,
+    },
 }
 
 #[cfg(feature = "dual-s3-wired")]
@@ -400,7 +431,8 @@ impl From<OutputTarget> for ManagementOutputTarget {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ManagementDestination {
-    Wired,
+    WiredHid,
+    DebugSerial,
     Ble(HostId),
 }
 
@@ -1131,6 +1163,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn protocol_stays_at_initial_version_during_early_development() {
+        assert_eq!(MANAGEMENT_PROTOCOL_VERSION, 1);
+    }
+
+    #[test]
     fn every_request_round_trips_in_one_att_packet() {
         let name = ManagementHostName::from_ascii("Work laptop").unwrap();
         for command in [
@@ -1223,6 +1260,10 @@ mod tests {
             ManagementCommand::GetMirrorCandidate(crate::output_target::MirrorCandidateId(3)),
             ManagementCommand::SetMirrorTarget(crate::output_target::MirrorCandidateId(0)),
             ManagementCommand::ClearMirrorTarget,
+            ManagementCommand::SetWiredHostLink {
+                ble_host: Some(HostId(1)),
+            },
+            ManagementCommand::SetWiredHostLink { ble_host: None },
         ] {
             let request = ManagementRequest {
                 request_id: 19,

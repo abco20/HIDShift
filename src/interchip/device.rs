@@ -1,15 +1,19 @@
 use heapless::Vec;
 
+use crate::management::{ManagementEvent, ManagementRequest, ManagementResponse};
+
 use super::message::{
     ActivateProfile, CAPABILITY_CONTROL_FORWARDING, CAPABILITY_DYNAMIC_PROFILE,
     CAPABILITY_ENDPOINT_IN, CAPABILITY_ENDPOINT_OUT, CAPABILITY_FALLBACK_PROFILE,
-    CAPABILITY_PROFILE_FLASH_CACHE, CAPABILITY_STANDARD_WIRED_HID, CAPABILITY_USB_STATE_REPORTING,
-    MirrorControlRequest, MirrorControlResponse, ProfileBegin, ProfileChunk, ProfileChunkData,
-    ProfileResult, RECORD_ACTIVATE_PROFILE, RECORD_CONTROL_REQUEST, RECORD_CONTROL_RESPONSE,
-    RECORD_FORCE_FALLBACK, RECORD_HEARTBEAT, RECORD_HELLO, RECORD_HELLO_ACK, RECORD_LINK_RESET,
-    RECORD_PROFILE_BEGIN, RECORD_PROFILE_CHUNK, RECORD_PROFILE_COMMIT, RECORD_PROFILE_RESULT,
-    RECORD_RAW_ENDPOINT_IN, RECORD_RAW_ENDPOINT_OUT, RECORD_STANDARD_INPUT_REPORT,
-    RECORD_STANDARD_OUTPUT_REPORT, RECORD_STANDARD_RELEASE_ALL, RECORD_USB_STATE,
+    CAPABILITY_HID_MANAGEMENT, CAPABILITY_PROFILE_FLASH_CACHE, CAPABILITY_STANDARD_WIRED_HID,
+    CAPABILITY_USB_STATE_REPORTING, MirrorControlRequest, MirrorControlResponse, ProfileBegin,
+    ProfileChunk, ProfileChunkData, ProfileResult, RECORD_ACTIVATE_PROFILE, RECORD_CONTROL_REQUEST,
+    RECORD_CONTROL_RESPONSE, RECORD_FORCE_FALLBACK, RECORD_HEARTBEAT, RECORD_HELLO,
+    RECORD_HELLO_ACK, RECORD_LINK_RESET, RECORD_MANAGEMENT_EVENT, RECORD_MANAGEMENT_REQUEST,
+    RECORD_MANAGEMENT_RESPONSE, RECORD_PROFILE_BEGIN, RECORD_PROFILE_CHUNK, RECORD_PROFILE_COMMIT,
+    RECORD_PROFILE_RESULT, RECORD_RAW_ENDPOINT_IN, RECORD_RAW_ENDPOINT_OUT,
+    RECORD_STANDARD_INPUT_REPORT, RECORD_STANDARD_OUTPUT_REPORT, RECORD_STANDARD_RELEASE_ALL,
+    RECORD_USB_STATE,
 };
 use super::{
     ControlRequestFragment, ControlResponseAssembler, ControlResponseFragment, Hello,
@@ -18,8 +22,10 @@ use super::{
     SpiCell, StandardInputReport, StandardOutputReport, UsbState, encode_records,
 };
 
-const DEVICE_CAPABILITIES: u32 =
-    CAPABILITY_FALLBACK_PROFILE | CAPABILITY_STANDARD_WIRED_HID | CAPABILITY_USB_STATE_REPORTING;
+const DEVICE_CAPABILITIES: u32 = CAPABILITY_FALLBACK_PROFILE
+    | CAPABILITY_STANDARD_WIRED_HID
+    | CAPABILITY_USB_STATE_REPORTING
+    | CAPABILITY_HID_MANAGEMENT;
 const RETRANSMIT_TIMEOUT_MS: u64 = 5;
 const MAX_RETRANSMIT_ATTEMPTS: u8 = 8;
 
@@ -34,6 +40,8 @@ pub enum DeviceLinkEvent {
     ProfileCommit { transfer_id: u32 },
     RawEndpointIn(RawEndpointReport),
     ControlResponse(MirrorControlResponse),
+    ManagementResponse(ManagementResponse),
+    ManagementEvent(ManagementEvent),
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -60,6 +68,7 @@ pub struct DeviceLink {
     active_profile_hash: u32,
     control_request_tx: Option<(MirrorControlRequest, u16)>,
     control_response_assembler: ControlResponseAssembler,
+    management_request_tx: Option<ManagementRequest>,
 }
 
 impl DeviceLink {
@@ -103,6 +112,7 @@ impl DeviceLink {
             active_profile_hash,
             control_request_tx: None,
             control_response_assembler: ControlResponseAssembler::new(),
+            management_request_tx: None,
         };
         link.next_cell = link.queue_hello(0);
         link
@@ -162,6 +172,16 @@ impl DeviceLink {
         self.next_cell.is_some()
     }
 
+    pub fn queue_management_request(&mut self, request: ManagementRequest, now_ms: u64) -> bool {
+        if !self.host_compatible || self.next_cell.is_some() || self.management_request_tx.is_some()
+        {
+            return false;
+        }
+        self.management_request_tx = Some(request);
+        self.next_cell = self.queue_pending_management_request(now_ms);
+        self.next_cell.is_some()
+    }
+
     pub fn next_transaction(&mut self, now_ms: u64) -> [u8; SPI_CELL_LEN] {
         self.sender
             .set_cumulative_ack(self.receiver.cumulative_ack());
@@ -169,6 +189,7 @@ impl DeviceLink {
             .next_cell
             .take()
             .or_else(|| self.queue_next_control_request_fragment(now_ms))
+            .or_else(|| self.queue_pending_management_request(now_ms))
             .or_else(|| self.queue_dirty_usb_state(now_ms))
             .or_else(|| {
                 match self.sender.poll_retransmit(
@@ -218,6 +239,7 @@ impl DeviceLink {
             self.host_compatible = false;
             self.control_request_tx = None;
             self.control_response_assembler.reset();
+            self.management_request_tx = None;
             if !contains_compatible_host_hello(&cell) {
                 self.receiver.reset_session(cell.header.session_id);
                 return;
@@ -263,6 +285,7 @@ impl DeviceLink {
                     self.usb_state_dirty = true;
                     self.control_request_tx = None;
                     self.control_response_assembler.reset();
+                    self.management_request_tx = None;
                     self.next_cell = self.queue_hello(now_ms);
                 }
                 RECORD_FORCE_FALLBACK => {
@@ -356,6 +379,22 @@ impl DeviceLink {
                         self.mark_malformed();
                     }
                 }
+                RECORD_MANAGEMENT_RESPONSE if self.host_compatible => {
+                    match ManagementResponse::decode(record.data) {
+                        Ok(response) => {
+                            self.push_event(events, DeviceLinkEvent::ManagementResponse(response))
+                        }
+                        Err(_) => self.mark_malformed(),
+                    }
+                }
+                RECORD_MANAGEMENT_EVENT if self.host_compatible => {
+                    match ManagementEvent::decode(record.data) {
+                        Ok(event) => {
+                            self.push_event(events, DeviceLinkEvent::ManagementEvent(event))
+                        }
+                        Err(_) => self.mark_malformed(),
+                    }
+                }
                 _ => {}
             }
         }
@@ -434,6 +473,13 @@ impl DeviceLink {
         Some(cell)
     }
 
+    fn queue_pending_management_request(&mut self, now_ms: u64) -> Option<SpiCell> {
+        let request = self.management_request_tx?;
+        let cell = self.queue_record(RECORD_MANAGEMENT_REQUEST, &request.encode(), now_ms)?;
+        self.management_request_tx = None;
+        Some(cell)
+    }
+
     fn queue_record(&mut self, record_type: u8, data: &[u8], now_ms: u64) -> Option<SpiCell> {
         self.queue_records(
             &[Record {
@@ -487,6 +533,7 @@ const fn nonzero_session(value: u32) -> u32 {
 mod tests {
     use super::*;
     use crate::interchip::SPI_TX_WINDOW;
+    use crate::management::{ManagementResponsePayload, ManagementResult, ManagementStatus};
     use crate::reports::{Keyboard6KroReport, StandardHidReport};
 
     fn fallback_state() -> UsbState {
@@ -516,6 +563,63 @@ mod tests {
             .unwrap()
             .encode()
             .unwrap()
+    }
+
+    #[test]
+    fn management_request_response_and_event_cross_the_device_link_without_serial_framing() {
+        let mut device = DeviceLink::new(2, fallback_state());
+        let mut host = ReliableSender::new(9);
+        let hello = Hello {
+            role: InterchipRole::Host,
+            protocol_version: SPI_PROTOCOL_VERSION,
+            firmware_major: 0,
+            firmware_minor: 2,
+            capabilities: CAPABILITY_HID_MANAGEMENT,
+            active_profile_hash: 0,
+        };
+        let mut events = Vec::<DeviceLinkEvent, 4>::new();
+        device.handle_transaction(
+            &host_cell(&mut host, RECORD_HELLO, &hello.encode()),
+            1,
+            &mut events,
+        );
+        let _ = device.next_transaction(1);
+
+        let request = ManagementRequest {
+            request_id: 7,
+            command: crate::management::ManagementCommand::GetStatus,
+        };
+        assert!(device.queue_management_request(request, 2));
+        let request_cell = SpiCell::decode(&device.next_transaction(2)).unwrap();
+        let mut records = RecordIter::new(request_cell.payload(), request_cell.header.record_count);
+        let record = records.next().unwrap().unwrap();
+        assert_eq!(record.record_type, RECORD_MANAGEMENT_REQUEST);
+        assert_eq!(ManagementRequest::decode(record.data), Ok(request));
+        assert!(records.finish().is_ok());
+
+        let response = ManagementResponse {
+            request_id: 7,
+            result: ManagementResult::Ok,
+            payload: ManagementResponsePayload::Status(ManagementStatus::empty(4)),
+        };
+        device.handle_transaction(
+            &host_cell(&mut host, RECORD_MANAGEMENT_RESPONSE, &response.encode()),
+            3,
+            &mut events,
+        );
+        let event = ManagementEvent::StatusChanged { sequence: 11 };
+        device.handle_transaction(
+            &host_cell(&mut host, RECORD_MANAGEMENT_EVENT, &event.encode()),
+            4,
+            &mut events,
+        );
+        assert_eq!(
+            events.as_slice(),
+            &[
+                DeviceLinkEvent::ManagementResponse(response),
+                DeviceLinkEvent::ManagementEvent(event),
+            ]
+        );
     }
 
     #[test]

@@ -5,5 +5,8 @@ edition = "2024"
 rust-version = "1.95"
 publish = false
 
+[features]
+debug-serial = []
+
 [dependencies]
 hidshift = { path = "../..", features = ["dual-s3-wired"] }

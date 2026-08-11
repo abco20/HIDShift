@@ -6,18 +6,34 @@ rust-version = "1.95"
 publish = false
 description = "Desktop manager and switch notification service for HIDShift"
 
+[features]
+# Keep release binaries self-contained even when they are built with Cargo
+# directly instead of through the Tauri CLI.
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
 btleplug = "0.12"
 futures-util = "0.3"
+# Native discovery distinguishes the local USB HID route from BLE HID devices.
+hidapi = { version = "2.6.6", default-features = false, features = ["linux-native-basic-udev", "macos-shared-device", "windows-native"] }
 hidshift = { path = "../..", features = ["dual-s3-wired"] }
 hidshift-client = { path = "../../tools/hidshift-client" }
+hidshift-manager-ui = { path = "../../manager-ui" }
+# The OS hostname labels and initializes this computer's BLE destination.
+hostname = "0.4.2"
 serde = { version = "1", features = ["derive"] }
-serialport = "4"
+serde_json = "1"
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-autostart = "2"
 tauri-plugin-notification = "2"
 tokio = { version = "1", features = ["macros", "sync", "time"] }
 uuid = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# GNOME associates notifications with their D-Bus sender, so the Companion
+# owns one session-bus connection instead of using one-shot notification calls.
+zbus = "5"

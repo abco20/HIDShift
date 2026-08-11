@@ -34,24 +34,5 @@ espflash flash \
   --target-app-partition ota_0 \
   target/xtensa-esp32s3-none-elf/release/firmware
 
-cargo build --locked --release --manifest-path tools/hidshiftctl/Cargo.toml
-ctl="$repo_root/tools/hidshiftctl/target/release/hidshiftctl"
-
-wait_for_management() {
-  local attempt
-  for attempt in 1 2 3; do
-    if "$ctl" --serial "$dut_port" --json status; then
-      return 0
-    fi
-    echo "management endpoint not ready (attempt $attempt/3)" >&2
-    sleep 1
-  done
-  return 1
-}
-
-# espflash returns as soon as the image has been written. Depending on the
-# serial adapter, the first request can race the application boot and be lost
-# before UART0 is listening, so establish readiness with an idempotent query.
-wait_for_management
-"$ctl" --serial "$dut_port" --json input list
-"$ctl" --serial "$dut_port" --json support status
+cargo run --locked --release --manifest-path e2e/runner/Cargo.toml \
+  --bin serial_management_smoke -- "$dut_port"

@@ -37,10 +37,10 @@ Actions occur when GPIO0 is released.
 
 ## Management
 
-The device can be managed over BLE or USB serial:
+The device can be managed over BLE or USB HID:
 
 - `tools/hidshiftctl`: command-line interface
-- `web`: Web Bluetooth / Web Serial interface
+- `web`: Web Bluetooth / WebHID interface
 
 ```sh
 cargo run --release --manifest-path tools/hidshiftctl/Cargo.toml -- status

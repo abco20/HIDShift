@@ -2,7 +2,7 @@
 
 | Task | Hardware | Purpose |
 | --- | --- | --- |
-| `HIDSHIFT_DUT_PORT=<path> mise run e2e:pc` | one DUT + Linux PC | cable management, CLI JSON, input/status/diagnostics smoke |
+| `HIDSHIFT_DUT_PORT=<path> mise run e2e:pc` | one DUT + Linux PC | debug-UART management input/status/diagnostics smoke |
 | `mise run e2e:linux` | one DUT + Linux PC | primary BLE input, user-observed latency, firmware latency, and stability |
 | `mise run e2e:radio` | DUT + Probe + Linux PC | optional direct-air latency and retained two-host session |
 | `mise run e2e:dual` | Host S3 + Device S3 + Linux PC | Wired presentation, exact descriptors, SPI loss and recovery |

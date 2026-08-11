@@ -1,4 +1,7 @@
-use hidshift::management::{MANAGEMENT_REQUEST_LEN, ManagementRequest, ManagementResponse};
+use hidshift::management::{
+    MANAGEMENT_REQUEST_LEN, MANAGEMENT_SERIAL_EVENT_PREFIX, ManagementEvent, ManagementRequest,
+    ManagementResponse,
+};
 
 pub const REQUEST_PREFIX: &[u8] = b"@HIDSHIFT:";
 pub const REQUEST_LINE_LEN: usize = REQUEST_PREFIX.len() + MANAGEMENT_REQUEST_LEN * 2;
@@ -41,6 +44,18 @@ pub fn print_response(response: ManagementResponse) {
         bytes[17],
         bytes[18],
         bytes[19]
+    );
+}
+
+pub fn print_event(event: ManagementEvent) {
+    let bytes = event.encode();
+    esp_println::println!(
+        "{}{:02x}{:02x}{:02x}{:02x}",
+        MANAGEMENT_SERIAL_EVENT_PREFIX,
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3]
     );
 }
 

@@ -1,26 +1,40 @@
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use gloo_timers::future::TimeoutFuture;
 use hidshift::{
-    MANAGEMENT_EVENT_LEN, MANAGEMENT_EVENT_UUID, MANAGEMENT_REQUEST_UUID, MANAGEMENT_RESPONSE_LEN,
-    MANAGEMENT_RESPONSE_UUID, MANAGEMENT_SERVICE_UUID,
+    MANAGEMENT_EVENT_LEN, MANAGEMENT_EVENT_UUID, MANAGEMENT_HID_REQUEST_REPORT_ID,
+    MANAGEMENT_HID_USAGE, MANAGEMENT_HID_USAGE_PAGE, MANAGEMENT_REQUEST_UUID,
+    MANAGEMENT_RESPONSE_LEN, MANAGEMENT_RESPONSE_UUID, MANAGEMENT_SERVICE_UUID,
 };
-use hidshift_client::{PendingRequest, SerialResponseDecoder, encode_serial_request};
+use hidshift_client::{HidManagementFrame, PendingRequest, decode_hid_input, encode_hid_request};
 use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
-use wasm_bindgen_futures::{JsFuture, spawn_local};
+use wasm_bindgen_futures::JsFuture;
 use web_sys::{Event, EventTarget};
 
 type BytesCallback = Rc<dyn Fn(&[u8])>;
 type DisconnectCallback = Rc<dyn Fn(String)>;
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct NativeCompanionSnapshot {
+    pub revision: u64,
+    pub device_revision: u64,
+    pub connected: bool,
+    pub connection_label: String,
+    pub computer_name: String,
+    pub local_ble_host: Option<u8>,
+    pub local_wired: bool,
+    pub notifications_enabled: bool,
+    pub notification_prompt_seen: bool,
+    pub autostart_enabled: bool,
+}
+
 pub enum BrowserTransport {
     Tauri(TauriTransport),
     Bluetooth(BluetoothTransport),
-    Serial(SerialTransport),
+    Hid(HidTransport),
 }
 
 impl BrowserTransport {
@@ -39,17 +53,18 @@ impl BrowserTransport {
         )))
     }
 
-    pub async fn connect_serial(
+    pub async fn connect_hid(
         on_bytes: BytesCallback,
         on_disconnect: DisconnectCallback,
+        on_event: BytesCallback,
     ) -> Result<Rc<Self>, String> {
         if tauri_invoke().is_some() {
             return Ok(Rc::new(Self::Tauri(
                 TauriTransport::connect(on_bytes).await?,
             )));
         }
-        Ok(Rc::new(Self::Serial(
-            SerialTransport::connect(on_bytes, on_disconnect).await?,
+        Ok(Rc::new(Self::Hid(
+            HidTransport::connect(on_bytes, on_disconnect, on_event).await?,
         )))
     }
 
@@ -57,7 +72,7 @@ impl BrowserTransport {
         match self {
             Self::Tauri(transport) => transport.write(request).await,
             Self::Bluetooth(transport) => transport.write(request).await,
-            Self::Serial(transport) => transport.write(request).await,
+            Self::Hid(transport) => transport.write(request).await,
         }
     }
 
@@ -65,12 +80,8 @@ impl BrowserTransport {
         match self {
             Self::Tauri(transport) => transport.label.clone(),
             Self::Bluetooth(_) => "Bluetooth · HIDShift".into(),
-            Self::Serial(_) => "有線 · Serial".into(),
+            Self::Hid(_) => "有線 · HID".into(),
         }
-    }
-
-    pub fn requires_readiness_probe(&self) -> bool {
-        matches!(self, Self::Serial(_))
     }
 }
 
@@ -115,17 +126,94 @@ pub(crate) fn is_tauri() -> bool {
     tauri_invoke().is_some()
 }
 
-pub(crate) async fn companion_onboarding(enable_autostart: bool) -> Result<(), String> {
-    tauri_call("request_notification_permission", &Object::new()).await?;
+pub(crate) async fn native_snapshot() -> Result<NativeCompanionSnapshot, String> {
+    let value = tauri_call("companion_snapshot", &Object::new()).await?;
+    parse_native_snapshot(&value)
+}
+
+pub(crate) async fn set_native_notifications(
+    enabled: bool,
+) -> Result<NativeCompanionSnapshot, String> {
     let args = Object::new();
-    Reflect::set(
-        &args,
-        &"enabled".into(),
-        &JsValue::from_bool(enable_autostart),
-    )
-    .map_err(js_error)?;
-    tauri_call("set_autostart", &args).await?;
+    Reflect::set(&args, &"enabled".into(), &JsValue::from_bool(enabled)).map_err(js_error)?;
+    let value = tauri_call("set_notifications_enabled", &args).await?;
+    parse_native_snapshot(&value)
+}
+
+pub(crate) async fn set_native_autostart(enabled: bool) -> Result<(), String> {
+    let args = Object::new();
+    Reflect::set(&args, &"enabled".into(), &JsValue::from_bool(enabled)).map_err(js_error)?;
+    tauri_call("set_autostart", &args).await.map(|_| ())
+}
+
+pub(crate) async fn listen_native_snapshots(
+    callback: Rc<dyn Fn(NativeCompanionSnapshot)>,
+) -> Result<(), String> {
+    let window: JsValue = web_sys::window().ok_or("window is unavailable")?.into();
+    let internals = Reflect::get(&window, &"__TAURI_INTERNALS__".into()).map_err(js_error)?;
+    let transform: Function = Reflect::get(&internals, &"transformCallback".into())
+        .map_err(js_error)?
+        .dyn_into()
+        .map_err(|_| "Tauri transformCallback is unavailable")?;
+    let closure = Closure::wrap(Box::new(move |event: JsValue| {
+        let payload = Reflect::get(&event, &"payload".into()).unwrap_or(JsValue::UNDEFINED);
+        if let Ok(snapshot) = parse_native_snapshot(&payload) {
+            callback(snapshot);
+        }
+    }) as Box<dyn FnMut(JsValue)>);
+    let handler = transform
+        .call2(
+            &JsValue::UNDEFINED,
+            closure.as_ref().unchecked_ref(),
+            &JsValue::FALSE,
+        )
+        .map_err(js_error)?;
+    let args = Object::new();
+    Reflect::set(&args, &"event".into(), &"hidshift://companion-state".into()).map_err(js_error)?;
+    let target = Object::new();
+    Reflect::set(&target, &"kind".into(), &"Any".into()).map_err(js_error)?;
+    Reflect::set(&args, &"target".into(), &target).map_err(js_error)?;
+    Reflect::set(&args, &"handler".into(), &handler).map_err(js_error)?;
+    tauri_call("plugin:event|listen", &args).await?;
+    // App owns the listener for the full WebView lifetime.
+    closure.forget();
     Ok(())
+}
+
+fn parse_native_snapshot(value: &JsValue) -> Result<NativeCompanionSnapshot, String> {
+    let string = |name: &str| {
+        Reflect::get(value, &name.into())
+            .map_err(js_error)?
+            .as_string()
+            .ok_or_else(|| format!("missing native snapshot field {name}"))
+    };
+    let boolean = |name: &str| {
+        Reflect::get(value, &name.into())
+            .map_err(js_error)?
+            .as_bool()
+            .ok_or_else(|| format!("missing native snapshot field {name}"))
+    };
+    let number = |name: &str| {
+        Reflect::get(value, &name.into())
+            .map_err(js_error)?
+            .as_f64()
+            .map(|number| number as u64)
+            .ok_or_else(|| format!("missing native snapshot field {name}"))
+    };
+    let kind = string("connection_kind")?;
+    let local_ble = Reflect::get(value, &"local_ble_host".into()).map_err(js_error)?;
+    Ok(NativeCompanionSnapshot {
+        revision: number("revision")?,
+        device_revision: number("device_revision")?,
+        connected: kind != "searching",
+        connection_label: string("connection_label")?,
+        computer_name: string("computer_name")?,
+        local_ble_host: local_ble.as_f64().map(|value| value as u8),
+        local_wired: boolean("local_wired")?,
+        notifications_enabled: boolean("notifications_enabled")?,
+        notification_prompt_seen: boolean("notification_prompt_seen")?,
+        autostart_enabled: boolean("autostart_enabled")?,
+    })
 }
 
 async fn tauri_call(command: &str, args: &Object) -> Result<JsValue, String> {
@@ -297,78 +385,117 @@ impl BluetoothTransport {
     }
 }
 
-pub struct SerialTransport {
-    writer: JsValue,
+pub struct HidTransport {
+    device: JsValue,
+    _input_report: Closure<dyn FnMut(Event)>,
+    _disconnect: Closure<dyn FnMut(Event)>,
 }
 
-impl SerialTransport {
+impl HidTransport {
     async fn connect(
         on_bytes: BytesCallback,
         on_disconnect: DisconnectCallback,
+        on_event: BytesCallback,
     ) -> Result<Self, String> {
         let navigator = web_sys::window()
             .ok_or("window is unavailable")?
             .navigator();
-        let serial = Reflect::get(&navigator, &"serial".into()).map_err(js_error)?;
-        if serial.is_undefined() {
-            return Err("このブラウザは Web Serial に対応していません".into());
+        let hid = Reflect::get(&navigator, &"hid".into()).map_err(js_error)?;
+        if hid.is_undefined() {
+            return Err("このブラウザはWebHIDに対応していません".into());
         }
-        let request_options = Object::new();
-        let port = await_method(&serial, "requestPort", &[request_options.into()]).await?;
+        let filter = Object::new();
+        Reflect::set(
+            &filter,
+            &"vendorId".into(),
+            &JsValue::from_f64(f64::from(hidshift::fallback::FALLBACK_USB_VENDOR_ID)),
+        )
+        .map_err(js_error)?;
+        Reflect::set(
+            &filter,
+            &"productId".into(),
+            &JsValue::from_f64(f64::from(hidshift::fallback::FALLBACK_USB_PRODUCT_ID)),
+        )
+        .map_err(js_error)?;
+        Reflect::set(
+            &filter,
+            &"usagePage".into(),
+            &JsValue::from_f64(f64::from(MANAGEMENT_HID_USAGE_PAGE)),
+        )
+        .map_err(js_error)?;
+        Reflect::set(
+            &filter,
+            &"usage".into(),
+            &JsValue::from_f64(f64::from(MANAGEMENT_HID_USAGE)),
+        )
+        .map_err(js_error)?;
+        let filters = Array::new();
+        filters.push(&filter);
         let options = Object::new();
-        Reflect::set(&options, &"baudRate".into(), &JsValue::from_f64(115_200.0))
-            .map_err(js_error)?;
-        await_method(&port, "open", &[options.into()]).await?;
-        let signals = Object::new();
-        Reflect::set(&signals, &"dataTerminalReady".into(), &JsValue::FALSE).map_err(js_error)?;
-        Reflect::set(&signals, &"requestToSend".into(), &JsValue::FALSE).map_err(js_error)?;
-        // CH340 adapters may reset the DUT when the browser opens the port.
-        // Deassert both modem-control signals when supported; readiness probes
-        // below still cover adapters or browsers that ignore this request.
-        let _ = await_method(&port, "setSignals", &[signals.into()]).await;
-        let writable = Reflect::get(&port, &"writable".into()).map_err(js_error)?;
-        let writer = call_method(&writable, "getWriter", &[])?;
-        let readable = Reflect::get(&port, &"readable".into()).map_err(js_error)?;
-        let reader = call_method(&readable, "getReader", &[])?;
+        Reflect::set(&options, &"filters".into(), &filters).map_err(js_error)?;
+        let devices = Array::from(&await_method(&hid, "requestDevice", &[options.into()]).await?);
+        let device = devices.get(0);
+        if device.is_undefined() {
+            return Err("HIDShiftが選択されませんでした".into());
+        }
+        await_method(&device, "open", &[]).await?;
 
-        spawn_local(read_serial(reader, on_bytes, on_disconnect));
-        Ok(Self { writer })
+        let device_target: EventTarget = device
+            .clone()
+            .dyn_into()
+            .map_err(|_| "HID device is not an EventTarget")?;
+        let input_report =
+            Closure::wrap(Box::new(move |event: Event| match hid_event_frame(&event) {
+                Some(HidManagementFrame::Response(response)) => on_bytes(&response),
+                Some(HidManagementFrame::Event(event)) => on_event(&event),
+                None => {}
+            }) as Box<dyn FnMut(Event)>);
+        device_target
+            .add_event_listener_with_callback("inputreport", input_report.as_ref().unchecked_ref())
+            .map_err(js_error)?;
+
+        let disconnected_device = device.clone();
+        let disconnect = Closure::wrap(Box::new(move |event: Event| {
+            let event_device = Reflect::get(&event, &"device".into()).unwrap_or_default();
+            if Object::is(&event_device, &disconnected_device) {
+                on_disconnect("USB HID接続が切れました".into());
+            }
+        }) as Box<dyn FnMut(Event)>);
+        let hid_target: EventTarget = hid
+            .dyn_into()
+            .map_err(|_| "WebHID manager is not an EventTarget")?;
+        hid_target
+            .add_event_listener_with_callback("disconnect", disconnect.as_ref().unchecked_ref())
+            .map_err(js_error)?;
+
+        Ok(Self {
+            device,
+            _input_report: input_report,
+            _disconnect: disconnect,
+        })
     }
 
     async fn write(&self, request: PendingRequest) -> Result<(), String> {
-        let line = encode_serial_request(request);
-        let bytes = Uint8Array::from(line.as_slice());
-        await_method(&self.writer, "write", &[bytes.into()]).await?;
+        let packet = encode_hid_request(request);
+        let bytes = Uint8Array::from(&packet[1..]);
+        await_method(
+            &self.device,
+            "sendReport",
+            &[
+                JsValue::from_f64(f64::from(MANAGEMENT_HID_REQUEST_REPORT_ID)),
+                bytes.into(),
+            ],
+        )
+        .await?;
         Ok(())
     }
 }
 
-async fn read_serial(reader: JsValue, on_bytes: BytesCallback, on_disconnect: DisconnectCallback) {
-    let decoder = Rc::new(RefCell::new(SerialResponseDecoder::default()));
-    loop {
-        let result = match await_method(&reader, "read", &[]).await {
-            Ok(result) => result,
-            Err(error) => {
-                on_disconnect(error);
-                return;
-            }
-        };
-        let done = Reflect::get(&result, &"done".into())
-            .ok()
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
-        if done {
-            on_disconnect("有線接続が切れました".into());
-            return;
-        }
-        let Ok(value) = Reflect::get(&result, &"value".into()) else {
-            continue;
-        };
-        let bytes = Uint8Array::new(&value).to_vec();
-        for response in decoder.borrow_mut().push(&bytes) {
-            on_bytes(&response);
-        }
-    }
+fn hid_event_frame(event: &Event) -> Option<HidManagementFrame> {
+    let report_id = Reflect::get(event, &"reportId".into()).ok()?.as_f64()? as u8;
+    let value = Reflect::get(event, &"data".into()).ok()?;
+    let bytes = data_view_bytes(&value)?;
+    decode_hid_input(report_id, &bytes)
 }
 
 fn bluetooth_event_bytes(event: &Event) -> Option<Vec<u8>> {
@@ -378,12 +505,14 @@ fn bluetooth_event_bytes(event: &Event) -> Option<Vec<u8>> {
 }
 
 fn bluetooth_value_bytes(value: &JsValue) -> Option<Vec<u8>> {
+    let bytes = data_view_bytes(value)?;
+    (bytes.len() == MANAGEMENT_RESPONSE_LEN).then_some(bytes)
+}
+
+fn data_view_bytes(value: &JsValue) -> Option<Vec<u8>> {
     let buffer = Reflect::get(value, &"buffer".into()).ok()?;
     let offset = Reflect::get(value, &"byteOffset".into()).ok()?.as_f64()? as u32;
     let length = Reflect::get(value, &"byteLength".into()).ok()?.as_f64()? as u32;
-    if length as usize != MANAGEMENT_RESPONSE_LEN {
-        return None;
-    }
     Some(Uint8Array::new_with_byte_offset_and_length(&buffer, offset, length).to_vec())
 }
 

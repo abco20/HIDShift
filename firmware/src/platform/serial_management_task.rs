@@ -178,7 +178,7 @@ pub async fn serial_management_task(
         if let Some(request) = crate::wired_management::decode_request_line(line) {
             sender
                 .send(RuntimeInputMessage::ManagementRequest {
-                    destination: ManagementDestination::Wired,
+                    destination: ManagementDestination::DebugSerial,
                     request,
                     now_ms: Instant::now().as_millis(),
                 })

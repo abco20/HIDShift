@@ -67,9 +67,9 @@ pub use ble::{
     cccd_notify_enabled,
 };
 pub use ble_connection::{
-    BLE_PAIRING_BACKOFF_STEPS_MS, BleConnectionEntry, BleConnectionParameters, BleConnectionSlot,
-    BleConnectionSlotError, BleConnectionSlots, BleConnectionTiming, BleInputGate,
-    BlePairingBackoff, BlePairingBackoffEntry, BlePeerIdentity, BlePhyPreference,
+    BLE_PAIRING_BACKOFF_STEPS_MS, BleBondRevocations, BleConnectionEntry, BleConnectionParameters,
+    BleConnectionSlot, BleConnectionSlotError, BleConnectionSlots, BleConnectionTiming,
+    BleInputGate, BlePairingBackoff, BlePairingBackoffEntry, BlePeerIdentity,
     connection_timing_update_required, low_latency_ble_connection_timing,
     resolve_host_id as resolve_ble_host_id, restrict_advertising_to_bonded_peers,
 };
@@ -115,8 +115,12 @@ pub use management::frame::{
 };
 pub use management::{
     MANAGEMENT_CAPABILITY_COMPANION_EVENTS, MANAGEMENT_EVENT_LEN, MANAGEMENT_EVENT_UUID,
-    MANAGEMENT_PROTOCOL_VERSION, MANAGEMENT_REQUEST_LEN, MANAGEMENT_REQUEST_UUID,
-    MANAGEMENT_RESPONSE_LEN, MANAGEMENT_RESPONSE_UUID, MANAGEMENT_SERVICE_UUID,
+    MANAGEMENT_HID_EVENT_PACKET_LEN, MANAGEMENT_HID_EVENT_REPORT_ID,
+    MANAGEMENT_HID_REQUEST_PACKET_LEN, MANAGEMENT_HID_REQUEST_REPORT_ID,
+    MANAGEMENT_HID_RESPONSE_PACKET_LEN, MANAGEMENT_HID_RESPONSE_REPORT_ID, MANAGEMENT_HID_USAGE,
+    MANAGEMENT_HID_USAGE_PAGE, MANAGEMENT_HOST_NAME_LEN, MANAGEMENT_PROTOCOL_VERSION,
+    MANAGEMENT_REQUEST_LEN, MANAGEMENT_REQUEST_UUID, MANAGEMENT_RESPONSE_LEN,
+    MANAGEMENT_RESPONSE_UUID, MANAGEMENT_SERIAL_EVENT_PREFIX, MANAGEMENT_SERVICE_UUID,
     ManagementClientSession, ManagementCommand, ManagementDestination, ManagementDiagnostics,
     ManagementEvent, ManagementHistoryEvent, ManagementHostInfo, ManagementHostName,
     ManagementHostStatus, ManagementHostTiming, ManagementProtocolError, ManagementRequest,
@@ -125,8 +129,9 @@ pub use management::{
 };
 #[cfg(feature = "dual-s3-wired")]
 pub use management::{
-    MANAGEMENT_CAPABILITY_DUAL_S3_WIRED, ManagementMirrorCandidate, ManagementOutputTarget,
-    ManagementOutputTargetStatus, ManagementUsbPresentationKind,
+    MANAGEMENT_CAPABILITY_COMPUTER_TARGET_LINKS, MANAGEMENT_CAPABILITY_DUAL_S3_WIRED,
+    ManagementMirrorCandidate, ManagementOutputTarget, ManagementOutputTargetStatus,
+    ManagementUsbPresentationKind,
 };
 #[cfg(feature = "dual-s3-wired")]
 pub use mirror::{

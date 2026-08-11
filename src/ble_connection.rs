@@ -48,20 +48,12 @@ pub const fn restrict_advertising_to_bonded_peers(
     bonded_peer_count != 0 && !pairing_open
 }
 
-/// Stack-independent timing policy for interactive BLE HID links.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BlePhyPreference {
-    Le1M,
-    Le2M,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BleConnectionTiming {
     pub interval_min_us: u32,
     pub interval_max_us: u32,
     pub peripheral_latency: u16,
     pub supervision_timeout_ms: u32,
-    pub preferred_phy: BlePhyPreference,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,7 +72,6 @@ pub const fn low_latency_ble_connection_timing() -> BleConnectionTiming {
         interval_max_us: 7_500,
         peripheral_latency: 19,
         supervision_timeout_ms: 4_000,
-        preferred_phy: BlePhyPreference::Le2M,
     }
 }
 
@@ -137,6 +128,53 @@ impl BlePeerIdentity {
             (Some(irk), Some(other_irk)) if irk == other_irk => true,
             _ => self.peer_address == other.peer_address,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BleBondRevocations<const HOSTS: usize> {
+    bonds: [Option<StoredBond>; HOSTS],
+}
+
+impl<const HOSTS: usize> BleBondRevocations<HOSTS> {
+    pub const fn new() -> Self {
+        Self {
+            bonds: [None; HOSTS],
+        }
+    }
+
+    /// Blocks a removed bond until the live BLE stack is rebuilt from the
+    /// updated storage snapshot. Mutating trouble-host's bond table while its
+    /// runner is active can overlap an internal `RefCell` borrow and panic.
+    pub fn revoke(&mut self, host_id: HostId, bond: Option<StoredBond>) {
+        if let Some(index) = host_index::<HOSTS>(host_id) {
+            self.bonds[index] = bond;
+        }
+    }
+
+    pub fn blocks(&self, peer: BlePeerIdentity) -> bool {
+        self.bonds
+            .iter()
+            .flatten()
+            .any(|bond| peer.matches_bond(*bond))
+    }
+
+    pub fn contains_host(&self, host_id: HostId) -> bool {
+        host_index::<HOSTS>(host_id)
+            .and_then(|index| self.bonds.get(index))
+            .is_some_and(Option::is_some)
+    }
+
+    pub fn clear_host(&mut self, host_id: HostId) {
+        if let Some(index) = host_index::<HOSTS>(host_id) {
+            self.bonds[index] = None;
+        }
+    }
+}
+
+impl<const HOSTS: usize> Default for BleBondRevocations<HOSTS> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -458,7 +496,6 @@ mod tests {
         assert_eq!(timing.interval_min_us, 7_500);
         assert_eq!(timing.interval_max_us, 7_500);
         assert_eq!(timing.peripheral_latency, 19);
-        assert_eq!(timing.preferred_phy, BlePhyPreference::Le2M);
         assert!(
             timing.supervision_timeout_ms * 1_000
                 > 2 * u32::from(timing.peripheral_latency + 1) * timing.interval_max_us
@@ -490,6 +527,7 @@ mod tests {
             desired
         ));
     }
+
     use crate::storage::{FixedName, StoredHostProfile, StoredSecurityLevel};
 
     fn peer(index: u8) -> BlePeerIdentity {
@@ -670,6 +708,47 @@ mod tests {
             resolve_host_id(Some(&storage), peer(9), Some(HostId(2))),
             Some(HostId(2))
         );
+    }
+
+    #[test]
+    fn revoked_bond_blocks_reconnect_until_the_stack_is_rebuilt() {
+        let identity = peer(2);
+        let bond = stored_host(2, identity).bond.unwrap();
+        let mut revocations = BleBondRevocations::<4>::new();
+
+        assert!(!revocations.blocks(identity));
+
+        revocations.revoke(HostId(2), Some(bond));
+
+        assert!(revocations.blocks(identity));
+        assert!(revocations.contains_host(HostId(2)));
+    }
+
+    #[test]
+    fn revoked_bond_matches_a_rotated_private_address_by_irk() {
+        let identity = peer(2);
+        let bond = stored_host(2, identity).bond.unwrap();
+        let mut revocations = BleBondRevocations::<4>::new();
+        revocations.revoke(HostId(2), Some(bond));
+        let rotated = BlePeerIdentity {
+            peer_address: [9, 8, 7, 6, 5, 4],
+            peer_irk: identity.peer_irk,
+        };
+
+        assert!(revocations.blocks(rotated));
+    }
+
+    #[test]
+    fn successful_repair_clears_the_runtime_revocation() {
+        let identity = peer(2);
+        let bond = stored_host(2, identity).bond.unwrap();
+        let mut revocations = BleBondRevocations::<4>::new();
+        revocations.revoke(HostId(2), Some(bond));
+
+        revocations.clear_host(HostId(2));
+
+        assert!(!revocations.blocks(identity));
+        assert!(!revocations.contains_host(HostId(2)));
     }
 
     #[test]

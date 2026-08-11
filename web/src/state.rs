@@ -12,8 +12,11 @@ use leptos::prelude::*;
 use send_wrapper::SendWrapper;
 use wasm_bindgen_futures::spawn_local;
 
+use hidshift_manager_ui::{LocalComputerIdentity, target_belongs_to_local_computer};
+
 use crate::browser_client::{BrowserClient, BrowserClientError};
-use crate::transport::BrowserTransport;
+use crate::command_effect::{CommandEffect, immediate_command_effect};
+use crate::transport::{BrowserTransport, NativeCompanionSnapshot};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Page {
@@ -79,6 +82,7 @@ pub(crate) struct AppState {
     pub is_error: RwSignal<bool>,
     pub undo: RwSignal<Option<ManagementCommand>>,
     pub last_event_sequence: RwSignal<Option<u16>>,
+    pub native: RwSignal<Option<NativeCompanionSnapshot>>,
 }
 
 impl AppState {
@@ -106,6 +110,7 @@ impl AppState {
             is_error: RwSignal::new(false),
             undo: RwSignal::new(None),
             last_event_sequence: RwSignal::new(None),
+            native: RwSignal::new(None),
         }
     }
 
@@ -152,7 +157,15 @@ impl AppState {
             let result = async {
                 let response = state.client.request(command).await?;
                 ensure_ok(response)?;
-                if let ManagementCommand::SetSetting { id, target, value } = command {
+                if let Some(effect) = immediate_command_effect(command, response.payload) {
+                    match effect {
+                        CommandEffect::Status(status) => state.status.set(Some(status)),
+                        CommandEffect::OutputTarget(status) => {
+                            state.output_status.set(Some(status))
+                        }
+                    }
+                    Ok(())
+                } else if let ManagementCommand::SetSetting { id, target, value } = command {
                     state.settings.update(|settings| {
                         if let Some(setting) = settings
                             .iter_mut()
@@ -207,17 +220,13 @@ impl AppState {
             let transport = if bluetooth {
                 BrowserTransport::connect_bluetooth(on_bytes, on_disconnect, on_event).await
             } else {
-                BrowserTransport::connect_serial(on_bytes, on_disconnect).await
+                BrowserTransport::connect_hid(on_bytes, on_disconnect, on_event).await
             };
             match transport {
                 Ok(transport) => {
-                    let requires_readiness_probe = transport.requires_readiness_probe();
                     state.connection.set(transport.label());
                     state.client.attach(transport);
                     let result = async {
-                        if requires_readiness_probe {
-                            state.client.wait_for_serial_readiness().await?;
-                        }
                         state.connected.set(true);
                         state.load_page(Page::Home).await
                     }
@@ -237,6 +246,90 @@ impl AppState {
         });
     }
 
+    pub fn start_native(&self) {
+        let listener_state = self.clone();
+        let snapshot_state = self.clone();
+        spawn_local(async move {
+            let callback_state = listener_state.clone();
+            let callback = Rc::new(move |snapshot| {
+                callback_state.apply_native_snapshot(snapshot);
+            });
+            if let Err(error) = crate::transport::listen_native_snapshots(callback).await {
+                listener_state.message.set(error);
+                listener_state.is_error.set(true);
+            }
+            match crate::transport::native_snapshot().await {
+                Ok(snapshot) => snapshot_state.apply_native_snapshot(snapshot),
+                Err(error) => {
+                    snapshot_state.message.set(error);
+                    snapshot_state.is_error.set(true);
+                }
+            }
+        });
+    }
+
+    pub fn set_native_notifications(&self, enabled: bool) {
+        let state = self.clone();
+        spawn_local(async move {
+            match crate::transport::set_native_notifications(enabled).await {
+                Ok(snapshot) => state.apply_native_snapshot(snapshot),
+                Err(error) => {
+                    state.message.set(error);
+                    state.is_error.set(true);
+                }
+            }
+        });
+    }
+
+    pub fn set_native_autostart(&self, enabled: bool) {
+        let state = self.clone();
+        spawn_local(async move {
+            match crate::transport::set_native_autostart(enabled).await {
+                Ok(()) => state.native.update(|snapshot| {
+                    if let Some(snapshot) = snapshot {
+                        snapshot.autostart_enabled = enabled;
+                    }
+                }),
+                Err(error) => {
+                    state.message.set(error);
+                    state.is_error.set(true);
+                }
+            }
+        });
+    }
+
+    fn apply_native_snapshot(&self, snapshot: NativeCompanionSnapshot) {
+        let previous = self.native.get_untracked();
+        if previous
+            .as_ref()
+            .is_some_and(|previous| previous.revision > snapshot.revision)
+        {
+            return;
+        }
+        let device_changed = previous
+            .as_ref()
+            .is_some_and(|previous| previous.device_revision != snapshot.device_revision);
+        let was_connected = previous.as_ref().is_some_and(|value| value.connected);
+        self.native.set(Some(snapshot.clone()));
+        if snapshot.connected {
+            self.connection.set(snapshot.connection_label.clone());
+            if !self.connected.get_untracked() && !self.busy.get_untracked() {
+                self.connect(true);
+            } else if device_changed && self.connected.get_untracked() && !self.busy.get_untracked()
+            {
+                self.refresh();
+            }
+        } else if was_connected || self.connected.get_untracked() {
+            self.client.detach();
+            self.connected.set(false);
+            self.connection.set(String::new());
+            self.status.set(None);
+            self.output_status.set(None);
+            self.busy.set(false);
+            self.message.set(String::new());
+        }
+    }
+
     fn handle_management_event(&self, bytes: &[u8]) {
         let Ok(ManagementEvent::StatusChanged { sequence }) = ManagementEvent::decode(bytes) else {
             return;
@@ -253,11 +346,26 @@ impl AppState {
         spawn_local(async move {
             let result = state.load_summary().await;
             if result.is_ok() {
-                let destination = match state
+                let native = state.native.get_untracked();
+                let local = native.as_ref().map(|snapshot| LocalComputerIdentity {
+                    ble_host: snapshot.local_ble_host.map(HostId),
+                    wired: snapshot.local_wired,
+                });
+                let active = state
                     .output_status
                     .get_untracked()
-                    .and_then(|status| status.active)
-                {
+                    .and_then(|status| status.active);
+                let destination = match active {
+                    Some(target) if target_belongs_to_local_computer(target, local) => native
+                        .as_ref()
+                        .map(|snapshot| {
+                            if snapshot.computer_name.is_empty() {
+                                "このPC".to_owned()
+                            } else {
+                                format!("このPC · {}", snapshot.computer_name)
+                            }
+                        })
+                        .unwrap_or_else(|| "このPC".to_owned()),
                     Some(ManagementOutputTarget::Wired) => "USB".to_string(),
                     Some(ManagementOutputTarget::Ble(host)) => state
                         .names

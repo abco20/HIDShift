@@ -6,6 +6,12 @@ use hidshift::mirror::{MIRROR_ENDPOINTS_MAX, MirrorControlForwarder, UsbDevicePl
 use hidshift::reports::{
     ConsumerReport, Keyboard6KroReport, MOUSE_REPORT_LEN, MouseReport, StandardHidReport,
 };
+use hidshift::{
+    MANAGEMENT_HID_EVENT_PACKET_LEN, MANAGEMENT_HID_EVENT_REPORT_ID,
+    MANAGEMENT_HID_REQUEST_PACKET_LEN, MANAGEMENT_HID_REQUEST_REPORT_ID,
+    MANAGEMENT_HID_RESPONSE_PACKET_LEN, MANAGEMENT_HID_RESPONSE_REPORT_ID, ManagementEvent,
+    ManagementRequest, ManagementResponse,
+};
 use usb_device::UsbDirection;
 use usb_device::class_prelude::*;
 use usb_device::control::{Recipient, Request, RequestType};
@@ -13,7 +19,10 @@ use usb_device::endpoint::{EndpointAddress, EndpointType};
 
 const RAW_PACKET_MAX_LEN: usize = 64;
 const RAW_QUEUE_CAPACITY: usize = 16;
-const FALLBACK_INTERFACE_COUNT: usize = 3;
+const FALLBACK_INTERFACE_COUNT: usize = 4;
+const MANAGEMENT_INTERFACE: usize = 3;
+const MANAGEMENT_IN_ENDPOINT: u8 = 0x84;
+const MANAGEMENT_OUT_ENDPOINT: u8 = 0x04;
 const HID_GET_REPORT: u8 = 0x01;
 const HID_GET_IDLE: u8 = 0x02;
 const HID_GET_PROTOCOL: u8 = 0x03;
@@ -84,6 +93,7 @@ pub struct DynamicUsb<'a, B: UsbBus> {
     pending_out: Deque<RawPacket, RAW_QUEUE_CAPACITY>,
     fallback: bool,
     pending_standard_output: Option<StandardOutputReport>,
+    pending_management_request: Option<ManagementRequest>,
     fallback_idle: [u8; FALLBACK_INTERFACE_COUNT],
     fallback_protocol: [u8; FALLBACK_INTERFACE_COUNT],
     fallback_last_input: [Option<RawPacket>; FALLBACK_INTERFACE_COUNT],
@@ -144,6 +154,7 @@ impl<'a, B: UsbBus> DynamicUsb<'a, B> {
             pending_out: Deque::new(),
             fallback,
             pending_standard_output: None,
+            pending_management_request: None,
             fallback_idle: [0; FALLBACK_INTERFACE_COUNT],
             fallback_protocol: [1; FALLBACK_INTERFACE_COUNT],
             fallback_last_input: [None; FALLBACK_INTERFACE_COUNT],
@@ -180,6 +191,57 @@ impl<'a, B: UsbBus> DynamicUsb<'a, B> {
         if self.pending_standard_output.is_none() {
             self.pending_standard_output = Some(report);
         }
+    }
+
+    pub fn take_management_request(&mut self) -> Option<ManagementRequest> {
+        self.pending_management_request.take()
+    }
+
+    pub fn restore_management_request(&mut self, request: ManagementRequest) {
+        if self.pending_management_request.is_none() {
+            self.pending_management_request = Some(request);
+        }
+    }
+
+    pub fn enqueue_management_response(&mut self, response: ManagementResponse) {
+        let mut packet = [0; MANAGEMENT_HID_RESPONSE_PACKET_LEN];
+        packet[0] = MANAGEMENT_HID_RESPONSE_REPORT_ID;
+        packet[1..].copy_from_slice(&response.encode());
+        self.enqueue_management_packet(&packet);
+    }
+
+    pub fn enqueue_management_event(&mut self, event: ManagementEvent) {
+        let mut packet = [0; MANAGEMENT_HID_EVENT_PACKET_LEN];
+        packet[0] = MANAGEMENT_HID_EVENT_REPORT_ID;
+        packet[1..].copy_from_slice(&event.encode());
+        self.enqueue_management_packet(&packet);
+    }
+
+    fn enqueue_management_packet(&mut self, bytes: &[u8]) {
+        if !self.fallback
+            || RawPacket::new(MANAGEMENT_IN_ENDPOINT, bytes)
+                .and_then(|packet| {
+                    self.pending_in
+                        .push_back(packet)
+                        .map_err(|_| DynamicUsbError::QueueFull)
+                })
+                .is_err()
+        {
+            self.dropped_packets = self.dropped_packets.saturating_add(1);
+        }
+    }
+
+    fn accept_management_request(&mut self, report_id: u8, bytes: &[u8]) -> bool {
+        if report_id != MANAGEMENT_HID_REQUEST_REPORT_ID
+            || self.pending_management_request.is_some()
+        {
+            return false;
+        }
+        let Ok(request) = ManagementRequest::decode(bytes) else {
+            return false;
+        };
+        self.pending_management_request = Some(request);
+        true
     }
 
     pub fn enqueue_standard_report(&mut self, report: StandardHidReport) {
@@ -286,7 +348,24 @@ impl<'a, B: UsbBus> DynamicUsb<'a, B> {
             match output.endpoint.read(&mut data) {
                 Ok(length) => {
                     if let Ok(packet) = RawPacket::new(output.address, &data[..length]) {
-                        if self.fallback && output.address == 0x01 {
+                        if self.fallback && output.address == MANAGEMENT_OUT_ENDPOINT {
+                            let request = (packet.data().len()
+                                >= MANAGEMENT_HID_REQUEST_PACKET_LEN
+                                && packet.data()[0] == MANAGEMENT_HID_REQUEST_REPORT_ID
+                                && self.pending_management_request.is_none())
+                            .then(|| {
+                                ManagementRequest::decode(
+                                    &packet.data()[1..MANAGEMENT_HID_REQUEST_PACKET_LEN],
+                                )
+                                .ok()
+                            })
+                            .flatten();
+                            if let Some(request) = request {
+                                self.pending_management_request = Some(request);
+                            } else {
+                                self.dropped_packets = self.dropped_packets.saturating_add(1);
+                            }
+                        } else if self.fallback && output.address == 0x01 {
                             self.pending_standard_output =
                                 StandardOutputReport::new(1, packet.data()).ok();
                         } else {
@@ -398,7 +477,7 @@ impl<B: UsbBus> UsbClass<B> for DynamicUsb<'_, B> {
                 return;
             }
             let interface = usize::from(request.index as u8);
-            if interface >= FALLBACK_INTERFACE_COUNT {
+            if interface >= FALLBACK_INTERFACE_COUNT || interface == MANAGEMENT_INTERFACE {
                 return;
             }
             match request.request {
@@ -445,6 +524,19 @@ impl<B: UsbBus> UsbClass<B> for DynamicUsb<'_, B> {
             }
             let interface = usize::from(request.index as u8);
             if interface >= FALLBACK_INTERFACE_COUNT {
+                return;
+            }
+            if interface == MANAGEMENT_INTERFACE {
+                let report_type = (request.value >> 8) as u8;
+                let report_id = request.value as u8;
+                if request.request == HID_SET_REPORT
+                    && report_type == HID_REPORT_TYPE_OUTPUT
+                    && self.accept_management_request(report_id, transfer.data())
+                {
+                    let _ = transfer.accept();
+                } else {
+                    let _ = transfer.reject();
+                }
                 return;
             }
             match request.request {
@@ -507,6 +599,7 @@ impl<B: UsbBus> UsbClass<B> for DynamicUsb<'_, B> {
         self.pending_control_response = None;
         self.pending_control_direction = None;
         self.pending_standard_output = None;
+        self.pending_management_request = None;
         self.fallback_idle.fill(0);
         self.fallback_protocol.fill(1);
         self.fallback_last_input.fill(None);

@@ -6,4 +6,4 @@ rust-version = "1.95"
 publish = false
 
 [dependencies]
-hidshift = { path = ".." }
+hidshift = { path = "..", features = ["dual-s3-wired"] }

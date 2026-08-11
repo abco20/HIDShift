@@ -11,8 +11,9 @@ use hidshift::runtime::{
     RUNTIME_INPUT_QUEUE_CAPACITY, RUNTIME_STORAGE_COMMAND_QUEUE_CAPACITY, StorageTaskCommand,
 };
 use hidshift::storage::{
-    StorageError, StorageHealth, StoragePersistPriority, StoragePersistence, StorageSlotBackend,
-    StorageState, StorageTaskAction, StorageTaskPolicy, restore_latest_storage_state,
+    QuiescedPersistCompletion, QuiescedPersistCompletionAction, StorageError, StorageHealth,
+    StoragePersistPriority, StoragePersistence, StorageSlotBackend, StorageState,
+    StorageTaskAction, StorageTaskPolicy, restore_latest_storage_state,
 };
 
 use super::flash_backend::FirmwareStorageBackend;
@@ -173,34 +174,24 @@ pub async fn storage_command_task(
                 let persisted = persist_due_storage_snapshot(&mut persistence, &mut backend);
                 drop(usb_interrupt_guard);
                 let next_health = persistence.effective_health(backend_health);
-                if next_health != reported_storage_health {
+                let health_change = if next_health != reported_storage_health {
                     reported_storage_health = next_health;
-                    runtime_input
-                        .send(RuntimeInputMessage::StorageHealthChanged(next_health))
-                        .await;
-                }
-                if persisted.is_ok_and(|persisted| persisted) {
-                    runtime_input
-                        .send(RuntimeInputMessage::DiagnosticsEvent(
-                            hidshift::runtime::RuntimeDiagnosticsEvent::FlashWrite {
-                                success: true,
-                            },
-                        ))
-                        .await;
-                    resume_ble_after_flash_write(ble_quiesce_done).await;
+                    Some(next_health)
                 } else {
-                    if let Err(error) = persisted {
-                        log::error!("firmware: storage_command error {:?}", error);
-                    }
-                    runtime_input
-                        .send(RuntimeInputMessage::DiagnosticsEvent(
-                            hidshift::runtime::RuntimeDiagnosticsEvent::FlashWrite {
-                                success: false,
-                            },
-                        ))
-                        .await;
-                    resume_ble_after_flash_write(ble_quiesce_done).await;
+                    None
+                };
+                if let Err(error) = persisted {
+                    log::error!("firmware: storage_command error {:?}", error);
                 }
+                complete_quiesced_persist(
+                    QuiescedPersistCompletion::new(
+                        health_change,
+                        persisted.is_ok_and(|persisted| persisted),
+                    ),
+                    runtime_input,
+                    ble_quiesce_done,
+                )
+                .await;
             }
         }
     }
@@ -238,14 +229,12 @@ async fn handle_storage_command(
                 }
                 Err(error) => {
                     log::error!("firmware: factory reset failed {:?}", error);
-                    runtime_input
-                        .send(RuntimeInputMessage::DiagnosticsEvent(
-                            hidshift::runtime::RuntimeDiagnosticsEvent::FlashWrite {
-                                success: false,
-                            },
-                        ))
-                        .await;
-                    resume_ble_after_flash_write(ble_quiesce_done).await;
+                    complete_quiesced_persist(
+                        QuiescedPersistCompletion::new(None, false),
+                        runtime_input,
+                        ble_quiesce_done,
+                    )
+                    .await;
                 }
             }
         }
@@ -288,6 +277,37 @@ async fn resume_ble_after_flash_write(
     {
         log::error!("firmware: storage BLE resume handshake timed out; rebooting");
         esp_hal::system::software_reset();
+    }
+}
+
+async fn complete_quiesced_persist(
+    completion: QuiescedPersistCompletion,
+    runtime_input: Sender<
+        'static,
+        CriticalSectionRawMutex,
+        RuntimeInputMessage,
+        RUNTIME_INPUT_QUEUE_CAPACITY,
+    >,
+    ble_quiesce_done: Sender<'static, CriticalSectionRawMutex, (), 1>,
+) {
+    for action in completion {
+        match action {
+            QuiescedPersistCompletionAction::ReleaseQuiesce => {
+                resume_ble_after_flash_write(ble_quiesce_done).await
+            }
+            QuiescedPersistCompletionAction::ReportStorageHealth(health) => {
+                runtime_input
+                    .send(RuntimeInputMessage::StorageHealthChanged(health))
+                    .await
+            }
+            QuiescedPersistCompletionAction::ReportFlashWrite { success } => {
+                runtime_input
+                    .send(RuntimeInputMessage::DiagnosticsEvent(
+                        hidshift::runtime::RuntimeDiagnosticsEvent::FlashWrite { success },
+                    ))
+                    .await
+            }
+        }
     }
 }
 

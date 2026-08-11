@@ -24,7 +24,10 @@ use hidshift::management::{
 };
 use hidshift::mirror::{UsbDevicePlan, validate_mirror_image};
 use hidshift::output_target::{MirrorCandidateId, OutputTargetAvailability};
-use hidshift_client::{ManagementClient, SerialResponseDecoder, encode_serial_request};
+use hidshift_client::{
+    ManagementClient,
+    debug_serial::{SerialResponseDecoder, encode_serial_request},
+};
 use serialport::SerialPort;
 
 mod wired_performance;

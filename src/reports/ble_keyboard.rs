@@ -163,6 +163,20 @@ mod tests {
     }
 
     #[test]
+    fn keyboard_report_preserves_extended_keyboard_usages() {
+        let mut keyboard = PhysicalKeyboardState::new();
+        let mut suppression = KeyboardSuppression::new();
+        let mut frame = KeyboardFrame::new(ModifierState::empty());
+        frame.push_key(KeyUsage(0x68)).unwrap();
+        frame.push_key(KeyUsage(0xa3)).unwrap();
+        keyboard.apply_frame(&frame, &mut suppression).unwrap();
+
+        let build = Keyboard6KroReport::from_physical_state(&keyboard, &suppression);
+
+        assert_eq!(build.report.as_bytes(), &[0, 0, 0x68, 0xa3, 0, 0, 0, 0]);
+    }
+
+    #[test]
     fn direct_physical_report_matches_visible_state_report() {
         let mut keyboard = PhysicalKeyboardState::new();
         let mut suppression = KeyboardSuppression::new();
