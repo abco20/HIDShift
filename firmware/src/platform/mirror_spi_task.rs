@@ -12,11 +12,13 @@ use hidshift::bridge::{BridgeEvent, NotifyReason};
 use hidshift::input::KeyboardLedState;
 use hidshift::interchip::message::{
     CAPABILITY_CONTROL_FORWARDING, CAPABILITY_DYNAMIC_PROFILE, CAPABILITY_FALLBACK_PROFILE,
-    CAPABILITY_STANDARD_WIRED_HID, CAPABILITY_USB_STATE_REPORTING, RECORD_ACTIVATE_PROFILE,
-    RECORD_CONTROL_REQUEST, RECORD_CONTROL_RESPONSE, RECORD_FORCE_FALLBACK, RECORD_HEARTBEAT,
-    RECORD_HELLO, RECORD_HELLO_ACK, RECORD_LINK_RESET, RECORD_PROFILE_BEGIN, RECORD_PROFILE_CHUNK,
-    RECORD_PROFILE_COMMIT, RECORD_PROFILE_RESULT, RECORD_RAW_ENDPOINT_OUT,
-    RECORD_STANDARD_OUTPUT_REPORT, RECORD_STANDARD_RELEASE_ALL, RECORD_USB_STATE,
+    CAPABILITY_HID_MANAGEMENT, CAPABILITY_STANDARD_WIRED_HID, CAPABILITY_USB_STATE_REPORTING,
+    RECORD_ACTIVATE_PROFILE, RECORD_CONTROL_REQUEST, RECORD_CONTROL_RESPONSE,
+    RECORD_FORCE_FALLBACK, RECORD_HEARTBEAT, RECORD_HELLO, RECORD_HELLO_ACK, RECORD_LINK_RESET,
+    RECORD_MANAGEMENT_EVENT, RECORD_MANAGEMENT_REQUEST, RECORD_MANAGEMENT_RESPONSE,
+    RECORD_PROFILE_BEGIN, RECORD_PROFILE_CHUNK, RECORD_PROFILE_COMMIT, RECORD_PROFILE_RESULT,
+    RECORD_RAW_ENDPOINT_OUT, RECORD_STANDARD_OUTPUT_REPORT, RECORD_STANDARD_RELEASE_ALL,
+    RECORD_USB_STATE,
 };
 use hidshift::interchip::{
     CONTROL_FRAGMENT_LAST, ControlRequestAssembler, ControlRequestFragment,
@@ -32,6 +34,7 @@ use hidshift::runtime::message::RuntimeInputMessage;
 use hidshift::runtime::{
     DeviceTaskCommand, RUNTIME_DEVICE_COMMAND_QUEUE_CAPACITY, RUNTIME_INPUT_QUEUE_CAPACITY,
 };
+use hidshift::{ManagementDestination, ManagementRequest};
 
 // A full 128-byte cell takes about 103 us at 10 MHz. Checking READY every
 // 200 us provides up to 5,000 cells/s while leaving time for Device processing
@@ -58,9 +61,12 @@ const HOST_CAPABILITIES: u32 = CAPABILITY_DYNAMIC_PROFILE
     | CAPABILITY_FALLBACK_PROFILE
     | CAPABILITY_STANDARD_WIRED_HID
     | CAPABILITY_USB_STATE_REPORTING
-    | CAPABILITY_CONTROL_FORWARDING;
-const REQUIRED_DEVICE_CAPABILITIES: u32 =
-    CAPABILITY_FALLBACK_PROFILE | CAPABILITY_STANDARD_WIRED_HID | CAPABILITY_USB_STATE_REPORTING;
+    | CAPABILITY_CONTROL_FORWARDING
+    | CAPABILITY_HID_MANAGEMENT;
+const REQUIRED_DEVICE_CAPABILITIES: u32 = CAPABILITY_FALLBACK_PROFILE
+    | CAPABILITY_STANDARD_WIRED_HID
+    | CAPABILITY_USB_STATE_REPORTING
+    | CAPABILITY_HID_MANAGEMENT;
 
 pub struct MirrorSpiResources {
     spi: esp_hal::peripherals::SPI2<'static>,
@@ -224,6 +230,7 @@ async fn run_link(
     let mut pending_profile_result = None;
     let mut pending_raw_endpoint_out = None;
     let mut pending_control_request = None;
+    let mut pending_management_request = None;
     let mut pending_device_usb_state = None;
     let mut control_request_assembler = ControlRequestAssembler::new();
     let mut delivery = ReliableDeliveryQueue::<WireCommand>::new();
@@ -265,6 +272,7 @@ async fn run_link(
         report_profile_result(&runtime_sender, &mut pending_profile_result);
         report_raw_endpoint_out(&runtime_sender, &mut pending_raw_endpoint_out);
         report_control_request(&runtime_sender, &mut pending_control_request);
+        report_management_request(&runtime_sender, &mut pending_management_request, now_ms);
         report_device_usb_state(&runtime_sender, &mut pending_device_usb_state);
 
         match recovery.advance(now_ms) {
@@ -560,6 +568,9 @@ async fn run_link(
                         if let Some(request) = processed.control_request {
                             pending_control_request = Some(request);
                         }
+                        if let Some(request) = processed.management_request {
+                            pending_management_request = Some(request);
+                        }
                         if let Some(state) = processed.usb_state {
                             pending_device_usb_state = Some(state);
                         }
@@ -734,6 +745,16 @@ fn queue_command(
         )
         .map_err(|_| ()),
         DeviceTaskCommand::ControlResponse(_) => Err(()),
+        DeviceTaskCommand::ManagementResponse(response) => queue_record(
+            sender,
+            RECORD_MANAGEMENT_RESPONSE,
+            &response.encode(),
+            now_ms,
+        )
+        .map_err(|_| ()),
+        DeviceTaskCommand::ManagementEvent(event) => {
+            queue_record(sender, RECORD_MANAGEMENT_EVENT, &event.encode(), now_ms).map_err(|_| ())
+        }
     }
 }
 
@@ -782,6 +803,7 @@ struct ProcessedRecords {
     profile_result: Option<ProfileResult>,
     raw_endpoint_out: Option<RawEndpointReport>,
     control_request: Option<MirrorControlRequest>,
+    management_request: Option<ManagementRequest>,
     usb_state: Option<UsbState>,
 }
 
@@ -856,6 +878,10 @@ fn process_records(
                 processed.control_request = control_request_assembler
                     .push(ControlRequestFragment::decode(record.data).map_err(|_| ())?)
                     .map_err(|_| ())?;
+            }
+            RECORD_MANAGEMENT_REQUEST => {
+                processed.management_request =
+                    Some(ManagementRequest::decode(record.data).map_err(|_| ())?);
             }
             _ => {}
         }
@@ -1011,6 +1037,31 @@ fn report_control_request(
             request.data().len(),
             hidshift::checksum::crc16_ccitt_false(request.data())
         );
+        *pending = None;
+    }
+}
+
+fn report_management_request(
+    sender: &Sender<
+        'static,
+        CriticalSectionRawMutex,
+        RuntimeInputMessage,
+        RUNTIME_INPUT_QUEUE_CAPACITY,
+    >,
+    pending: &mut Option<ManagementRequest>,
+    now_ms: u64,
+) {
+    let Some(request) = *pending else {
+        return;
+    };
+    if sender
+        .try_send(RuntimeInputMessage::ManagementRequest {
+            destination: ManagementDestination::WiredHid,
+            request,
+            now_ms,
+        })
+        .is_ok()
+    {
         *pending = None;
     }
 }

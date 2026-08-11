@@ -8,7 +8,7 @@ publish = false
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 hidshift = { path = "../..", features = ["dual-s3-wired", "hardware-e2e"] }
-hidshift-client = { path = "../../tools/hidshift-client" }
+hidshift-client = { path = "../../tools/hidshift-client", features = ["debug-serial"] }
 serialport = { version = "4.8", default-features = false }
 libc = "0.2"
 rusb = "0.9"

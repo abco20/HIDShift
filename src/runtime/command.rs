@@ -115,6 +115,8 @@ pub enum DeviceTaskCommand {
     },
     RawEndpointIn(RawEndpointReport),
     ControlResponse(MirrorControlResponse),
+    ManagementResponse(ManagementResponse),
+    ManagementEvent(crate::management::ManagementEvent),
 }
 
 #[cfg(feature = "dual-s3-wired")]
@@ -136,7 +138,9 @@ impl DeviceTaskCommand {
                 CommandClass::BestEffort
             }
             Self::RawEndpointIn(_) => CommandClass::Realtime,
-            Self::ControlResponse(_) => CommandClass::Critical,
+            Self::ControlResponse(_) | Self::ManagementResponse(_) | Self::ManagementEvent(_) => {
+                CommandClass::Critical
+            }
         }
     }
 }
@@ -378,7 +382,7 @@ mod tests {
                 },
                 snapshot: StatusSnapshot::empty(),
                 management: Some(ManagementTaskResponse {
-                    destination: ManagementDestination::Wired,
+                    destination: ManagementDestination::WiredHid,
                     response: ManagementResponse {
                         request_id: 1,
                         result: ManagementResult::Ok,

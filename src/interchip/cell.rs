@@ -4,7 +4,7 @@ pub const SPI_CELL_LEN: usize = 128;
 pub const SPI_CELL_HEADER_LEN: usize = 16;
 pub const SPI_CELL_PAYLOAD_LEN: usize = 110;
 pub const SPI_CELL_MAGIC: u16 = 0x4853;
-pub const SPI_PROTOCOL_VERSION: u8 = 2;
+pub const SPI_PROTOCOL_VERSION: u8 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SpiCellHeader {
@@ -135,6 +135,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn protocol_stays_at_initial_version_during_early_development() {
+        assert_eq!(SPI_PROTOCOL_VERSION, 1);
+    }
+
+    #[test]
     fn cell_round_trips_exact_fixed_wire_size() {
         let mut cell = SpiCell::empty(0x1234_5678);
         cell.header.tx_sequence = 7;
@@ -155,9 +160,9 @@ mod tests {
     }
 
     #[test]
-    fn previous_wire_version_is_rejected_before_message_decode() {
+    fn unsupported_wire_version_is_rejected_before_message_decode() {
         let mut cell = SpiCell::empty(9);
-        cell.header.version = SPI_PROTOCOL_VERSION - 1;
+        cell.header.version = SPI_PROTOCOL_VERSION.wrapping_add(1);
         let bytes = cell.encode().unwrap();
 
         assert_eq!(

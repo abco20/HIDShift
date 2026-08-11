@@ -212,12 +212,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "hidshift-client"
+version = "0.1.0"
+dependencies = [
+ "hidshift",
+]
+
+[[package]]
 name = "hidshift-e2e"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
  "hidshift",
+ "hidshift-client",
  "libc",
  "serde",
  "serde_json",

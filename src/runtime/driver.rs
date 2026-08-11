@@ -311,7 +311,7 @@ mod tests {
     #[test]
     fn log_level_effect_runs_only_after_successful_commit() {
         let message = RuntimeInputMessage::ManagementRequest {
-            destination: crate::management::ManagementDestination::Wired,
+            destination: crate::management::ManagementDestination::WiredHid,
             request: crate::management::ManagementRequest {
                 request_id: 9,
                 command: crate::management::ManagementCommand::SetSetting {

@@ -40,7 +40,7 @@ jobs:
       - run: cargo test --locked --manifest-path tools/hidshift-client/Cargo.toml
       - run: cargo test --locked --manifest-path manager-ui/Cargo.toml
       - run: cargo test --locked --manifest-path tools/hidshiftctl/Cargo.toml
-      - run: cargo check --locked --manifest-path companion/src-tauri/Cargo.toml
+      - run: cargo check --locked --no-default-features --manifest-path companion/src-tauri/Cargo.toml
       - run: cargo test --locked --all-targets --manifest-path e2e/runner/Cargo.toml
       - run: cargo test --locked --all-targets --manifest-path e2e/mirror-runner/Cargo.toml
       - run: cargo check --locked --manifest-path web/Cargo.toml --target wasm32-unknown-unknown

@@ -11,6 +11,21 @@ use crate::state::SettingView;
 
 type CommandSender = SendWrapper<Rc<dyn Fn(ManagementCommand)>>;
 
+const EXTENDED_FUNCTION_KEY_CHOICES: &[(u8, &str)] = &[
+    (0x68, "F13"),
+    (0x69, "F14"),
+    (0x6a, "F15"),
+    (0x6b, "F16"),
+    (0x6c, "F17"),
+    (0x6d, "F18"),
+    (0x6e, "F19"),
+    (0x6f, "F20"),
+    (0x70, "F21"),
+    (0x71, "F22"),
+    (0x72, "F23"),
+    (0x73, "F24"),
+];
+
 #[component]
 pub(crate) fn SettingsPanel(
     settings: RwSignal<Vec<SettingView>>,
@@ -156,7 +171,7 @@ fn shortcut_label(packed: u16) -> String {
     if bits.intersects(hidshift::ModifierState::LEFT_GUI | hidshift::ModifierState::RIGHT_GUI) {
         parts.push("Meta".to_string());
     }
-    parts.push(format!("Usage 0x{:02X}", shortcut.key.0));
+    parts.push(hidshift_manager_ui::keyboard_usage_label(shortcut.key));
     parts.join(" + ")
 }
 
@@ -245,7 +260,7 @@ fn friendly_description(descriptor: &SettingDescriptor) -> &'static str {
 
 fn usage_choices(descriptor: &SettingDescriptor) -> Vec<(i32, &'static str)> {
     if descriptor.max <= 255 {
-        vec![
+        let mut choices = vec![
             (0, "変更しない"),
             (4, "A"),
             (5, "B"),
@@ -300,7 +315,13 @@ fn usage_choices(descriptor: &SettingDescriptor) -> Vec<(i32, &'static str)> {
             (67, "F10"),
             (68, "F11"),
             (69, "F12"),
-        ]
+        ];
+        choices.extend(
+            EXTENDED_FUNCTION_KEY_CHOICES
+                .iter()
+                .map(|(usage, label)| (i32::from(*usage), *label)),
+        );
+        choices
     } else {
         vec![
             (0, "変更しない"),
@@ -339,5 +360,18 @@ mod tests {
                 assert!(!choices[index + 1..].iter().any(|(other, _)| other == value));
             }
         }
+    }
+
+    #[test]
+    fn keyboard_usage_choices_include_extended_function_keys() {
+        let descriptor = hidshift::SETTING_DESCRIPTORS
+            .iter()
+            .find(|item| item.id == SettingId::RemapFromUsage)
+            .unwrap();
+        let choices = usage_choices(descriptor);
+
+        assert!(choices.contains(&(104, "F13")));
+        assert!(choices.contains(&(105, "F14")));
+        assert!(choices.contains(&(115, "F24")));
     }
 }

@@ -8,7 +8,7 @@ use crate::input::{
     ConsumerFrame, ConsumerUsage, InputFrame, KeyUsage, KeyboardFrame, ModifierState, MouseButtons,
     MouseFrame, MouseMovement, StandardInputFrame,
 };
-pub const E2E_PROTOCOL_VERSION: u8 = 2;
+pub const E2E_PROTOCOL_VERSION: u8 = 1;
 pub const E2E_PACKET_LEN: usize = 20;
 pub const E2E_LINE_PREFIX: &[u8] = b"@HIDSHIFT-E2E:";
 pub const E2E_LINE_LEN: usize = E2E_LINE_PREFIX.len() + E2E_PACKET_LEN * 2;
@@ -354,6 +354,11 @@ pub fn crc16_ccitt_false(bytes: &[u8]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protocol_stays_at_initial_version_during_early_development() {
+        assert_eq!(E2E_PROTOCOL_VERSION, 1);
+    }
 
     fn commands() -> [E2eCommand; 7] {
         [

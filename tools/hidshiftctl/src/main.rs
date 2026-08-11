@@ -1,12 +1,13 @@
 use std::env;
 use std::error::Error;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use btleplug::api::{Central, CharPropFlags, Manager as _, Peripheral as _, ScanFilter, WriteType};
 use btleplug::platform::{Adapter, Manager, Peripheral};
 use clap::{ArgGroup, Parser, Subcommand};
 use futures_util::StreamExt;
+use hidapi::{BusType, HidApi, HidDevice};
 use hidshift::{
     HostId, MANAGEMENT_REQUEST_UUID, MANAGEMENT_RESPONSE_LEN, MANAGEMENT_RESPONSE_UUID,
     MANAGEMENT_SERVICE_UUID, ManagementCommand, ManagementHostStatus, ManagementOutputTarget,
@@ -14,9 +15,9 @@ use hidshift::{
     SETTING_DESCRIPTORS, SettingScope, SettingTarget, setting_by_key,
 };
 use hidshift_client::{
-    ManagementClient, PendingRequest, SerialResponseDecoder, encode_serial_request,
+    HidManagementFrame, ManagementClient, PendingRequest, decode_hid_input_packet,
+    encode_hid_request, is_management_hid_identity,
 };
-use serialport::{FlowControl, SerialPort};
 use uuid::Uuid;
 
 macro_rules! println {
@@ -46,14 +47,14 @@ fn normalize_stdout_result(result: io::Result<()>) -> io::Result<()> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Transport {
     Auto,
-    Serial(String),
+    Hid,
     Ble(Option<String>),
 }
 
 struct ManagementTransport {
     configured: Transport,
     resolved: Option<Transport>,
-    serial: Option<SerialManagementSession>,
+    hid: Option<HidManagementSession>,
 }
 
 impl ManagementTransport {
@@ -61,7 +62,7 @@ impl ManagementTransport {
         Self {
             configured,
             resolved: None,
-            serial: None,
+            hid: None,
         }
     }
 
@@ -112,11 +113,11 @@ enum CliCommand {
 
 #[derive(Debug, Parser)]
 #[command(name = "hidshiftctl", version, about = "HIDShiftをUSBまたはBluetooth経由で管理します", long_about = None)]
-#[command(group(ArgGroup::new("transport").multiple(false).args(["serial", "ble"])))]
+#[command(group(ArgGroup::new("transport").multiple(false).args(["hid", "ble"])))]
 struct CliArgs {
-    /// USB Serialポート
-    #[arg(long, value_name = "PORT")]
-    serial: Option<String>,
+    /// USB HIDでHIDShiftを自動検出
+    #[arg(long)]
+    hid: bool,
     /// BluetoothでHIDShiftを自動検出
     #[arg(long)]
     ble: bool,
@@ -773,16 +774,14 @@ async fn request(
     let resolved = transport.resolve()?;
     let bytes = match resolved {
         Transport::Auto => return Err("automatic transport was not resolved".into()),
-        Transport::Serial(port) => {
-            if transport.serial.is_none() {
-                let mut serial = SerialManagementSession::open(&port)?;
-                wait_for_serial_readiness(&mut serial, DEFAULT_TIMEOUT)?;
-                transport.serial = Some(serial);
+        Transport::Hid => {
+            if transport.hid.is_none() {
+                transport.hid = Some(HidManagementSession::open()?);
             }
             transport
-                .serial
+                .hid
                 .as_mut()
-                .ok_or("serial session initialization produced no session")?
+                .ok_or("HID session initialization produced no session")?
                 .exchange(request, DEFAULT_TIMEOUT)?
         }
         Transport::Ble(address) => {
@@ -796,45 +795,19 @@ async fn request(
 }
 
 fn resolve_auto_transport() -> Result<Transport, Box<dyn Error>> {
-    let mut candidates = Vec::new();
-    if let Ok(entries) = std::fs::read_dir("/dev/serial/by-id") {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.contains("HIDShift") || name.contains("1a86_USB_Single_Serial") {
-                candidates.push(entry.path().display().to_string());
-            }
-        }
-    }
-    if candidates.is_empty() {
-        for port in serialport::available_ports().unwrap_or_default() {
-            if let serialport::SerialPortType::UsbPort(info) = &port.port_type
-                && (info
-                    .product
-                    .as_deref()
-                    .is_some_and(|name| name.contains("HIDShift"))
-                    || info
-                        .manufacturer
-                        .as_deref()
-                        .is_some_and(|name| name.contains("HIDShift")))
-            {
-                candidates.push(port.port_name);
-            }
-        }
-    }
-    choose_auto_transport(candidates)
+    let api = HidApi::new()?;
+    choose_auto_transport(
+        api.device_list()
+            .filter(|device| is_management_hid(device))
+            .count(),
+    )
 }
 
-fn choose_auto_transport(mut candidates: Vec<String>) -> Result<Transport, Box<dyn Error>> {
-    candidates.sort();
-    candidates.dedup();
-    match candidates.as_slice() {
-        [] => Ok(Transport::Ble(None)),
-        [port] => Ok(Transport::Serial(port.clone())),
-        _ => Err(format!(
-            "multiple HIDShift USB devices found: {}; specify --serial PORT or --ble",
-            candidates.join(", ")
-        )
-        .into()),
+fn choose_auto_transport(hid_count: usize) -> Result<Transport, Box<dyn Error>> {
+    match hid_count {
+        0 => Ok(Transport::Ble(None)),
+        1 => Ok(Transport::Hid),
+        _ => Err("multiple HIDShift management HID interfaces found; specify --ble or disconnect all but one".into()),
     }
 }
 
@@ -844,112 +817,55 @@ fn ensure_ok(response: ManagementResponse) -> Result<(), Box<dyn Error>> {
         .ok_or_else(|| result_message(response.result).into())
 }
 
-trait SerialExchange {
-    fn exchange(
-        &mut self,
-        request: PendingRequest,
-        timeout: Duration,
-    ) -> Result<[u8; MANAGEMENT_RESPONSE_LEN], Box<dyn Error>>;
+struct HidManagementSession {
+    _api: HidApi,
+    device: HidDevice,
 }
 
-struct SerialManagementSession {
-    port: Box<dyn SerialPort>,
-    decoder: SerialResponseDecoder,
-    diagnostic_tail: Vec<u8>,
-    boot_diagnostic: Option<&'static str>,
-}
-
-impl SerialManagementSession {
-    fn open(port_name: &str) -> Result<Self, Box<dyn Error>> {
-        let mut port = serialport::new(port_name, 115_200)
-            .timeout(Duration::from_millis(200))
-            .open()?;
-        let _ = port.set_flow_control(FlowControl::None);
-        Ok(Self {
-            port,
-            decoder: SerialResponseDecoder::default(),
-            diagnostic_tail: Vec::with_capacity(512),
-            boot_diagnostic: None,
-        })
+impl HidManagementSession {
+    fn open() -> Result<Self, Box<dyn Error>> {
+        let api = HidApi::new()?;
+        let candidates = api
+            .device_list()
+            .filter(|device| is_management_hid(device))
+            .collect::<Vec<_>>();
+        let info = match candidates.as_slice() {
+            [] => return Err("HIDShift management HID interface not found".into()),
+            [info] => *info,
+            _ => return Err("multiple HIDShift management HID interfaces found".into()),
+        };
+        let device = info.open_device(&api)?;
+        Ok(Self { _api: api, device })
     }
-}
 
-impl SerialExchange for SerialManagementSession {
     fn exchange(
         &mut self,
         request: PendingRequest,
         timeout: Duration,
     ) -> Result<[u8; MANAGEMENT_RESPONSE_LEN], Box<dyn Error>> {
-        self.port.write_all(&encode_serial_request(request))?;
-        self.port.flush()?;
-
+        self.device.write(&encode_hid_request(request))?;
         let deadline = Instant::now() + timeout;
-        let mut chunk = [0u8; 128];
+        let mut packet = [0u8; 64];
         while Instant::now() < deadline {
-            let length = match self.port.read(&mut chunk) {
-                Ok(0) => continue,
-                Ok(length) => length,
-                Err(error) if error.kind() == std::io::ErrorKind::TimedOut => continue,
-                Err(error) => return Err(error.into()),
-            };
-            self.diagnostic_tail.extend_from_slice(&chunk[..length]);
-            self.boot_diagnostic = self
-                .boot_diagnostic
-                .or_else(|| serial_boot_diagnostic(&self.diagnostic_tail));
-            if self.diagnostic_tail.len() > 512 {
-                self.diagnostic_tail
-                    .drain(..self.diagnostic_tail.len() - 512);
-            }
-            for response in self.decoder.push(&chunk[..length]) {
-                if response[1] == request.request().request_id {
-                    return Ok(response);
-                }
+            let length = self.device.read_timeout(&mut packet, 100)?;
+            if let Some(HidManagementFrame::Response(response)) =
+                decode_hid_input_packet(&packet[..length])
+                && response[1] == request.request().request_id
+            {
+                return Ok(response);
             }
         }
-        Err(self
-            .boot_diagnostic
-            .unwrap_or("timed out waiting for HIDShift on the serial port")
-            .into())
+        Err("timed out waiting for HIDShift on USB HID".into())
     }
 }
 
-fn wait_for_serial_readiness<S: SerialExchange>(
-    serial: &mut S,
-    timeout: Duration,
-) -> Result<(), Box<dyn Error>> {
-    const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
-    let deadline = Instant::now() + timeout;
-    let mut request_id = 0x80u8;
-    let mut last_error = None;
-    while Instant::now() < deadline {
-        let mut client = ManagementClient::new(request_id);
-        let request = client
-            .begin(ManagementCommand::GetStatus)
-            .map_err(|error| format!("could not start readiness probe: {error:?}"))?;
-        match serial.exchange(request, PROBE_TIMEOUT) {
-            Ok(bytes) => match client.accept(&bytes) {
-                Ok(response) if response.result == ManagementResult::Ok => return Ok(()),
-                Ok(response) => {
-                    last_error = Some(format!("readiness probe returned {:?}", response.result))
-                }
-                Err(error) => last_error = Some(format!("invalid readiness response: {error:?}")),
-            },
-            Err(error) => last_error = Some(error.to_string()),
-        }
-        request_id = request_id.wrapping_add(1);
-    }
-    Err(format!(
-        "serial management did not become ready after open: {}",
-        last_error.unwrap_or_else(|| "no response".to_owned())
-    )
-    .into())
-}
-
-fn serial_boot_diagnostic(bytes: &[u8]) -> Option<&'static str> {
-    bytes.windows(b"BROWNOUT_RST".len())
-        .any(|window| window == b"BROWNOUT_RST")
-        .then_some(
-            "HIDShiftが電圧低下（brownout）で再起動しています。電源容量、USBケーブル、USB機器への給電を確認してください",
+fn is_management_hid(device: &hidapi::DeviceInfo) -> bool {
+    matches!(device.bus_type(), BusType::Usb)
+        && is_management_hid_identity(
+            device.vendor_id(),
+            device.product_id(),
+            device.usage_page(),
+            device.usage(),
         )
 }
 
@@ -1656,8 +1572,8 @@ where
 {
     let parsed =
         CliArgs::try_parse_from(std::iter::once("hidshiftctl".to_owned()).chain(arguments))?;
-    let transport = if let Some(port) = parsed.serial {
-        Transport::Serial(port)
+    let transport = if parsed.hid {
+        Transport::Hid
     } else if parsed.ble {
         Transport::Ble(parsed.address)
     } else {
@@ -1772,38 +1688,12 @@ where
 mod tests {
     use super::*;
 
-    struct FakeSerialExchange {
-        failures_remaining: usize,
-        commands: Vec<ManagementCommand>,
-    }
-
-    impl SerialExchange for FakeSerialExchange {
-        fn exchange(
-            &mut self,
-            request: PendingRequest,
-            _timeout: Duration,
-        ) -> Result<[u8; MANAGEMENT_RESPONSE_LEN], Box<dyn Error>> {
-            self.commands.push(request.request().command);
-            if self.failures_remaining > 0 {
-                self.failures_remaining -= 1;
-                return Err("firmware still booting".into());
-            }
-            Ok(ManagementResponse {
-                request_id: request.request().request_id,
-                result: ManagementResult::Ok,
-                payload: ManagementResponsePayload::Status(hidshift::ManagementStatus::empty(4)),
-            }
-            .encode())
-        }
-    }
-
     #[test]
-    fn parses_serial_and_ble_commands() {
+    fn parses_hid_and_ble_commands() {
         assert_eq!(
-            parse_arguments(["--serial", "/dev/ttyUSB0", "select", "3"].map(str::to_owned))
-                .unwrap(),
+            parse_arguments(["--hid", "select", "3"].map(str::to_owned)).unwrap(),
             Arguments {
-                transport: Transport::Serial("/dev/ttyUSB0".to_owned()),
+                transport: Transport::Hid,
                 command: CliCommand::Request(ManagementCommand::SelectHost(hidshift::HostId(3))),
                 json: false,
             }
@@ -1861,21 +1751,15 @@ mod tests {
 
     #[test]
     fn auto_transport_never_guesses_between_multiple_usb_devices() {
-        assert_eq!(
-            choose_auto_transport(vec!["/dev/one".into()]).unwrap(),
-            Transport::Serial("/dev/one".into())
-        );
-        assert_eq!(
-            choose_auto_transport(Vec::new()).unwrap(),
-            Transport::Ble(None)
-        );
-        assert!(choose_auto_transport(vec!["/dev/one".into(), "/dev/two".into()]).is_err());
+        assert_eq!(choose_auto_transport(1).unwrap(), Transport::Hid);
+        assert_eq!(choose_auto_transport(0).unwrap(), Transport::Ble(None));
+        assert!(choose_auto_transport(2).is_err());
     }
 
     #[test]
     fn parses_wired_and_ble_output_target_commands() {
         assert_eq!(
-            parse_arguments(["--serial", "/dev/ttyACM0", "target", "usb"].map(str::to_owned))
+            parse_arguments(["--hid", "target", "usb"].map(str::to_owned))
                 .unwrap()
                 .command,
             CliCommand::Request(ManagementCommand::SelectOutputTarget(
@@ -1906,10 +1790,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_cli_slots_and_extra_arguments() {
-        assert!(
-            parse_arguments(["--serial", "/dev/ttyUSB0", "select", "0"].map(str::to_owned))
-                .is_err()
-        );
+        assert!(parse_arguments(["--hid", "select", "0"].map(str::to_owned)).is_err());
         assert!(parse_arguments(["--ble", "pair", "5"].map(str::to_owned)).is_err());
         assert!(parse_arguments(["--ble", "status", "extra"].map(str::to_owned)).is_err());
     }
@@ -1919,8 +1800,7 @@ mod tests {
         assert_eq!(
             parse_arguments(
                 [
-                    "--serial",
-                    "/dev/ttyACM0",
+                    "--hid",
                     "settings",
                     "set",
                     "keyboard_layout",
@@ -1970,36 +1850,6 @@ mod tests {
                 },
                 json: false,
             }
-        );
-    }
-
-    #[test]
-    fn serial_log_reports_brownout_instead_of_a_generic_timeout() {
-        assert_eq!(
-            serial_boot_diagnostic(b"rst:0xf (BROWNOUT_RST),boot:0x2b"),
-            Some(
-                "HIDShiftが電圧低下（brownout）で再起動しています。電源容量、USBケーブル、USB機器への給電を確認してください"
-            )
-        );
-        assert_eq!(serial_boot_diagnostic(b"normal management response"), None);
-    }
-
-    #[test]
-    fn serial_readiness_retries_only_idempotent_status_requests() {
-        let mut serial = FakeSerialExchange {
-            failures_remaining: 2,
-            commands: Vec::new(),
-        };
-
-        wait_for_serial_readiness(&mut serial, Duration::from_secs(1)).unwrap();
-
-        assert_eq!(
-            serial.commands,
-            vec![
-                ManagementCommand::GetStatus,
-                ManagementCommand::GetStatus,
-                ManagementCommand::GetStatus,
-            ]
         );
     }
 

@@ -188,14 +188,16 @@ const V1_KEYBOARD_REPORT_MAP: &[u8] = &[
     0x08, // Report Size (8)
     0x15,
     0x00, // Logical Minimum (0)
-    0x25,
-    0x65, // Logical Maximum (101)
+    0x26,
+    0xff,
+    0x00, // Logical Maximum (255)
     0x05,
     0x07, // Usage Page (Keyboard/Keypad)
     0x19,
     0x00, // Usage Minimum (Reserved)
-    0x29,
-    0x65, // Usage Maximum (Keyboard Application)
+    0x2a,
+    0xff,
+    0x00, // Usage Maximum (255)
     0x81,
     0x00, // Input (Data,Array,Abs)
     0xc0, // End Collection
@@ -469,6 +471,19 @@ mod tests {
         assert_eq!(mouse.size_in_bytes(), MOUSE_REPORT_LEN + 1);
         assert_eq!(consumer.size_in_bytes(), CONSUMER_REPORT_LEN + 1);
         assert_eq!(keyboard_output.size_in_bytes(), 2);
+
+        let keyboard_usage_range = keyboard
+            .fields()
+            .iter()
+            .find_map(|field| match field {
+                Field::Array(field) => field.usage_range(),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            keyboard_usage_range.maximum().usage_id(),
+            UsageId::from(0x00ff)
+        );
 
         let led_usages = keyboard_output
             .fields()

@@ -2,8 +2,8 @@ use core::fmt::Write;
 use core::future::pending;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use bt_hci::cmd::le::{LeAddDeviceToFilterAcceptList, LeClearFilterAcceptList, LeSetPhy};
-use bt_hci::controller::{ControllerCmdAsync, ControllerCmdSync};
+use bt_hci::cmd::le::{LeAddDeviceToFilterAcceptList, LeClearFilterAcceptList};
+use bt_hci::controller::ControllerCmdSync;
 use embassy_futures::join::join;
 use embassy_futures::select::{Either, Either3, Either4, select, select3, select4};
 use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
@@ -38,7 +38,8 @@ use hidshift::runtime::{
 use hidshift::storage::StoredAddressKind;
 use hidshift::storage::{FixedName, StorageState};
 use hidshift::{
-    BleConnectionSlots, BleInputGate, BlePairingBackoff, BlePeerIdentity, resolve_ble_host_id,
+    BleBondRevocations, BleConnectionSlots, BleInputGate, BlePairingBackoff, BlePeerIdentity,
+    resolve_ble_host_id,
 };
 use static_cell::StaticCell;
 use trouble_host::prelude::*;
@@ -401,8 +402,7 @@ async fn run_ble_host_events<'server, C>(
 ) where
     C: Controller
         + ControllerCmdSync<LeClearFilterAcceptList>
-        + ControllerCmdSync<LeAddDeviceToFilterAcceptList>
-        + ControllerCmdAsync<LeSetPhy>,
+        + ControllerCmdSync<LeAddDeviceToFilterAcceptList>,
 {
     let mut resources: HostResources<
         DefaultPacketPool,
@@ -448,6 +448,7 @@ fn retain_gatt_service_fields(server: &Server) {
 struct BleControlState<'backoff> {
     pairing_allowed: [bool; RUNTIME_HOSTS_MAX],
     restored_bond: [bool; RUNTIME_HOSTS_MAX],
+    revoked_bonds: BleBondRevocations<RUNTIME_HOSTS_MAX>,
     input_gate: BleInputGate<RUNTIME_HOSTS_MAX>,
     pairing_backoff: &'backoff mut BlePairingBackoff<RUNTIME_HOSTS_MAX>,
 }
@@ -461,6 +462,7 @@ impl<'backoff> BleControlState<'backoff> {
         let mut state = Self {
             pairing_allowed: [false; RUNTIME_HOSTS_MAX],
             restored_bond: [false; RUNTIME_HOSTS_MAX],
+            revoked_bonds: BleBondRevocations::new(),
             input_gate: BleInputGate::new(),
             pairing_backoff,
         };
@@ -499,9 +501,10 @@ impl<'backoff> BleControlState<'backoff> {
                     self.pairing_backoff.clear();
                 }
             }
-            BleTaskCommand::ClearBond { host_id, .. } => {
+            BleTaskCommand::ClearBond { host_id, bond } => {
                 self.set_pairing_allowed(host_id, false);
                 self.set_restored_bond(host_id, false);
+                self.revoked_bonds.revoke(host_id, bond);
             }
         }
     }
@@ -523,6 +526,14 @@ impl<'backoff> BleControlState<'backoff> {
 
     fn clear_pairing_failure(&mut self, peer: BlePeerIdentity) {
         self.pairing_backoff.clear_peer(peer);
+    }
+
+    fn peer_is_revoked(&self, peer: BlePeerIdentity) -> bool {
+        self.revoked_bonds.blocks(peer)
+    }
+
+    fn confirm_security(&mut self, host_id: HostId) {
+        self.revoked_bonds.clear_host(host_id);
     }
 
     fn should_drop(&self, command: BleTaskCommand) -> bool {
@@ -632,7 +643,12 @@ where
         }
     }
 
-    let peer_matches_stored_bond = resolve_ble_host_id(restored_state, peer, None).is_some();
+    // A live trouble-host runner owns its security-manager `RefCell`. Removing
+    // a bond from that table concurrently can panic, so a revoked peer is
+    // treated as unknown until the next storage quiesce rebuilds the stack.
+    let peer_is_revoked = control.peer_is_revoked(peer);
+    let peer_matches_stored_bond =
+        !peer_is_revoked && resolve_ble_host_id(restored_state, peer, None).is_some();
     if control.pairing_host().is_some()
         && !peer_matches_stored_bond
         && let Some(remaining_ms) = control.pairing_backoff_remaining_ms(peer, now_ms)
@@ -640,7 +656,12 @@ where
         return BleConnectionAdmission::RejectBackoff { remaining_ms };
     }
 
-    let Some(host_id) = resolve_ble_host_id(restored_state, peer, control.pairing_host()) else {
+    let resolved_host = if peer_is_revoked {
+        control.pairing_host()
+    } else {
+        resolve_ble_host_id(restored_state, peer, control.pairing_host())
+    };
+    let Some(host_id) = resolved_host else {
         return BleConnectionAdmission::RejectUnknown;
     };
     // An existing bond remains admissible while a pairing window is open,
@@ -661,7 +682,9 @@ fn is_pairing_candidate(
     control: &BleControlState<'_>,
     peer: BlePeerIdentity,
 ) -> bool {
-    control.pairing_host().is_some() && resolve_ble_host_id(restored_state, peer, None).is_none()
+    control.pairing_host().is_some()
+        && (control.peer_is_revoked(peer)
+            || resolve_ble_host_id(restored_state, peer, None).is_none())
 }
 
 fn reject_ble_connection<P>(conn: &GattConnection<'_, '_, P>)
@@ -762,8 +785,7 @@ async fn accept_ble_connections<'values, 'server, C>(
 ) where
     C: Controller
         + ControllerCmdSync<LeClearFilterAcceptList>
-        + ControllerCmdSync<LeAddDeviceToFilterAcceptList>
-        + ControllerCmdAsync<LeSetPhy>,
+        + ControllerCmdSync<LeAddDeviceToFilterAcceptList>,
 {
     let mut control = BleControlState::new(restored_state, pairable_host, pairing_backoff);
     configure_ble_accept_list(stack, restored_state).await;
@@ -859,7 +881,6 @@ async fn accept_ble_connections<'values, 'server, C>(
                 log::warn!("firmware: ble advertising failed: {:?}", err);
             }
             Either::Second(command) => {
-                apply_ble_stack_command(stack, command);
                 control.apply_command(command);
                 log_ble_command_without_connection(command);
             }
@@ -896,7 +917,7 @@ async fn manage_ble_connections<'values, 'server, C>(
     restored_state: Option<&StorageState>,
     control: &mut BleControlState<'_>,
 ) where
-    C: Controller + ControllerCmdAsync<LeSetPhy>,
+    C: Controller,
 {
     let mut slots = BleConnectionSlots::<BLE_CONNECTIONS_MAX>::new();
     let mut connection_slots = [
@@ -1016,6 +1037,7 @@ async fn manage_ble_connections<'values, 'server, C>(
                         ConnectionProgress::SecurityEstablished => {
                             if let Some(entry) = slots.entry_for_slot(slot) {
                                 control.clear_pairing_failure(entry.peer_identity);
+                                control.confirm_security(entry.host_id);
                             }
                             if let Some(connection_slot) = connection_slots.get_mut(slot) {
                                 connection_slot.pairing_failure_recorded = false;
@@ -1078,7 +1100,6 @@ async fn manage_ble_connections<'values, 'server, C>(
                         sender,
                     )
                     .await;
-                    apply_ble_stack_command(stack, command);
                     if restart_advertising {
                         continue 'connections;
                     }
@@ -1282,24 +1303,6 @@ fn clear_connection_slot<'values, 'server>(
     }
 }
 
-fn apply_ble_stack_command<C, P>(stack: &Stack<'_, C, P>, command: BleTaskCommand)
-where
-    C: Controller,
-    P: PacketPool,
-{
-    if let BleTaskCommand::ClearBond {
-        bond: Some(bond), ..
-    } = command
-    {
-        let Some(bond_information) = super::ble_bonds::to_trouble(bond) else {
-            return;
-        };
-        if let Err(err) = stack.remove_bond_information(bond_information.identity) {
-            log::error!("firmware: clear bond failed: {:?}", err);
-        }
-    }
-}
-
 async fn dispatch_ble_command_to_connected_slot<C>(
     stack: &Stack<'_, C, DefaultPacketPool>,
     server: &Server<'_>,
@@ -1472,7 +1475,7 @@ async fn configure_ble_connection<C, P>(
     restored_bond: bool,
 ) where
     P: PacketPool,
-    C: Controller + ControllerCmdAsync<LeSetPhy>,
+    C: Controller,
 {
     let current_params = conn.raw().params();
     #[cfg(feature = "hardware-e2e")]
@@ -1526,18 +1529,9 @@ async fn configure_ble_connection<C, P>(
             current.supervision_timeout_ms
         );
     }
-    let preferred_phy = match timing.preferred_phy {
-        hidshift::BlePhyPreference::Le1M => PhyKind::Le1M,
-        hidshift::BlePhyPreference::Le2M => PhyKind::Le2M,
-    };
-    match conn.raw().set_phy(stack, preferred_phy).await {
-        Ok(()) => log::info!(
-            "firmware: ble slot {} requested phy={:?}",
-            slot,
-            preferred_phy
-        ),
-        Err(err) => log::warn!("firmware: ble slot {} phy request failed: {:?}", slot, err),
-    }
+    // Do not initiate a PHY LLCP from the ESP32-S3 peripheral. The controller
+    // asserts when it overlaps encryption or a central-initiated PHY update.
+    // Central-initiated PHY changes remain supported and are recorded below.
     sender.send(connected_message(host_id)).await;
     if let Some(name) = fallback_ble_peer_name(conn) {
         sender

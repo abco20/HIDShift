@@ -1,17 +1,63 @@
 //! Transport-independent client support for HIDShift management frontends.
 //!
 //! The firmware owns the wire schema in `hidshift::management`. This crate owns
-//! client-side request correlation and stream framing, so CLI, Web Bluetooth,
-//! and Web Serial do not each grow their own protocol implementation.
+//! client-side request correlation and transport framing, so CLI, WebHID, and
+//! Web Bluetooth do not each grow their own protocol implementation.
 
 use hidshift::{
-    HostId, MANAGEMENT_REQUEST_LEN, MANAGEMENT_RESPONSE_LEN, ManagementCommand, ManagementEvent,
-    ManagementOutputTarget, ManagementOutputTargetStatus, ManagementProtocolError,
-    ManagementRequest, ManagementResponse, ManagementStatus,
+    HostId, MANAGEMENT_EVENT_LEN, MANAGEMENT_HID_EVENT_PACKET_LEN, MANAGEMENT_HID_EVENT_REPORT_ID,
+    MANAGEMENT_HID_REQUEST_PACKET_LEN, MANAGEMENT_HID_REQUEST_REPORT_ID,
+    MANAGEMENT_HID_RESPONSE_PACKET_LEN, MANAGEMENT_HID_RESPONSE_REPORT_ID, MANAGEMENT_REQUEST_LEN,
+    MANAGEMENT_RESPONSE_LEN, ManagementCommand, ManagementEvent, ManagementOutputTarget,
+    ManagementOutputTargetStatus, ManagementProtocolError, ManagementRequest, ManagementResponse,
+    ManagementStatus,
 };
 
-pub const SERIAL_PREFIX: &[u8] = b"@HIDSHIFT:";
-pub const SERIAL_RESPONSE_LINE_LEN: usize = SERIAL_PREFIX.len() + MANAGEMENT_RESPONSE_LEN * 2;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HidManagementFrame {
+    Response([u8; MANAGEMENT_RESPONSE_LEN]),
+    Event([u8; MANAGEMENT_EVENT_LEN]),
+}
+
+pub const fn is_management_hid_identity(
+    vendor_id: u16,
+    product_id: u16,
+    usage_page: u16,
+    usage: u16,
+) -> bool {
+    vendor_id == hidshift::fallback::FALLBACK_USB_VENDOR_ID
+        && product_id == hidshift::fallback::FALLBACK_USB_PRODUCT_ID
+        && usage_page == hidshift::MANAGEMENT_HID_USAGE_PAGE
+        && usage == hidshift::MANAGEMENT_HID_USAGE
+}
+
+pub fn encode_hid_request(request: PendingRequest) -> [u8; MANAGEMENT_HID_REQUEST_PACKET_LEN] {
+    let mut packet = [0; MANAGEMENT_HID_REQUEST_PACKET_LEN];
+    packet[0] = MANAGEMENT_HID_REQUEST_REPORT_ID;
+    packet[1..].copy_from_slice(&request.encode());
+    packet
+}
+
+pub fn decode_hid_input(report_id: u8, data: &[u8]) -> Option<HidManagementFrame> {
+    match (report_id, data.len()) {
+        (MANAGEMENT_HID_RESPONSE_REPORT_ID, MANAGEMENT_RESPONSE_LEN) => {
+            Some(HidManagementFrame::Response(data.try_into().ok()?))
+        }
+        (MANAGEMENT_HID_EVENT_REPORT_ID, MANAGEMENT_EVENT_LEN) => {
+            Some(HidManagementFrame::Event(data.try_into().ok()?))
+        }
+        _ => None,
+    }
+}
+
+pub fn decode_hid_input_packet(bytes: &[u8]) -> Option<HidManagementFrame> {
+    match bytes.len() {
+        MANAGEMENT_HID_RESPONSE_PACKET_LEN | MANAGEMENT_HID_EVENT_PACKET_LEN => {
+            decode_hid_input(bytes[0], &bytes[1..])
+        }
+        _ => None,
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClientError {
@@ -208,92 +254,152 @@ impl ManagementClient {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct SerialResponseDecoder {
-    line: Vec<u8>,
-    discard_until_newline: bool,
-}
+/// UART text framing for lab diagnostics and hardware E2E only. Production
+/// frontends intentionally do not enable this feature.
+#[cfg(feature = "debug-serial")]
+pub mod debug_serial {
+    use super::PendingRequest;
+    use hidshift::{MANAGEMENT_REQUEST_LEN, MANAGEMENT_RESPONSE_LEN};
 
-impl SerialResponseDecoder {
-    pub fn push(&mut self, bytes: &[u8]) -> Vec<[u8; MANAGEMENT_RESPONSE_LEN]> {
-        let mut responses = Vec::new();
-        for &byte in bytes {
-            if byte == b'\n' || byte == b'\r' {
-                if !self.discard_until_newline
-                    && let Some(response) = decode_serial_response_line(&self.line)
-                {
-                    responses.push(response);
-                }
-                self.line.clear();
-                self.discard_until_newline = false;
-            } else if !self.discard_until_newline {
-                if self.line.len() < SERIAL_RESPONSE_LINE_LEN {
-                    self.line.push(byte);
-                } else {
+    pub const SERIAL_PREFIX: &[u8] = b"@HIDSHIFT:";
+    pub const SERIAL_RESPONSE_LINE_LEN: usize = SERIAL_PREFIX.len() + MANAGEMENT_RESPONSE_LEN * 2;
+    pub const SERIAL_EVENT_PREFIX: &[u8] = hidshift::MANAGEMENT_SERIAL_EVENT_PREFIX.as_bytes();
+    pub const SERIAL_EVENT_LINE_LEN: usize =
+        SERIAL_EVENT_PREFIX.len() + hidshift::MANAGEMENT_EVENT_LEN * 2;
+    const SERIAL_MANAGEMENT_LINE_LEN: usize = if SERIAL_RESPONSE_LINE_LEN > SERIAL_EVENT_LINE_LEN {
+        SERIAL_RESPONSE_LINE_LEN
+    } else {
+        SERIAL_EVENT_LINE_LEN
+    };
+
+    #[derive(Debug, Default)]
+    pub struct SerialResponseDecoder {
+        frames: SerialManagementDecoder,
+    }
+
+    impl SerialResponseDecoder {
+        pub fn push(&mut self, bytes: &[u8]) -> Vec<[u8; MANAGEMENT_RESPONSE_LEN]> {
+            self.frames
+                .push(bytes)
+                .into_iter()
+                .filter_map(|frame| match frame {
+                    SerialManagementFrame::Response(response) => Some(response),
+                    SerialManagementFrame::Event(_) => None,
+                })
+                .collect()
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum SerialManagementFrame {
+        Response([u8; MANAGEMENT_RESPONSE_LEN]),
+        Event([u8; hidshift::MANAGEMENT_EVENT_LEN]),
+    }
+
+    #[derive(Debug, Default)]
+    pub struct SerialManagementDecoder {
+        line: Vec<u8>,
+        discard_until_newline: bool,
+    }
+
+    impl SerialManagementDecoder {
+        pub fn push(&mut self, bytes: &[u8]) -> Vec<SerialManagementFrame> {
+            let mut frames = Vec::new();
+            for &byte in bytes {
+                if byte == b'\n' || byte == b'\r' {
+                    if !self.discard_until_newline {
+                        if let Some(response) = decode_serial_response_line(&self.line) {
+                            frames.push(SerialManagementFrame::Response(response));
+                        } else if let Some(event) = decode_serial_event_line(&self.line) {
+                            frames.push(SerialManagementFrame::Event(event));
+                        }
+                    }
                     self.line.clear();
-                    self.discard_until_newline = true;
+                    self.discard_until_newline = false;
+                } else if !self.discard_until_newline {
+                    if self.line.len() < SERIAL_MANAGEMENT_LINE_LEN {
+                        self.line.push(byte);
+                    } else {
+                        self.line.clear();
+                        self.discard_until_newline = true;
+                    }
                 }
             }
+            frames
         }
-        responses
     }
-}
 
-pub fn encode_serial_request(request: PendingRequest) -> Vec<u8> {
-    let mut line = Vec::with_capacity(SERIAL_PREFIX.len() + MANAGEMENT_REQUEST_LEN * 2 + 1);
-    line.extend_from_slice(SERIAL_PREFIX);
-    for byte in request.encode() {
-        line.push(hex_digit(byte >> 4));
-        line.push(hex_digit(byte & 0x0f));
+    pub fn encode_serial_request(request: PendingRequest) -> Vec<u8> {
+        let mut line = Vec::with_capacity(SERIAL_PREFIX.len() + MANAGEMENT_REQUEST_LEN * 2 + 1);
+        line.extend_from_slice(SERIAL_PREFIX);
+        for byte in request.encode() {
+            line.push(hex_digit(byte >> 4));
+            line.push(hex_digit(byte & 0x0f));
+        }
+        line.push(b'\n');
+        line
     }
-    line.push(b'\n');
-    line
-}
 
-pub fn decode_serial_response_line(line: &[u8]) -> Option<[u8; MANAGEMENT_RESPONSE_LEN]> {
-    let line = trim_ascii(line);
-    let encoded = line.strip_prefix(SERIAL_PREFIX)?;
-    if encoded.len() != MANAGEMENT_RESPONSE_LEN * 2 {
-        return None;
+    pub fn decode_serial_response_line(line: &[u8]) -> Option<[u8; MANAGEMENT_RESPONSE_LEN]> {
+        let line = trim_ascii(line);
+        let encoded = line.strip_prefix(SERIAL_PREFIX)?;
+        if encoded.len() != MANAGEMENT_RESPONSE_LEN * 2 {
+            return None;
+        }
+        let mut response = [0u8; MANAGEMENT_RESPONSE_LEN];
+        for (index, output) in response.iter_mut().enumerate() {
+            *output = (hex_nibble(encoded[index * 2])? << 4) | hex_nibble(encoded[index * 2 + 1])?;
+        }
+        Some(response)
     }
-    let mut response = [0u8; MANAGEMENT_RESPONSE_LEN];
-    for (index, output) in response.iter_mut().enumerate() {
-        *output = (hex_nibble(encoded[index * 2])? << 4) | hex_nibble(encoded[index * 2 + 1])?;
-    }
-    Some(response)
-}
 
-const fn hex_digit(value: u8) -> u8 {
-    if value < 10 {
-        b'0' + value
-    } else {
-        b'a' + value - 10
+    pub fn decode_serial_event_line(line: &[u8]) -> Option<[u8; hidshift::MANAGEMENT_EVENT_LEN]> {
+        let line = trim_ascii(line);
+        let encoded = line.strip_prefix(SERIAL_EVENT_PREFIX)?;
+        if encoded.len() != hidshift::MANAGEMENT_EVENT_LEN * 2 {
+            return None;
+        }
+        let mut event = [0u8; hidshift::MANAGEMENT_EVENT_LEN];
+        for (index, output) in event.iter_mut().enumerate() {
+            *output = (hex_nibble(encoded[index * 2])? << 4) | hex_nibble(encoded[index * 2 + 1])?;
+        }
+        Some(event)
     }
-}
 
-const fn hex_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
+    pub(crate) const fn hex_digit(value: u8) -> u8 {
+        if value < 10 {
+            b'0' + value
+        } else {
+            b'a' + value - 10
+        }
     }
-}
 
-fn trim_ascii(bytes: &[u8]) -> &[u8] {
-    let start = bytes
-        .iter()
-        .position(|byte| !byte.is_ascii_whitespace())
-        .unwrap_or(bytes.len());
-    let end = bytes
-        .iter()
-        .rposition(|byte| !byte.is_ascii_whitespace())
-        .map_or(start, |index| index + 1);
-    &bytes[start..end]
+    const fn hex_nibble(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    fn trim_ascii(bytes: &[u8]) -> &[u8] {
+        let start = bytes
+            .iter()
+            .position(|byte| !byte.is_ascii_whitespace())
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|byte| !byte.is_ascii_whitespace())
+            .map_or(start, |index| index + 1);
+        &bytes[start..end]
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "debug-serial")]
+    use super::debug_serial::*;
     use super::*;
     use hidshift::{HostId, ManagementResponsePayload, ManagementResult, ManagementStatus};
 
@@ -306,9 +412,21 @@ mod tests {
         .encode()
     }
 
+    #[cfg(feature = "debug-serial")]
     fn serial_response_line(request_id: u8) -> Vec<u8> {
         let mut line = SERIAL_PREFIX.to_vec();
         for byte in response(request_id) {
+            line.push(hex_digit(byte >> 4));
+            line.push(hex_digit(byte & 0x0f));
+        }
+        line.push(b'\n');
+        line
+    }
+
+    #[cfg(feature = "debug-serial")]
+    fn serial_event_line(sequence: u16) -> Vec<u8> {
+        let mut line = SERIAL_EVENT_PREFIX.to_vec();
+        for byte in (ManagementEvent::StatusChanged { sequence }).encode() {
             line.push(hex_digit(byte >> 4));
             line.push(hex_digit(byte & 0x0f));
         }
@@ -367,6 +485,7 @@ mod tests {
         assert!(!client.is_pending());
     }
 
+    #[cfg(feature = "debug-serial")]
     #[test]
     fn serial_decoder_handles_fragmented_and_coalesced_input_with_logs() {
         let mut decoder = SerialResponseDecoder::default();
@@ -381,6 +500,7 @@ mod tests {
         assert_eq!(responses[1], response(2));
     }
 
+    #[cfg(feature = "debug-serial")]
     #[test]
     fn oversized_or_malformed_serial_lines_are_discarded_and_decoder_recovers() {
         let mut decoder = SerialResponseDecoder::default();
@@ -390,6 +510,40 @@ mod tests {
         assert_eq!(decoder.push(&input), vec![response(1)]);
     }
 
+    #[cfg(feature = "debug-serial")]
+    #[test]
+    fn serial_management_decoder_preserves_events_mixed_with_responses_and_logs() {
+        let mut decoder = SerialManagementDecoder::default();
+        let event = serial_event_line(0x1234);
+        let response = serial_response_line(7);
+        let split = event.len() - 3;
+
+        assert!(decoder.push(b"firmware: switched\r\n").is_empty());
+        assert!(decoder.push(&event[..split]).is_empty());
+        let mut remainder = event[split..].to_vec();
+        remainder.extend_from_slice(&response);
+
+        assert_eq!(
+            decoder.push(&remainder),
+            vec![
+                SerialManagementFrame::Event(
+                    (ManagementEvent::StatusChanged { sequence: 0x1234 }).encode()
+                ),
+                SerialManagementFrame::Response(self::response(7)),
+            ]
+        );
+    }
+
+    #[cfg(feature = "debug-serial")]
+    #[test]
+    fn response_only_decoder_ignores_unsolicited_serial_events() {
+        let mut decoder = SerialResponseDecoder::default();
+        let mut input = serial_event_line(4);
+        input.extend_from_slice(&serial_response_line(8));
+        assert_eq!(decoder.push(&input), vec![response(8)]);
+    }
+
+    #[cfg(feature = "debug-serial")]
     #[test]
     fn serial_request_uses_shared_protocol_encoding() {
         let mut client = ManagementClient::new(0x2a);
@@ -410,6 +564,52 @@ mod tests {
                 .as_bytes()
             )
         );
+    }
+
+    #[test]
+    fn hid_request_and_input_reports_keep_transport_ids_outside_protocol_bytes() {
+        let mut client = ManagementClient::new(0x2a);
+        let pending = client.begin(ManagementCommand::GetStatus).unwrap();
+        let packet = encode_hid_request(pending);
+        assert_eq!(packet[0], MANAGEMENT_HID_REQUEST_REPORT_ID);
+        assert_eq!(&packet[1..], &pending.encode());
+
+        let response = response(0x2a);
+        assert_eq!(
+            decode_hid_input(MANAGEMENT_HID_RESPONSE_REPORT_ID, &response),
+            Some(HidManagementFrame::Response(response))
+        );
+        let event = ManagementEvent::StatusChanged { sequence: 9 }.encode();
+        assert_eq!(
+            decode_hid_input(MANAGEMENT_HID_EVENT_REPORT_ID, &event),
+            Some(HidManagementFrame::Event(event))
+        );
+    }
+
+    #[test]
+    fn hid_input_rejects_wrong_report_lengths_and_unknown_ids() {
+        assert_eq!(
+            decode_hid_input(MANAGEMENT_HID_RESPONSE_REPORT_ID, &[0; 19]),
+            None
+        );
+        assert_eq!(decode_hid_input(0xff, &[0; MANAGEMENT_EVENT_LEN]), None);
+        assert_eq!(decode_hid_input_packet(&[0; 64]), None);
+    }
+
+    #[test]
+    fn management_hid_identity_excludes_other_collections_on_the_composite_device() {
+        assert!(is_management_hid_identity(
+            hidshift::fallback::FALLBACK_USB_VENDOR_ID,
+            hidshift::fallback::FALLBACK_USB_PRODUCT_ID,
+            hidshift::MANAGEMENT_HID_USAGE_PAGE,
+            hidshift::MANAGEMENT_HID_USAGE,
+        ));
+        assert!(!is_management_hid_identity(
+            hidshift::fallback::FALLBACK_USB_VENDOR_ID,
+            hidshift::fallback::FALLBACK_USB_PRODUCT_ID,
+            0x01,
+            0x06,
+        ));
     }
 
     #[test]

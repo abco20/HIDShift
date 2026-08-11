@@ -25,8 +25,8 @@ pub const FALLBACK_DEVICE_DESCRIPTOR: [u8; 18] = [
     1,
 ];
 
-pub const FALLBACK_CONFIGURATION_DESCRIPTOR: [u8; 91] = [
-    9, 0x02, 91, 0, 3, 1, 0, 0xa0, 50, // configuration, Remote Wakeup
+pub const FALLBACK_CONFIGURATION_DESCRIPTOR: [u8; 123] = [
+    9, 0x02, 123, 0, 4, 1, 0, 0xa0, 50, // configuration, Remote Wakeup
     9, 0x04, 0, 0, 2, 0x03, 0x01, 0x01, 0, // boot keyboard
     9, 0x21, 0x11, 0x01, 0, 1, 0x22, 65, 0, // keyboard HID
     7, 0x05, 0x81, 0x03, 8, 0, 1, // keyboard IN
@@ -37,6 +37,10 @@ pub const FALLBACK_CONFIGURATION_DESCRIPTOR: [u8; 91] = [
     9, 0x04, 2, 0, 1, 0x03, 0, 0, 0, // consumer control
     9, 0x21, 0x11, 0x01, 0, 1, 0x22, 23, 0, // consumer HID
     7, 0x05, 0x83, 0x03, 2, 0, 1, // consumer IN
+    9, 0x04, 3, 0, 2, 0x03, 0, 0, 0, // vendor management HID
+    9, 0x21, 0x11, 0x01, 0, 1, 0x22, 39, 0, // management HID
+    7, 0x05, 0x84, 0x03, 64, 0, 1, // management IN
+    7, 0x05, 0x04, 0x03, 64, 0, 1, // management OUT
 ];
 
 const LANGUAGES_STRING_DESCRIPTOR: [u8; 4] = [4, 0x03, 0x09, 0x04];
@@ -133,6 +137,48 @@ pub const CONSUMER_REPORT_DESCRIPTOR: &[u8] = &[
     0xc0, // End Collection
 ];
 
+pub const MANAGEMENT_REPORT_DESCRIPTOR: &[u8] = &[
+    0x06,
+    0x60,
+    0xff, // Usage Page (Vendor 0xff60)
+    0x09,
+    0x61, // Usage (HIDShift Management)
+    0xa1,
+    0x01, // Collection (Application)
+    0x15,
+    0x00, // Logical Minimum (0)
+    0x26,
+    0xff,
+    0x00, // Logical Maximum (255)
+    0x75,
+    0x08, // Report Size (8)
+    0x85,
+    crate::management::MANAGEMENT_HID_REQUEST_REPORT_ID,
+    0x09,
+    0x62, // Usage (Request)
+    0x95,
+    crate::management::MANAGEMENT_REQUEST_LEN as u8,
+    0x91,
+    0x02, // Output (Data, Variable, Absolute)
+    0x85,
+    crate::management::MANAGEMENT_HID_RESPONSE_REPORT_ID,
+    0x09,
+    0x63, // Usage (Response)
+    0x95,
+    crate::management::MANAGEMENT_RESPONSE_LEN as u8,
+    0x81,
+    0x02, // Input (Data, Variable, Absolute)
+    0x85,
+    crate::management::MANAGEMENT_HID_EVENT_REPORT_ID,
+    0x09,
+    0x64, // Usage (Event)
+    0x95,
+    crate::management::MANAGEMENT_EVENT_LEN as u8,
+    0x81,
+    0x02, // Input (Data, Variable, Absolute)
+    0xc0, // End Collection
+];
+
 pub fn build_fallback_mirror_image(
     out: &mut [u8],
 ) -> Result<usize, crate::mirror::MirrorImageEncodeError> {
@@ -166,6 +212,10 @@ pub fn build_fallback_mirror_image(
             interface_number: 2,
             descriptor: CONSUMER_REPORT_DESCRIPTOR,
         },
+        crate::mirror::HidReportRecord {
+            interface_number: 3,
+            descriptor: MANAGEMENT_REPORT_DESCRIPTOR,
+        },
     ];
     crate::mirror::serialize_mirror_image(
         crate::mirror::MirrorImageSource {
@@ -191,13 +241,14 @@ mod tests {
             KEYBOARD_REPORT_DESCRIPTOR,
             MOUSE_REPORT_DESCRIPTOR,
             CONSUMER_REPORT_DESCRIPTOR,
+            MANAGEMENT_REPORT_DESCRIPTOR,
         ] {
             assert!(ReportDescriptor::try_from(descriptor).is_ok());
         }
     }
 
     #[test]
-    fn fallback_identity_is_not_a_serial_or_management_device() {
+    fn fallback_identity_is_not_a_serial_device() {
         assert_eq!(FALLBACK_USB_PRODUCT, "HIDShift Wired");
         assert_ne!(FALLBACK_USB_VENDOR_ID, 0);
         assert_ne!(FALLBACK_USB_PRODUCT_ID, 0);
@@ -209,17 +260,17 @@ mod tests {
         let length = build_fallback_mirror_image(&mut bytes).unwrap();
         let plan = crate::mirror::validate_mirror_image(&bytes[..length]).unwrap();
 
-        assert_eq!(plan.interfaces.len(), 3);
-        assert_eq!(plan.endpoints.len(), 4);
+        assert_eq!(plan.interfaces.len(), 4);
+        assert_eq!(plan.endpoints.len(), 6);
         assert!(plan.supports_remote_wakeup());
         assert_eq!(plan.configuration_descriptor[5], 1);
         assert_eq!(
             plan.endpoints
                 .iter()
                 .map(|endpoint| endpoint.address)
-                .collect::<heapless::Vec<_, 4>>()
+                .collect::<heapless::Vec<_, 8>>()
                 .as_slice(),
-            &[0x81, 0x01, 0x82, 0x83]
+            &[0x81, 0x01, 0x82, 0x83, 0x84, 0x04]
         );
 
         let descriptor = ReportDescriptor::try_from(MOUSE_REPORT_DESCRIPTOR).unwrap();

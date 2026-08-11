@@ -1,5 +1,6 @@
 mod app;
 mod browser_client;
+mod command_effect;
 mod settings_ui;
 mod state;
 mod transport;

@@ -22,6 +22,9 @@ pub const RECORD_RAW_ENDPOINT_OUT: u8 = 0x25;
 pub const RECORD_STANDARD_INPUT_REPORT: u8 = 0x26;
 pub const RECORD_STANDARD_OUTPUT_REPORT: u8 = 0x27;
 pub const RECORD_STANDARD_RELEASE_ALL: u8 = 0x28;
+pub const RECORD_MANAGEMENT_REQUEST: u8 = 0x29;
+pub const RECORD_MANAGEMENT_RESPONSE: u8 = 0x2a;
+pub const RECORD_MANAGEMENT_EVENT: u8 = 0x2b;
 pub const RECORD_GET_DIAGNOSTICS: u8 = 0x30;
 pub const RECORD_DIAGNOSTICS: u8 = 0x31;
 pub const RECORD_TEST_FAULT: u8 = 0x32;
@@ -61,6 +64,7 @@ pub const CAPABILITY_ENDPOINT_OUT: u32 = 1 << 4;
 pub const CAPABILITY_PROFILE_FLASH_CACHE: u32 = 1 << 5;
 pub const CAPABILITY_STANDARD_WIRED_HID: u32 = 1 << 6;
 pub const CAPABILITY_USB_STATE_REPORTING: u32 = 1 << 7;
+pub const CAPABILITY_HID_MANAGEMENT: u32 = 1 << 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Hello {

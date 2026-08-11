@@ -1,10 +1,13 @@
 use std::rc::Rc;
 
-use gloo_timers::callback::Interval;
 use hidshift::{
     HostId, ManagementCommand, ManagementDiagnostics, ManagementHistoryEvent, ManagementHostName,
     ManagementHostStatus, ManagementOutputTarget, ManagementOutputTargetStatus, ManagementStatus,
     StorageHealth,
+};
+use hidshift_manager_ui::{
+    DestinationRoute, LocalComputerIdentity, ready_destinations, ready_routes,
+    select_destination_command as select_route_command,
 };
 use leptos::prelude::*;
 use send_wrapper::SendWrapper;
@@ -26,9 +29,9 @@ pub fn App() -> impl IntoView {
     let connect_ble_state = state.clone();
     let connect_ble: SendWrapper<Rc<dyn Fn()>> =
         SendWrapper::new(Rc::new(move || connect_ble_state.connect(true)));
-    let connect_serial_state = state.clone();
-    let connect_serial: SendWrapper<Rc<dyn Fn()>> =
-        SendWrapper::new(Rc::new(move || connect_serial_state.connect(false)));
+    let connect_hid_state = state.clone();
+    let connect_hid: SendWrapper<Rc<dyn Fn()>> =
+        SendWrapper::new(Rc::new(move || connect_hid_state.connect(false)));
     let notice_message = state.message;
     let notice_error = state.is_error;
     let notice_undo = state.undo;
@@ -39,39 +42,27 @@ pub fn App() -> impl IntoView {
     let connect_locale = state.locale;
     let page_state = state.clone();
     let page_send = send.clone();
-    let show_companion_onboarding = RwSignal::new(
-        crate::transport::is_tauri()
-            && web_sys::window()
-                .and_then(|window| window.local_storage().ok().flatten())
-                .and_then(|storage| {
-                    storage
-                        .get_item("hidshift-companion-onboarded")
-                        .ok()
-                        .flatten()
-                })
-                .is_none(),
-    );
+    let onboarding_native = state.native;
+    let onboarding_decline = state.clone();
+    let onboarding_enable = state.clone();
     if crate::transport::is_tauri() {
-        state.connect(true);
-        let reconnect_state = state.clone();
-        let reconnect = Interval::new(2_000, move || {
-            if !reconnect_state.connected.get_untracked() && !reconnect_state.busy.get_untracked() {
-                reconnect_state.connect(true);
-            }
-        });
-        // App is the root component, so this interval intentionally lives for
-        // the full WebView lifetime.
-        reconnect.forget();
+        state.start_native();
     }
 
     view! {
         <div class="app-shell">
-            {move || show_companion_onboarding.get().then(|| view! {
+            {move || onboarding_native.get().is_some_and(|snapshot| !snapshot.notification_prompt_seen).then(|| view! {
                 <div class="notice" role="dialog" aria-label="Companion setup">
-                    <span>"切替通知を許可し、ログイン時にHIDShift Companionを起動しますか？"</span>
+                    <span>"入力先の切替をOS通知で受け取りますか？"</span>
                     <span>
-                        <button class="quiet compact" on:click=move |_| finish_companion_onboarding(show_companion_onboarding, false)>"後で"</button>
-                        <button class="compact" on:click=move |_| finish_companion_onboarding(show_companion_onboarding, true)>"有効にする"</button>
+                        <button class="quiet compact" on:click={
+                            let state = onboarding_decline.clone();
+                            move |_| state.set_native_notifications(false)
+                        }>"後で"</button>
+                        <button class="compact" on:click={
+                            let state = onboarding_enable.clone();
+                            move |_| state.set_native_notifications(true)
+                        }>"有効にする"</button>
                     </span>
                 </div>
             })}
@@ -99,10 +90,12 @@ pub fn App() -> impl IntoView {
                             <strong>{move || if state.connected.get() {
                                 let label = state.connection.get();
                                 if label.is_empty() { "HIDShift".into() } else { label }
+                            } else if crate::transport::is_tauri() {
+                                text(state.locale.get(), "HIDShiftを検索中", "Searching for HIDShift").into()
                             } else {
                                 text(state.locale.get(), "未接続", "Not connected").into()
                             }}</strong>
-                            <small>{move || current_target(state.status.get(), state.output_status.get(), &state.names.get(), state.locale.get())}</small>
+                            <small>{move || current_target(state.status.get(), state.output_status.get(), &state.names.get(), state.native.get().as_ref(), state.locale.get())}</small>
                         </span>
                     </div>
                     <div class="top-actions">
@@ -138,19 +131,19 @@ pub fn App() -> impl IntoView {
                         })
                     }}
 
-                    {move || (!connect_connected.get()).then(|| view! {
+                    {move || (!connect_connected.get() && !crate::transport::is_tauri()).then(|| view! {
                         <section class="connect-panel">
                             <h2>{move || text(connect_locale.get(), "HIDShiftへ接続", "Connect to HIDShift")}</h2>
-                            <p>{move || text(connect_locale.get(), "普段はBluetooth、初期設定や復旧時はUSB Serialを利用できます。接続後は必要なページのデータだけを取得します。", "Use Bluetooth for everyday access or USB Serial for setup and recovery. Only the current page is loaded after connecting.")}</p>
+                            <p>{move || text(connect_locale.get(), "BluetoothまたはUSB HIDで接続できます。接続後は必要なページのデータだけを取得します。", "Connect over Bluetooth or USB HID. Only the current page is loaded after connecting.")}</p>
                             <div class="connect-actions">
                                 <button disabled=move || connect_busy.get() on:click={
                                     let action = connect_ble.clone();
                                     move |_| action()
                                 }>{move || text(connect_locale.get(), "Bluetoothで接続", "Connect with Bluetooth")}</button>
                                 <button class="secondary" disabled=move || connect_busy.get() on:click={
-                                    let action = connect_serial.clone();
+                                    let action = connect_hid.clone();
                                     move |_| action()
-                                }>{move || text(connect_locale.get(), "USB Serialで接続", "Connect with USB Serial")}</button>
+                                }>{move || text(connect_locale.get(), "USB HIDで接続", "Connect with USB HID")}</button>
                             </div>
                         </section>
                     })}
@@ -172,20 +165,6 @@ pub fn App() -> impl IntoView {
                 <NavButton state=state.clone() page=Page::Settings label_ja="設定" label_en="Settings" icon="settings"/>
             </nav>
         </div>
-    }
-}
-
-fn finish_companion_onboarding(visible: RwSignal<bool>, enable: bool) {
-    visible.set(false);
-    if let Some(storage) =
-        web_sys::window().and_then(|window| window.local_storage().ok().flatten())
-    {
-        let _ = storage.set_item("hidshift-companion-onboarded", "1");
-    }
-    if enable {
-        spawn_local(async move {
-            let _ = crate::transport::companion_onboarding(true).await;
-        });
     }
 }
 
@@ -255,7 +234,7 @@ fn home_page(state: AppState, send: CommandSender) -> impl IntoView {
                         <span class="row-icon active"><RouteIcon/></span>
                         <div class="row-copy">
                             <small>{text(locale, "現在の送信先", "Current destination")}</small>
-                            <strong>{current_target(status, state.output_status.get(), &state.names.get(), locale)}</strong>
+                            <strong>{current_target(status, state.output_status.get(), &state.names.get(), state.native.get().as_ref(), locale)}</strong>
                         </div>
                         <div class="row-meta">{route_state(status, state.output_status.get(), locale)}</div>
                     </div>
@@ -265,7 +244,7 @@ fn home_page(state: AppState, send: CommandSender) -> impl IntoView {
                         let state = state.clone();
                         move |_| state.navigate(Page::Destinations)
                     }>{text(locale, "すべて表示", "View all")}</button></div>
-                    <div class="row-list">{connected_destination_rows(status, state.output_status.get(), state.names.get(), state.busy, send.clone(), locale)}</div>
+                    <div class="row-list">{home_destination_rows(state.clone(), send.clone(), locale)}</div>
                 </section>
                 <section class="section">
                     <div class="section-heading"><div><h2>{text(locale, "USB入力", "USB inputs")}</h2></div><button class="quiet compact" on:click={
@@ -305,7 +284,7 @@ fn destinations_page(state: AppState, send: CommandSender) -> impl IntoView {
         {wired_destination_section(state.clone(), send.clone(), locale)}
         <section class="section">
             <div class="section-heading"><h2>{text(locale, "接続中", "Connected")}</h2></div>
-            <div class="row-list">{connected_destination_rows(state.status.get(), state.output_status.get(), state.names.get(), state.busy, send.clone(), locale)}</div>
+            <div class="row-list">{destination_route_rows(state.clone(), send.clone(), locale)}</div>
         </section>
         <section class="section">
             <div class="section-heading"><h2>{text(locale, "登録済み", "Registered")}</h2></div>
@@ -314,39 +293,151 @@ fn destinations_page(state: AppState, send: CommandSender) -> impl IntoView {
     }
 }
 
-fn connected_destination_rows(
-    status: Option<ManagementStatus>,
-    output: Option<ManagementOutputTargetStatus>,
-    names: [String; 4],
-    busy: RwSignal<bool>,
-    send: CommandSender,
-    locale: Locale,
-) -> impl IntoView {
-    let Some(status) = status else {
+fn destination_route_rows(state: AppState, send: CommandSender, locale: Locale) -> impl IntoView {
+    let Some(status) = state.status.get() else {
         return view! { <div class="empty-row">{text(locale, "HIDShiftへ接続してください", "Connect to HIDShift")}</div> }.into_any();
     };
-    let rows = status.hosts[..status.host_count.min(4) as usize]
-        .iter()
-        .enumerate()
-        .filter(|(_, host)| host.connected)
-        .map(|(index, host)| {
-            destination_row(
-                index,
-                *host,
-                status,
-                output,
-                names[index].clone(),
-                None,
-                busy,
-                send.clone(),
-                locale,
-            )
+    let (local, local_name) = local_computer(&state);
+    let dual_s3 = state.output_status.get().is_some();
+    let routes = ready_routes(
+        status,
+        state.output_status.get(),
+        &state.names.get(),
+        local,
+        &local_name,
+    );
+    if routes.is_empty() {
+        return view! { <div class="empty-row">{text(locale, "接続中の経路はありません", "No connected routes")}</div> }.into_any();
+    }
+
+    routes
+        .into_iter()
+        .map(|route_view| {
+            let route = route_view.route;
+            let command = select_route_command(route, dual_s3);
+            let title = if route_view.this_computer {
+                this_computer_title(&route_view.name, locale)
+            } else {
+                match route {
+                    DestinationRoute::Wired => text(locale, "有線USB", "Wired USB").into(),
+                    DestinationRoute::Ble(host) if route_view.name.is_empty() => {
+                        format!("{} {}", text(locale, "接続先", "Destination"), host.0)
+                    }
+                    DestinationRoute::Ble(_) => route_view.name,
+                }
+            };
+            let route_label = match route {
+                DestinationRoute::Wired => text(locale, "有線USB", "Wired USB").into(),
+                DestinationRoute::Ble(host) => format!("Bluetooth · ID {}", host.0),
+            };
+            let active = route_view.active;
+            let selected = route_view.selected;
+            let busy = state.busy;
+            let send = send.clone();
+            view! {
+                <div class="row has-actions">
+                    <span class:active=active class="row-icon"><DestinationIcon/></span>
+                    <div class="row-copy">
+                        <strong>{title}</strong>
+                        <small class="route-icons">
+                            <span class:active=active class="route-kind">
+                                {match route {
+                                    DestinationRoute::Wired => view! { <UsbRouteIcon/> }.into_any(),
+                                    DestinationRoute::Ble(_) => view! { <BluetoothRouteIcon/> }.into_any(),
+                                }}
+                                {route_label}
+                            </span>
+                        </small>
+                    </div>
+                    <div class="row-meta">
+                        <span class="state connected">{if active { text(locale, "使用中", "Active") } else { text(locale, "準備完了", "Ready") }}</span>
+                        {selected.then(|| view! { <span>{text(locale, "選択中", "Selected")}</span> })}
+                    </div>
+                    <div class="row-actions"><button class="secondary compact" disabled=move || busy.get() || selected on:click=move |_| send(command)>{if selected { text(locale, "選択中", "Selected") } else { text(locale, "選択", "Select") }}</button></div>
+                </div>
+            }
         })
-        .collect::<Vec<_>>();
-    if rows.is_empty() {
-        view! { <div class="empty-row">{text(locale, "接続中の接続先はありません", "No connected destinations")}</div> }.into_any()
+        .collect_view()
+        .into_any()
+}
+
+fn home_destination_rows(state: AppState, send: CommandSender, locale: Locale) -> impl IntoView {
+    let Some(status) = state.status.get() else {
+        return view! { <div class="empty-row">{text(locale, "HIDShiftへ接続してください", "Connect to HIDShift")}</div> }.into_any();
+    };
+    let (local, local_name) = local_computer(&state);
+    let dual_s3 = state.output_status.get().is_some();
+    let destinations = ready_destinations(
+        status,
+        state.output_status.get(),
+        &state.names.get(),
+        local,
+        &local_name,
+    );
+    if destinations.is_empty() {
+        return view! { <div class="empty-row">{text(locale, "接続中の接続先はありません", "No connected destinations")}</div> }.into_any();
+    }
+    destinations
+        .into_iter()
+        .filter_map(|destination| {
+            let route = destination.preferred_route()?;
+            let command = select_route_command(route, dual_s3);
+            let title = if destination.this_computer {
+                this_computer_title(&destination.name, locale)
+            } else if destination.wired {
+                text(locale, "有線USB", "Wired USB").into()
+            } else if destination.name.is_empty() {
+                match destination.ble_host {
+                    Some(host) => format!("{} {}", text(locale, "接続先", "Destination"), host.0),
+                    None => return None,
+                }
+            } else {
+                destination.name.clone()
+            };
+            let active = destination.active_route.is_some();
+            let selected = destination.selected;
+            let busy = state.busy;
+            let send = send.clone();
+            Some(view! {
+                <div class="row has-actions">
+                    <span class:active=active class="row-icon"><DestinationIcon/></span>
+                    <div class="row-copy">
+                        <strong>{title}</strong>
+                        <small class="route-icons">
+                            {destination.wired.then(|| view! {
+                                <span class:active=destination.active_route == Some(DestinationRoute::Wired) class="route-kind"><UsbRouteIcon/>{text(locale, "有線", "USB")}</span>
+                            })}
+                            {destination.ble_host.map(|host| view! {
+                                <span class:active=destination.active_route == Some(DestinationRoute::Ble(host)) class="route-kind"><BluetoothRouteIcon/>"Bluetooth"</span>
+                            })}
+                        </small>
+                    </div>
+                    <div class="row-meta"><span class="state connected">{text(locale, "準備完了", "Ready")}</span>{selected.then(|| view! { <span>{text(locale, "選択中", "Selected")}</span> })}</div>
+                    <div class="row-actions"><button class="secondary compact" disabled=move || busy.get() || selected on:click=move |_| send(command)>{if selected { text(locale, "選択中", "Selected") } else { text(locale, "選択", "Select") }}</button></div>
+                </div>
+            })
+        })
+        .collect_view()
+        .into_any()
+}
+
+fn local_computer(state: &AppState) -> (Option<LocalComputerIdentity>, String) {
+    let native = state.native.get();
+    let identity = native.as_ref().map(|snapshot| LocalComputerIdentity {
+        ble_host: snapshot.local_ble_host.map(HostId),
+        wired: snapshot.local_wired,
+    });
+    let name = native
+        .map(|snapshot| snapshot.computer_name)
+        .unwrap_or_default();
+    (identity, name)
+}
+
+fn this_computer_title(name: &str, locale: Locale) -> String {
+    if name.is_empty() {
+        text(locale, "このPC", "This computer").into()
     } else {
-        rows.into_iter().collect_view().into_any()
+        format!("{} · {name}", text(locale, "このPC", "This computer"))
     }
 }
 
@@ -423,7 +514,7 @@ fn destination_row(
             <div class="row-copy"><strong>{title.clone()}</strong><small>{timing.map(|value| format!("{}s · 0x{:02x}", value.last_connected_seconds, value.last_disconnect_reason)).unwrap_or_else(|| format!("ID {}", host.0))}</small></div>
             <div class="row-meta"><span class=if ready { "state connected" } else if flags.connected { "state waiting" } else { "state" }>{if ready { text(locale, "準備完了", "Ready") } else if flags.connected { text(locale, "準備中", "Waiting") } else { text(locale, "切断中", "Disconnected") }}</span>{selected.then(|| view! { <span>{text(locale, "選択中", "Selected")}</span> })}</div>
             <div class="row-actions">
-                <button class="secondary compact" disabled=move || busy.get() || !ready || selected on:click=move |_| select_send(select_destination_command(ManagementOutputTarget::Ble(host), dual_s3))>{if selected { text(locale, "選択中", "Selected") } else { text(locale, "選択", "Select") }}</button>
+                <button class="secondary compact" disabled=move || busy.get() || !ready || selected on:click=move |_| select_send(select_route_command(DestinationRoute::Ble(host), dual_s3))>{if selected { text(locale, "選択中", "Selected") } else { text(locale, "選択", "Select") }}</button>
                 <button class="quiet compact" disabled=move || busy.get() on:click=move |_| {
                     let Some(window) = web_sys::window() else { return; };
                     if let Ok(Some(value)) = window.prompt_with_message_and_default(text(locale, "表示名", "Display name"), &title)
@@ -447,7 +538,7 @@ fn wired_destination_section(
     locale: Locale,
 ) -> impl IntoView {
     view! {
-        {move || state.output_status.get().map(|output| {
+        {move || state.output_status.get().filter(|output| !output.wired_ready).map(|output| {
             let selected = output.selected == ManagementOutputTarget::Wired;
             let active = output.active == Some(ManagementOutputTarget::Wired);
             let ready = output.wired_ready;
@@ -460,19 +551,12 @@ fn wired_destination_section(
                             <span class:active=active class="row-icon"><DestinationIcon/></span>
                             <div class="row-copy"><strong>{text(locale, "有線USB", "Wired USB")}</strong><small>{text(locale, "Device S3からPCへUSB HIDとして出力", "USB HID output to the PC through Device S3")}</small></div>
                             <div class="row-meta"><span class=if ready { "state connected" } else { "state" }>{if ready { text(locale, "準備完了", "Ready") } else { text(locale, "未接続", "Unavailable") }}</span>{selected.then(|| view! { <span>{text(locale, "選択中", "Selected")}</span> })}</div>
-                            <div class="row-actions"><button class="secondary compact" disabled=move || state.busy.get() || !ready || selected on:click=move |_| select_send(select_destination_command(ManagementOutputTarget::Wired, true))>{if selected { text(locale, "選択中", "Selected") } else { text(locale, "選択", "Select") }}</button></div>
+                            <div class="row-actions"><button class="secondary compact" disabled=move || state.busy.get() || !ready || selected on:click=move |_| select_send(select_route_command(DestinationRoute::Wired, true))>{if selected { text(locale, "選択中", "Selected") } else { text(locale, "選択", "Select") }}</button></div>
                         </div>
                     </div>
                 </section>
             }
         })}
-    }
-}
-
-fn select_destination_command(target: ManagementOutputTarget, dual_s3: bool) -> ManagementCommand {
-    match (dual_s3, target) {
-        (false, ManagementOutputTarget::Ble(host)) => ManagementCommand::SelectHost(host),
-        (_, target) => ManagementCommand::SelectOutputTarget(target),
     }
 }
 
@@ -569,6 +653,27 @@ fn settings_page(state: AppState, send: CommandSender) -> impl IntoView {
                 </div>
             </div>
         </section>
+        {crate::transport::is_tauri().then(|| view! {
+            <section class="section">
+                <div class="section-heading"><div><h2>{text(locale, "Local app", "Local app")}</h2><p>{text(locale, "OS統合とバックグラウンド動作を設定します。", "Configure operating-system integration and background behavior.")}</p></div></div>
+                <div class="setting-list">
+                    <div class="setting-row">
+                        <div class="setting-copy"><h4>{text(locale, "送信先切替通知", "Destination notifications")}</h4><p>{text(locale, "入力先が別のPCへ変わった時と、有線断でBluetoothへ退避した時に通知します。", "Notify when input moves to another computer or falls back from USB to Bluetooth.")}</p></div>
+                        <div class="setting-control"><input type="checkbox" checked=move || state.native.get().is_some_and(|value| value.notifications_enabled) on:change={
+                            let state = state.clone();
+                            move |event| state.set_native_notifications(event_target_checked(&event))
+                        }/></div>
+                    </div>
+                    <div class="setting-row">
+                        <div class="setting-copy"><h4>{text(locale, "ログイン時に起動", "Start at login")}</h4><p>{text(locale, "ウィンドウを閉じてもTrayで接続と切替を維持します。", "Keep connection and switching available from the tray after closing the window.")}</p></div>
+                        <div class="setting-control"><input type="checkbox" checked=move || state.native.get().is_some_and(|value| value.autostart_enabled) on:change={
+                            let state = state.clone();
+                            move |event| state.set_native_autostart(event_target_checked(&event))
+                        }/></div>
+                    </div>
+                </div>
+            </section>
+        })}
         <section class="section">
             <div class="section-heading"><div><h2>{text(locale, "詳細設定", "Advanced device settings")}</h2><p>{text(locale, "現在のfirmwareが提供する設定です。", "Settings exposed by the current firmware.")}</p></div></div>
             {move || if state.settings.get().is_empty() {
@@ -660,17 +765,43 @@ fn current_target(
     status: Option<ManagementStatus>,
     output: Option<ManagementOutputTargetStatus>,
     names: &[String; 4],
+    native: Option<&crate::transport::NativeCompanionSnapshot>,
     locale: Locale,
 ) -> String {
     match output.and_then(|output| output.active) {
+        Some(ManagementOutputTarget::Wired) if native.is_some_and(|value| value.local_wired) => {
+            this_computer_name(native.expect("guarded"), locale)
+        }
         Some(ManagementOutputTarget::Wired) => text(locale, "有線USB", "Wired USB").into(),
+        Some(ManagementOutputTarget::Ble(host))
+            if native.and_then(|value| value.local_ble_host) == Some(host.0) =>
+        {
+            this_computer_name(native.expect("guarded"), locale)
+        }
         Some(ManagementOutputTarget::Ble(host)) => host_name(host, names, locale),
         None if output.is_some() => text(locale, "準備待ち", "Waiting").into(),
         None => status
             .and_then(|status| status.active_host)
-            .map(|host| host_name(host, names, locale))
+            .map(|host| {
+                if native.and_then(|value| value.local_ble_host) == Some(host.0) {
+                    this_computer_name(native.expect("guarded"), locale)
+                } else {
+                    host_name(host, names, locale)
+                }
+            })
             .unwrap_or_else(|| text(locale, "送信先なし", "No destination").into()),
     }
+}
+
+fn this_computer_name(
+    native: &crate::transport::NativeCompanionSnapshot,
+    locale: Locale,
+) -> String {
+    format!(
+        "{} · {}",
+        text(locale, "このPC", "This computer"),
+        native.computer_name
+    )
 }
 
 fn route_state(
@@ -737,6 +868,16 @@ fn DestinationIcon() -> impl IntoView {
 }
 
 #[component]
+fn UsbRouteIcon() -> impl IntoView {
+    view! { <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v13M9 6l3-3 3 3M12 11l-4 3M8 14v3M12 13l4 2M16 15v2M6 17h4v4H6zM14 17h4v4h-4z" stroke-linecap="round" stroke-linejoin="round"/></svg> }
+}
+
+#[component]
+fn BluetoothRouteIcon() -> impl IntoView {
+    view! { <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 7 8 10V7L8 17l8-10-4-4v18l4-4" stroke-linecap="round" stroke-linejoin="round"/></svg> }
+}
+
+#[component]
 fn InputIcon() -> impl IntoView {
     view! { <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18v12H3zM6 10h.01M9 10h.01M12 10h.01M15 10h.01M18 10h.01M7 14h10" stroke-linecap="round" stroke-linejoin="round"/></svg> }
 }
@@ -775,11 +916,11 @@ mod tests {
     #[test]
     fn dual_destinations_use_output_target_commands() {
         assert_eq!(
-            select_destination_command(ManagementOutputTarget::Wired, true),
+            select_route_command(DestinationRoute::Wired, true),
             ManagementCommand::SelectOutputTarget(ManagementOutputTarget::Wired)
         );
         assert_eq!(
-            select_destination_command(ManagementOutputTarget::Ble(HostId(2)), true),
+            select_route_command(DestinationRoute::Ble(HostId(2)), true),
             ManagementCommand::SelectOutputTarget(ManagementOutputTarget::Ble(HostId(2)))
         );
     }
@@ -787,7 +928,7 @@ mod tests {
     #[test]
     fn single_s3_ble_destination_keeps_legacy_select_command() {
         assert_eq!(
-            select_destination_command(ManagementOutputTarget::Ble(HostId(3)), false),
+            select_route_command(DestinationRoute::Ble(HostId(3)), false),
             ManagementCommand::SelectHost(HostId(3))
         );
     }

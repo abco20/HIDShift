@@ -447,7 +447,6 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
         host_id: HostId,
         out: &mut heapless::Vec<BridgeAction, ACTIONS>,
     ) -> Result<(), BridgeError> {
-        self.activate_target(host_id, NotifyReason::TargetSwitchRelease, out)?;
         if let Some(previous) = self.state.pairable_host.replace(host_id)
             && previous != host_id
         {
@@ -457,6 +456,7 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
         self.push_status(out)
     }
 
+    #[cfg(not(feature = "dual-s3-wired"))]
     fn activate_target<const ACTIONS: usize>(
         &mut self,
         target: HostId,
@@ -511,6 +511,10 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
         }
         let removed = self.state.hosts.clear_host(host_id);
         if removed {
+            #[cfg(feature = "dual-s3-wired")]
+            if self.state.wired_ble_host == Some(host_id) {
+                self.state.wired_ble_host = None;
+            }
             push_action(out, BridgeAction::ClearBond { host_id, bond })?;
             push_action(out, BridgeAction::PersistProfiles)?;
             if was_active {
@@ -838,6 +842,11 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
     }
 
     #[cfg(feature = "dual-s3-wired")]
+    pub fn set_wired_host_link(&mut self, host: Option<HostId>) {
+        self.state.wired_ble_host = host;
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
     pub fn begin_wired_presentation_transition(&mut self) -> Result<u32, BridgeError> {
         self.state
             .suppression
@@ -874,6 +883,12 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
                             .map_err(|_| StorageError::InvalidHostId)?,
                     ),
                 },
+                wired_ble_host: self
+                    .state
+                    .wired_ble_host
+                    .map(|host| host.validated())
+                    .transpose()
+                    .map_err(|_| StorageError::InvalidHostId)?,
                 mirror_target: self.state.mirror_target,
             };
         }
@@ -896,6 +911,10 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
                     (stored, _) => stored.as_output_target(),
                 };
             self.state.mirror_target = storage.presentation.mirror_target;
+            self.state.wired_ble_host = storage
+                .presentation
+                .wired_ble_host
+                .map(|slot| HostId(slot.get()));
             if self.state.output_target.selected == OutputTarget::Wired {
                 self.state.hosts.clear_active_target();
             }
@@ -928,6 +947,8 @@ pub struct BridgeState<const HOSTS: usize> {
     #[cfg(feature = "dual-s3-wired")]
     pub wired_keyboard_leds: KeyboardLedState,
     #[cfg(feature = "dual-s3-wired")]
+    pub wired_ble_host: Option<HostId>,
+    #[cfg(feature = "dual-s3-wired")]
     pub mirror_target: Option<crate::output_target::StoredMirrorTarget>,
 }
 
@@ -947,6 +968,8 @@ impl<const HOSTS: usize> BridgeState<HOSTS> {
             wired_availability: OutputTargetAvailability::Unavailable,
             #[cfg(feature = "dual-s3-wired")]
             wired_keyboard_leds: KeyboardLedState::empty(),
+            #[cfg(feature = "dual-s3-wired")]
+            wired_ble_host: None,
             #[cfg(feature = "dual-s3-wired")]
             mirror_target: None,
         }
@@ -2377,6 +2400,32 @@ mod tests {
                     active_target: Some(HOST_A),
                     pairable_host: Some(HOST_A),
                 }))
+        );
+    }
+
+    #[test]
+    fn entering_pairing_for_another_host_preserves_the_current_input_target() {
+        let mut bridge = ready_bridge();
+        let mut actions = heapless::Vec::<BridgeAction, 8>::new();
+
+        bridge
+            .handle_event(
+                BridgeEvent::EnterPairingMode { host_id: HOST_B },
+                &mut actions,
+            )
+            .unwrap();
+
+        assert_eq!(bridge.state().hosts.active_target(), Some(HOST_A));
+        assert_eq!(bridge.state().pairable_host, Some(HOST_B));
+        assert!(
+            !actions
+                .as_slice()
+                .contains(&BridgeAction::ActivateInput { host_id: HOST_B })
+        );
+        assert!(
+            actions
+                .as_slice()
+                .contains(&BridgeAction::AllowPairing { host_id: HOST_B })
         );
     }
 

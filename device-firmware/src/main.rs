@@ -34,6 +34,7 @@ static PROFILE_STAGING: StaticCell<[u8; HSMI_MAX_SIZE]> = StaticCell::new();
 static PROFILE_ACTIVE_IMAGE: StaticCell<[u8; HSMI_MAX_SIZE]> = StaticCell::new();
 static FALLBACK_IMAGE: StaticCell<[u8; 1024]> = StaticCell::new();
 const SPI_LINK_LOSS_TIMEOUT_MS: u64 = 1_500;
+const USB_MANAGEMENT_DRAIN_BEFORE_RESTART_MS: u64 = 20;
 
 #[esp_hal::main]
 fn main() -> ! {
@@ -198,6 +199,10 @@ trait PresentationRuntime<B: UsbBus> {
         None
     }
     fn restore_control_request(&mut self, _request: hidshift::interchip::MirrorControlRequest) {}
+    fn take_management_request(&mut self) -> Option<hidshift::ManagementRequest> {
+        None
+    }
+    fn restore_management_request(&mut self, _request: hidshift::ManagementRequest) {}
     fn usb_state(&self, configured: bool, profile_hash: u32) -> UsbState;
     fn is_fallback(&self) -> bool;
 }
@@ -231,6 +236,12 @@ impl<B: UsbBus> PresentationRuntime<B> for DynamicUsb<'_, B> {
             DeviceLinkEvent::ControlResponse(response) => {
                 self.enqueue_control_response(response);
             }
+            DeviceLinkEvent::ManagementResponse(response) => {
+                self.enqueue_management_response(response);
+            }
+            DeviceLinkEvent::ManagementEvent(event) => {
+                self.enqueue_management_event(event);
+            }
             _ => {}
         }
     }
@@ -257,6 +268,14 @@ impl<B: UsbBus> PresentationRuntime<B> for DynamicUsb<'_, B> {
 
     fn restore_control_request(&mut self, request: hidshift::interchip::MirrorControlRequest) {
         self.restore_control_request(request);
+    }
+
+    fn take_management_request(&mut self) -> Option<hidshift::ManagementRequest> {
+        self.take_management_request()
+    }
+
+    fn restore_management_request(&mut self, request: hidshift::ManagementRequest) {
+        self.restore_management_request(request);
     }
 
     fn usb_state(&self, configured: bool, profile_hash: u32) -> UsbState {
@@ -431,11 +450,13 @@ fn run<'a, B: UsbBus, P: PresentationRuntime<B>>(
                             .is_some()
                     {
                         boot_presentation::request_mirror(activate.profile_hash);
+                        drain_usb_before_restart(&mut usb_device, &mut presentation);
                         let _ = usb_device.force_reset();
                         restart_presentation();
                     }
                 }
                 DeviceLinkEvent::ForceFallback { .. } if !presentation.is_fallback() => {
+                    drain_usb_before_restart(&mut usb_device, &mut presentation);
                     let _ = usb_device.force_reset();
                     restart_presentation();
                 }
@@ -500,6 +521,17 @@ fn soft_disconnect_usb() {
     usb_signaling::soft_disconnect();
 }
 
+fn drain_usb_before_restart<B: UsbBus, P: PresentationRuntime<B>>(
+    usb_device: &mut UsbDevice<'_, B>,
+    presentation: &mut P,
+) {
+    let deadline = now_ms().saturating_add(USB_MANAGEMENT_DRAIN_BEFORE_RESTART_MS);
+    while now_ms() < deadline {
+        presentation.poll(usb_device);
+        core::hint::spin_loop();
+    }
+}
+
 fn profile_transfer_error_result(
     error: ProfileTransferError,
     transfer_id: u32,
@@ -555,6 +587,11 @@ fn service_usb<B: UsbBus, P: PresentationRuntime<B>>(
         && !link.queue_control_request(request, now_ms)
     {
         presentation.restore_control_request(request);
+    }
+    if let Some(request) = presentation.take_management_request()
+        && !link.queue_management_request(request, now_ms)
+    {
+        presentation.restore_management_request(request);
     }
 
     let next_usb_state = presentation.usb_state(

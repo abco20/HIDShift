@@ -18,6 +18,52 @@ impl OutputTarget {
     }
 }
 
+/// Selects the next ready computer for a physical target-cycle action.
+///
+/// A Companion can associate the wired route with the BLE host belonging to
+/// the same computer. The two transports then occupy one position in the
+/// cycle: wired is preferred while available and BLE is its fallback.
+pub fn next_ready_computer_target(
+    selected: OutputTarget,
+    wired_ready: bool,
+    ready_ble_mask: u8,
+    wired_ble_host: Option<HostId>,
+) -> Option<OutputTarget> {
+    let selected_index = match selected {
+        OutputTarget::Wired => 0,
+        OutputTarget::Ble(host) if Some(host) == wired_ble_host => 0,
+        OutputTarget::Ble(host) => usize::from(host.0.min(HOST_SLOT_COUNT as u8)),
+    };
+
+    // Index zero is the wired computer and indices 1..=4 are the remaining
+    // BLE computers. Do not scan the current logical index again: cycling a
+    // single ready computer should be a no-op rather than changing transport.
+    for offset in 1..=HOST_SLOT_COUNT {
+        let index = (selected_index + offset) % (HOST_SLOT_COUNT + 1);
+        if index == 0 {
+            if wired_ready {
+                return Some(OutputTarget::Wired);
+            }
+            if let Some(host) = wired_ble_host
+                && ble_host_ready(ready_ble_mask, host)
+            {
+                return Some(OutputTarget::Ble(host));
+            }
+            continue;
+        }
+
+        let host = HostId(index as u8);
+        if Some(host) != wired_ble_host && ble_host_ready(ready_ble_mask, host) {
+            return Some(OutputTarget::Ble(host));
+        }
+    }
+    None
+}
+
+const fn ble_host_ready(ready_ble_mask: u8, host: HostId) -> bool {
+    host.0 >= 1 && host.0 <= HOST_SLOT_COUNT as u8 && ready_ble_mask & (1 << (host.0 - 1)) != 0
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OutputTargetError {
     InvalidBleHost,
@@ -217,12 +263,14 @@ pub struct StoredMirrorTarget(pub MirrorStableId);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StoredPresentationConfig {
     pub output_target: StoredOutputTarget,
+    pub wired_ble_host: Option<crate::ids::HostSlot>,
     pub mirror_target: Option<StoredMirrorTarget>,
 }
 
 impl StoredPresentationConfig {
     pub const DEFAULT: Self = Self {
         output_target: StoredOutputTarget::Wired,
+        wired_ble_host: None,
         mirror_target: None,
     };
 }
@@ -296,6 +344,48 @@ mod tests {
             effective_presentation(OutputTarget::Wired, MirrorConfiguration::Disabled, true),
             UsbPresentation::Fallback
         );
+    }
+
+    #[test]
+    fn physical_cycle_collapses_wired_and_linked_ble_into_one_computer() {
+        let ready_ble_mask = 0b0111;
+
+        assert_eq!(
+            next_ready_computer_target(OutputTarget::Wired, true, ready_ble_mask, Some(HostId(1)),),
+            Some(OutputTarget::Ble(HostId(2)))
+        );
+        assert_eq!(
+            next_ready_computer_target(
+                OutputTarget::Ble(HostId(3)),
+                true,
+                ready_ble_mask,
+                Some(HostId(1)),
+            ),
+            Some(OutputTarget::Wired)
+        );
+    }
+
+    #[test]
+    fn physical_cycle_uses_linked_ble_as_the_computer_fallback() {
+        assert_eq!(
+            next_ready_computer_target(
+                OutputTarget::Ble(HostId(2)),
+                false,
+                0b0011,
+                Some(HostId(1)),
+            ),
+            Some(OutputTarget::Ble(HostId(1)))
+        );
+    }
+
+    #[test]
+    fn physical_cycle_does_nothing_when_only_the_current_computer_is_ready() {
+        for selected in [OutputTarget::Wired, OutputTarget::Ble(HostId(1))] {
+            assert_eq!(
+                next_ready_computer_target(selected, true, 0b0001, Some(HostId(1))),
+                None
+            );
+        }
     }
 
     #[test]
