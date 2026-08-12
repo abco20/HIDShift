@@ -93,7 +93,8 @@ impl<const BLE: usize, const USB_HOST: usize, const STORAGE: usize, const STATUS
                 RuntimeCommand::BleCommand(_) => ble += 1,
                 #[cfg(feature = "dual-s3-wired")]
                 RuntimeCommand::DeviceCommand(_) => device += 1,
-                RuntimeCommand::UsbKeyboardLedWrite { .. } => usb += 1,
+                RuntimeCommand::UsbKeyboardLedWrite { .. }
+                | RuntimeCommand::SetUsbHostBusState(_) => usb += 1,
                 #[cfg(feature = "dual-s3-wired")]
                 RuntimeCommand::UsbMirrorEndpointOut { .. }
                 | RuntimeCommand::UsbMirrorControlRequest { .. } => usb += 1,
@@ -159,6 +160,10 @@ impl<const BLE: usize, const USB_HOST: usize, const STORAGE: usize, const STATUS
                     device_id: *device_id,
                     bytes: *bytes,
                 })
+                .map_err(|_| RuntimeDispatchError::UsbQueueCapacity),
+            RuntimeCommand::SetUsbHostBusState(state) => self
+                .usb_host
+                .push(UsbHostTaskCommand::SetBusState(*state))
                 .map_err(|_| RuntimeDispatchError::UsbQueueCapacity),
             #[cfg(feature = "dual-s3-wired")]
             RuntimeCommand::UsbMirrorEndpointOut { device_id, report } => self

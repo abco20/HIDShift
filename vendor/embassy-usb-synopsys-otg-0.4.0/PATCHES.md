@@ -13,6 +13,7 @@ see [LICENSE-MIT](LICENSE-MIT).
 - clean up a transfer when its async future is cancelled
 - preserve periodic endpoint scheduling from `bInterval`
 - retry transient periodic transaction errors without losing channel state
+- suspend and resume the root port while pausing every active host transfer
 
 The repository uses this copy through `[patch.crates-io]` in the root
 `Cargo.toml`. Host stress testing with a one-level hub, composite keyboard, and

@@ -27,6 +27,7 @@ const EV_FRMOR: u16 = 1 << 6;
 const EV_DTERR: u16 = 1 << 7;
 const EV_CHH: u16 = 1 << 8;
 const EV_DISCONNECT: u16 = 1 << 9;
+const EV_SUSPEND: u16 = 1 << 10;
 
 enum ChannelEvent {
     None,
@@ -37,6 +38,7 @@ enum ChannelEvent {
     TransactionError,
     FrameOverrun,
     Error(PipeError),
+    Suspended,
 }
 
 /// HCINT.NYET bit (not exposed by the PAC struct).
@@ -73,6 +75,7 @@ struct HostStateFields {
     port_waker: AtomicWaker,
     port_event: AtomicU8,
     port_speed: AtomicU8,
+    suspended: AtomicBool,
 }
 
 /// Storage object for USB host driver state. Create one per OTG instance.
@@ -99,6 +102,7 @@ impl<const CH_COUNT: usize> HostStateStorage<CH_COUNT> {
                 port_waker: AtomicWaker::new(),
                 port_event: AtomicU8::new(0),
                 port_speed: AtomicU8::new(0),
+                suspended: AtomicBool::new(false),
             },
         }
     }
@@ -180,6 +184,7 @@ pub unsafe fn on_host_interrupt(r: Otg, state: &HostState<'_>) {
                 state.fields.port_event.fetch_or(PORT_EVENT_ENABLED, Ordering::Release);
             } else {
                 // Port disabled
+                leave_suspend_after_disconnect(r, state);
                 state
                     .fields
                     .port_event
@@ -206,6 +211,7 @@ pub unsafe fn on_host_interrupt(r: Otg, state: &HostState<'_>) {
     // Disconnect interrupt
     if gintsts.discint() {
         r.gintsts().write(|w| w.set_discint(true)); // clear
+        leave_suspend_after_disconnect(r, state);
         state
             .fields
             .port_event
@@ -396,6 +402,18 @@ fn hprt_read_safe(r: Otg) -> u32 {
     val & !(0x2E)
 }
 
+fn leave_suspend_after_disconnect(r: Otg, state: &HostState<'_>) {
+    if !state.fields.suspended.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let safe_val = hprt_read_safe(r);
+    r.hprt().write(|w| {
+        w.0 = safe_val;
+        w.set_psusp(false);
+        w.set_pres(false);
+    });
+}
+
 /// USB OTG Host Driver.
 pub struct OtgHost<'d> {
     instance: OtgHostInstance<'d>,
@@ -408,6 +426,14 @@ impl<'d> OtgHost<'d> {
         Self {
             instance,
             inited: false,
+        }
+    }
+
+    /// Returns a copyable handle for suspending and resuming the root port.
+    pub fn port_control(&self) -> OtgHostPortControl<'d> {
+        OtgHostPortControl {
+            regs: self.instance.regs,
+            state: self.instance.state,
         }
     }
 
@@ -541,6 +567,83 @@ impl<'d> OtgHost<'d> {
         r.gahbcfg().write(|w| {
             w.set_gint(true);
         });
+    }
+}
+
+/// Bus-wide root-port power-state control for an initialized OTG host.
+///
+/// The handle shares the controller state with every allocated channel so
+/// transfers wait across suspend instead of treating the missing transaction
+/// interrupt as a controller failure.
+#[derive(Clone, Copy)]
+pub struct OtgHostPortControl<'d> {
+    regs: Otg,
+    state: HostState<'d>,
+}
+
+impl OtgHostPortControl<'_> {
+    /// Suspends the root port and pauses every allocated host channel.
+    pub async fn suspend(&self) {
+        if self.state.fields.suspended.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        for (index, channel) in self.state.channels.iter().enumerate() {
+            if channel.allocated.load(Ordering::Acquire)
+                && self.regs.hcchar(index).read().chena()
+            {
+                self.regs.hcchar(index).modify(|w| {
+                    w.set_chena(true);
+                    w.set_chdis(true);
+                });
+            }
+        }
+        Timer::after_millis(1).await;
+        if !self.state.fields.suspended.load(Ordering::Acquire) {
+            return;
+        }
+
+        let safe_val = hprt_read_safe(self.regs);
+        self.regs.hprt().write(|w| {
+            w.0 = safe_val;
+            w.set_psusp(true);
+        });
+
+        for channel in self.state.channels {
+            if channel.allocated.load(Ordering::Acquire) {
+                channel.result.fetch_or(EV_SUSPEND, Ordering::Release);
+                channel.waker.wake();
+            }
+        }
+    }
+
+    /// Resumes the root port and releases paused channel transfers.
+    pub async fn resume(&self) {
+        if !self.state.fields.suspended.load(Ordering::Acquire) {
+            return;
+        }
+
+        // USB 2.0 resume signaling from a host must last at least 20 ms.
+        let safe_val = hprt_read_safe(self.regs);
+        self.regs.hprt().write(|w| {
+            w.0 = safe_val;
+            w.set_psusp(true);
+            w.set_pres(true);
+        });
+        Timer::after_millis(20).await;
+        let safe_val = hprt_read_safe(self.regs);
+        self.regs.hprt().write(|w| {
+            w.0 = safe_val;
+            w.set_psusp(false);
+            w.set_pres(false);
+        });
+
+        self.state.fields.suspended.store(false, Ordering::Release);
+        for channel in self.state.channels {
+            if channel.allocated.load(Ordering::Acquire) {
+                channel.waker.wake();
+            }
+        }
     }
 }
 
@@ -1114,6 +1217,8 @@ impl<T: pipe::Type, D: pipe::Direction> Channel<'_, T, D> {
     fn classify_events(events: u16) -> ChannelEvent {
         if events & EV_DISCONNECT != 0 {
             ChannelEvent::Error(PipeError::Disconnected)
+        } else if events & EV_SUSPEND != 0 {
+            ChannelEvent::Suspended
         } else if events & EV_STALL != 0 {
             ChannelEvent::Error(PipeError::Stall)
         } else if events & EV_DTERR != 0 {
@@ -1137,6 +1242,19 @@ impl<T: pipe::Type, D: pipe::Direction> Channel<'_, T, D> {
         }
     }
 
+    async fn wait_until_running(&self) {
+        poll_fn(|cx| {
+            let channel = &self.state.channels[self.index];
+            channel.waker.register(cx.waker());
+            if self.state.fields.suspended.load(Ordering::Acquire) {
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
+        })
+        .await
+    }
+
     /// Execute an OUT transfer on this channel, retrying indefinitely on NAK/NYET.
     ///
     /// Per USB spec, NAK is a legitimate "try again" response with no
@@ -1155,6 +1273,7 @@ impl<T: pipe::Type, D: pipe::Direction> Channel<'_, T, D> {
         // rewrites HCTSIZ each iteration so we re-assert it here.
         let mut do_ping = false;
         loop {
+            self.wait_until_running().await;
             self.configure_channel(false, ep_type, pktcnt, data.len() as u32, dpid);
             if do_ping {
                 self.regs.hctsiz(self.index).modify(|w| w.set_doping(true));
@@ -1176,6 +1295,10 @@ impl<T: pipe::Type, D: pipe::Direction> Channel<'_, T, D> {
                 }
                 ChannelEvent::Nak | ChannelEvent::Halted | ChannelEvent::None => {
                     yield_now().await;
+                    continue;
+                }
+                ChannelEvent::Suspended => {
+                    self.halt_channel();
                     continue;
                 }
                 ChannelEvent::TransactionError | ChannelEvent::FrameOverrun => {
@@ -1213,6 +1336,7 @@ impl<T: pipe::Type, D: pipe::Direction> Channel<'_, T, D> {
             if is_periodic {
                 self.wait_for_periodic_slot().await;
             }
+            self.wait_until_running().await;
             self.setup_rx_buffer(&mut buf[..xfer_size as usize]);
             self.configure_channel(true, ep_type, pktcnt, xfer_size, dpid);
             self.enable_channel();
@@ -1258,6 +1382,10 @@ impl<T: pipe::Type, D: pipe::Direction> Channel<'_, T, D> {
                         self.halt_channel();
                     }
                     yield_now().await;
+                    continue;
+                }
+                ChannelEvent::Suspended => {
+                    self.halt_channel();
                     continue;
                 }
                 ChannelEvent::TransactionError | ChannelEvent::FrameOverrun if is_periodic => {

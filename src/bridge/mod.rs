@@ -10,7 +10,7 @@ use crate::output_target::OutputTarget;
 #[cfg(feature = "dual-s3-wired")]
 use crate::output_target::{
     BLE_TARGET_READINESS_POLICY, OutputTargetAvailability, OutputTargetState, StoredOutputTarget,
-    StoredPresentationConfig,
+    StoredPresentationConfig, next_ready_computer_target,
 };
 use crate::reports::{
     BleKeyboardLedOutputReport, BleKeyboardOutputError, ConsumerReport, KEYBOARD_6KRO_KEY_CAPACITY,
@@ -99,9 +99,30 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
                 self.push_status(out)
             }
             BridgeEvent::HostDisconnected { host_id } => {
+                #[cfg(not(feature = "dual-s3-wired"))]
+                let should_fallback = self.state.hosts.active_target() == Some(host_id)
+                    && self.can_send(host_id, ReportKind::Keyboard);
+                #[cfg(feature = "dual-s3-wired")]
+                let should_fallback =
+                    self.state.output_target.active == Some(OutputTarget::Ble(host_id));
                 self.state.hosts.on_disconnected(host_id);
                 #[cfg(feature = "dual-s3-wired")]
                 self.refresh_selected_target_availability();
+                if should_fallback {
+                    #[cfg(not(feature = "dual-s3-wired"))]
+                    if let Some(target) = self
+                        .state
+                        .hosts
+                        .next_ready_target_after(Some(host_id), ReportKind::Keyboard)
+                    {
+                        self.transition_ble_target(target, None, out)?;
+                        return self.push_status(out);
+                    }
+                    #[cfg(feature = "dual-s3-wired")]
+                    if let Some(target) = self.next_ready_output_target() {
+                        return self.transition_output_target(target, None, out);
+                    }
+                }
                 self.push_status(out)
             }
             BridgeEvent::HostSecurityChanged {
@@ -362,7 +383,7 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
         #[cfg(feature = "dual-s3-wired")]
         self.select_output_target(OutputTarget::Ble(target), out)?;
         #[cfg(not(feature = "dual-s3-wired"))]
-        self.activate_target(target, NotifyReason::TargetSwitchRelease, out)?;
+        self.transition_ble_target(target, Some(NotifyReason::TargetSwitchRelease), out)?;
         #[cfg(feature = "dual-s3-wired")]
         return Ok(());
         #[cfg(not(feature = "dual-s3-wired"))]
@@ -375,6 +396,16 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
         target: OutputTarget,
         out: &mut heapless::Vec<BridgeAction, ACTIONS>,
     ) -> Result<(), BridgeError> {
+        self.transition_output_target(target, Some(NotifyReason::TargetSwitchRelease), out)
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    fn transition_output_target<const ACTIONS: usize>(
+        &mut self,
+        target: OutputTarget,
+        release_previous: Option<NotifyReason>,
+        out: &mut heapless::Vec<BridgeAction, ACTIONS>,
+    ) -> Result<(), BridgeError> {
         target
             .validate()
             .map_err(|_| BridgeError::InvalidOutputTarget)?;
@@ -382,8 +413,10 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
             return self.push_status(out);
         }
 
-        if let Some(active) = self.state.output_target.active {
-            self.push_release_target(active, NotifyReason::TargetSwitchRelease, out)?;
+        if let Some(active) = self.state.output_target.active
+            && let Some(reason) = release_previous
+        {
+            self.push_release_target(active, reason, out)?;
         }
         self.state
             .suppression
@@ -457,17 +490,19 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
     }
 
     #[cfg(not(feature = "dual-s3-wired"))]
-    fn activate_target<const ACTIONS: usize>(
+    fn transition_ble_target<const ACTIONS: usize>(
         &mut self,
         target: HostId,
-        release_reason: NotifyReason,
+        release_previous: Option<NotifyReason>,
         out: &mut heapless::Vec<BridgeAction, ACTIONS>,
     ) -> Result<bool, BridgeError> {
         if self.state.hosts.active_target() == Some(target) {
             return Ok(false);
         }
-        if let Some(old_host) = self.state.hosts.active_target() {
-            self.push_release_reports(old_host, release_reason, out)?;
+        if let Some(old_host) = self.state.hosts.active_target()
+            && let Some(reason) = release_previous
+        {
+            self.push_release_reports(old_host, reason, out)?;
         }
         self.state
             .suppression
@@ -825,6 +860,50 @@ impl<const HOSTS: usize> Bridge<HOSTS> {
 
     pub fn can_send(&self, host_id: HostId, kind: ReportKind) -> bool {
         self.state.hosts.can_send(host_id, kind)
+    }
+
+    /// Returns whether any computer transport is currently connected.
+    ///
+    /// This intentionally does not require encryption or report readiness:
+    /// the physical USB input bus should already be awake while a newly
+    /// connected computer is completing its session setup.
+    pub fn has_connected_computer(&self) -> bool {
+        if self
+            .state
+            .hosts
+            .hosts()
+            .iter()
+            .flatten()
+            .any(|host| host.connected)
+        {
+            return true;
+        }
+        #[cfg(feature = "dual-s3-wired")]
+        {
+            self.state.wired_availability != OutputTargetAvailability::Unavailable
+        }
+        #[cfg(not(feature = "dual-s3-wired"))]
+        {
+            false
+        }
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    pub fn next_ready_output_target(&self) -> Option<OutputTarget> {
+        let selected = self.state.output_target.selected;
+        let wired_ready = self.state.wired_availability == OutputTargetAvailability::Ready;
+        let mut ready_ble_mask = 0;
+        for index in 0..HOSTS.min(crate::ids::HOST_SLOT_COUNT) {
+            if self.ble_target_ready(HostId((index + 1) as u8)) {
+                ready_ble_mask |= 1 << index;
+            }
+        }
+        next_ready_computer_target(
+            selected,
+            wired_ready,
+            ready_ble_mask,
+            self.state.wired_ble_host,
+        )
     }
 
     #[cfg(feature = "dual-s3-wired")]
@@ -1328,6 +1407,139 @@ mod tests {
         );
     }
 
+    #[test]
+    fn disconnecting_active_host_falls_back_without_notifying_disconnected_host() {
+        let mut bridge = ready_bridge();
+        let mut actions = heapless::Vec::<BridgeAction, 12>::new();
+        make_ready(&mut bridge, HOST_B);
+
+        bridge
+            .handle_event(
+                BridgeEvent::InputFrame(InputFrame::Standard(keyboard_frame(&[0x04]))),
+                &mut actions,
+            )
+            .unwrap();
+        actions.clear();
+
+        bridge
+            .handle_event(
+                BridgeEvent::HostDisconnected { host_id: HOST_A },
+                &mut actions,
+            )
+            .unwrap();
+
+        assert_eq!(bridge.state().hosts.active_target(), Some(HOST_B));
+        assert!(actions.contains(&BridgeAction::ActivateInput { host_id: HOST_B }));
+        assert!(actions.contains(&BridgeAction::PersistProfiles));
+        assert!(!actions.iter().any(|action| matches!(
+            action,
+            BridgeAction::Notify {
+                target: OutputTarget::Ble(HOST_A),
+                ..
+            }
+        )));
+        assert_eq!(
+            bridge.storage_state(1).unwrap().last_active_host,
+            Some(HOST_B)
+        );
+
+        actions.clear();
+        bridge
+            .handle_event(
+                BridgeEvent::InputFrame(InputFrame::Standard(keyboard_frame(&[0x04]))),
+                &mut actions,
+            )
+            .unwrap();
+        assert!(matches!(
+            actions.as_slice(),
+            [BridgeAction::Notify {
+                target: OutputTarget::Ble(HOST_B),
+                report: StandardHidReport::Keyboard(report),
+                reason: NotifyReason::Input,
+            }] if report == &Keyboard6KroReport::release()
+        ));
+
+        bridge
+            .handle_event(BridgeEvent::HostConnected { host_id: HOST_A }, &mut actions)
+            .unwrap();
+        assert_eq!(bridge.state().hosts.active_target(), Some(HOST_B));
+    }
+
+    #[test]
+    fn disconnecting_active_host_keeps_selection_when_no_fallback_is_ready() {
+        let mut bridge = ready_bridge();
+        let mut actions = heapless::Vec::<BridgeAction, 8>::new();
+
+        bridge
+            .handle_event(
+                BridgeEvent::HostDisconnected { host_id: HOST_A },
+                &mut actions,
+            )
+            .unwrap();
+
+        assert_eq!(bridge.state().hosts.active_target(), Some(HOST_A));
+        assert!(!actions.contains(&BridgeAction::PersistProfiles));
+    }
+
+    #[test]
+    fn disconnect_fallback_skips_connected_host_that_is_not_report_ready() {
+        let host_c = HostId(3);
+        let mut bridge = Bridge::<3>::new();
+        let mut actions = heapless::Vec::<BridgeAction, 12>::new();
+        make_ready(&mut bridge, HOST_A);
+        bridge
+            .handle_event(BridgeEvent::SwitchTarget { target: HOST_A }, &mut actions)
+            .unwrap();
+        bridge
+            .handle_event(BridgeEvent::HostConnected { host_id: HOST_B }, &mut actions)
+            .unwrap();
+        make_ready(&mut bridge, host_c);
+        actions.clear();
+
+        bridge
+            .handle_event(
+                BridgeEvent::HostDisconnected { host_id: HOST_A },
+                &mut actions,
+            )
+            .unwrap();
+
+        assert_eq!(bridge.state().hosts.active_target(), Some(host_c));
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    #[test]
+    fn dual_s3_disconnect_fallback_updates_selected_and_active_target() {
+        let mut bridge = ready_bridge();
+        let mut actions = heapless::Vec::<BridgeAction, 12>::new();
+        make_ready(&mut bridge, HOST_B);
+        actions.clear();
+
+        bridge
+            .handle_event(
+                BridgeEvent::HostDisconnected { host_id: HOST_A },
+                &mut actions,
+            )
+            .unwrap();
+
+        assert_eq!(
+            bridge.state().output_target.selected,
+            OutputTarget::Ble(HOST_B)
+        );
+        assert_eq!(
+            bridge.state().output_target.active,
+            Some(OutputTarget::Ble(HOST_B))
+        );
+        assert!(actions.contains(&BridgeAction::ActivateInput { host_id: HOST_B }));
+        assert!(actions.contains(&BridgeAction::PersistProfiles));
+        assert!(!actions.iter().any(|action| matches!(
+            action,
+            BridgeAction::Notify {
+                target: OutputTarget::Ble(HOST_A),
+                ..
+            }
+        )));
+    }
+
     #[cfg(feature = "dual-s3-wired")]
     #[test]
     fn wired_target_routes_exclusively_after_release_and_suppression() {
@@ -1439,7 +1651,7 @@ mod tests {
 
     #[cfg(feature = "dual-s3-wired")]
     #[test]
-    fn unavailable_selected_target_never_fails_over() {
+    fn unavailable_wired_target_keeps_explicit_selection() {
         let mut bridge = ready_bridge();
         let mut actions = heapless::Vec::<BridgeAction, 12>::new();
         bridge

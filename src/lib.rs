@@ -211,6 +211,7 @@ pub use usb_hid::host_interface::{HidInterfaceInfo, HidInterfaceLookupError, fin
 pub use usb_hid::output::{
     BitPos, KeyboardLedOutputBytes, KeyboardLedOutputError, KeyboardLedOutputReport,
 };
+pub use usb_hid::power::{USB_HOST_SUSPEND_DELAY_MS, UsbHostBusState, UsbHostPowerPolicy};
 pub use usb_hid::runtime_adapter::runtime_input_from_usb_report;
 pub use usb_hid::source::{
     OwnedUsbHidInputReport, USB_DEVICE_STRING_MAX_LEN, USB_HID_REPORT_DESCRIPTOR_MAX_LEN,

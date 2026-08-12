@@ -337,7 +337,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(queues.usb_host.len(), 1);
-        assert_eq!(queues.usb_host[0].device_id(), DeviceId(7));
+        assert_eq!(queues.usb_host[0].target_device_id(), Some(DeviceId(7)));
         assert_eq!(queues.ble.len(), 0);
         assert_eq!(queues.storage.len(), 0);
         assert_eq!(queues.status.len(), 0);

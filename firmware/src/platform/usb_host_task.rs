@@ -14,7 +14,8 @@ use embassy_usb_host::handler::HandlerEvent;
 use embassy_usb_host::{BusRoute, BusState};
 use embassy_usb_synopsys_otg::PhyType;
 use embassy_usb_synopsys_otg::host::{
-    HostStateStorage, OtgHost, OtgHostAllocator, OtgHostInstance, on_host_interrupt,
+    HostStateStorage, OtgHost, OtgHostAllocator, OtgHostInstance, OtgHostPortControl,
+    on_host_interrupt,
 };
 use esp_hal::otg_fs::Usb;
 use esp_hal::peripherals::Interrupt;
@@ -674,6 +675,7 @@ pub async fn usb_input_task(
 
     let usb = Usb::new(usb0, usb_dp, usb_dm);
     let host = new_otg_host(usb);
+    let port_control = host.port_control();
 
     let (bus_controller, bus_handle) = embassy_usb_host::bus(host, &BUS_STATE);
     let config_buf = CONFIG_DESCRIPTOR_STORAGE.take();
@@ -852,7 +854,14 @@ pub async fn usb_input_task(
                         }
                     }
                     Either4::Third(command) => {
-                        handle_usb_command(&sender, &bus_handle, &mut active_slots, command).await;
+                        handle_usb_command(
+                            &sender,
+                            &bus_handle,
+                            &port_control,
+                            &mut active_slots,
+                            command,
+                        )
+                        .await;
                     }
                     Either4::Fourth(root_event) => {
                         log::info!("firmware: USB root session ended: {:?}", root_event);
@@ -930,7 +939,14 @@ pub async fn usb_input_task(
                     }
                 }
                 Either3::Second(command) => {
-                    handle_usb_command(&sender, &bus_handle, &mut active_slots, command).await;
+                    handle_usb_command(
+                        &sender,
+                        &bus_handle,
+                        &port_control,
+                        &mut active_slots,
+                        command,
+                    )
+                    .await;
                 }
                 Either3::Third(root_event) => {
                     log::info!("firmware: USB root session ended: {:?}", root_event);
@@ -957,10 +973,21 @@ async fn handle_usb_command<'d>(
         RUNTIME_INPUT_QUEUE_CAPACITY,
     >,
     bus_handle: &FirmwareBusHandle<'d>,
+    port_control: &OtgHostPortControl<'d>,
     active_slots: &mut [Option<ActiveUsbInterfaceSlot<'d>>; MAX_ACTIVE_USB_INTERFACES],
     command: UsbHostTaskCommand,
 ) {
     match command {
+        UsbHostTaskCommand::SetBusState(state) => match state {
+            hidshift::UsbHostBusState::Running => {
+                log::info!("firmware: resuming USB input bus");
+                port_control.resume().await;
+            }
+            hidshift::UsbHostBusState::Suspended => {
+                log::info!("firmware: suspending USB input bus");
+                port_control.suspend().await;
+            }
+        },
         UsbHostTaskCommand::KeyboardLedWrite {
             interface_id,
             device_id,

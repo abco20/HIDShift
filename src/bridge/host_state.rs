@@ -194,11 +194,27 @@ impl<const HOSTS: usize> BleHostStateMachine<HOSTS> {
     }
 
     pub fn next_connected_target_after(&self, current: Option<HostId>) -> Option<HostId> {
+        self.next_target_after(current, |host| host.connected)
+    }
+
+    pub fn next_ready_target_after(
+        &self,
+        current: Option<HostId>,
+        report: ReportKind,
+    ) -> Option<HostId> {
+        self.next_target_after(current, |host| host.can_send(report))
+    }
+
+    fn next_target_after(
+        &self,
+        current: Option<HostId>,
+        mut is_candidate: impl FnMut(&HostRuntimeState) -> bool,
+    ) -> Option<HostId> {
         let mut first_connected = None;
         let mut return_next = current.is_none();
 
-        for host in self.hosts.iter().flatten().copied() {
-            if !host.connected {
+        for host in self.hosts.iter().flatten() {
+            if !is_candidate(host) {
                 continue;
             }
             if first_connected.is_none() {
