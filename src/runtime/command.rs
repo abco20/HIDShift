@@ -11,6 +11,7 @@ use crate::reports::BleHidReport;
 use crate::reports::StandardHidReport;
 use crate::storage::{StoragePersistPriority, StorageState, StoredBond};
 use crate::usb_hid::output::KeyboardLedOutputBytes;
+use crate::usb_hid::power::UsbHostBusState;
 
 use super::StatusSnapshot;
 
@@ -26,6 +27,7 @@ pub enum RuntimeCommand {
         device_id: DeviceId,
         bytes: KeyboardLedOutputBytes,
     },
+    SetUsbHostBusState(UsbHostBusState),
     #[cfg(feature = "dual-s3-wired")]
     UsbMirrorEndpointOut {
         device_id: DeviceId,
@@ -216,6 +218,7 @@ pub enum UsbHostTaskCommand {
         device_id: DeviceId,
         bytes: KeyboardLedOutputBytes,
     },
+    SetBusState(UsbHostBusState),
     #[cfg(feature = "dual-s3-wired")]
     MirrorEndpointOut {
         device_id: DeviceId,
@@ -232,6 +235,7 @@ impl UsbHostTaskCommand {
     pub const fn class(self) -> CommandClass {
         match self {
             Self::KeyboardLedWrite { .. } => CommandClass::Realtime,
+            Self::SetBusState(_) => CommandClass::Critical,
             #[cfg(feature = "dual-s3-wired")]
             Self::MirrorEndpointOut { .. } | Self::MirrorControlRequest { .. } => {
                 CommandClass::Critical
@@ -246,17 +250,19 @@ impl UsbHostTaskCommand {
                 device_id,
                 ..
             } => Some((interface_id, device_id)),
+            Self::SetBusState(_) => None,
             #[cfg(feature = "dual-s3-wired")]
             Self::MirrorEndpointOut { .. } | Self::MirrorControlRequest { .. } => None,
         }
     }
 
-    pub const fn device_id(self) -> DeviceId {
+    pub const fn target_device_id(self) -> Option<DeviceId> {
         match self {
-            Self::KeyboardLedWrite { device_id, .. } => device_id,
+            Self::KeyboardLedWrite { device_id, .. } => Some(device_id),
+            Self::SetBusState(_) => None,
             #[cfg(feature = "dual-s3-wired")]
             Self::MirrorEndpointOut { device_id, .. }
-            | Self::MirrorControlRequest { device_id, .. } => device_id,
+            | Self::MirrorControlRequest { device_id, .. } => Some(device_id),
         }
     }
 }
@@ -360,6 +366,10 @@ mod tests {
         );
         assert_eq!(
             BleTaskCommand::AllowPairing { host_id: HostId(1) }.class(),
+            CommandClass::Critical
+        );
+        assert_eq!(
+            UsbHostTaskCommand::SetBusState(UsbHostBusState::Suspended).class(),
             CommandClass::Critical
         );
         assert_eq!(

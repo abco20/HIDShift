@@ -14,15 +14,14 @@ use crate::management::{
 use crate::mirror::{MirrorCandidateMetadata, MirrorCandidateRegistry};
 use crate::output_target::OutputTarget;
 #[cfg(feature = "dual-s3-wired")]
-use crate::output_target::{
-    MirrorCandidateId, MirrorStableId, OutputTargetAvailability, next_ready_computer_target,
-};
+use crate::output_target::{MirrorCandidateId, MirrorStableId, OutputTargetAvailability};
 use crate::settings::GlobalSettings;
 use crate::storage::{
     FixedName, STORED_HOSTS_MAX, StorageError, StorageHealth, StoragePersistPriority, StorageState,
 };
 use crate::target_control::ButtonIntent;
 use crate::usb_hid::output::{KeyboardLedOutputError, KeyboardLedOutputReport};
+use crate::usb_hid::power::UsbHostPowerPolicy;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 pub mod bootstrap;
@@ -52,7 +51,7 @@ pub const USB_LED_ACTIONS_MAX: usize = RUNTIME_USB_INTERFACES_MAX;
 pub const TARGET_CONTROL_ACTIONS_MAX: usize = 4;
 pub const RUNTIME_BRIDGE_ACTION_CAPACITY: usize =
     RELEASE_REPORTS_MAX + USB_LED_ACTIONS_MAX + TARGET_CONTROL_ACTIONS_MAX + 1;
-pub const RUNTIME_COMMAND_CAPACITY: usize = RUNTIME_BRIDGE_ACTION_CAPACITY;
+pub const RUNTIME_COMMAND_CAPACITY: usize = RUNTIME_BRIDGE_ACTION_CAPACITY + 1;
 pub const RUNTIME_BLE_EVENT_CAPACITY: usize = 2;
 pub const RUNTIME_INPUT_QUEUE_CAPACITY: usize = 16;
 pub const RUNTIME_BLE_GATT_WRITE_MAX_LEN: usize = 2;
@@ -232,6 +231,7 @@ pub struct BridgeRuntime<const HOSTS: usize, const USB_INTERFACES: usize> {
     status_sequence: u64,
     counters: RuntimeCounters,
     storage_health: StorageHealth,
+    usb_host_power: UsbHostPowerPolicy,
     #[cfg(feature = "dual-s3-wired")]
     last_profile_result: Option<ProfileResult>,
     #[cfg(feature = "dual-s3-wired")]
@@ -287,6 +287,7 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             status_sequence: 0,
             counters: RuntimeCounters::new(),
             storage_health: StorageHealth::Persistent,
+            usb_host_power: UsbHostPowerPolicy::new(),
             #[cfg(feature = "dual-s3-wired")]
             last_profile_result: None,
             #[cfg(feature = "dual-s3-wired")]
@@ -578,6 +579,19 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         input: RuntimeInput<'_>,
         commands: &mut heapless::Vec<RuntimeCommand, COMMANDS>,
     ) -> Result<(), RuntimeError> {
+        self.handle_input_core_in_place::<COMMANDS, ACTIONS, EVENTS>(input, commands)?;
+        self.reconcile_usb_host_power(commands)
+    }
+
+    fn handle_input_core_in_place<
+        const COMMANDS: usize,
+        const ACTIONS: usize,
+        const EVENTS: usize,
+    >(
+        &mut self,
+        input: RuntimeInput<'_>,
+        commands: &mut heapless::Vec<RuntimeCommand, COMMANDS>,
+    ) -> Result<(), RuntimeError> {
         match input {
             RuntimeInput::BridgeEvent(mut event) => {
                 let mut shortcut_triggered = false;
@@ -767,7 +781,7 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                         RuntimeCommand::DeviceCommand(DeviceTaskCommand::RawEndpointIn(report)),
                     )
                 } else if let Some(frame) = standard {
-                    self.handle_input_in_place::<COMMANDS, ACTIONS, EVENTS>(
+                    self.handle_input_core_in_place::<COMMANDS, ACTIONS, EVENTS>(
                         RuntimeInput::BridgeEvent(BridgeEvent::InputFrame(frame)),
                         commands,
                     )
@@ -959,6 +973,21 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
                 self.restore_storage_state::<COMMANDS>(storage, commands)
             }
         }
+    }
+
+    fn reconcile_usb_host_power<const COMMANDS: usize>(
+        &mut self,
+        commands: &mut heapless::Vec<RuntimeCommand, COMMANDS>,
+    ) -> Result<(), RuntimeError> {
+        let usb_device_present = self.usb_interfaces.iter().any(Option::is_some);
+        let computer_connected = self.bridge.has_connected_computer();
+        if let Some(state) =
+            self.usb_host_power
+                .update(self.now_ms, usb_device_present, computer_connected)
+        {
+            push_command(commands, RuntimeCommand::SetUsbHostBusState(state))?;
+        }
+        Ok(())
     }
 
     #[cfg(not(feature = "dual-s3-wired"))]
@@ -1237,7 +1266,7 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             ButtonIntent::NextConnectedTarget => {
                 #[cfg(feature = "dual-s3-wired")]
                 {
-                    let Some(target) = self.next_ready_output_target() else {
+                    let Some(target) = self.bridge.next_ready_output_target() else {
                         commands.clear();
                         return Ok(());
                     };
@@ -1293,7 +1322,7 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
         #[cfg(feature = "dual-s3-wired")]
         {
             let _ = now_ms;
-            let Some(target) = self.next_ready_output_target() else {
+            let Some(target) = self.bridge.next_ready_output_target() else {
                 return Ok(());
             };
             self.pending_target_switch = None;
@@ -1309,25 +1338,6 @@ impl<const HOSTS: usize, const USB_INTERFACES: usize> BridgeRuntime<HOSTS, USB_I
             };
             self.request_target_switch::<COMMANDS, ACTIONS>(target, now_ms, commands)
         }
-    }
-
-    #[cfg(feature = "dual-s3-wired")]
-    fn next_ready_output_target(&self) -> Option<OutputTarget> {
-        let selected = self.bridge.state().output_target.selected;
-        let wired_ready = self.bridge.state().wired_availability
-            == crate::output_target::OutputTargetAvailability::Ready;
-        let mut ready_ble_mask = 0;
-        for index in 0..HOSTS.min(4) {
-            if self.bridge.ble_target_ready(HostId((index + 1) as u8)) {
-                ready_ble_mask |= 1 << index;
-            }
-        }
-        next_ready_computer_target(
-            selected,
-            wired_ready,
-            ready_ble_mask,
-            self.bridge.state().wired_ble_host,
-        )
     }
 
     fn push_storage_snapshot<const COMMANDS: usize>(
@@ -1984,7 +1994,9 @@ const fn storage_persist_priority_for_event(event: &BridgeEvent) -> Option<Stora
         | BridgeEvent::ClearHost { .. }
         | BridgeEvent::SetHostName { .. } => Some(StoragePersistPriority::Critical),
         BridgeEvent::CccdChanged { .. } => Some(StoragePersistPriority::Normal),
-        BridgeEvent::SwitchTarget { .. } => Some(StoragePersistPriority::Lazy),
+        BridgeEvent::HostDisconnected { .. } | BridgeEvent::SwitchTarget { .. } => {
+            Some(StoragePersistPriority::Lazy)
+        }
         _ => None,
     }
 }
@@ -3926,6 +3938,109 @@ mod tests {
     }
 
     #[test]
+    fn disconnected_usb_input_bus_suspends_after_the_idle_delay_and_resumes_on_connect() {
+        let mut runtime = BridgeRuntime::<2, 1>::new(0);
+        let mut commands = heapless::Vec::<RuntimeCommand, 8>::new();
+
+        runtime
+            .handle_input::<8, 8, 2>(
+                RuntimeInput::UsbHidInterfaceConnected {
+                    interface_id: InterfaceId(1),
+                    device_id: DeviceId(7),
+                    led_output: None,
+                },
+                &mut commands,
+            )
+            .unwrap();
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, RuntimeCommand::SetUsbHostBusState(_)))
+        );
+
+        runtime
+            .handle_input::<8, 8, 2>(
+                RuntimeInput::Tick {
+                    now_ms: crate::usb_hid::power::USB_HOST_SUSPEND_DELAY_MS - 1,
+                },
+                &mut commands,
+            )
+            .unwrap();
+        assert!(commands.is_empty());
+
+        runtime
+            .handle_input::<8, 8, 2>(
+                RuntimeInput::Tick {
+                    now_ms: crate::usb_hid::power::USB_HOST_SUSPEND_DELAY_MS,
+                },
+                &mut commands,
+            )
+            .unwrap();
+        assert_eq!(
+            commands.as_slice(),
+            &[RuntimeCommand::SetUsbHostBusState(
+                crate::usb_hid::power::UsbHostBusState::Suspended
+            )]
+        );
+        let mut queues = RuntimeCommandQueues::<1, 1, 1, 1>::new();
+        queues.dispatch_from(commands.as_slice()).unwrap();
+        assert_eq!(
+            queues.usb_host.as_slice(),
+            &[UsbHostTaskCommand::SetBusState(
+                crate::usb_hid::power::UsbHostBusState::Suspended
+            )]
+        );
+
+        runtime
+            .handle_input::<8, 8, 2>(
+                RuntimeInput::BridgeEvent(BridgeEvent::HostConnected { host_id: HostId(1) }),
+                &mut commands,
+            )
+            .unwrap();
+        assert!(commands.contains(&RuntimeCommand::SetUsbHostBusState(
+            crate::usb_hid::power::UsbHostBusState::Running
+        )));
+    }
+
+    #[cfg(feature = "dual-s3-wired")]
+    #[test]
+    fn a_wired_transport_in_session_setup_resumes_the_usb_input_bus() {
+        let mut runtime = BridgeRuntime::<2, 1>::new(0);
+        let mut commands = heapless::Vec::<RuntimeCommand, 8>::new();
+        runtime
+            .handle_input::<8, 8, 2>(
+                RuntimeInput::UsbHidInterfaceConnected {
+                    interface_id: InterfaceId(1),
+                    device_id: DeviceId(7),
+                    led_output: None,
+                },
+                &mut commands,
+            )
+            .unwrap();
+        runtime
+            .handle_input::<8, 8, 2>(
+                RuntimeInput::Tick {
+                    now_ms: crate::usb_hid::power::USB_HOST_SUSPEND_DELAY_MS,
+                },
+                &mut commands,
+            )
+            .unwrap();
+
+        runtime
+            .handle_input::<8, 8, 2>(
+                RuntimeInput::BridgeEvent(BridgeEvent::WiredAvailabilityChanged {
+                    availability: OutputTargetAvailability::ConnectedNotReady,
+                }),
+                &mut commands,
+            )
+            .unwrap();
+
+        assert!(commands.contains(&RuntimeCommand::SetUsbHostBusState(
+            crate::usb_hid::power::UsbHostBusState::Running
+        )));
+    }
+
+    #[test]
     fn host_led_change_fans_out_to_all_registered_usb_interfaces() {
         let mut runtime = BridgeRuntime::<2, 4>::new(0);
         let mut commands = heapless::Vec::<RuntimeCommand, 16>::new();
@@ -4900,7 +5015,7 @@ mod tests {
         assert_eq!(queues.usb_host.len(), RUNTIME_USB_INTERFACES_MAX);
         assert_eq!(queues.storage.len(), 1);
         assert_eq!(queues.status.len(), 1);
-        assert_eq!(queues.usb_host[0].device_id(), DeviceId(1));
+        assert_eq!(queues.usb_host[0].target_device_id(), Some(DeviceId(1)));
 
         runtime
             .handle_default_input(
@@ -5084,7 +5199,7 @@ mod tests {
                 .unwrap(),
         };
         assert_eq!(command.led_target(), Some((InterfaceId(3), DeviceId(7))));
-        assert_eq!(command.device_id(), DeviceId(7));
+        assert_eq!(command.target_device_id(), Some(DeviceId(7)));
     }
 
     fn ready_runtime() -> BridgeRuntime<2, 1> {

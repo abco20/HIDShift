@@ -18,11 +18,12 @@ impl OutputTarget {
     }
 }
 
-/// Selects the next ready computer for a physical target-cycle action.
+/// Selects the next ready computer after the current logical selection.
 ///
 /// A Companion can associate the wired route with the BLE host belonging to
 /// the same computer. The two transports then occupy one position in the
-/// cycle: wired is preferred while available and BLE is its fallback.
+/// cycle: wired is preferred while available and BLE is its fallback. Both
+/// physical target cycling and disconnect fallback use this ordering.
 pub fn next_ready_computer_target(
     selected: OutputTarget,
     wired_ready: bool,
@@ -300,7 +301,7 @@ mod tests {
     }
 
     #[test]
-    fn selection_never_fails_over_and_only_ready_becomes_active() {
+    fn selection_and_availability_are_updated_explicitly() {
         let mut state = OutputTargetState::new();
         state.set_availability(OutputTargetAvailability::Ready);
         assert_eq!(state.active, Some(OutputTarget::Wired));
